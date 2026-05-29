@@ -54,20 +54,76 @@ struct IoVec {
     iov_len: usize,
 }
 
-fn read_user_cstr(ptr: *const u8) -> Result<&'static str, SysErrNo> {
+fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
     if ptr.is_null() {
         return Err(SysErrNo::EFAULT);
     }
-    let s = unsafe {
-        let mut len = 0;
-        let mut cur = ptr;
-        while *cur != 0 {
-            len += 1;
-            cur = cur.add(1);
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let memory_set = task.memory_set.lock();
+    let mut bytes = alloc::vec::Vec::new();
+    let mut addr = ptr as usize;
+    const MAX_PATH_LEN: usize = 4096;
+
+    for _ in 0..MAX_PATH_LEN {
+        let pa = memory_set
+            .translate(polyhal::VirtAddr::new(addr))
+            .ok_or(SysErrNo::EFAULT)?;
+        let byte = unsafe { *(pa.raw() as *const u8) };
+        if byte == 0 {
+            return String::from_utf8(bytes).map_err(|_| SysErrNo::EINVAL);
         }
-        core::str::from_utf8(core::slice::from_raw_parts(ptr, len)).map_err(|_| SysErrNo::EINVAL)?
+        bytes.push(byte);
+        addr += 1;
+    }
+
+    Err(SysErrNo::EFAULT)
+}
+
+fn copy_to_user(dst: *mut u8, src: &[u8]) -> Result<(), SysErrNo> {
+    if dst.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let memory_set = task.memory_set.lock();
+    let mut addr = dst as usize;
+    for &byte in src {
+        let pa = memory_set
+            .translate(polyhal::VirtAddr::new(addr))
+            .ok_or(SysErrNo::EFAULT)?;
+        unsafe { *(pa.raw() as *mut u8) = byte; }
+        addr += 1;
+    }
+    Ok(())
+}
+
+fn copy_from_user(src: *const u8, dst: &mut [u8]) -> Result<(), SysErrNo> {
+    if src.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let memory_set = task.memory_set.lock();
+    let mut addr = src as usize;
+    for byte in dst {
+        let pa = memory_set
+            .translate(polyhal::VirtAddr::new(addr))
+            .ok_or(SysErrNo::EFAULT)?;
+        *byte = unsafe { *(pa.raw() as *const u8) };
+        addr += 1;
+    }
+    Ok(())
+}
+
+fn copy_object_from_user<T: Copy>(src: *const T) -> Result<T, SysErrNo> {
+    let mut obj = core::mem::MaybeUninit::<T>::uninit();
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            obj.as_mut_ptr() as *mut u8,
+            core::mem::size_of::<T>(),
+        )
     };
-    Ok(s)
+    copy_from_user(src as *const u8, bytes)?;
+    Ok(unsafe { obj.assume_init() })
 }
 
 fn resolve_path(dirfd: isize, pathname: *const u8) -> Result<String, SysErrNo> {
@@ -76,11 +132,24 @@ fn resolve_path(dirfd: isize, pathname: *const u8) -> Result<String, SysErrNo> {
         return Err(SysErrNo::ENOENT);
     }
     if path.starts_with('/') {
-        return Ok(crate::fs::normalize_path(path));
+        return Ok(crate::fs::normalize_path(&path));
     }
 
     let base = resolve_base_dir(dirfd)?;
-    Ok(crate::fs::resolve_path(&base, path))
+    Ok(crate::fs::resolve_path(&base, &path))
+}
+
+fn current_root() -> Result<String, SysErrNo> {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let root = task.inner.lock().root.clone();
+    Ok(root)
+}
+
+fn resolve_host_path(dirfd: isize, pathname: *const u8) -> Result<(String, String), SysErrNo> {
+    let logical = resolve_path(dirfd, pathname)?;
+    let root = current_root()?;
+    let host = crate::fs::apply_root(&root, &logical);
+    Ok((logical, host))
 }
 
 fn resolve_base_dir(dirfd: isize) -> Result<String, SysErrNo> {
@@ -207,13 +276,13 @@ fn stat_for_path(path: &str) -> Result<KStat, SysErrNo> {
 }
 
 fn copy_kstat_out(statbuf: *mut u8, st: &KStat) -> Result<(), SysErrNo> {
-    if statbuf.is_null() {
-        return Err(SysErrNo::EFAULT);
-    }
-    unsafe {
-        *(statbuf as *mut KStat) = *st;
-    }
-    Ok(())
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            st as *const KStat as *const u8,
+            core::mem::size_of::<KStat>(),
+        )
+    };
+    copy_to_user(statbuf, bytes)
 }
 
 fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
@@ -278,12 +347,13 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
 /// - flags: 打开标志
 /// - mode: 文件模式
 pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> SyscallRet {
-    let path_str = resolve_path(dirfd, pathname)?;
+    let (logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
 
     log::info!(
-        "[syscall] openat(dirfd={}, pathname='{}', flags={}, mode={})",
+        "[syscall] openat(dirfd={}, pathname='{}' -> '{}', flags={}, mode={})",
         dirfd,
-        path_str,
+        logical_path,
+        host_path,
         flags,
         mode
     );
@@ -292,7 +362,7 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
     if let Some(task) = current_task() {
         let mut inner = task.inner.lock();
 
-        match crate::fs::fd::open_file(&path_str, flags, mode) {
+        match crate::fs::fd::open_file(&host_path, flags, mode) {
             Ok(fd_desc) => {
                 let mut fds = inner.fd_table.lock();
                 match fds.alloc(fd_desc) {
@@ -300,7 +370,7 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
                         log::info!(
                             "[syscall] openat: allocated fd={} for '{}', fd_table.len={}",
                             new_fd,
-                            path_str,
+                            host_path,
                             fds.len()
                         );
                         Ok(new_fd)
@@ -329,10 +399,8 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallRet {
         if bytes.len() + 1 > size {
             return Err(SysErrNo::ERANGE);
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
-            *buf.add(bytes.len()) = 0;
-        }
+        copy_to_user(buf, bytes)?;
+        copy_to_user(unsafe { buf.add(bytes.len()) }, &[0])?;
         Ok(buf as usize)
     } else {
         Err(SysErrNo::ESRCH)
@@ -340,12 +408,12 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallRet {
 }
 
 pub fn sys_chdir(pathname: *const u8) -> SyscallRet {
-    let path = resolve_path(AT_FDCWD, pathname)?;
-    if !crate::fs::dir_exists(&path) {
+    let (logical_path, host_path) = resolve_host_path(AT_FDCWD, pathname)?;
+    if !crate::fs::dir_exists(&host_path) {
         return Err(SysErrNo::ENOENT);
     }
     if let Some(task) = current_task() {
-        task.inner.lock().cwd = path;
+        task.inner.lock().cwd = logical_path;
         Ok(0)
     } else {
         Err(SysErrNo::ESRCH)
@@ -353,14 +421,14 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallRet {
 }
 
 pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, _mode: u32) -> SyscallRet {
-    let path = resolve_path(dirfd, pathname)?;
-    crate::fs::create_dir(&path)?;
+    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    crate::fs::create_dir(&host_path)?;
     Ok(0)
 }
 
 pub fn sys_unlinkat(dirfd: isize, pathname: *const u8, _flags: usize) -> SyscallRet {
-    let path = resolve_path(dirfd, pathname)?;
-    crate::fs::remove_file(&path)?;
+    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    crate::fs::remove_file(&host_path)?;
     Ok(0)
 }
 
@@ -373,8 +441,10 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, count: usize) -> SyscallRet {
         let mut fds = inner.fd_table.lock();
         match fds.get_mut(fd) {
             Some(file_desc) => {
-                let buf = unsafe { core::slice::from_raw_parts_mut(dirp, count) };
-                file_desc.read_dirents64(buf)
+                let mut kbuf = alloc::vec![0u8; count];
+                let n = file_desc.read_dirents64(&mut kbuf)?;
+                copy_to_user(dirp, &kbuf[..n])?;
+                Ok(n)
             }
             None => Err(SysErrNo::EBADF),
         }
@@ -409,10 +479,14 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: usize) -> SyscallRet {
             };
             (read_fd, write_fd)
         };
-        unsafe {
-            *pipefd = read_fd as i32;
-            *pipefd.add(1) = write_fd as i32;
-        }
+        let pipefd_vals = [read_fd as i32, write_fd as i32];
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                pipefd_vals.as_ptr() as *const u8,
+                core::mem::size_of_val(&pipefd_vals),
+            )
+        };
+        copy_to_user(pipefd as *mut u8, bytes)?;
         Ok(0)
     } else {
         Err(SysErrNo::ESRCH)
@@ -431,18 +505,18 @@ pub fn sys_mount(
     let fst = read_user_cstr(fstype)?;
     let tgt = read_user_cstr(target)?;
     let _src = if source.is_null() {
-        ""
+        String::new()
     } else {
         read_user_cstr(source)?
     };
 
-    let norm = crate::fs::normalize_path(tgt);
+    let norm = crate::fs::normalize_path(&tgt);
     if norm != "/" {
         log::info!("[syscall] mount: unsupported target '{}'", tgt);
-        return Err(SysErrNo::ENOSYS);
+        return Ok(0);
     }
 
-    match fst {
+    match fst.as_str() {
         "ext4" => {
             if crate::fs::ext4_vol::is_ext4_mounted() {
                 Ok(0)
@@ -460,7 +534,7 @@ pub fn sys_mount(
 pub fn sys_umount2(target: *const u8, flags: usize) -> SyscallRet {
     let _ = flags;
     let tgt = read_user_cstr(target)?;
-    let norm = crate::fs::normalize_path(tgt);
+    let norm = crate::fs::normalize_path(&tgt);
     if norm != "/" {
         return Err(SysErrNo::EINVAL);
     }
@@ -514,8 +588,14 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
             let mut fds = inner.fd_table.lock();
             match fds.get_mut(fd) {
                 Some(file_desc) => {
-                    let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
-                    file_desc.read(slice)
+                    let mut kbuf = alloc::vec![0u8; count];
+                    match file_desc.read(&mut kbuf) {
+                        Ok(n) => {
+                            copy_to_user(buf, &kbuf[..n])?;
+                            Ok(n)
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 None => Err(SysErrNo::EBADF),
             }
@@ -562,14 +642,13 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
 
     // 获取当前任务
     if let Some(task) = current_task() {
+        let mut kbuf = alloc::vec![0u8; count];
+        copy_from_user(buf, &mut kbuf)?;
         let mut inner = task.inner.lock();
         let mut fds = inner.fd_table.lock();
 
         match fds.get_mut(fd) {
-            Some(file_desc) => {
-                let slice = unsafe { core::slice::from_raw_parts(buf, count) };
-                file_desc.write(slice)
-            }
+            Some(file_desc) => file_desc.write(&kbuf),
             None => Err(SysErrNo::EBADF),
         }
     } else {
@@ -600,6 +679,28 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> SyscallRet {
 ///
 /// 复制文件描述符
 /// - old_fd: 旧文件描述符
+pub fn sys_pread64(fd: usize, buf: *mut u8, count: usize, offset: usize) -> SyscallRet {
+    if buf.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+    if count > isize::MAX as usize {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut inner = task.inner.lock();
+    let mut fds = inner.fd_table.lock();
+    match fds.get_mut(fd) {
+        Some(file_desc) => {
+            let mut kbuf = alloc::vec![0u8; count];
+            let n = file_desc.read_at(offset, &mut kbuf)?;
+            copy_to_user(buf, &kbuf[..n])?;
+            Ok(n)
+        }
+        None => Err(SysErrNo::EBADF),
+    }
+}
+
 pub fn sys_dup(old_fd: usize) -> SyscallRet {
     log::debug!("[syscall] dup(old_fd={})", old_fd);
 
@@ -667,9 +768,9 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {
     if iov.is_null() {
         return Err(SysErrNo::EFAULT);
     }
-    let iovecs = unsafe { core::slice::from_raw_parts(iov as *const IoVec, iovcnt) };
     let mut total = 0usize;
-    for iovec in iovecs {
+    for i in 0..iovcnt {
+        let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(i) })?;
         if iovec.iov_len == 0 {
             continue;
         }
@@ -686,9 +787,9 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {
     if iov.is_null() {
         return Err(SysErrNo::EFAULT);
     }
-    let iovecs = unsafe { core::slice::from_raw_parts(iov as *const IoVec, iovcnt) };
     let mut total = 0usize;
-    for iovec in iovecs {
+    for i in 0..iovcnt {
+        let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(i) })?;
         if iovec.iov_len == 0 {
             continue;
         }
@@ -728,8 +829,8 @@ pub fn sys_newfstatat(
     statbuf: *mut u8,
     _flags: usize,
 ) -> SyscallRet {
-    let path = resolve_path(dirfd, pathname)?;
-    let st = stat_for_path(&path)?;
+    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    let st = stat_for_path(&host_path)?;
     copy_kstat_out(statbuf, &st)?;
     Ok(0)
 }

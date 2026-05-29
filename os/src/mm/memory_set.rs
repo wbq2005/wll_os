@@ -20,9 +20,6 @@ impl MemorySet {
     /// 使用 alloc_new() 创建独立页表，避免与其他 MemorySet 共享 boot page table。
     /// 这样当 MemorySet 被 drop 时，不会清空 boot page table 中的用户空间映射。
     pub fn new_bare() -> Self {
-        // UART: 'N' = new_bare start
-        #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x4e; sb t1, 0(t0)"); }
         Self {
             page_table: PageTableWrapper::alloc_new(),
             areas: Vec::new(),
@@ -91,6 +88,23 @@ impl MemorySet {
     /// 遍历 KERNEL_PAGE_TABLE 复制 SV39 内核区域的映射。
     pub fn from_kernel() -> Self {
         let mut ms = Self::new_bare();
+        #[cfg(target_arch = "riscv64")]
+        {
+            let device_flags = PTEFlags::R | PTEFlags::W | PTEFlags::V;
+            for paddr in [
+                0x0200_0000usize,
+                0x0c00_0000usize,
+                0x1000_0000usize,
+                0x1000_1000usize,
+            ] {
+                ms.page_table.map_page(
+                    VirtAddr::new(paddr),
+                    PhysAddr::new(paddr),
+                    device_flags.into(),
+                    MappingSize::Page4KB,
+                );
+            }
+        }
 
         // RISC-V: OpenSBI 建立了 1:1 恒等映射和全空用户空间。
         // 用户的页表暂时只包含 OpenSBI 的 identity 映射，
@@ -106,9 +120,7 @@ impl MemorySet {
         ms
     }
 
-    /// 激活此地址空间
-    /// 
-    /// 将当前页表设置为活跃页表
+    /// 激活此地址空间。
     pub fn activate(&self) {
         self.page_table.change();
     }
@@ -153,7 +165,6 @@ impl MemorySet {
 
 impl Clone for MemorySet {
     fn clone(&self) -> Self {
-        // 1. 用 from_kernel 建立内核映射（复制 KERNEL_PAGE_TABLE 中的内核区域）
         let mut new_ms = Self::from_kernel();
 
         // 2. 复制用户空间区域（Copy-on-Write）

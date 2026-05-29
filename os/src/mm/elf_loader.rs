@@ -171,14 +171,99 @@ impl<'a> ElfFile<'a> {
         self.header.e_entry
     }
 
+    pub fn interp_path(&self) -> Option<&'a str> {
+        let ph = self.program_headers.iter().find(|ph| ph.p_type == PT_INTERP)?;
+        let start = ph.p_offset;
+        let end = start.checked_add(ph.p_filesz)?;
+        if start >= end || end > self.data.len() {
+            return None;
+        }
+        let bytes = &self.data[start..end];
+        let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        core::str::from_utf8(&bytes[..nul]).ok()
+    }
+
     /// 加载 ELF 到内存空间
     ///
     /// 返回 (MemorySet, 用户栈顶地址, 入口地址)
+    pub fn phdr_vaddr(&self, bias: usize) -> usize {
+        self.program_headers.iter()
+            .find(|ph| ph.p_type == PT_PHDR)
+            .map(|ph| ph.p_vaddr + bias)
+            .unwrap_or_else(|| {
+                self.program_headers.iter()
+                    .filter(|ph| ph.p_type == PT_LOAD)
+                    .map(|ph| ph.p_vaddr)
+                    .min()
+                    .unwrap_or(0)
+                    + self.header.e_phoff
+                    + bias
+            })
+    }
+
+    pub fn phnum(&self) -> usize {
+        self.header.e_phnum as usize
+    }
+
+    pub fn entry_with_bias(&self, bias: usize) -> usize {
+        self.entry() + bias
+    }
+
+    pub fn load_segments_into(&self, memory_set: &mut MemorySet, bias: usize) -> Result<(), SysErrNo> {
+        for ph in &self.program_headers {
+            if ph.p_type != PT_LOAD {
+                continue;
+            }
+            let start_va = VirtAddr::new(ph.p_vaddr + bias);
+            let end_va = VirtAddr::new(ph.p_vaddr + ph.p_memsz + bias);
+            let mut flags = PTEFlags::U | PTEFlags::V;
+            if ph.p_flags & 1 != 0 { flags |= PTEFlags::X; }
+            if ph.p_flags & 2 != 0 { flags |= PTEFlags::W; }
+            if ph.p_flags & 4 != 0 { flags |= PTEFlags::R; }
+            memory_set.insert_framed_area(start_va, end_va, flags);
+
+            if ph.p_filesz > 0 {
+                let src_start = ph.p_offset;
+                let src_end = ph.p_offset + ph.p_filesz;
+                if src_end > self.data.len() {
+                    return Err(SysErrNo::ENOEXEC);
+                }
+                let src = &self.data[src_start..src_end];
+                let page_size = crate::config::PAGE_SIZE;
+                let mut vaddr = ph.p_vaddr + bias;
+                let mut src_offset = 0usize;
+                while src_offset < src.len() {
+                    if let Some(paddr) = memory_set.translate(VirtAddr::new(vaddr)) {
+                        let page_offset = vaddr % page_size;
+                        let copy_len = (src.len() - src_offset).min(page_size - page_offset);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                src[src_offset..].as_ptr(),
+                                paddr.get_mut_ptr::<u8>(),
+                                copy_len,
+                            );
+                        }
+                        src_offset += copy_len;
+                    }
+                    vaddr += page_size - (vaddr % page_size);
+                }
+            }
+
+            if ph.p_memsz > ph.p_filesz {
+                let bss_start = ph.p_vaddr + ph.p_filesz + bias;
+                let bss_end = ph.p_vaddr + ph.p_memsz + bias;
+                for addr in bss_start..bss_end {
+                    if let Some(pa) = memory_set.translate(VirtAddr::new(addr)) {
+                        unsafe { *(pa.raw() as *mut u8) = 0; }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn load(&self) -> Result<(MemorySet, usize, usize), SysErrNo> {
         // UART marker: 'A' = elf.load() entry
-        #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x41; sb t1, 0(t0)"); }
-
         let mut memory_set = MemorySet::from_kernel();
 
         // 加载所有 LOAD 段
@@ -207,17 +292,9 @@ impl<'a> ElfFile<'a> {
 
                 // 为段分配物理页帧并建立映射
                 // UART marker: 'C' = before insert_framed_area
-                #[cfg(target_arch = "riscv64")]
-                unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x43; sb t1, 0(t0)"); }
                 memory_set.insert_framed_area(start_va, end_va, flags);
                 // UART marker: 'D' = after insert_framed_area
-                #[cfg(target_arch = "riscv64")]
-                unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x44; sb t1, 0(t0)"); }
-
                 // UART marker: 'F' = after all segment processing
-                #[cfg(target_arch = "riscv64")]
-                unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x46; sb t1, 0(t0)"); }
-
                 // 复制文件内容到内存（按页批量复制，避免逐字节翻译）
                 if ph.p_filesz > 0 {
                     let src_start = ph.p_offset;
@@ -300,9 +377,6 @@ impl<'a> ElfFile<'a> {
         );
 
         // UART marker: 'E' = all load done
-        #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x45; sb t1, 0(t0)"); }
-
         Ok((memory_set, user_stack_top, self.entry()))
     }
 }

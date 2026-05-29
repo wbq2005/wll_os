@@ -196,6 +196,10 @@ impl PageTable {
         let arr = Self::get_pte_list(self.0);
         if current.raw() == 0 {
             arr.fill(PTE(0));
+            arr[2] = PTE::new_page(
+                PhysAddr::new(0x8000_0000),
+                PTEFlags::V | PTEFlags::R | PTEFlags::W | PTEFlags::X | PTEFlags::G | PTEFlags::A | PTEFlags::D,
+            );
             return;
         }
 
@@ -227,7 +231,11 @@ impl PageTable {
 
     #[inline]
     pub fn change(&self) {
-        let satp_val = (8usize << 60) | (self.0.raw() >> 12);
+        let satp_val = if self.0.raw() == 0 {
+            0
+        } else {
+            (8usize << 60) | (self.0.raw() >> 12)
+        };
         unsafe { satp::write(Satp::from_bits(satp_val)) }
         TLB::flush_all();
     }

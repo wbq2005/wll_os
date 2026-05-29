@@ -6,6 +6,9 @@ pub mod other;
 
 use crate::utils::error::SysErrNo;
 
+/// Linux AT_FDCWD = -100, used to indicate "use current working directory" for *at syscalls.
+const AT_FDCWD: isize = -100;
+
 /// 系统调用返回值类型
 pub type SyscallRet = Result<usize, SysErrNo>;
 
@@ -29,6 +32,7 @@ pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_READV: usize = 65;
 pub const SYSCALL_WRITEV: usize = 66;
+pub const SYSCALL_PREAD64: usize = 67;
 pub const SYSCALL_LSEEK: usize = 62;
 pub const SYSCALL_SENDFILE: usize = 71;
 pub const SYSCALL_PSELECT6: usize = 72;
@@ -114,6 +118,11 @@ pub const SYSCALL_MEMBARRIER: usize = 283;
 pub const SYSCALL_COPY_FILE_RANGE: usize = 326;
 pub const SYSCALL_GETRANDOM: usize = 318;
 
+/// Old SYS_open = 1024, used by some basic test binaries via syscall(SYS_open, ...).
+/// Maps to openat(AT_FDCWD, path, flags, mode).
+/// Linux defines SYS_open = 1024 on RISC-V (only open/openat split happened later).
+pub const SYSCALL_OPEN: usize = 1024;
+
 /// 系统调用分发
 /// 
 /// 根据系统调用号分发到对应的处理函数
@@ -128,12 +137,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
     match syscall_id {
         // 文件操作
         SYSCALL_GETCWD => fs::sys_getcwd(args[0] as *mut u8, args[1]),
-        SYSCALL_MKDIRAT => fs::sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
-        SYSCALL_UNLINKAT => fs::sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
-        SYSCALL_UMOUNT2 => fs::sys_umount2(args[0] as *const u8, args[1]),
-        SYSCALL_MOUNT => fs::sys_mount(args[0] as *const u8, args[1] as *const u8, args[2] as *const u8, args[3], args[4]),
-        SYSCALL_CHDIR => fs::sys_chdir(args[0] as *const u8),
         SYSCALL_OPENAT => fs::sys_openat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
+        SYSCALL_OPEN => fs::sys_openat(AT_FDCWD, args[0] as *const u8, args[1] as u32, args[2] as u32),
         SYSCALL_CLOSE => fs::sys_close(args[0]),
         SYSCALL_PIPE2 => fs::sys_pipe2(args[0] as *mut i32, args[1]),
         SYSCALL_GETDENTS64 => fs::sys_getdents64(args[0], args[1] as *mut u8, args[2]),
@@ -141,6 +146,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_WRITE => fs::sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_READV => fs::sys_readv(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITEV => fs::sys_writev(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_PREAD64 => fs::sys_pread64(args[0], args[1] as *mut u8, args[2], args[3]),
         SYSCALL_LSEEK => fs::sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_DUP => fs::sys_dup(args[0]),
         SYSCALL_DUP3 => fs::sys_dup3(args[0], args[1], args[2]),
@@ -148,6 +154,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_IOCTL => fs::sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_NEWFSTATAT => fs::sys_newfstatat(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
         SYSCALL_FSTAT => fs::sys_fstat(args[0], args[1] as *mut u8),
+        SYSCALL_CHDIR => fs::sys_chdir(args[0] as *const u8),
+        SYSCALL_MKDIRAT => fs::sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_UNLINKAT => fs::sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
+        SYSCALL_MOUNT => fs::sys_mount(args[0] as *const u8, args[1] as *const u8, args[2] as *const u8, args[3], args[4]),
+        SYSCALL_UMOUNT2 => fs::sys_umount2(args[0] as *const u8, args[1]),
 
         // 进程管理
         SYSCALL_EXIT => process::sys_exit(args[0] as i32),

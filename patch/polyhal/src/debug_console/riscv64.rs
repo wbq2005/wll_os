@@ -1,6 +1,6 @@
 use crate::debug_console::DebugConsole;
 
-/// Debug console using SBI legacy console_putchar (HTIF)
+/// Debug console using SBI legacy console_putchar.
 impl DebugConsole {
     #[inline]
     pub fn putchar(ch: u8) {

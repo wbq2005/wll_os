@@ -122,8 +122,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     // J=entry, K=init_dtb_once done, L=logging done, M=polyhal done
     // N=mm done, O=memory regions added, P=page_table done, Q=kernel_space done
     // R=trap init done, S=timer done, T=Hello printed, U=Memorry init, V=VirtIO done
-    #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x4a; sb t1, 0(t0)"); }
     #[cfg(target_arch = "loongarch64")]
     early_la_line(b"[EARLY] rust_main reached\n");
 
@@ -134,8 +132,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     use core::sync::atomic::{AtomicBool, Ordering};
     static INIT_GUARD: AtomicBool = AtomicBool::new(false);
     if INIT_GUARD.swap(true, Ordering::SeqCst) {
-        #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x21; sb t1, 0(t0)"); }
         #[cfg(target_arch = "loongarch64")]
         early_la_line(b"[DBG] RECURSIVE CALL - halting\n");
         loop { wait_for_interrupt(); }
@@ -144,8 +140,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     #[cfg(target_arch = "loongarch64")]
     early_la_line(b"[DBG] B\n");
     if let Err(_e) = polyhal::mem::init_dtb_once(PhysAddr::new(dtb_ptr)) {
-        #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x21; sb t1, 0(t0)"); }
         loop { wait_for_interrupt(); }
     }
 
@@ -163,9 +157,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
     #[cfg(target_arch = "riscv64")]
     {
-        // UART marker: 'X' = frame allocator init start
-        #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x58; sb t1, 0(t0)") }
         // DTB init is done above; now register available memory regions
         // with the buddy frame allocator so that elf.load() can allocate
         // user-space pages.
@@ -179,9 +170,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
                 }
             }
         }
-        // UART marker: 'Y' = frame allocator init done
-        #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x59; sb t1, 0(t0)") }
         log::info!("[mm] Memory regions added to frame allocator: {}", count);
     }
 

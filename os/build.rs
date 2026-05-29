@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use ext4_view::Ext4;
 
-const MAX_PRELOAD_FILES: usize = 8;
+const MAX_PRELOAD_FILES: usize = 256;
 const MAX_PRELOAD_FILE_SIZE: usize = 2 * 1024 * 1024;
 
 fn main() {
@@ -122,7 +122,11 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
                                 "    crate::fs::add_user_program({:?}, &{data:?});\n",
                                 actual_path
                             ));
-                            if seen_alias.insert(alias.clone()) && actual_path != alias {
+                            // Only add basename alias for non-script files (like /init)
+                            // Skip for _testcode.sh and run-all.sh to avoid path shadowing
+                            let base = basename(&actual_path);
+                            let is_script = base.ends_with("_testcode.sh") || base == "run-all.sh";
+                            if !is_script && seen_alias.insert(alias.clone()) && actual_path != alias {
                                 code.push_str(&format!(
                                     "    crate::fs::add_user_program({:?}, &{data:?});\n",
                                     alias
@@ -201,10 +205,13 @@ fn collect_test_scripts(fs: &Ext4, dir: &str, depth: usize, out: &mut Vec<String
             if let Ok(path) = entry.path().to_str().map(|s| s.to_string()) {
                 if let Ok(meta) = entry.metadata() {
                     if meta.is_dir() {
+                        // Recurse into subdirectories to find *_testcode.sh files
                         collect_test_scripts(fs, &path, depth - 1, out);
                     } else {
+                        // Only collect *_testcode.sh files, not run-all.sh
+                        // run-all.sh is handled by parse_basic_script when it finds ./run-all.sh
                         let base = basename(&path);
-                        if base.ends_with("_testcode.sh") || base == "run-all.sh" {
+                        if base.ends_with("_testcode.sh") {
                             out.push(path);
                         }
                     }

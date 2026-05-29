@@ -226,6 +226,23 @@ pub fn resolve_path(cwd: &str, path: &str) -> String {
     }
 }
 
+pub fn apply_root(root: &str, logical_path: &str) -> String {
+    let root = normalize_path(root);
+    let logical_path = normalize_path(logical_path);
+    if root == "/" {
+        return logical_path;
+    }
+    if logical_path == "/" {
+        return root;
+    }
+    normalize_path(&format!("{}/{}", root, logical_path.trim_start_matches('/')))
+}
+
+pub fn resolve_path_with_root(root: &str, cwd: &str, path: &str) -> String {
+    let logical = resolve_path(cwd, path);
+    apply_root(root, &logical)
+}
+
 fn file_name(path: &str) -> &str {
     path.rsplit('/').find(|part| !part.is_empty()).unwrap_or("")
 }

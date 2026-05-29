@@ -46,49 +46,38 @@ pub fn is_ext4_mounted() -> bool {
 pub fn mount_block_device(device: Arc<dyn ext4_rs::BlockDevice>) {
     log::info!("[fs] Attempting to mount ext4 from block device...");
 
-    // 先读出 superblock 所在块做诊断
-    let superblock_data = device.read_offset(0);
-    if superblock_data.len() < 1024 {
-        log::error!("[fs] ext4: superblock read returned only {} bytes", superblock_data.len());
+    // Read first block. For 4KB block ext4: block0 = boot(1024) + superblock(1024) + bgd(2048).
+    // Superblock magic (0xEF53 LE) is at superblock offset 0x38 = absolute byte 1024+0x38 = 0x438.
+    // In the returned block buffer, it's at index 0x438.
+    let block0 = device.read_offset(0);
+    log::info!("[fs] read_offset(0) returned {} bytes", block0.len());
+
+    if block0.len() < 0x438 + 2 {
+        log::error!("[fs] ext4: buffer too small ({} < {})", block0.len(), 0x438 + 2);
         return;
     }
 
-    // ext4 superblock magic: 0x53EF at offset 0x38 (little-endian) within the 1024-byte superblock
-    let magic = u16::from_le_bytes([superblock_data[0x38], superblock_data[0x39]]);
-    log::info!("[fs] ext4: superblock magic = {:#x} (expect 0x53ef)", magic);
-    // Also print first few bytes of superblock for diagnostics
-    log::info!("[fs] ext4: superblock first 16 bytes: {:02x?}", &superblock_data[0..16]);
-    if magic != 0x53ef {
+    let magic = u16::from_le_bytes([block0[0x438], block0[0x439]]);
+    log::info!("[fs] ext4: superblock magic = {:#x} (expect 0xef53)", magic);
+    if magic != 0xef53 {
         log::error!(
-            "[fs] ext4: INVALID superblock magic {:#x} != 0x53ef. Image may not be a valid ext4 filesystem.",
+            "[fs] ext4: INVALID superblock magic {:#x} != 0xef53. Image may not be a valid ext4 filesystem.",
             magic
         );
         return;
     }
 
-    // blocksize: stored as log2 value at offset 0x18
+    // block_size: stored as log2 at superblock offset 0x18 = block0[1024+0x18] = block0[0x418]
     let log_block_size = u32::from_le_bytes([
-        superblock_data[0x18],
-        superblock_data[0x19],
-        superblock_data[0x1a],
-        superblock_data[0x1b],
+        block0[0x418],
+        block0[0x419],
+        block0[0x41a],
+        block0[0x41b],
     ]) as usize;
     let block_size = 1024usize << log_block_size;
-    let blocks_lo = u32::from_le_bytes([
-        superblock_data[0x4],
-        superblock_data[0x5],
-        superblock_data[0x6],
-        superblock_data[0x7],
-    ]);
-    log::info!(
-        "[fs] ext4: block_size_log={}, block_size={}, s_blocks_lo={}",
-        log_block_size,
-        block_size,
-        blocks_lo
-    );
+    log::info!("[fs] ext4: log_block_size={}, block_size={}", log_block_size, block_size);
 
     let fs = Ext4::open(device);
-    // 验证根目录可访问
     let root_count = fs.ext4_dir_get_entries(ROOT_INODE).len();
     match root_count {
         0 => log::warn!("[fs] EXT4 root dir appears empty — expected test scripts here"),

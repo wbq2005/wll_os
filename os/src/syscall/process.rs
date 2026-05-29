@@ -94,7 +94,7 @@ fn read_user_cstr(ptr: *const u8) -> &'static str {
 ///   - argv[0..n] 指针
 ///   - argc    (usize)
 ///   ← SP 指向这里
-fn setup_user_stack(
+pub(crate) fn setup_user_stack(
     memory_set: &crate::mm::memory_set::MemorySet,
     stack_top: usize,
     argv: &[String],
@@ -102,6 +102,7 @@ fn setup_user_stack(
     elf_entry: usize,
     phdr_vaddr: usize,
     phnum: usize,
+    interp_base: usize,
 ) -> usize {
     let mut sp = stack_top;
 
@@ -162,7 +163,7 @@ fn setup_user_stack(
     //    envp: envp_ptrs.len() + 1 (NULL)
     //    argv: argv_ptrs.len() + 1 (NULL)
     //    argc: 1
-    let auxv_entries = 7; // AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_ENTRY, AT_RANDOM, AT_NULL
+    let auxv_entries = 8; // AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_BASE, AT_ENTRY, AT_RANDOM, AT_NULL
     let total_slots = 1 + (argv_ptrs.len() + 1) + (envp_ptrs.len() + 1) + auxv_entries * 2;
     // 确保 sp 在写完后 16 字节对齐
     sp -= total_slots * core::mem::size_of::<usize>();
@@ -218,14 +219,16 @@ fn setup_user_stack(
     const AT_PHENT: usize = 4;
     const AT_PHNUM: usize = 5;
     const AT_PAGESZ: usize = 6;
+    const AT_BASE: usize = 7;
     const AT_ENTRY: usize = 9;
     const AT_RANDOM: usize = 25;
 
-    let auxv_pairs: [(usize, usize); 7] = [
+    let auxv_pairs: [(usize, usize); 8] = [
         (AT_PHDR, phdr_vaddr),
         (AT_PHENT, 56), // sizeof(Elf64_Phdr)
         (AT_PHNUM, phnum),
         (AT_PAGESZ, crate::config::PAGE_SIZE),
+        (AT_BASE, interp_base),
         (AT_ENTRY, elf_entry),
         (AT_RANDOM, random_addr),
         (AT_NULL, 0),
@@ -244,6 +247,10 @@ fn setup_user_stack(
 ///
 /// 加载并执行新程序
 pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallRet {
+    if *crate::trap::FOREGROUND_MODE.lock() {
+        return Err(SysErrNo::ENOSYS);
+    }
+
     let path_str = read_user_cstr(path);
     log::info!("[syscall] execve(path='{}')", path_str);
 
@@ -303,26 +310,33 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         entry,
         phdr_vaddr,
         phnum,
+        0,
     );
 
     if let Some(task) = current_task() {
-        let mut inner = task.inner.lock();
+        {
+            let mut inner = task.inner.lock();
 
-        // 重置堆
-        inner.program_break = crate::config::USER_HEAP_START;
-        inner.mapped_break = crate::config::USER_HEAP_START;
-        inner.next_mmap = 0x4000_0000;
+            // 重置堆
+            inner.program_break = crate::config::USER_HEAP_START;
+            inner.mapped_break = crate::config::USER_HEAP_START;
+            inner.next_mmap = 0x4000_0000;
+        }
 
         {
-            let mut ms = inner.memory_set.lock();
+            let mut ms = task.memory_set.lock();
             *ms = new_memory_set;
             ms.activate();
         }
 
-        if let Some(ref mut tf) = inner.trap_frame {
-            tf[TrapFrameArgs::SP] = sp;
-            tf[TrapFrameArgs::SEPC] = entry;
-            tf[TrapFrameArgs::RET] = 0;
+        {
+            let mut tf_guard = task.trap_frame.lock();
+            if let Some(ref mut tf) = *tf_guard {
+                tf[TrapFrameArgs::SP] = sp;
+                tf[TrapFrameArgs::SEPC] = entry;
+                tf[TrapFrameArgs::ARG0] = argv_with_path.len();
+                tf[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
+            }
         }
 
         log::info!(
@@ -347,6 +361,10 @@ pub fn sys_exit(exit_code: i32) -> SyscallRet {
     }
 
     exit_current_and_run_next(exit_code);
+
+    if *crate::trap::FOREGROUND_MODE.lock() {
+        return Ok(0);
+    }
 
     unreachable!("sys_exit should not return")
 }
@@ -374,7 +392,7 @@ pub fn sys_getppid() -> SyscallRet {
         .parent
         .as_ref()
         .map(|p| p.pid.0)
-        .unwrap_or(0usize);
+        .unwrap_or(1usize);
     log::debug!("[syscall] getppid() = {}", ppid);
     Ok(ppid)
 }
@@ -458,6 +476,10 @@ pub fn sys_clone(
     let parent = current_task().ok_or(SysErrNo::ESRCH)?;
     let parent_pid = parent.pid.0;
 
+    if *crate::trap::FOREGROUND_MODE.lock() {
+        return Ok(0);
+    }
+
     let clone_bits = flags & !CSIGNAL;
     if (clone_bits & THREAD_SHARING_FLAGS) != 0 {
         log::warn!(
@@ -491,33 +513,41 @@ pub fn sys_clone(
         }
     }
 
-    let memory_set = new_shared_memory_set(parent_inner.memory_set.lock().clone());
+    let memory_set = new_shared_memory_set(parent.memory_set.lock().clone());
 
     let fd_table = dup_fd_table(&*parent_inner.fd_table.lock());
+
+    drop(parent_inner);
 
     let child = Arc::new(crate::task::TaskControlBlock {
         pid: crate::task::pid::Pid::alloc(),
         inner: Mutex::new(crate::task::TaskControlBlockInner {
-            status: crate::task::TaskStatus::Ready,
-            memory_set,
-            task_ctx: crate::task::context::TaskContext::zero_init(),
-            trap_frame: Some(child_tf),
             exit_code: 0,
             clone_flags: clone_bits,
             parent: Some(parent.clone()),
             children: Vec::new(),
             fd_table,
-            cwd: parent_inner.cwd.clone(),
-            program_break: parent_inner.program_break,
-            mapped_break: parent_inner.mapped_break,
-            next_mmap: parent_inner.next_mmap,
+            cwd: parent.inner.lock().cwd.clone(),
+            root: parent.inner.lock().root.clone(),
+            program_break: parent.inner.lock().program_break,
+            mapped_break: parent.inner.lock().mapped_break,
+            next_mmap: parent.inner.lock().next_mmap,
         }),
+        task_ctx: crate::task::KernelCtx::new(crate::task::context::TaskContext::zero_init()),
+        memory_set,
+        trap_frame: Mutex::new(Some(child_tf)),
+        status: Mutex::new(crate::task::TaskStatus::Ready),
     });
     let child_pid = child.pid.0;
-    drop(parent_inner);
 
     parent.inner.lock().children.push(child.clone());
-    crate::task::manager::add_task(child);
+    if *crate::trap::FOREGROUND_MODE.lock() {
+        crate::task::run_user_task_foreground(child);
+        *crate::trap::FOREGROUND_MODE.lock() = true;
+        *crate::task::CURRENT_TASK.lock() = Some(parent.clone());
+    } else {
+        crate::task::manager::add_task(child);
+    }
 
     log::info!(
         "[syscall] clone(flags={:#x}, stack={:#x}) parent={} child={}",
@@ -543,5 +573,5 @@ pub fn setup_user_stack_for_init(
         String::from("PATH=/:/bin:/usr/bin"),
         String::from("LD_LIBRARY_PATH=/"),
     ];
-    setup_user_stack(memory_set, stack_top, &argv, &envp, elf_entry, phdr_vaddr, phnum)
+    setup_user_stack(memory_set, stack_top, &argv, &envp, elf_entry, phdr_vaddr, phnum, 0)
 }

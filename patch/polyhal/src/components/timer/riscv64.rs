@@ -31,8 +31,9 @@ pub fn get_freq() -> u64 {
 ///
 /// - next [Duration] next time from system boot#[inline]
 pub fn set_next_timer(next: Duration) {
+    let delta = next.as_secs() * CLOCK_FREQ + next.subsec_nanos() as u64 * CLOCK_FREQ / 1_000_000_000;
     sbi_rt::set_timer(
-        next.as_secs() * CLOCK_FREQ + next.subsec_nanos() as u64 * CLOCK_FREQ / 1_000_000_000,
+        get_ticks().saturating_add(delta),
     );
 }
 

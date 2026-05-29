@@ -12,6 +12,7 @@ lazy_static! {
 
 /// 添加任务到就绪队列
 pub fn add_task(task: Arc<TaskControlBlock>) {
+    log::info!("[task] add_task pid={}", task.pid.0);
     READY_QUEUE.lock().push_back(task);
 }
 

@@ -11,11 +11,15 @@ use crate::timer::set_next_trigger;
 
 lazy_static! {
     /// 存 `TrapFrame` 裸指针（单核）；用 `usize` 避免 `*mut TrapFrame: !Send` 与 `lazy_static` 冲突。
-    static ref CURRENT_SYSCALL_CTX_PTR: Mutex<usize> = Mutex::new(0);
+    pub static ref CURRENT_SYSCALL_CTX_PTR: Mutex<usize> = Mutex::new(0);
 
     /// 标记当前是否处于 execve 调用上下文中。
     /// 置位时 handle_syscall 跳过 syscall_ok() PC 前进，让 execve 直接返回到新程序入口。
-    static ref EXECVE_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
+    pub static ref EXECVE_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
+
+    /// 标记前台驱动模式：当此标志为 true 时，exit/suspend/timer 不要调用 run_next_task()，
+    /// 而是将当前任务置为 Zombie 后直接返回，由前台驱动负责收尾。
+    pub static ref FOREGROUND_MODE: Mutex<bool> = Mutex::new(false);
 }
 
 pub fn clone_current_trapframe() -> Option<TrapFrame> {
@@ -24,6 +28,12 @@ pub fn clone_current_trapframe() -> Option<TrapFrame> {
         None
     } else {
         unsafe { Some((*(ptr as *mut TrapFrame)).clone()) }
+    }
+}
+
+pub fn save_current_trapframe(tf: &TrapFrame) {
+    if let Some(task) = crate::task::current_task() {
+        *task.trap_frame.lock() = Some(tf.clone());
     }
 }
 
@@ -48,6 +58,8 @@ pub fn take_execve_done() -> bool {
 /// LoongArch: trap 向量已在 ctor 中初始化。
 pub fn init() {
     // trap 向量已在 polyhal-trap 的 ctor 中初始化
+    #[cfg(target_arch = "riscv64")]
+    polyhal_trap::trap::init_trap_only();
     log::info!("[trap] Trap handler initialized");
 }
 
@@ -62,10 +74,6 @@ pub fn init_timer() {
 
 /// 内核中断处理函数
 pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
-    // UART marker: 'K' = kernel_interrupt entry
-    #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x6b; sb t1, 0(t0)") }
-
     match trap_type {
         TrapType::SysCall => {
             // 系统调用处理
@@ -82,7 +90,9 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         TrapType::Timer => {
             // 定时器中断 - 设置下一次定时器并触发调度
             set_next_trigger();
-            suspend_current_and_run_next();
+            if !*FOREGROUND_MODE.lock() {
+                suspend_current_and_run_next();
+            }
         }
         TrapType::IllegalInstruction(vaddr) => {
             log::error!("[trap] Illegal instruction at {:#x}", vaddr);
@@ -108,10 +118,6 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 ///
 /// 用户态陷入内核时的处理入口
 pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
-    // UART marker: 'I' = user_interrupt entry
-    #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x49; sb t1, 0(t0)"); }
-
     // 获取当前任务的 trap 上下文
     // 对于用户态中断，需要保存用户上下文并处理
 
@@ -120,11 +126,16 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             handle_syscall(ctx);
         }
         TrapType::Timer => {
-            // 定时器中断 - 时间片用完，需要切换任务
             set_next_trigger();
-            suspend_current_and_run_next();
+            // Foreground mode: don't suspend. Trap frame is unchanged, foreground
+            // loop will re-run the task immediately. Only break if FOREGROUND_MODE.
+            if *FOREGROUND_MODE.lock() {
+                // just return, trap frame unchanged, foreground loop re-runs
+            } else {
+                suspend_current_and_run_next();
+            }
         }
-        TrapType::StorePageFault(vaddr) | TrapType::LoadPageFault(vaddr) 
+        TrapType::StorePageFault(vaddr) | TrapType::LoadPageFault(vaddr)
         | TrapType::InstructionPageFault(vaddr) => {
             log::error!(
                 "[trap] User page fault at {:#x}, killing process",
@@ -188,9 +199,19 @@ fn handle_syscall(ctx: &mut TrapFrame) {
 }
 
 /// 处理进程退出系统调用
-/// 
+///
 /// 当用户进程调用 exit 时，切换到下一个任务
 pub fn handle_exit(exit_code: i32) {
     log::info!("[trap] Process exit with code {}", exit_code);
     exit_current_and_run_next(exit_code);
+}
+
+/// 恢复内核页表
+///
+/// 在用户任务返回后调用，因为 SATP 在用户态运行时被切换到了用户页表。
+/// 内核代码无法通过高虚拟地址访问，必须先恢复内核页表。
+pub fn restore_kernel_page_table() {
+    if let Some(ref kpt) = *crate::mm::page_table::kernel_page_table().lock() {
+        kpt.change();
+    }
 }

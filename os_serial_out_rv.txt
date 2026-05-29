@@ -1,0 +1,3796 @@
+qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 -bios default -drive file=sdcard-rv.img,if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -no-reboot -device virtio-net-device,netdev=net -netdev user,id=net -rtc base=utc 
+
+OpenSBI v1.5.1
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name             : riscv-virtio,qemu
+Platform Features         : medeleg
+Platform HART Count       : 1
+Platform IPI Device       : aclint-mswi
+Platform Timer Device     : aclint-mtimer @ 10000000Hz
+Platform Console Device   : uart8250
+Platform HSM Device       : ---
+Platform PMU Device       : ---
+Platform Reboot Device    : syscon-reboot
+Platform Shutdown Device  : syscon-poweroff
+Platform Suspend Device   : ---
+Platform CPPC Device      : ---
+Firmware Base             : 0x80000000
+Firmware Size             : 327 KB
+Firmware RW Offset        : 0x40000
+Firmware RW Size          : 71 KB
+Firmware Heap Offset      : 0x49000
+Firmware Heap Size        : 35 KB (total), 2 KB (reserved), 11 KB (used), 21 KB (free)
+Firmware Scratch Size     : 4096 B (total), 416 B (used), 3680 B (free)
+Runtime SBI Version       : 2.0
+
+Domain0 Name              : root
+Domain0 Boot HART         : 0
+Domain0 HARTs             : 0*
+Domain0 Region00          : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01          : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02          : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03          : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04          : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05          : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06          : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07          : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address      : 0x0000000080200000
+Domain0 Next Arg1         : 0x00000000bfe00000
+Domain0 Next Mode         : S-mode
+Domain0 SysReset          : yes
+Domain0 SysSuspend        : yes
+
+Boot HART ID              : 0
+Boot HART Domain          : root
+Boot HART Priv Version    : v1.12
+Boot HART Base ISA        : rv64imafdch
+Boot HART ISA Extensions  : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count       : 16
+Boot HART PMP Granularity : 2 bits
+Boot HART PMP Address Bits: 54
+Boot HART MHPM Info       : 16 (0x0007fff8)
+Boot HART Debug Triggers  : 2 triggers
+Boot HART MIDELEG         : 0x0000000000001666
+Boot HART MEDELEG         : 0x0000000000f0b509
+ABCDEJ[DTB] raw ptr = 0xbfe00000
+
+[DTB] Using low addr direct mapping
+
+[DTB] ptr = 0xbfe00000
+
+[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+
+XY[kernel] Hello, OS!
+
+[kernel] Memory init
+
+[VIRTIO] Probing..
+
+[VIRTIO] mounting ext4..
+
+[EXT4] mounted successfully
+
+[harness] total files found: 6368
+
+[harness]   script found: /glibc/basic/run-all.sh
+
+[harness]   script found: /glibc/basic_testcode.sh
+
+[harness]   script found: /glibc/busybox_testcode.sh
+
+[harness]   script found: /glibc/cyclictest_testcode.sh
+
+[harness]   script found: /glibc/iozone_testcode.sh
+
+[harness]   script found: /glibc/iperf_testcode.sh
+
+[harness]   script found: /glibc/libcbench_testcode.sh
+
+[harness]   script found: /glibc/libctest_testcode.sh
+
+[harness]   script found: /glibc/lmbench_testcode.sh
+
+[harness]   script found: /glibc/ltp_testcode.sh
+
+[harness]   script found: /glibc/lua_testcode.sh
+
+[harness]   script found: /glibc/netperf_testcode.sh
+
+[harness]   script found: /glibc/unixbench_testcode.sh
+
+[harness]   script found: /musl/basic/run-all.sh
+
+[harness]   script found: /musl/basic_testcode.sh
+
+[harness]   script found: /musl/busybox_testcode.sh
+
+[harness]   script found: /musl/cyclictest_testcode.sh
+
+[harness]   script found: /musl/iozone_testcode.sh
+
+[harness]   script found: /musl/iperf_testcode.sh
+
+[harness]   script found: /musl/libcbench_testcode.sh
+
+[harness]   script found: /musl/libctest_testcode.sh
+
+[harness]   script found: /musl/lmbench_testcode.sh
+
+[harness]   script found: /musl/ltp_testcode.sh
+
+[harness]   script found: /musl/lua_testcode.sh
+
+[harness]   script found: /musl/netperf_testcode.sh
+
+[harness]   script found: /musl/unixbench_testcode.sh
+
+[harness] scripts after filter: 26
+
+[task] no /init, start preloaded test harness task.
+
+N[kernel] Starting sched.
+
+ST[harness] HARNESS_ENTER
+
+[harness] total files found: 6368
+
+[harness]   script found: /glibc/basic/run-all.sh
+
+[harness]   script found: /glibc/basic_testcode.sh
+
+[harness]   script found: /glibc/busybox_testcode.sh
+
+[harness]   script found: /glibc/cyclictest_testcode.sh
+
+[harness]   script found: /glibc/iozone_testcode.sh
+
+[harness]   script found: /glibc/iperf_testcode.sh
+
+[harness]   script found: /glibc/libcbench_testcode.sh
+
+[harness]   script found: /glibc/libctest_testcode.sh
+
+[harness]   script found: /glibc/lmbench_testcode.sh
+
+[harness]   script found: /glibc/ltp_testcode.sh
+
+[harness]   script found: /glibc/lua_testcode.sh
+
+[harness]   script found: /glibc/netperf_testcode.sh
+
+[harness]   script found: /glibc/unixbench_testcode.sh
+
+[harness]   script found: /musl/basic/run-all.sh
+
+[harness]   script found: /musl/basic_testcode.sh
+
+[harness]   script found: /musl/busybox_testcode.sh
+
+[harness]   script found: /musl/cyclictest_testcode.sh
+
+[harness]   script found: /musl/iozone_testcode.sh
+
+[harness]   script found: /musl/iperf_testcode.sh
+
+[harness]   script found: /musl/libcbench_testcode.sh
+
+[harness]   script found: /musl/libctest_testcode.sh
+
+[harness]   script found: /musl/lmbench_testcode.sh
+
+[harness]   script found: /musl/ltp_testcode.sh
+
+[harness]   script found: /musl/lua_testcode.sh
+
+[harness]   script found: /musl/netperf_testcode.sh
+
+[harness]   script found: /musl/unixbench_testcode.sh
+
+[harness] scripts after filter: 26
+
+[harness] SCRIPT /glibc/basic/run-all.sh
+
+#### OS COMP TEST GROUP START basic ####
+
+[harness] script read ok, len=274
+
+[harness] extracted 33 commands
+
+[harness] RUN_CMD brk
+
+[harness] START brk
+
+========== START brk ==========
+
+[harness] skip missing test binary: brk
+
+========== END brk ==========
+
+[harness] CMD_DONE brk
+
+[harness] RUN_CMD chdir
+
+[harness] START chdir
+
+========== START chdir ==========
+
+[harness] skip missing test binary: chdir
+
+========== END chdir ==========
+
+[harness] CMD_DONE chdir
+
+[harness] RUN_CMD clone
+
+[harness] START clone
+
+========== START clone ==========
+
+[harness] skip missing test binary: clone
+
+========== END clone ==========
+
+[harness] CMD_DONE clone
+
+[harness] RUN_CMD close
+
+[harness] START close
+
+========== START close ==========
+
+[harness] skip missing test binary: close
+
+========== END close ==========
+
+[harness] CMD_DONE close
+
+[harness] RUN_CMD dup2
+
+[harness] START dup2
+
+========== START dup2 ==========
+
+[harness] skip missing test binary: dup2
+
+========== END dup2 ==========
+
+[harness] CMD_DONE dup2
+
+[harness] RUN_CMD dup
+
+[harness] START dup
+
+========== START dup ==========
+
+[harness] skip missing test binary: dup
+
+========== END dup ==========
+
+[harness] CMD_DONE dup
+
+[harness] RUN_CMD execve
+
+[harness] START execve
+
+========== START execve ==========
+
+[harness] skip missing test binary: execve
+
+========== END execve ==========
+
+[harness] CMD_DONE execve
+
+[harness] RUN_CMD exit
+
+[harness] START exit
+
+========== START exit ==========
+
+[harness] skip missing test binary: exit
+
+========== END exit ==========
+
+[harness] CMD_DONE exit
+
+[harness] RUN_CMD fork
+
+[harness] START fork
+
+========== START fork ==========
+
+[harness] skip missing test binary: fork
+
+========== END fork ==========
+
+[harness] CMD_DONE fork
+
+[harness] RUN_CMD fstat
+
+[harness] START fstat
+
+========== START fstat ==========
+
+[harness] skip missing test binary: fstat
+
+========== END fstat ==========
+
+[harness] CMD_DONE fstat
+
+[harness] RUN_CMD getcwd
+
+[harness] START getcwd
+
+========== START getcwd ==========
+
+[harness] skip missing test binary: getcwd
+
+========== END getcwd ==========
+
+[harness] CMD_DONE getcwd
+
+[harness] RUN_CMD getdents
+
+[harness] START getdents
+
+========== START getdents ==========
+
+[harness] skip missing test binary: getdents
+
+========== END getdents ==========
+
+[harness] CMD_DONE getdents
+
+[harness] RUN_CMD getpid
+
+[harness] START getpid
+
+========== START getpid ==========
+
+[harness] skip missing test binary: getpid
+
+========== END getpid ==========
+
+[harness] CMD_DONE getpid
+
+[harness] RUN_CMD getppid
+
+[harness] START getppid
+
+========== START getppid ==========
+
+[harness] skip missing test binary: getppid
+
+========== END getppid ==========
+
+[harness] CMD_DONE getppid
+
+[harness] RUN_CMD gettimeofday
+
+[harness] START gettimeofday
+
+========== START gettimeofday ==========
+
+[harness] skip missing test binary: gettimeofday
+
+========== END gettimeofday ==========
+
+[harness] CMD_DONE gettimeofday
+
+[harness] RUN_CMD mkdir_
+
+[harness] START mkdir_
+
+========== START mkdir_ ==========
+
+[harness] skip missing test binary: mkdir_
+
+========== END mkdir_ ==========
+
+[harness] CMD_DONE mkdir_
+
+[harness] RUN_CMD mmap
+
+[harness] START mmap
+
+========== START mmap ==========
+
+[harness] skip missing test binary: mmap
+
+========== END mmap ==========
+
+[harness] CMD_DONE mmap
+
+[harness] RUN_CMD mount
+
+[harness] START mount
+
+========== START mount ==========
+
+[harness] skip missing test binary: mount
+
+========== END mount ==========
+
+[harness] CMD_DONE mount
+
+[harness] RUN_CMD munmap
+
+[harness] START munmap
+
+========== START munmap ==========
+
+[harness] skip missing test binary: munmap
+
+========== END munmap ==========
+
+[harness] CMD_DONE munmap
+
+[harness] RUN_CMD openat
+
+[harness] START openat
+
+========== START openat ==========
+
+[harness] skip missing test binary: openat
+
+========== END openat ==========
+
+[harness] CMD_DONE openat
+
+[harness] RUN_CMD open
+
+[harness] START open
+
+========== START open ==========
+
+[harness] skip missing test binary: open
+
+========== END open ==========
+
+[harness] CMD_DONE open
+
+[harness] RUN_CMD pipe
+
+[harness] START pipe
+
+========== START pipe ==========
+
+[harness] skip missing test binary: pipe
+
+========== END pipe ==========
+
+[harness] CMD_DONE pipe
+
+[harness] RUN_CMD read
+
+[harness] START read
+
+========== START read ==========
+
+[harness] skip missing test binary: read
+
+========== END read ==========
+
+[harness] CMD_DONE read
+
+[harness] RUN_CMD sleep
+
+[harness] START sleep
+
+========== START sleep ==========
+
+[harness] skip missing test binary: sleep
+
+========== END sleep ==========
+
+[harness] CMD_DONE sleep
+
+[harness] RUN_CMD times
+
+[harness] START times
+
+========== START times ==========
+
+[harness] skip missing test binary: times
+
+========== END times ==========
+
+[harness] CMD_DONE times
+
+[harness] RUN_CMD umount
+
+[harness] START umount
+
+========== START umount ==========
+
+[harness] skip missing test binary: umount
+
+========== END umount ==========
+
+[harness] CMD_DONE umount
+
+[harness] RUN_CMD uname
+
+[harness] START uname
+
+========== START uname ==========
+
+[harness] skip missing test binary: uname
+
+========== END uname ==========
+
+[harness] CMD_DONE uname
+
+[harness] RUN_CMD unlink
+
+[harness] START unlink
+
+========== START unlink ==========
+
+[harness] skip missing test binary: unlink
+
+========== END unlink ==========
+
+[harness] CMD_DONE unlink
+
+[harness] RUN_CMD wait
+
+[harness] START wait
+
+========== START wait ==========
+
+[harness] skip missing test binary: wait
+
+========== END wait ==========
+
+[harness] CMD_DONE wait
+
+[harness] RUN_CMD waitpid
+
+[harness] START waitpid
+
+========== START waitpid ==========
+
+[harness] skip missing test binary: waitpid
+
+========== END waitpid ==========
+
+[harness] CMD_DONE waitpid
+
+[harness] RUN_CMD write
+
+[harness] START write
+
+========== START write ==========
+
+[harness] skip missing test binary: write
+
+========== END write ==========
+
+[harness] CMD_DONE write
+
+[harness] RUN_CMD yield
+
+[harness] START yield
+
+========== START yield ==========
+
+[harness] skip missing test binary: yield
+
+========== END yield ==========
+
+[harness] CMD_DONE yield
+
+[harness] RUN_CMD $i
+
+[harness] START $i
+
+========== START $i ==========
+
+[harness] skip missing test binary: $i
+
+========== END $i ==========
+
+[harness] CMD_DONE $i
+
+#### OS COMP TEST GROUP END basic ####
+
+[harness] SCRIPT /glibc/basic_testcode.sh
+
+#### OS COMP TEST GROUP START basic ####
+
+[harness] script read ok, len=156
+
+[harness] extracted 3 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD run-all.sh
+
+[harness] START run-all.sh
+
+========== START run-all.sh ==========
+
+[harness] skip missing test binary: run-all.sh
+
+========== END run-all.sh ==========
+
+[harness] CMD_DONE run-all.sh
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END basic ####
+
+[harness] SCRIPT /glibc/busybox_testcode.sh
+
+#### OS COMP TEST GROUP START busybox ####
+
+[harness] script read ok, len=667
+
+[harness] extracted 3 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END busybox ####
+
+[harness] SCRIPT /glibc/cyclictest_testcode.sh
+
+#### OS COMP TEST GROUP START cyclictest ####
+
+[harness] script read ok, len=935
+
+[harness] extracted 4 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD cyclictest
+
+[harness] START cyclictest
+
+========== START cyclictest ==========
+
+[harness] skip missing test binary: cyclictest
+
+========== END cyclictest ==========
+
+[harness] CMD_DONE cyclictest
+
+[harness] RUN_CMD hackbench
+
+[harness] START hackbench
+
+========== START hackbench ==========
+
+[harness] skip missing test binary: hackbench
+
+========== END hackbench ==========
+
+[harness] CMD_DONE hackbench
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END cyclictest ####
+
+[harness] SCRIPT /glibc/iozone_testcode.sh
+
+#### OS COMP TEST GROUP START iozone ####
+
+[harness] script read ok, len=865
+
+[harness] extracted 18 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END iozone ####
+
+[harness] SCRIPT /glibc/iperf_testcode.sh
+
+#### OS COMP TEST GROUP START iperf ####
+
+[harness] script read ok, len=765
+
+[harness] extracted 2 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END iperf ####
+
+[harness] SCRIPT /glibc/libcbench_testcode.sh
+
+#### OS COMP TEST GROUP START libcbench ####
+
+[harness] script read ok, len=147
+
+[harness] extracted 3 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD libc-bench
+
+[harness] START libc-bench
+
+========== START libc-bench ==========
+
+[harness] skip missing test binary: libc-bench
+
+========== END libc-bench ==========
+
+[harness] CMD_DONE libc-bench
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END libcbench ####
+
+[harness] SCRIPT /glibc/libctest_testcode.sh
+
+#### OS COMP TEST GROUP START libctest ####
+
+[harness] script read ok, len=167
+
+[harness] extracted 4 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD run-static.sh
+
+[harness] START run-static.sh
+
+========== START run-static.sh ==========
+
+[harness] skip missing test binary: run-static.sh
+
+========== END run-static.sh ==========
+
+[harness] CMD_DONE run-static.sh
+
+[harness] RUN_CMD run-dynamic.sh
+
+[harness] START run-dynamic.sh
+
+========== START run-dynamic.sh ==========
+
+[harness] skip missing test binary: run-dynamic.sh
+
+========== END run-dynamic.sh ==========
+
+[harness] CMD_DONE run-dynamic.sh
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END libctest ####
+
+[harness] SCRIPT /glibc/lmbench_testcode.sh
+
+#### OS COMP TEST GROUP START lmbench ####
+
+[harness] script read ok, len=1391
+
+[harness] extracted 26 commands
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+#### OS COMP TEST GROUP END lmbench ####
+
+[harness] SCRIPT /glibc/ltp_testcode.sh
+
+#### OS COMP TEST GROUP START ltp ####
+
+[harness] script read ok, len=483
+
+[harness] extracted 0 commands
+
+#### OS COMP TEST GROUP END ltp ####
+
+[harness] SCRIPT /glibc/lua_testcode.sh
+
+#### OS COMP TEST GROUP START lua ####
+
+[harness] script read ok, len=314
+
+[harness] extracted 11 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END lua ####
+
+[harness] SCRIPT /glibc/netperf_testcode.sh
+
+#### OS COMP TEST GROUP START netperf ####
+
+[harness] script read ok, len=759
+
+[harness] extracted 4 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD netperf
+
+[harness] START netperf
+
+========== START netperf ==========
+
+[harness] skip missing test binary: netperf
+
+========== END netperf ==========
+
+[harness] CMD_DONE netperf
+
+[harness] RUN_CMD netserver
+
+[harness] START netserver
+
+========== START netserver ==========
+
+[harness] skip missing test binary: netserver
+
+========== END netserver ==========
+
+[harness] CMD_DONE netserver
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END netperf ####
+
+[harness] SCRIPT /glibc/unixbench_testcode.sh
+
+#### OS COMP TEST GROUP START unixbench ####
+
+[harness] script read ok, len=4691
+
+[harness] extracted 28 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD dhry2reg
+
+[harness] START dhry2reg
+
+========== START dhry2reg ==========
+
+[harness] skip missing test binary: dhry2reg
+
+========== END dhry2reg ==========
+
+[harness] CMD_DONE dhry2reg
+
+[harness] RUN_CMD whetstone-double
+
+[harness] START whetstone-double
+
+========== START whetstone-double ==========
+
+[harness] skip missing test binary: whetstone-double
+
+========== END whetstone-double ==========
+
+[harness] CMD_DONE whetstone-double
+
+[harness] RUN_CMD syscall
+
+[harness] START syscall
+
+========== START syscall ==========
+
+[harness] skip missing test binary: syscall
+
+========== END syscall ==========
+
+[harness] CMD_DONE syscall
+
+[harness] RUN_CMD context1
+
+[harness] START context1
+
+========== START context1 ==========
+
+[harness] skip missing test binary: context1
+
+========== END context1 ==========
+
+[harness] CMD_DONE context1
+
+[harness] RUN_CMD pipe
+
+[harness] START pipe
+
+========== START pipe ==========
+
+[harness] skip missing test binary: pipe
+
+========== END pipe ==========
+
+[harness] CMD_DONE pipe
+
+[harness] RUN_CMD spawn
+
+[harness] START spawn
+
+========== START spawn ==========
+
+[harness] skip missing test binary: spawn
+
+========== END spawn ==========
+
+[harness] CMD_DONE spawn
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD looper
+
+[harness] START looper
+
+========== START looper ==========
+
+[harness] skip missing test binary: looper
+
+========== END looper ==========
+
+[harness] CMD_DONE looper
+
+[harness] RUN_CMD looper
+
+[harness] START looper
+
+========== START looper ==========
+
+[harness] skip missing test binary: looper
+
+========== END looper ==========
+
+[harness] CMD_DONE looper
+
+[harness] RUN_CMD looper
+
+[harness] START looper
+
+========== START looper ==========
+
+[harness] skip missing test binary: looper
+
+========== END looper ==========
+
+[harness] CMD_DONE looper
+
+[harness] RUN_CMD arithoh
+
+[harness] START arithoh
+
+========== START arithoh ==========
+
+[harness] skip missing test binary: arithoh
+
+========== END arithoh ==========
+
+[harness] CMD_DONE arithoh
+
+[harness] RUN_CMD short
+
+[harness] START short
+
+========== START short ==========
+
+[harness] skip missing test binary: short
+
+========== END short ==========
+
+[harness] CMD_DONE short
+
+[harness] RUN_CMD int
+
+[harness] START int
+
+========== START int ==========
+
+[harness] skip missing test binary: int
+
+========== END int ==========
+
+[harness] CMD_DONE int
+
+[harness] RUN_CMD long
+
+[harness] START long
+
+========== START long ==========
+
+[harness] skip missing test binary: long
+
+========== END long ==========
+
+[harness] CMD_DONE long
+
+[harness] RUN_CMD float
+
+[harness] START float
+
+========== START float ==========
+
+[harness] skip missing test binary: float
+
+========== END float ==========
+
+[harness] CMD_DONE float
+
+[harness] RUN_CMD double
+
+[harness] START double
+
+========== START double ==========
+
+[harness] skip missing test binary: double
+
+========== END double ==========
+
+[harness] CMD_DONE double
+
+[harness] RUN_CMD hanoi
+
+[harness] START hanoi
+
+========== START hanoi ==========
+
+[harness] skip missing test binary: hanoi
+
+========== END hanoi ==========
+
+[harness] CMD_DONE hanoi
+
+[harness] RUN_CMD syscall
+
+[harness] START syscall
+
+========== START syscall ==========
+
+[harness] skip missing test binary: syscall
+
+========== END syscall ==========
+
+[harness] CMD_DONE syscall
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END unixbench ####
+
+[harness] SCRIPT /musl/basic/run-all.sh
+
+#### OS COMP TEST GROUP START basic ####
+
+[harness] script read ok, len=274
+
+[harness] extracted 33 commands
+
+[harness] RUN_CMD brk
+
+[harness] START brk
+
+========== START brk ==========
+
+[harness] skip missing test binary: brk
+
+========== END brk ==========
+
+[harness] CMD_DONE brk
+
+[harness] RUN_CMD chdir
+
+[harness] START chdir
+
+========== START chdir ==========
+
+[harness] skip missing test binary: chdir
+
+========== END chdir ==========
+
+[harness] CMD_DONE chdir
+
+[harness] RUN_CMD clone
+
+[harness] START clone
+
+========== START clone ==========
+
+[harness] skip missing test binary: clone
+
+========== END clone ==========
+
+[harness] CMD_DONE clone
+
+[harness] RUN_CMD close
+
+[harness] START close
+
+========== START close ==========
+
+[harness] skip missing test binary: close
+
+========== END close ==========
+
+[harness] CMD_DONE close
+
+[harness] RUN_CMD dup2
+
+[harness] START dup2
+
+========== START dup2 ==========
+
+[harness] skip missing test binary: dup2
+
+========== END dup2 ==========
+
+[harness] CMD_DONE dup2
+
+[harness] RUN_CMD dup
+
+[harness] START dup
+
+========== START dup ==========
+
+[harness] skip missing test binary: dup
+
+========== END dup ==========
+
+[harness] CMD_DONE dup
+
+[harness] RUN_CMD execve
+
+[harness] START execve
+
+========== START execve ==========
+
+[harness] skip missing test binary: execve
+
+========== END execve ==========
+
+[harness] CMD_DONE execve
+
+[harness] RUN_CMD exit
+
+[harness] START exit
+
+========== START exit ==========
+
+[harness] skip missing test binary: exit
+
+========== END exit ==========
+
+[harness] CMD_DONE exit
+
+[harness] RUN_CMD fork
+
+[harness] START fork
+
+========== START fork ==========
+
+[harness] skip missing test binary: fork
+
+========== END fork ==========
+
+[harness] CMD_DONE fork
+
+[harness] RUN_CMD fstat
+
+[harness] START fstat
+
+========== START fstat ==========
+
+[harness] skip missing test binary: fstat
+
+========== END fstat ==========
+
+[harness] CMD_DONE fstat
+
+[harness] RUN_CMD getcwd
+
+[harness] START getcwd
+
+========== START getcwd ==========
+
+[harness] skip missing test binary: getcwd
+
+========== END getcwd ==========
+
+[harness] CMD_DONE getcwd
+
+[harness] RUN_CMD getdents
+
+[harness] START getdents
+
+========== START getdents ==========
+
+[harness] skip missing test binary: getdents
+
+========== END getdents ==========
+
+[harness] CMD_DONE getdents
+
+[harness] RUN_CMD getpid
+
+[harness] START getpid
+
+========== START getpid ==========
+
+[harness] skip missing test binary: getpid
+
+========== END getpid ==========
+
+[harness] CMD_DONE getpid
+
+[harness] RUN_CMD getppid
+
+[harness] START getppid
+
+========== START getppid ==========
+
+[harness] skip missing test binary: getppid
+
+========== END getppid ==========
+
+[harness] CMD_DONE getppid
+
+[harness] RUN_CMD gettimeofday
+
+[harness] START gettimeofday
+
+========== START gettimeofday ==========
+
+[harness] skip missing test binary: gettimeofday
+
+========== END gettimeofday ==========
+
+[harness] CMD_DONE gettimeofday
+
+[harness] RUN_CMD mkdir_
+
+[harness] START mkdir_
+
+========== START mkdir_ ==========
+
+[harness] skip missing test binary: mkdir_
+
+========== END mkdir_ ==========
+
+[harness] CMD_DONE mkdir_
+
+[harness] RUN_CMD mmap
+
+[harness] START mmap
+
+========== START mmap ==========
+
+[harness] skip missing test binary: mmap
+
+========== END mmap ==========
+
+[harness] CMD_DONE mmap
+
+[harness] RUN_CMD mount
+
+[harness] START mount
+
+========== START mount ==========
+
+[harness] skip missing test binary: mount
+
+========== END mount ==========
+
+[harness] CMD_DONE mount
+
+[harness] RUN_CMD munmap
+
+[harness] START munmap
+
+========== START munmap ==========
+
+[harness] skip missing test binary: munmap
+
+========== END munmap ==========
+
+[harness] CMD_DONE munmap
+
+[harness] RUN_CMD openat
+
+[harness] START openat
+
+========== START openat ==========
+
+[harness] skip missing test binary: openat
+
+========== END openat ==========
+
+[harness] CMD_DONE openat
+
+[harness] RUN_CMD open
+
+[harness] START open
+
+========== START open ==========
+
+[harness] skip missing test binary: open
+
+========== END open ==========
+
+[harness] CMD_DONE open
+
+[harness] RUN_CMD pipe
+
+[harness] START pipe
+
+========== START pipe ==========
+
+[harness] skip missing test binary: pipe
+
+========== END pipe ==========
+
+[harness] CMD_DONE pipe
+
+[harness] RUN_CMD read
+
+[harness] START read
+
+========== START read ==========
+
+[harness] skip missing test binary: read
+
+========== END read ==========
+
+[harness] CMD_DONE read
+
+[harness] RUN_CMD sleep
+
+[harness] START sleep
+
+========== START sleep ==========
+
+[harness] skip missing test binary: sleep
+
+========== END sleep ==========
+
+[harness] CMD_DONE sleep
+
+[harness] RUN_CMD times
+
+[harness] START times
+
+========== START times ==========
+
+[harness] skip missing test binary: times
+
+========== END times ==========
+
+[harness] CMD_DONE times
+
+[harness] RUN_CMD umount
+
+[harness] START umount
+
+========== START umount ==========
+
+[harness] skip missing test binary: umount
+
+========== END umount ==========
+
+[harness] CMD_DONE umount
+
+[harness] RUN_CMD uname
+
+[harness] START uname
+
+========== START uname ==========
+
+[harness] skip missing test binary: uname
+
+========== END uname ==========
+
+[harness] CMD_DONE uname
+
+[harness] RUN_CMD unlink
+
+[harness] START unlink
+
+========== START unlink ==========
+
+[harness] skip missing test binary: unlink
+
+========== END unlink ==========
+
+[harness] CMD_DONE unlink
+
+[harness] RUN_CMD wait
+
+[harness] START wait
+
+========== START wait ==========
+
+[harness] skip missing test binary: wait
+
+========== END wait ==========
+
+[harness] CMD_DONE wait
+
+[harness] RUN_CMD waitpid
+
+[harness] START waitpid
+
+========== START waitpid ==========
+
+[harness] skip missing test binary: waitpid
+
+========== END waitpid ==========
+
+[harness] CMD_DONE waitpid
+
+[harness] RUN_CMD write
+
+[harness] START write
+
+========== START write ==========
+
+[harness] skip missing test binary: write
+
+========== END write ==========
+
+[harness] CMD_DONE write
+
+[harness] RUN_CMD yield
+
+[harness] START yield
+
+========== START yield ==========
+
+[harness] skip missing test binary: yield
+
+========== END yield ==========
+
+[harness] CMD_DONE yield
+
+[harness] RUN_CMD $i
+
+[harness] START $i
+
+========== START $i ==========
+
+[harness] skip missing test binary: $i
+
+========== END $i ==========
+
+[harness] CMD_DONE $i
+
+#### OS COMP TEST GROUP END basic ####
+
+[harness] SCRIPT /musl/basic_testcode.sh
+
+#### OS COMP TEST GROUP START basic ####
+
+[harness] script read ok, len=154
+
+[harness] extracted 3 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD run-all.sh
+
+[harness] START run-all.sh
+
+========== START run-all.sh ==========
+
+[harness] skip missing test binary: run-all.sh
+
+========== END run-all.sh ==========
+
+[harness] CMD_DONE run-all.sh
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END basic ####
+
+[harness] SCRIPT /musl/busybox_testcode.sh
+
+#### OS COMP TEST GROUP START busybox ####
+
+[harness] script read ok, len=665
+
+[harness] extracted 3 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END busybox ####
+
+[harness] SCRIPT /musl/cyclictest_testcode.sh
+
+#### OS COMP TEST GROUP START cyclictest ####
+
+[harness] script read ok, len=933
+
+[harness] extracted 4 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD cyclictest
+
+[harness] START cyclictest
+
+========== START cyclictest ==========
+
+[harness] skip missing test binary: cyclictest
+
+========== END cyclictest ==========
+
+[harness] CMD_DONE cyclictest
+
+[harness] RUN_CMD hackbench
+
+[harness] START hackbench
+
+========== START hackbench ==========
+
+[harness] skip missing test binary: hackbench
+
+========== END hackbench ==========
+
+[harness] CMD_DONE hackbench
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END cyclictest ####
+
+[harness] SCRIPT /musl/iozone_testcode.sh
+
+#### OS COMP TEST GROUP START iozone ####
+
+[harness] script read ok, len=863
+
+[harness] extracted 18 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD iozone
+
+[harness] START iozone
+
+========== START iozone ==========
+
+[harness] skip missing test binary: iozone
+
+========== END iozone ==========
+
+[harness] CMD_DONE iozone
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END iozone ####
+
+[harness] SCRIPT /musl/iperf_testcode.sh
+
+#### OS COMP TEST GROUP START iperf ####
+
+[harness] script read ok, len=763
+
+[harness] extracted 2 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END iperf ####
+
+[harness] SCRIPT /musl/libcbench_testcode.sh
+
+#### OS COMP TEST GROUP START libcbench ####
+
+[harness] script read ok, len=145
+
+[harness] extracted 3 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD libc-bench
+
+[harness] START libc-bench
+
+========== START libc-bench ==========
+
+[harness] skip missing test binary: libc-bench
+
+========== END libc-bench ==========
+
+[harness] CMD_DONE libc-bench
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END libcbench ####
+
+[harness] SCRIPT /musl/libctest_testcode.sh
+
+#### OS COMP TEST GROUP START libctest ####
+
+[harness] script read ok, len=165
+
+[harness] extracted 4 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD run-static.sh
+
+[harness] START run-static.sh
+
+========== START run-static.sh ==========
+
+[harness] skip missing test binary: run-static.sh
+
+========== END run-static.sh ==========
+
+[harness] CMD_DONE run-static.sh
+
+[harness] RUN_CMD run-dynamic.sh
+
+[harness] START run-dynamic.sh
+
+========== START run-dynamic.sh ==========
+
+[harness] skip missing test binary: run-dynamic.sh
+
+========== END run-dynamic.sh ==========
+
+[harness] CMD_DONE run-dynamic.sh
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END libctest ####
+
+[harness] SCRIPT /musl/lmbench_testcode.sh
+
+#### OS COMP TEST GROUP START lmbench ####
+
+[harness] script read ok, len=1389
+
+[harness] extracted 26 commands
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+[harness] RUN_CMD lmbench_all
+
+[harness] START lmbench_all
+
+========== START lmbench_all ==========
+
+[harness] skip missing test binary: lmbench_all
+
+========== END lmbench_all ==========
+
+[harness] CMD_DONE lmbench_all
+
+#### OS COMP TEST GROUP END lmbench ####
+
+[harness] SCRIPT /musl/ltp_testcode.sh
+
+#### OS COMP TEST GROUP START ltp ####
+
+[harness] script read ok, len=481
+
+[harness] extracted 0 commands
+
+#### OS COMP TEST GROUP END ltp ####
+
+[harness] SCRIPT /musl/lua_testcode.sh
+
+#### OS COMP TEST GROUP START lua ####
+
+[harness] script read ok, len=312
+
+[harness] extracted 11 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD test.sh
+
+[harness] START test.sh
+
+========== START test.sh ==========
+
+[harness] skip missing test binary: test.sh
+
+========== END test.sh ==========
+
+[harness] CMD_DONE test.sh
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END lua ####
+
+[harness] SCRIPT /musl/netperf_testcode.sh
+
+#### OS COMP TEST GROUP START netperf ####
+
+[harness] script read ok, len=757
+
+[harness] extracted 4 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD netperf
+
+[harness] START netperf
+
+========== START netperf ==========
+
+[harness] skip missing test binary: netperf
+
+========== END netperf ==========
+
+[harness] CMD_DONE netperf
+
+[harness] RUN_CMD netserver
+
+[harness] START netserver
+
+========== START netserver ==========
+
+[harness] skip missing test binary: netserver
+
+========== END netserver ==========
+
+[harness] CMD_DONE netserver
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END netperf ####
+
+[harness] SCRIPT /musl/unixbench_testcode.sh
+
+#### OS COMP TEST GROUP START unixbench ####
+
+[harness] script read ok, len=4689
+
+[harness] extracted 28 commands
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+[harness] RUN_CMD dhry2reg
+
+[harness] START dhry2reg
+
+========== START dhry2reg ==========
+
+[harness] skip missing test binary: dhry2reg
+
+========== END dhry2reg ==========
+
+[harness] CMD_DONE dhry2reg
+
+[harness] RUN_CMD whetstone-double
+
+[harness] START whetstone-double
+
+========== START whetstone-double ==========
+
+[harness] skip missing test binary: whetstone-double
+
+========== END whetstone-double ==========
+
+[harness] CMD_DONE whetstone-double
+
+[harness] RUN_CMD syscall
+
+[harness] START syscall
+
+========== START syscall ==========
+
+[harness] skip missing test binary: syscall
+
+========== END syscall ==========
+
+[harness] CMD_DONE syscall
+
+[harness] RUN_CMD context1
+
+[harness] START context1
+
+========== START context1 ==========
+
+[harness] skip missing test binary: context1
+
+========== END context1 ==========
+
+[harness] CMD_DONE context1
+
+[harness] RUN_CMD pipe
+
+[harness] START pipe
+
+========== START pipe ==========
+
+[harness] skip missing test binary: pipe
+
+========== END pipe ==========
+
+[harness] CMD_DONE pipe
+
+[harness] RUN_CMD spawn
+
+[harness] START spawn
+
+========== START spawn ==========
+
+[harness] skip missing test binary: spawn
+
+========== END spawn ==========
+
+[harness] CMD_DONE spawn
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD fstime
+
+[harness] START fstime
+
+========== START fstime ==========
+
+[harness] skip missing test binary: fstime
+
+========== END fstime ==========
+
+[harness] CMD_DONE fstime
+
+[harness] RUN_CMD looper
+
+[harness] START looper
+
+========== START looper ==========
+
+[harness] skip missing test binary: looper
+
+========== END looper ==========
+
+[harness] CMD_DONE looper
+
+[harness] RUN_CMD looper
+
+[harness] START looper
+
+========== START looper ==========
+
+[harness] skip missing test binary: looper
+
+========== END looper ==========
+
+[harness] CMD_DONE looper
+
+[harness] RUN_CMD looper
+
+[harness] START looper
+
+========== START looper ==========
+
+[harness] skip missing test binary: looper
+
+========== END looper ==========
+
+[harness] CMD_DONE looper
+
+[harness] RUN_CMD arithoh
+
+[harness] START arithoh
+
+========== START arithoh ==========
+
+[harness] skip missing test binary: arithoh
+
+========== END arithoh ==========
+
+[harness] CMD_DONE arithoh
+
+[harness] RUN_CMD short
+
+[harness] START short
+
+========== START short ==========
+
+[harness] skip missing test binary: short
+
+========== END short ==========
+
+[harness] CMD_DONE short
+
+[harness] RUN_CMD int
+
+[harness] START int
+
+========== START int ==========
+
+[harness] skip missing test binary: int
+
+========== END int ==========
+
+[harness] CMD_DONE int
+
+[harness] RUN_CMD long
+
+[harness] START long
+
+========== START long ==========
+
+[harness] skip missing test binary: long
+
+========== END long ==========
+
+[harness] CMD_DONE long
+
+[harness] RUN_CMD float
+
+[harness] START float
+
+========== START float ==========
+
+[harness] skip missing test binary: float
+
+========== END float ==========
+
+[harness] CMD_DONE float
+
+[harness] RUN_CMD double
+
+[harness] START double
+
+========== START double ==========
+
+[harness] skip missing test binary: double
+
+========== END double ==========
+
+[harness] CMD_DONE double
+
+[harness] RUN_CMD hanoi
+
+[harness] START hanoi
+
+========== START hanoi ==========
+
+[harness] skip missing test binary: hanoi
+
+========== END hanoi ==========
+
+[harness] CMD_DONE hanoi
+
+[harness] RUN_CMD syscall
+
+[harness] START syscall
+
+========== START syscall ==========
+
+[harness] skip missing test binary: syscall
+
+========== END syscall ==========
+
+[harness] CMD_DONE syscall
+
+[harness] RUN_CMD busybox
+
+[harness] START busybox
+
+========== START busybox ==========
+
+[harness] skip missing test binary: busybox
+
+========== END busybox ==========
+
+[harness] CMD_DONE busybox
+
+#### OS COMP TEST GROUP END unixbench ####
+
+[harness] all preloaded scripts done, shutdown.
+

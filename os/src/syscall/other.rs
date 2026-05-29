@@ -2,26 +2,31 @@ use crate::utils::error::SysErrNo;
 use super::SyscallRet;
 use crate::timer;
 use crate::task::current_task;
+use polyhal::VirtAddr;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct TimeSpec {
     tv_sec: usize,
     tv_nsec: usize,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct RLimit {
     rlim_cur: usize,
     rlim_max: usize,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct TimeVal {
     tv_sec: usize,
     tv_usec: usize,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Tms {
     tms_utime: isize,
     tms_stime: isize,
@@ -30,6 +35,7 @@ struct Tms {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct UtsName {
     sysname: [u8; 65],
     nodename: [u8; 65],
@@ -47,18 +53,71 @@ fn write_c_string(dst: &mut [u8; 65], value: &str) {
 }
 
 /// nanosleep 系统调用
+fn copy_to_user(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
+    if dst == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let memory_set = task.memory_set.lock();
+    let mut addr = dst;
+    for &byte in src {
+        let pa = memory_set
+            .translate(VirtAddr::new(addr))
+            .ok_or(SysErrNo::EFAULT)?;
+        unsafe { *(pa.raw() as *mut u8) = byte; }
+        addr += 1;
+    }
+    Ok(())
+}
+
+fn copy_from_user(src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
+    if src == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let memory_set = task.memory_set.lock();
+    let mut addr = src;
+    for byte in dst {
+        let pa = memory_set
+            .translate(VirtAddr::new(addr))
+            .ok_or(SysErrNo::EFAULT)?;
+        *byte = unsafe { *(pa.raw() as *const u8) };
+        addr += 1;
+    }
+    Ok(())
+}
+
+fn copy_object_to_user<T>(dst: usize, obj: &T) -> Result<(), SysErrNo> {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(obj as *const T as *const u8, core::mem::size_of::<T>())
+    };
+    copy_to_user(dst, bytes)
+}
+
+fn copy_object_from_user<T: Copy>(src: usize) -> Result<T, SysErrNo> {
+    let mut obj = core::mem::MaybeUninit::<T>::uninit();
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            obj.as_mut_ptr() as *mut u8,
+            core::mem::size_of::<T>(),
+        )
+    };
+    copy_from_user(src, bytes)?;
+    Ok(unsafe { obj.assume_init() })
+}
+
 pub fn sys_nanosleep(req: usize, rem: usize) -> SyscallRet {
     if req == 0 {
         return Err(SysErrNo::EFAULT);
     }
 
-    let req = unsafe { &*(req as *const TimeSpec) };
+    let req = copy_object_from_user::<TimeSpec>(req)?;
     let sleep_ms = req.tv_sec.saturating_mul(1000).saturating_add(req.tv_nsec.div_ceil(1_000_000));
     timer::sleep_ms(sleep_ms);
 
     if rem != 0 {
         unsafe {
-            *(rem as *mut TimeSpec) = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+            copy_object_to_user(rem, &TimeSpec { tv_sec: 0, tv_nsec: 0 })?;
         }
     }
 
@@ -72,11 +131,11 @@ pub fn sys_gettimeofday(tv: usize, tz: usize) -> SyscallRet {
     }
     let (sec, usec) = timer::get_timeval();
     unsafe {
-        *(tv as *mut TimeVal) = TimeVal { tv_sec: sec, tv_usec: usec };
+        copy_object_to_user(tv, &TimeVal { tv_sec: sec, tv_usec: usec })?;
     }
     if tz != 0 {
         unsafe {
-            *(tz as *mut [u8; 8]) = [0; 8];
+            copy_to_user(tz, &[0; 8])?;
         }
     }
     Ok(0)
@@ -88,10 +147,10 @@ pub fn sys_clock_gettime(_clock_id: usize, tp: usize) -> SyscallRet {
     }
     let time_us = timer::get_time_us();
     unsafe {
-        *(tp as *mut TimeSpec) = TimeSpec {
+        copy_object_to_user(tp, &TimeSpec {
             tv_sec: time_us / 1_000_000,
             tv_nsec: (time_us % 1_000_000) * 1000,
-        };
+        })?;
     }
     Ok(0)
 }
@@ -101,10 +160,10 @@ pub fn sys_clock_getres(_clock_id: usize, tp: usize) -> SyscallRet {
         return Err(SysErrNo::EFAULT);
     }
     unsafe {
-        *(tp as *mut TimeSpec) = TimeSpec {
+        copy_object_to_user(tp, &TimeSpec {
             tv_sec: 0,
             tv_nsec: 1_000,
-        };
+        })?;
     }
     Ok(0)
 }
@@ -124,7 +183,7 @@ pub fn sys_uname(buf: usize) -> SyscallRet {
     };
     write_c_string(&mut uts.sysname, "wll_OS");
     write_c_string(&mut uts.nodename, "os-contest");
-    write_c_string(&mut uts.release, "0.1");
+    write_c_string(&mut uts.release, "5.10.0");
     write_c_string(&mut uts.version, "2026");
     #[cfg(target_arch = "riscv64")]
     write_c_string(&mut uts.machine, "riscv64");
@@ -132,7 +191,7 @@ pub fn sys_uname(buf: usize) -> SyscallRet {
     write_c_string(&mut uts.machine, "loongarch64");
     write_c_string(&mut uts.domainname, "localdomain");
     unsafe {
-        *(buf as *mut UtsName) = uts;
+        copy_object_to_user(buf, &uts)?;
     }
     Ok(0)
 }
@@ -141,12 +200,12 @@ pub fn sys_times(buf: usize) -> SyscallRet {
     if buf != 0 {
         let ticks = timer::get_time() as isize;
         unsafe {
-            *(buf as *mut Tms) = Tms {
+            copy_object_to_user(buf, &Tms {
                 tms_utime: ticks,
                 tms_stime: 0,
                 tms_cutime: 0,
                 tms_cstime: 0,
-            };
+            })?;
         }
     }
     Ok(timer::get_time())
@@ -178,10 +237,10 @@ pub fn sys_prlimit64(_pid: usize, _resource: usize, new_limit: usize, old_limit:
     let _ = new_limit;
     if old_limit != 0 {
         unsafe {
-            *(old_limit as *mut RLimit) = RLimit {
+            copy_object_to_user(old_limit, &RLimit {
                 rlim_cur: usize::MAX,
                 rlim_max: usize::MAX,
-            };
+            })?;
         }
     }
     Ok(0)
@@ -198,12 +257,11 @@ pub fn sys_getrandom(buf: usize, buflen: usize, _flags: usize) -> SyscallRet {
         return Err(SysErrNo::EFAULT);
     }
     let time = timer::get_time();
-    unsafe {
-        let slice = core::slice::from_raw_parts_mut(buf as *mut u8, buflen);
-        for (i, byte) in slice.iter_mut().enumerate() {
-            *byte = ((time.wrapping_mul(1103515245).wrapping_add(12345 + i)) >> 16) as u8;
-        }
+    let mut bytes = alloc::vec![0u8; buflen];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = ((time.wrapping_mul(1103515245).wrapping_add(12345 + i)) >> 16) as u8;
     }
+    copy_to_user(buf, &bytes)?;
     Ok(buflen)
 }
 
@@ -246,17 +304,13 @@ pub fn sys_sysinfo(info: usize) -> SyscallRet {
         mem_unit: 1,
         _pad: [0; 4],
     };
-    unsafe {
-        *(info as *mut SysInfo) = si;
-    }
+    copy_object_to_user(info, &si)?;
     Ok(0)
 }
 
 pub fn sys_getrusage(_who: usize, usage: usize) -> SyscallRet {
     if usage != 0 {
-        unsafe {
-            core::ptr::write_bytes(usage as *mut u8, 0, 144);
-        }
+        copy_to_user(usage, &[0; 144])?;
     }
     Ok(0)
 }

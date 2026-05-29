@@ -144,9 +144,6 @@ extern "C" fn user_restore(context: *mut TrapFrame) {
                 csrw     sscratch, a0
                 mv       sp, a0
 
-                .short   0x2452      # fld  fs0, 272(sp)
-                .short   0x24f2      # fld  fs1, 280(sp)
-
                 LOAD_GENERAL_REGS
                 sret
             ",
@@ -163,9 +160,6 @@ pub unsafe extern "C" fn uservec() {
         "
         SAVE_GENERAL_REGS
         csrw    sscratch, x0
-
-        .word   0x10813827          # fsd fs0, 272(sp)
-        .word   0x10913c27          # fsd fs1, 280(sp)
 
         mv      a0, sp
         ld      sp, 0*8(a0)

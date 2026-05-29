@@ -7,7 +7,9 @@ pub mod pid;
 use alloc::sync::Arc;
 use alloc::string::{String, ToString};
 use alloc::format;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
@@ -19,15 +21,65 @@ use crate::task::processor::Processor;
 use crate::fs::fd::FileDescriptorTable;
 use crate::console::putchar;
 
+static mut SCHEDULER_CONTEXT: TaskContext = TaskContext {
+    ra: 0,
+    sp: 0,
+    s: [0; 12],
+};
+static SCHEDULER_CONTEXT_PTR: AtomicUsize = AtomicUsize::new(0);
+
 lazy_static! {
     /// 当前运行的任务
     pub static ref CURRENT_TASK: Mutex<Option<Arc<TaskControlBlock>>> = Mutex::new(None);
-    
+
     /// CPU 处理器状态
     pub static ref PROCESSOR: Mutex<Processor> = Mutex::new(Processor::new());
 
     /// 孤儿进程收养者：`/init` 或预载入 harness（无 init 时），供父退出时移交子进程
     pub static ref ORPHAN_REAPER: Mutex<Option<Arc<TaskControlBlock>>> = Mutex::new(None);
+}
+
+/// Unified specification for launching user programs with full control over
+/// argv, envp, cwd, and output marker name. Used by the test harness to run
+/// basic test binaries with correct paths and working directories.
+pub struct UserProgramSpec {
+    /// Absolute ELF path, e.g. "/glibc/basic/test_brk"
+    pub path: String,
+    /// Argument vector (argv[0] should be the program name or path)
+    pub argv: Vec<String>,
+    /// Environment vector (e.g. "PATH=/bin:/glibc", "LD_LIBRARY_PATH=/lib")
+    pub envp: Vec<String>,
+    /// Current working directory for the new task
+    pub cwd: String,
+    /// Logical root directory for this task, e.g. "/glibc" or "/musl"
+    pub root: String,
+    /// Output marker name for judge, e.g. "test_brk" (None = use argv[0])
+    pub marker_name: Option<String>,
+}
+
+impl Default for UserProgramSpec {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            argv: vec![String::from("/init")],
+            envp: vec![
+                String::from("PATH=/:/bin:/usr/bin"),
+                String::from("LD_LIBRARY_PATH=/"),
+            ],
+            cwd: String::from("/"),
+            root: String::from("/"),
+            marker_name: None,
+        }
+    }
+}
+
+impl UserProgramSpec {
+    /// Returns the marker name: explicit marker_name or argv[0]
+    pub fn marker(&self) -> String {
+        self.marker_name
+            .clone()
+            .unwrap_or_else(|| self.argv.first().cloned().unwrap_or_default())
+    }
 }
 
 /// `MemorySet` / `FdTable` 在 `CLONE_VM` / `CLONE_FILES` 下跨任务共享（`fork` 时各自深拷贝）。
@@ -56,6 +108,26 @@ pub fn set_orphan_reaper(task: Arc<TaskControlBlock>) {
 
 fn orphan_reaper() -> Option<Arc<TaskControlBlock>> {
     ORPHAN_REAPER.lock().clone()
+}
+
+fn is_kernel_task(task: &Arc<TaskControlBlock>) -> bool {
+    task.trap_frame.lock().is_none()
+}
+
+fn task_ctx_ptr(task: &Arc<TaskControlBlock>) -> *mut TaskContext {
+    task.task_ctx_ptr()
+}
+
+fn switch_kernel_task_back_to_scheduler(task: &Arc<TaskControlBlock>) {
+    let scheduler_ctx_ptr = SCHEDULER_CONTEXT_PTR.load(Ordering::SeqCst);
+    if scheduler_ctx_ptr == 0 {
+        log::error!("[task] missing scheduler context for kernel task {}", task.pid.0);
+        return;
+    }
+    let current_ctx_ptr = task_ctx_ptr(task);
+    unsafe {
+        context::switch_to(current_ctx_ptr, scheduler_ctx_ptr as *const TaskContext);
+    }
 }
 
 /// 初始化内核页表
@@ -121,17 +193,19 @@ fn report_no_init_and_maybe_shutdown(reason: &str) {
 }
 
 /// 合并 MemFS + ext4 上的脚本路径（运行时扫描；编译期预载仍写入 MemFS）。
+/// 只匹配顶层 *_testcode.sh，忽略 run-all.sh（由 *_testcode.sh 间接调用）。
 fn collect_script_paths() -> Vec<String> {
     let all_files = crate::fs::list_files();
     console_write("[harness] total files found: ");
     console_write(&alloc::format!("{}", all_files.len()));
     console_write("\n");
-    
+
     let mut scripts: Vec<String> = all_files
         .into_iter()
         .filter(|path| {
             let name = path.rsplit('/').next().unwrap_or(path);
-            let matches = name.ends_with("_testcode.sh") || name == "run-all.sh";
+            // Only collect top-level *_testcode.sh files, NOT run-all.sh
+            let matches = name.ends_with("_testcode.sh");
             if matches {
                 console_write("[harness]   script found: ");
                 console_write(path);
@@ -140,11 +214,220 @@ fn collect_script_paths() -> Vec<String> {
             matches
         })
         .collect();
-    scripts.sort();
+    scripts.sort_by(|a, b| {
+        let rank = |path: &String| {
+            if path.starts_with("/glibc/basic") {
+                0usize
+            } else if path.starts_with("/glibc/") {
+                1
+            } else if path.starts_with("/musl/basic") {
+                2
+            } else {
+                3
+            }
+        };
+        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+    });
     console_write("[harness] scripts after filter: ");
     console_write(&alloc::format!("{}", scripts.len()));
     console_write("\n");
     scripts
+}
+
+/// Parsed information for a single test case.
+pub struct ParsedTestCase {
+    /// The binary path on disk, e.g. "/glibc/basic/test_brk"
+    pub binary_path: String,
+    /// Working directory for the test, e.g. "/glibc/basic"
+    pub cwd: String,
+    /// Marker name for judge output, e.g. "test_brk"
+    pub marker_name: String,
+}
+
+/// Parse a `basic_testcode.sh` script to extract test cases.
+///
+/// Most `*_testcode.sh` are simple wrappers that cd into a subdirectory and
+/// call `./run-all.sh`. We understand this pattern so we can resolve the
+/// actual binary paths and set the correct CWD for each test.
+///
+/// Returns `Vec<ParsedTestCase>` with fully resolved paths.
+fn parse_basic_script(script_path: &str, script_text: &str) -> Vec<ParsedTestCase> {
+    // Determine libc prefix from script path: "/glibc/basic_testcode.sh" -> "glibc"
+    // or "/musl/basic_testcode.sh" -> "musl"
+    let libc_prefix = script_path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+
+    let mut results = Vec::new();
+    let mut in_tests = false;
+    let mut runall_subpath: Option<String> = None;
+    let mut test_dir: Option<String> = None;
+
+    for line in script_text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+
+        // Detect "cd ./basic" or "cd ./<subdir>" pattern
+        // Ignore "cd .." since it's used to restore cwd after running tests
+        if t.starts_with("cd ") && !t.contains("..") {
+            let target = t.trim_start_matches("cd ").trim();
+            let stripped = target.trim_start_matches("./");
+            // Store the subdirectory; we'll prepend the libc prefix later
+            // Only update if not going to parent (..)
+            if !stripped.is_empty() && stripped != ".." {
+                test_dir = Some(stripped.to_string());
+            }
+            continue;
+        }
+
+        // Detect "./run-all.sh" or "./<script>.sh" invocation
+        if t.starts_with("./") && t.ends_with(".sh") {
+            // e.g. "./run-all.sh" -> "run-all.sh"
+            let name = t.trim_start_matches("./");
+            let stripped = name.trim_start_matches("./");
+            runall_subpath = Some(stripped.to_string());
+            continue;
+        }
+
+        // Parse tests="..." block (multiline)
+        if t.starts_with("tests=\"") {
+            in_tests = true;
+            let rest = t.trim_start_matches("tests=\"").trim();
+            if !rest.is_empty() && rest != "\"" {
+                // Single-line case: tests="brk chdir ..."
+                for name in rest.split_whitespace() {
+                    if !name.is_empty() && name != "\"" {
+                        if let Some(tc) = make_test_case(libc_prefix, test_dir.as_deref(), name) {
+                            results.push(tc);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if in_tests {
+            if t == "\"" {
+                in_tests = false;
+                continue;
+            }
+            // Each line inside the tests block is a test name
+            for name in t.split_whitespace() {
+                if !name.is_empty() && name != "\"" {
+                    if let Some(tc) = make_test_case(libc_prefix, test_dir.as_deref(), name) {
+                        results.push(tc);
+                    }
+                }
+            }
+            continue;
+        }
+    }
+
+    // If the script didn't use tests="..." but directly invoked ./run-all.sh,
+    // try to read and parse run-all.sh to get test names.
+    if results.is_empty() {
+        if let Some(ref runall_name) = runall_subpath {
+            // Build the full path to run-all.sh: base_dir + test_dir + runall_name
+            let base_dir = script_path.rsplit('/').next().map(|s| {
+                let idx = script_path.len() - s.len();
+                &script_path[..idx]
+            }).unwrap_or("");
+            let runall_path = if let Some(ref dir) = test_dir {
+                alloc::format!("{}/{}/{}", base_dir, dir, runall_name)
+            } else {
+                alloc::format!("{}/{}", base_dir, runall_name)
+            };
+
+            if let Some(bytes) = crate::fs::read_file(&runall_path) {
+                if let Ok(runall_text) = core::str::from_utf8(&bytes) {
+                    let dir = test_dir.as_deref().unwrap_or("");
+                    for line in runall_text.lines() {
+                        let t = line.trim();
+                        if t.is_empty() || t.starts_with('#') {
+                            continue;
+                        }
+                        if t.starts_with("tests=\"") {
+                            in_tests = true;
+                            let rest = t.trim_start_matches("tests=\"").trim();
+                            if !rest.is_empty() && rest != "\"" {
+                                for name in rest.split_whitespace() {
+                                    if !name.is_empty() && name != "\"" {
+                                        if let Some(tc) = make_test_case(libc_prefix, Some(dir), name) {
+                                            results.push(tc);
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if in_tests {
+                            if t == "\"" {
+                                in_tests = false;
+                                continue;
+                            }
+                            for name in t.split_whitespace() {
+                                if !name.is_empty() && name != "\"" {
+                                    if let Some(tc) = make_test_case(libc_prefix, Some(dir), name) {
+                                        results.push(tc);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Helper: create a ParsedTestCase from a test name and directory info.
+/// The raw_name is used directly for the binary path:
+/// - binary_path = /<libc>/<subdir>/<raw_name>
+/// - marker_name = test_<raw_name>
+/// e.g. "brk" with libc="glibc", dir="basic" -> "/glibc/basic/brk", "test_brk"
+fn make_test_case(libc_prefix: &str, test_dir: Option<&str>, raw_name: &str) -> Option<ParsedTestCase> {
+    let name = raw_name.trim();
+    if name.is_empty() || name == "\"" {
+        return None;
+    }
+
+    let raw_without_prefix = name.strip_prefix("test_").unwrap_or(name);
+    let marker_name = alloc::format!("test_{}", raw_without_prefix);
+
+    let subdir = test_dir.unwrap_or("").trim_end_matches('/');
+    let dir = if subdir.is_empty() {
+        alloc::format!("/{}", libc_prefix)
+    } else {
+        alloc::format!("/{}/{}", libc_prefix, subdir)
+    };
+
+    let raw_path = alloc::format!("{}/{}", dir, raw_without_prefix);
+    let prefixed_path = alloc::format!("{}/{}", dir, marker_name);
+    let binary_path = if crate::fs::file_exists(&raw_path) {
+        raw_path
+    } else if crate::fs::file_exists(&prefixed_path) {
+        prefixed_path
+    } else {
+        raw_path
+    };
+
+    let cwd = if subdir.is_empty() {
+        alloc::format!("/{}", libc_prefix)
+    } else {
+        alloc::format!("/{}/{}", libc_prefix, subdir)
+    };
+
+    Some(ParsedTestCase {
+        binary_path,
+        cwd,
+        marker_name,
+    })
 }
 
 fn try_start_preloaded_test_harness() -> bool {
@@ -165,42 +448,49 @@ fn run_preloaded_test_harness() -> ! {
     console_write("[harness] HARNESS_ENTER\n");
     let scripts = collect_script_paths();
 
-    for script in scripts {
+    for script in &scripts {
         console_write("[harness] SCRIPT ");
-        console_write(&script);
+        console_write(script);
         console_write("\n");
 
-        let group = group_name_from_script(&script);
+        // Determine group name from script filename
+        let group = {
+            let base = script.rsplit('/').next().unwrap_or(script);
+            base.strip_suffix("_testcode.sh")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| base.to_string())
+        };
+
         console_write("#### OS COMP TEST GROUP START ");
         console_write(&group);
         console_write(" ####\n");
 
-        if let Some(bytes) = crate::fs::read_file(&script) {
-            console_write("[harness] script read ok, len=");
-            console_write(&alloc::format!("{}", bytes.len()));
-            console_write("\n");
+        if let Some(bytes) = crate::fs::read_file(script) {
             if let Ok(text) = core::str::from_utf8(&bytes) {
-                let cmds = extract_exec_names(text);
-                console_write("[harness] extracted ");
-                console_write(&alloc::format!("{}", cmds.len()));
-                console_write(" commands\n");
-                for cmd in cmds {
-                    console_write("[harness] RUN_CMD ");
-                    console_write(&cmd);
-                    console_write("\n");
-                    run_one_test_binary(&cmd);
-                    console_write("[harness] CMD_DONE ");
-                    console_write(&cmd);
-                    console_write("\n");
+                // Try script-aware parsing first (for basic_testcode.sh)
+                let test_cases = parse_basic_script(script, text);
+                if !test_cases.is_empty() {
+                    console_write("[harness] script-aware parse: ");
+                    console_write(&alloc::format!("{}", test_cases.len()));
+                    console_write(" cases\n");
+                    for case in test_cases {
+                        run_one_test_binary_with_spec(&case);
+                    }
+                } else {
+                    // Fallback: treat as non-basic script, try busybox
+                    console_write("[harness] non-basic script, trying busybox...\n");
+                    if !run_script_via_busybox(script) {
+                        console_write("[harness] busybox script skipped (not yet implemented or failed)\n");
+                    }
                 }
             } else {
                 console_write("[harness] skip non-utf8 script: ");
-                console_write(&script);
+                console_write(script);
                 console_write("\n");
             }
         } else {
             console_write("[harness] script missing: ");
-            console_write(&script);
+            console_write(script);
             console_write("\n");
         }
 
@@ -213,132 +503,169 @@ fn run_preloaded_test_harness() -> ! {
     polyhal::instruction::shutdown();
 }
 
-fn group_name_from_script(script: &str) -> String {
-    let base = script.rsplit('/').next().unwrap_or(script);
-    if let Some(name) = base.strip_suffix("_testcode.sh") {
-        return name.to_string();
-    }
-    if base == "run-all.sh" {
-        return "basic".to_string();
-    }
-    base.to_string()
-}
+/// Execute a single test binary using a ParsedTestCase specification.
+/// Uses UserProgramSpec to set correct path, argv, envp, cwd, and marker name.
+fn run_one_test_binary_with_spec(case: &ParsedTestCase) {
+    let marker = &case.marker_name;
 
-fn extract_exec_names(script: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut in_tests = false;
-
-    for line in script.lines() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
-        }
-        if t.starts_with("tests=\"") {
-            in_tests = true;
-            let rest = t.trim_start_matches("tests=\"").trim();
-            if !rest.is_empty() && rest != "\"" {
-                names.push(rest.to_string());
-            }
-            continue;
-        }
-        if in_tests {
-            if t == "\"" {
-                in_tests = false;
-                continue;
-            }
-            names.push(t.trim_matches('"').to_string());
-            continue;
-        }
-        if let Some(cmd) = t.split_whitespace().next() {
-            if let Some(name) = cmd.strip_prefix("./") {
-                if !name.is_empty() {
-                    // Keep "test_" prefix so it matches runner dict key (e.g., "test_brk")
-                    names.push(name.to_string());
-                }
-            }
-        }
-    }
-
-    names
-}
-
-fn run_one_test_binary(name: &str) {
-    console_write("[harness] START ");
-    console_write(name);
-    console_write("\n");
-
-    // Output format required by judge_basic-*.py: "========== START <name> =========="
-    // Everything between START and END markers is parsed as test output.
-    console_write("========== START ");
-    console_write(name);
-    console_write(" ==========\n");
-
-    // Try multiple path variants for the test binary
-    let candidates: [&str; 6] = [
-        name,
-        name.trim_start_matches('/'),
-        &format!("/{}", name),
-        &format!("/test_{}", name.strip_prefix("test_").unwrap_or(name)),
-        &format!("/mnt/{}", name),
-        &format!("/mnt/test_{}", name.strip_prefix("test_").unwrap_or(name)),
-    ];
-    let elf_data = candidates
-        .iter()
-        .filter_map(|path| crate::fs::read_file(path))
-        .next();
-
-    let Some(elf_data) = elf_data else {
-        console_write("[harness] skip missing test binary: ");
-        console_write(name);
-        console_write("\n");
-        console_write("========== END ");
-        console_write(name);
-        console_write(" ==========\n");
-        return;
-    };
-
-    console_write("[harness] ELF loaded, creating task...\n");
-    let task = match TaskControlBlock::new_user(&elf_data) {
+    // Try to load the ELF first (outside marker region for clean output)
+    let spec = spec_from_case(case);
+    let task = match TaskControlBlock::new_user_with_args_env_cwd(&spec) {
         Ok(task) => task,
         Err(err) => {
-            console_write("[harness] skip invalid ELF: ");
-            console_write(name);
+            console_write("========== START ");
+            console_write(marker);
+            console_write(" ==========\n");
+            console_write("[harness] ELF load failed: ");
+            console_write(&case.binary_path);
             console_write(" (");
             console_write(&alloc::format!("{:?}", err));
             console_write(")\n");
             console_write("========== END ");
-            console_write(name);
+            console_write(marker);
             console_write(" ==========\n");
             return;
         }
     };
-    console_write("[harness] task created\n");
 
-    let pid = task.pid.0;
-    console_write("[harness] task created pid=");
-    console_write(&alloc::format!("{}", pid));
-    console_write(", adding to scheduler...\n");
-    manager::add_task(task.clone());
+    // From the START marker until the foreground runner exits, timer interrupts
+    // must not reschedule the kernel harness task away.
+    *crate::trap::FOREGROUND_MODE.lock() = true;
 
-    console_write("[harness] waiting for task pid=");
-    console_write(&alloc::format!("{}", pid));
-    console_write(" to complete...\n");
+    // ELF loaded successfully - now output START marker and run the test
+    console_write("========== START ");
+    console_write(marker);
+    console_write(" ==========\n");
+
+    // Prefer a foreground driver model for harness stability:
+    // directly enter the user task from here, without relying on
+    // enqueue + yield + kernel-task resumption.
+    run_user_task_foreground(task.clone());
+
+    console_write("========== END ");
+    console_write(marker);
+    console_write(" ==========\n");
+}
+
+pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
+
+    *crate::trap::FOREGROUND_MODE.lock() = true;
+    task.set_status(TaskStatus::Running);
+    *CURRENT_TASK.lock() = Some(task.clone());
+
+    const TIMEOUT_TICKS: usize = 2_000_000;
+    let mut waited = 0usize;
+
     loop {
         if task.status() == TaskStatus::Zombie {
             break;
         }
-        suspend_current_and_run_next();
-    }
-    console_write("[harness] test done: ");
-    console_write(name);
-    console_write(" pid=");
-    console_write(&alloc::format!("{}", pid));
-    console_write("\n");
+        if waited >= TIMEOUT_TICKS {
+            console_write("[harness] TIMEOUT in foreground driver, pid=");
+            console_write(&alloc::format!("{}", task.pid.0));
+            console_write("\n");
+            break;
+        }
+        waited += 1;
 
-    // Output format required by judge_basic-*.py
-    console_write("========== END ");
-    console_write(name);
-    console_write(" ==========\n");
+
+        // Check trap frame (field is at TCB level now, no inner lock needed for reading)
+        let mut tf_guard = task.trap_frame.lock();
+
+
+        if tf_guard.is_none() {
+            drop(tf_guard);
+            console_write("[harness] trap_frame None, breaking\n");
+            break;
+        }
+        let mut ctx = tf_guard.take().unwrap();
+        drop(tf_guard);
+
+        // Activate memory set while no task.inner lock is held.
+        // trap handlers lock task.inner, not memory_set.inner, so this is safe.
+        {
+            let ms = task.memory_set.lock();
+            ms.activate();
+        }
+
+        let _reason = run_user_task(&mut ctx);
+        crate::trap::restore_kernel_page_table();
+
+        // execve special-case: re-run immediately with new address space
+        let execve_done = crate::trap::take_execve_done();
+        if execve_done {
+            // Put ctx back and activate new address space
+            *task.trap_frame.lock() = Some(ctx);
+            {
+                let _ms_lock = task.memory_set.lock();
+                _ms_lock.activate();
+            }
+
+
+            let mut tf = task.trap_frame.lock().take().unwrap();
+            let _reason2 = run_user_task(&mut tf);
+            crate::trap::restore_kernel_page_table();
+            ctx = task.trap_frame.lock().take().unwrap();
+        }
+
+        *task.trap_frame.lock() = Some(ctx);
+
+        if task.status() == TaskStatus::Zombie {
+            break;
+        }
+    }
+
+    // Exit foreground mode
+    *crate::trap::FOREGROUND_MODE.lock() = false;
+    *CURRENT_TASK.lock() = None;
+}
+
+/// Helper: construct UserProgramSpec from ParsedTestCase
+fn spec_from_case(case: &ParsedTestCase) -> UserProgramSpec {
+    let (root, logical_path, logical_cwd) = if let Some(rest) = case.binary_path.strip_prefix("/glibc") {
+        let cwd = case.cwd.strip_prefix("/glibc").unwrap_or(&case.cwd);
+        (String::from("/glibc"), rest.to_string(), cwd.to_string())
+    } else if let Some(rest) = case.binary_path.strip_prefix("/musl") {
+        let cwd = case.cwd.strip_prefix("/musl").unwrap_or(&case.cwd);
+        (String::from("/musl"), rest.to_string(), cwd.to_string())
+    } else {
+        (String::from("/"), case.binary_path.clone(), case.cwd.clone())
+    };
+
+    // Use logical in-root paths so /lib resolves to /glibc/lib or /musl/lib via task.root.
+    let envp = alloc::vec![
+        String::from("PATH=/bin:/basic:/"),
+        String::from("LD_LIBRARY_PATH=/lib"),
+    ];
+
+    let argv = alloc::vec![logical_path.clone()];
+
+    UserProgramSpec {
+        path: logical_path,
+        argv,
+        envp,
+        cwd: logical_cwd,
+        root,
+        marker_name: Some(case.marker_name.clone()),
+    }
+}
+
+/// Execute a script via busybox shell.
+///
+/// This is a Phase 2 placeholder. For the first round (basic tests),
+/// we rely on parse_basic_script + run_one_test_binary_with_spec instead.
+///
+/// Returns `true` if the script was executed, `false` if not available.
+pub fn run_script_via_busybox(script_path: &str) -> bool {
+    // Phase 2 implementation will:
+    // - Read /musl/busybox or /glibc/busybox ELF
+    // - Set argv = ["/musl/busybox", "sh", script_path]
+    // - Set cwd = dirname(script_path)
+    // - Set envp = PATH=/bin
+    // - Create user task and wait for completion
+    // For now, always fail so we fall back gracefully
+    let _ = script_path;
+    false
 }
 
 /// 开始运行任务
@@ -353,19 +680,41 @@ pub fn run_tasks() -> ! {
 /// 挂起当前任务并运行下一个
 ///
 /// 将当前任务放回就绪队列，然后切换到下一个任务
+/// NOTE: Kernel tasks (trap_frame=None) can't be properly context-switched.
+/// When a kernel task yields, we restart it from the beginning instead of resuming.
 pub fn suspend_current_and_run_next() {
+    if let Some(task) = current_task() {
+        if is_kernel_task(&task) {
+            task.set_status(TaskStatus::Ready);
+            manager::add_task(task.clone());
+            *CURRENT_TASK.lock() = None;
+            switch_kernel_task_back_to_scheduler(&task);
+            return;
+        }
+        if let Some(tf) = crate::trap::clone_current_trapframe() {
+            *task.trap_frame.lock() = Some(tf);
+        }
+        task.set_status(TaskStatus::Ready);
+        manager::add_task(task);
+        *CURRENT_TASK.lock() = None;
+        run_next_task();
+    }
     // 获取当前任务
     let current = current_task();
 
     if let Some(task) = current {
-        // 将当前任务状态改为 Ready
-        task.set_status(TaskStatus::Ready);
+        let is_kernel = is_kernel_task(&task);
 
-        // 将任务放回就绪队列
-        manager::add_task(task);
-
-        // 清除当前任务
-        *CURRENT_TASK.lock() = None;
+        if is_kernel {
+            // 内核任务：不需要重新入队，直接清除
+            // 下次需要时会重新创建
+            *CURRENT_TASK.lock() = None;
+        } else {
+            // 用户任务：放回就绪队列
+            task.set_status(TaskStatus::Ready);
+            manager::add_task(task);
+            *CURRENT_TASK.lock() = None;
+        }
     }
 
     // 运行下一个任务
@@ -377,6 +726,16 @@ pub fn suspend_current_and_run_next() {
 /// 将当前任务标记为 Zombie，然后切换到下一个任务
 /// - exit_code: 退出码
 pub fn exit_current_and_run_next(exit_code: i32) {
+    if let Some(task) = current_task() {
+        if !*crate::trap::FOREGROUND_MODE.lock() && is_kernel_task(&task) {
+            log::info!("[task] Kernel task {} exiting with code {}", task.pid.0, exit_code);
+            task.set_exit_code(exit_code);
+            task.set_status(TaskStatus::Zombie);
+            *CURRENT_TASK.lock() = None;
+            switch_kernel_task_back_to_scheduler(&task);
+            return;
+        }
+    }
     // 获取当前任务
     let current = current_task();
 
@@ -418,6 +777,12 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         *CURRENT_TASK.lock() = None;
     }
 
+    // Foreground mode: don't call run_next_task(), just return.
+    // The trap handler -> run_user_task() -> returns here -> foreground loop sees Zombie and breaks.
+    if *crate::trap::FOREGROUND_MODE.lock() {
+        return;
+    }
+
     // 运行下一个任务
     run_next_task();
 }
@@ -427,8 +792,6 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 /// 从就绪队列中获取下一个任务并切换到它
 fn run_next_task() -> ! {
     // UART marker: 'S' = scheduler entry
-    #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x53; sb t1, 0(t0)") }
 
     if let Some(task) = manager::fetch_task() {
         // 设置当前任务
@@ -439,48 +802,44 @@ fn run_next_task() -> ! {
 
         log::debug!("[task] Switching to task pid={}", task.pid.0);
         // UART marker: 'T' = about to get trap_frame
-        #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x54; sb t1, 0(t0)"); }
-
         // 获取任务的 TrapFrame（用户态上下文）
         // 如果任务有保存的 TrapFrame，从那里恢复
         // 否则这是一个新任务，需要初始化
         // 只有用户态任务才切换其地址空间。
         // `MemorySet::new_bare()` + RISC-V `PageTable::restore()` 会清零根页表「低半」条目；
-        // 本项目内核链接在 `0x80200000`，落在该低半区——若对纯内核线程切换 SATP，会在用户页表里丢失内核代码映射而卡死。
-        let trap_frame = {
-            let mut inn = task.inner.lock();
-            let has_user_ctx = inn.trap_frame.is_some();
-            if has_user_ctx {
-                inn.memory_set.lock().activate();
-            }
-            inn.trap_frame.take()
+        // 本项目内核链接在 `0x80200000`，落在该低半区——若对纯内核线程切换 SATP，
+        // 会在用户页表里丢失内核代码映射而卡死。
+        let (has_user_ctx, tf_opt, ms_arc) = {
+            let tf = task.trap_frame.lock().take();
+            let has_user = tf.is_some();
+            let ms = task.memory_set.clone();
+            (has_user, tf, ms)
         };
+        if has_user_ctx {
+            {
+                let _ms_lock = ms_arc.lock();
+                _ms_lock.activate();
+            }
+        }
 
-        if let Some(mut ctx) = trap_frame {
+        if let Some(mut ctx) = tf_opt {
             // 恢复任务的 TrapFrame 并返回用户态
             // 使用 polyhal_trap 提供的返回机制
             log::debug!("[task] Restoring TrapFrame for task {}", task.pid.0);
-            // UART marker: 'U' = about to call run_user_task
-            #[cfg(target_arch = "riscv64")]
-            unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x55; sb t1, 0(t0)"); }
             // 调用 polyhal_trap::run_user_task 从 TrapFrame 返回
             // 这会恢复用户态上下文并运行，直到中断发生才返回
             let reason = unsafe { run_user_task(&mut ctx) };
-            // UART marker: 'R' = returned from run_user_task
-            #[cfg(target_arch = "riscv64")]
-            unsafe { core::arch::asm!("li t0, 0x10000000; li t1, 0x52; sb t1, 0(t0)"); }
             log::debug!("[task] User task returned with reason: {:?}", reason);
-            // Check execve before putting ctx back into task inner
+            // Check execve before putting ctx back into task
             let execve_done = crate::trap::take_execve_done();
             // If execve: activate new memory set and re-run immediately
             if execve_done {
                 // Activate the new address space before re-running
-                task.inner.lock().memory_set.lock().activate();
+                task.memory_set.lock().activate();
                 // Extract sepc before moving ctx
                 let sepc = ctx[TrapFrameArgs::SEPC];
                 // Put trapframe back for re-run
-                task.inner.lock().trap_frame = Some(ctx);
+                *task.trap_frame.lock() = Some(ctx);
                 log::info!(
                     "[task] execve done, re-running task {} with new program at sepc={:#x}",
                     task.pid.0,
@@ -488,44 +847,58 @@ fn run_next_task() -> ! {
                 );
                 task.set_status(TaskStatus::Running);
                 // Re-run the task: it will jump to the new program entry point
-                let _reason2 = unsafe { run_user_task(&mut *task.inner.lock().trap_frame.as_mut().unwrap()) };
+                let _reason2 = unsafe { run_user_task(&mut *task.trap_frame.lock().as_mut().unwrap()) };
                 // Task returned from the re-run (probably another syscall)
-                ctx = task.inner.lock().trap_frame.take().unwrap();
+                ctx = task.trap_frame.lock().take().unwrap();
                 task.set_status(TaskStatus::Ready);
                 manager::add_task(task);
                 *CURRENT_TASK.lock() = None;
                 run_next_task();
             }
             // Normal case: put ctx back and requeue task
-            task.inner.lock().trap_frame = Some(ctx);
+            *task.trap_frame.lock() = Some(ctx);
+            if task.status() != TaskStatus::Zombie {
+                task.set_status(TaskStatus::Ready);
+                manager::add_task(task.clone());
+            }
+            *CURRENT_TASK.lock() = None;
             // 继续调度下一个任务
             run_next_task();
         } else {
-            // 新任务或内核任务，使用 task_ctx 进行上下文切换
-            let task_ctx = task.task_ctx();
-            let mut idle_ctx = TaskContext::zero_init();
-            // 设置 idle_ctx 的返回地址为 run_next_task 的继续点
-            // 这样当任务让出 CPU 时，可以回到这里继续调度
-            idle_ctx.set_ra(kernel_task_return as *const () as usize);
+            // 内核任务：使用 task_ctx 进行上下文切换
+            // 注意：只有内核任务（有 task_ctx 但 trap_frame=None）才会走这里
+            let task_ctx = task_ctx_ptr(&task);
+            unsafe {
+                SCHEDULER_CONTEXT.ra = kernel_task_return as usize;
+                SCHEDULER_CONTEXT.sp = 0;
+                SCHEDULER_CONTEXT.s = [0; 12];
+            }
+            let idle_ctx = core::ptr::addr_of_mut!(SCHEDULER_CONTEXT);
+            SCHEDULER_CONTEXT_PTR.store(idle_ctx as usize, Ordering::SeqCst);
+            // 设置 idle_ctx 的返回地址
 
-            log::debug!("[task] Starting new task {} via context switch", task.pid.0);
+            log::debug!("[task] Starting kernel task {} via context switch", task.pid.0);
 
             // 切换到任务的上下文
             // 注意：switch_to 不会返回，而是直接跳转到任务的入口函数
             unsafe {
                 context::switch_to(
-                    &mut idle_ctx as *mut TaskContext,
-                    &task_ctx as *const TaskContext,
+                    idle_ctx,
+                    task_ctx as *const TaskContext,
                 );
             }
 
             // 这行代码不会执行到，因为 switch_to 直接跳转
-            unreachable!();
+            SCHEDULER_CONTEXT_PTR.store(0, Ordering::SeqCst);
+            run_next_task();
         }
     } else {
         // 没有可运行任务，进入 idle
+        console_write("[run_next] no task, entering idle\n");
         log::debug!("[task] No tasks available, idling");
+        console_write("[run_next] calling idle_loop\n");
         idle_loop();
+        console_write("[run_next] idle_loop returned??\n");
     }
 }
 
@@ -578,29 +951,52 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     CURRENT_TASK.lock().clone()
 }
 
+/// Wrapper for kernel task context stored outside the mutex.
+///
+/// Kernel tasks hold `task.inner` lock indefinitely, but trap handlers also need to
+/// lock `task.inner`. By keeping `TaskContext` in an `UnsafeCell` (outside the mutex)
+/// and wrapping it in `KernelCtx` with explicit `Send + Sync`, we can context-switch
+/// without holding the lock.
+pub(crate) struct KernelCtx {
+    ctx: core::cell::UnsafeCell<context::TaskContext>,
+}
+impl KernelCtx {
+    pub(crate) fn new(ctx: context::TaskContext) -> Self {
+        Self { ctx: core::cell::UnsafeCell::new(ctx) }
+    }
+}
+unsafe impl Send for KernelCtx {}
+unsafe impl Sync for KernelCtx {}
+
 /// 任务控制块
-/// 
+///
 /// 每个进程/线程对应一个 TaskControlBlock
 pub struct TaskControlBlock {
     pub pid: pid::Pid,
+    /// Inner data protected by mutex (fd_table, children, cwd, etc.)
     pub inner: Mutex<TaskControlBlockInner>,
+    /// Kernel task context. Outside inner to avoid deadlock.
+    pub(crate) task_ctx: KernelCtx,
+    /// User address space. Outside inner to avoid deadlock with activate().
+    pub memory_set: SharedMemorySet,
+    /// User trap frame. Outside inner for foreground driver.
+    pub trap_frame: Mutex<Option<TrapFrame>>,
+    /// Task status. Outside inner to avoid deadlock.
+    pub status: Mutex<TaskStatus>,
 }
 
+unsafe impl Send for TaskControlBlock {}
+unsafe impl Sync for TaskControlBlock {}
+
 /// 任务控制块内部数据
-///
-/// 需要加锁保护的可变数据
 pub struct TaskControlBlockInner {
-    pub status: TaskStatus,
-    pub memory_set: SharedMemorySet,
-    pub task_ctx: TaskContext,
-    pub trap_frame: Option<TrapFrame>, // 用户态上下文（中断时保存）
     pub exit_code: i32,
-    /// `clone(2)` 传入的 clone 位（已去掉 CSIGNAL），fork 形态为 0
     pub clone_flags: usize,
     pub parent: Option<Arc<TaskControlBlock>>,
     pub children: Vec<Arc<TaskControlBlock>>,
-    pub fd_table: SharedFdTable, // 文件描述符表
+    pub fd_table: SharedFdTable,
     pub cwd: String,
+    pub root: String,
     pub program_break: usize,
     pub mapped_break: usize,
     pub next_mmap: usize,

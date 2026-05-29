@@ -3,6 +3,7 @@ use super::SyscallRet;
 use crate::config::{PAGE_SIZE, USER_HEAP_START};
 use crate::mm::page_table::PTEFlags;
 use crate::task::current_task;
+use alloc::vec::Vec;
 use polyhal::VirtAddr;
 
 fn align_up(value: usize) -> usize {
@@ -10,6 +11,20 @@ fn align_up(value: usize) -> usize {
 }
 
 /// brk 系统调用
+fn copy_to_user_mapped(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let memory_set = task.memory_set.lock();
+    let mut addr = dst;
+    for &byte in src {
+        let pa = memory_set
+            .translate(VirtAddr::new(addr))
+            .ok_or(SysErrNo::EFAULT)?;
+        unsafe { *(pa.raw() as *mut u8) = byte; }
+        addr += 1;
+    }
+    Ok(())
+}
+
 pub fn sys_brk(new_brk: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let mut inner = task.inner.lock();
@@ -24,15 +39,18 @@ pub fn sys_brk(new_brk: usize) -> SyscallRet {
     let new_mapped_end = align_up(new_brk);
     if new_mapped_end > inner.mapped_break {
         let mapped_break = inner.mapped_break;
-        inner.memory_set.lock().insert_framed_area(
+        task.memory_set.lock().insert_framed_area(
             VirtAddr::new(mapped_break),
             VirtAddr::new(new_mapped_end),
             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
         );
         inner.mapped_break = new_mapped_end;
-        inner.memory_set.lock().activate();
     }
+    drop(inner);
 
+    task.memory_set.lock().activate();
+
+    let mut inner = task.inner.lock();
     inner.program_break = new_brk;
     Ok(new_brk)
 }
@@ -52,13 +70,6 @@ pub fn sys_mmap(
     if length == 0 {
         return Err(SysErrNo::EINVAL);
     }
-    if fd >= 0 {
-        return Err(SysErrNo::ENOSYS);
-    }
-    if offset != 0 {
-        return Err(SysErrNo::EINVAL);
-    }
-
     let start = if addr == 0 {
         let next = inner.next_mmap;
         inner.next_mmap = align_up(next + length);
@@ -82,12 +93,28 @@ pub fn sys_mmap(
         flags |= PTEFlags::R | PTEFlags::W;
     }
 
-    inner.memory_set.lock().insert_framed_area(
+    let file_data = if fd >= 0 {
+        let mut fds = inner.fd_table.lock();
+        let file_desc = fds.get_mut(fd as usize).ok_or(SysErrNo::EBADF)?;
+        let mut data = Vec::new();
+        data.resize(length, 0);
+        let n = file_desc.read_at(offset, &mut data)?;
+        data.truncate(n);
+        Some(data)
+    } else {
+        None
+    };
+
+    drop(inner);
+    task.memory_set.lock().insert_framed_area(
         VirtAddr::new(start),
         VirtAddr::new(end),
         flags,
     );
-    inner.memory_set.lock().activate();
+    task.memory_set.lock().activate();
+    if let Some(data) = file_data {
+        copy_to_user_mapped(start, &data)?;
+    }
     Ok(start)
 }
 
@@ -115,14 +142,14 @@ pub fn sys_munmap(addr: usize, length: usize) -> SyscallRet {
     let end = align_up(addr + length);
     let mut current = start;
     while current < end {
-        inner
-            .memory_set
+        task.memory_set
             .lock()
             .page_table
             .unmap_page(VirtAddr::new(current));
         current += PAGE_SIZE;
     }
-    inner.memory_set.lock().remove_area(VirtAddr::new(start));
-    inner.memory_set.lock().activate();
+    drop(inner);
+    task.memory_set.lock().remove_area(VirtAddr::new(start));
+    task.memory_set.lock().activate();
     Ok(0)
 }

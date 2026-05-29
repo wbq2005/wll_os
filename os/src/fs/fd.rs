@@ -156,7 +156,10 @@ impl FileDescriptor {
                         Ok(0)
                     }
                 } else {
-                    Err(SysErrNo::EAGAIN)
+                    // No input available. In the evaluation environment there is no
+                    // interactive terminal, so return EOF (0) immediately instead
+                    // of EAGAIN. EAGAIN would cause blocking reads to spin forever.
+                    Ok(0)
                 }
             }
             FileDescriptor::MemFile { content, offset, .. } => {
@@ -212,6 +215,30 @@ impl FileDescriptor {
     }
 
     /// 写入数据
+    /// Read from a regular file at a fixed offset without changing the fd offset.
+    pub fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, SysErrNo> {
+        match self {
+            FileDescriptor::MemFile { content, .. } => {
+                if offset >= content.len() {
+                    return Ok(0);
+                }
+                let to_read = buf.len().min(content.len() - offset);
+                buf[..to_read].copy_from_slice(&content[offset..offset + to_read]);
+                Ok(to_read)
+            }
+            FileDescriptor::Ext4Regular { ino, readable, .. } => {
+                if !*readable {
+                    return Err(SysErrNo::EBADF);
+                }
+                ext4_vol::ext4_read_at(*ino, offset, buf)
+            }
+            FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
+            FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => Err(SysErrNo::ESPIPE),
+            _ => Err(SysErrNo::EBADF),
+        }
+    }
+
+    /// Write data to this descriptor.
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, SysErrNo> {
         match self {
             FileDescriptor::Stdout | FileDescriptor::Stderr => {
