@@ -1,0 +1,18 @@
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[unstable]
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "panic=abort",
+]
+
+[target.loongarch64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "panic=abort",
+]

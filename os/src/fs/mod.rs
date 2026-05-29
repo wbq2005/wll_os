@@ -1,0 +1,251 @@
+/// 内存文件系统实现
+///
+/// 提供一个简单的基于内存的文件系统，用于支持用户程序加载和基本文件操作
+pub mod ext4_vol;
+pub mod fd;
+pub mod vfs;
+
+#[allow(unused_imports)]
+pub use vfs::{create_dir, dir_exists, file_exists, list_dir, list_files, read_file, remove_file};
+
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use spin::Mutex;
+use lazy_static::lazy_static;
+
+use crate::utils::error::SysErrNo;
+
+/// 文件内容
+pub type FileContent = Vec<u8>;
+
+/// 内存中的文件
+pub struct MemFile {
+    pub name: String,
+    pub content: FileContent,
+}
+
+impl MemFile {
+    pub fn new(name: &str, content: Vec<u8>) -> Self {
+        Self {
+            name: String::from(name),
+            content,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.content.len()
+    }
+}
+
+/// 内存文件系统
+pub struct MemFileSystem {
+    files: Vec<MemFile>,
+    dirs: Vec<String>,
+}
+
+impl MemFileSystem {
+    pub fn new() -> Self {
+        Self {
+            files: Vec::new(),
+            dirs: vec!["/".to_string()],
+        }
+    }
+
+    /// 添加文件
+    pub fn add_file(&mut self, name: &str, content: Vec<u8>) {
+        let name = normalize_path(name);
+        self.ensure_parent_dirs(&name);
+
+        // 如果文件已存在，先删除
+        self.files.retain(|f| f.name != name);
+        let len = content.len();
+        self.files.push(MemFile::new(&name, content));
+        log::info!("[fs] Added file '{}' ({} bytes)", name, len);
+    }
+
+    /// 添加目录
+    pub fn add_dir(&mut self, name: &str) {
+        let name = normalize_path(name);
+        self.ensure_parent_dirs(&name);
+        if !self.dirs.iter().any(|dir| dir == &name) {
+            self.dirs.push(name.clone());
+            log::info!("[fs] Added directory '{}'", name);
+        }
+    }
+
+    /// 获取文件
+    pub fn get_file(&self, name: &str) -> Option<&MemFile> {
+        let name = normalize_path(name);
+        self.files.iter().find(|f| f.name == name)
+    }
+
+    /// 检查文件是否存在
+    pub fn exists(&self, name: &str) -> bool {
+        let name = normalize_path(name);
+        self.files.iter().any(|f| f.name == name) || self.dirs.iter().any(|dir| dir == &name)
+    }
+
+    pub fn is_dir(&self, name: &str) -> bool {
+        let name = normalize_path(name);
+        self.dirs.iter().any(|dir| dir == &name)
+    }
+
+    /// 列出所有文件
+    pub fn list_files(&self) -> Vec<&str> {
+        self.files.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    pub fn list_file_names(&self) -> Vec<String> {
+        self.files.iter().map(|f| f.name.clone()).collect()
+    }
+
+    pub fn list_dir(&self, dir: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
+        let dir = normalize_path(dir);
+        if !self.is_dir(&dir) {
+            return Err(SysErrNo::ENOTDIR);
+        }
+
+        let mut entries = Vec::new();
+
+        for subdir in &self.dirs {
+            if let Some(name) = child_name(&dir, subdir) {
+                entries.push(fd::DirEntryRecord {
+                    name,
+                    is_dir: true,
+                });
+            }
+        }
+
+        for file in &self.files {
+            if let Some(name) = child_name(&dir, &file.name) {
+                entries.push(fd::DirEntryRecord {
+                    name,
+                    is_dir: false,
+                });
+            }
+        }
+
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
+    pub fn remove_file(&mut self, name: &str) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        let before = self.files.len();
+        self.files.retain(|file| file.name != name);
+        if before == self.files.len() {
+            return Err(SysErrNo::ENOENT);
+        }
+        Ok(())
+    }
+
+    pub fn truncate_file(&mut self, name: &str, new_len: usize) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        let file = self
+            .files
+            .iter_mut()
+            .find(|f| f.name == name)
+            .ok_or(SysErrNo::ENOENT)?;
+        file.content.truncate(new_len);
+        Ok(())
+    }
+
+    fn ensure_parent_dirs(&mut self, path: &str) {
+        let mut current = String::from("/");
+        for component in path.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>().iter().take_while(|part| **part != file_name(path)) {
+            if current != "/" {
+                current.push('/');
+            }
+            current.push_str(component);
+            if !self.dirs.iter().any(|dir| dir == &current) {
+                self.dirs.push(current.clone());
+            }
+        }
+    }
+}
+
+lazy_static! {
+    /// 全局内存文件系统
+    pub static ref MEM_FS: Mutex<MemFileSystem> = Mutex::new(MemFileSystem::new());
+}
+
+/// 初始化文件系统
+///
+/// 在内核启动时调用，加载所有内置的用户程序
+pub fn init() {
+    log::info!("[fs] Initializing memory filesystem...");
+    preload_generated_programs();
+}
+
+/// 添加用户程序到文件系统
+///
+/// 在内核初始化时调用，将编译进内核的用户程序 ELF 数据添加到文件系统
+pub fn add_user_program(name: &str, data: &[u8]) {
+    MEM_FS.lock().add_file(name, data.to_vec());
+}
+
+pub fn normalize_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    let is_absolute = path.starts_with('/');
+
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+
+    let mut normalized = if is_absolute {
+        String::from("/")
+    } else {
+        String::new()
+    };
+
+    normalized.push_str(&parts.join("/"));
+    if normalized.is_empty() {
+        String::from(".")
+    } else if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized
+    }
+}
+
+pub fn resolve_path(cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        normalize_path(path)
+    } else if cwd == "/" {
+        normalize_path(&format!("/{}", path))
+    } else {
+        normalize_path(&format!("{}/{}", cwd, path))
+    }
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').find(|part| !part.is_empty()).unwrap_or("")
+}
+
+fn child_name(parent: &str, child: &str) -> Option<String> {
+    if child == parent || !child.starts_with(parent) {
+        return None;
+    }
+
+    let rest = if parent == "/" {
+        child.strip_prefix('/')?
+    } else {
+        child.strip_prefix(parent)?.strip_prefix('/')?
+    };
+
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+
+    Some(rest.to_string())
+}
+
+include!(concat!(env!("OUT_DIR"), "/preloaded_apps.rs"));

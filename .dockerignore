@@ -1,0 +1,27 @@
+# Git
+.git
+.gitignore
+
+# Rust build artifacts
+target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build outputs (from Makefile)
+kernel-rv
+kernel-la
+
+# Documentation
+*.md
+!README.md

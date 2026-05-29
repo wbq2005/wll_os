@@ -1,0 +1,77 @@
+[package]
+name = "wll_OS"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 硬件抽象层
+polyhal = { version = "0.4.0", features = ["trap", "boot"] }
+polyhal-boot = { version = "0.4.0" }
+polyhal-trap = { version = "0.4.0" }
+
+# 内存分配器
+buddy_system_allocator = { version = "0.11.0", default-features = false, features = ["use_spin", "alloc"] }
+lazyinit = "0.2.1"
+
+# 同步原语
+spin = "0.9.8"
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+
+# 实用工具
+bitflags = "2.4.0"
+cfg-if = "1"
+log = "0.4"
+ext4_rs = "1.3.3"
+flat_device_tree = "3.1.1"
+virtio-drivers = { version = "0.7.4", default-features = false, features = ["alloc"] }
+
+# 架构特定库 - RISC-V
+riscv = { version = "0.11" }
+
+# 架构特定库 - LoongArch
+loongArch64 = { version = "0.2", optional = true }
+
+[profile.release]
+panic = "abort"
+
+[features]
+default = ["riscv"]
+riscv = []
+loongarch = ["dep:loongArch64"]
+no-init-idle = []
+
+[[bin]]
+name = "wll_OS"
+path = "src/main.rs"
+
+[build-dependencies]
+ext4-view = "0.9.3"
+
+# === PATCH: use local polyhal sources instead of crates.io ===
+# Changes to patch/ directories will now trigger incremental recompilation.
+[patch.crates-io]
+polyhal = { path = "../patch/polyhal" }
+polyhal-boot = { path = "../patch/polyhal-boot" }
+polyhal-trap = { path = "../patch/polyhal-trap" }
+
+# === RISC-V target (default) ===
+# code-model=medium: avoids R_RISCV_PCREL_HI20 relocation errors when .bss is >512KB from code.
+# link-arg=-T: specifies the linker script for memory layout.
+[target.riscv64gc-unknown-none-elf.rustflags]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "panic=abort",
+    "-C", "target-feature=-c",
+    "-C", "code-model=medium",
+    "-C", "link-arg=-T", "-C", "link-arg=../os/src/linker_riscv64.lds",
+]
+
+# === LoongArch64 target ===
+# code-model=large: required because LoongArch64 binutils default to small model.
+[target.loongarch64-unknown-none.rustflags]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=large",
+    "-C", "panic=abort",
+    "-C", "link-arg=-T", "-C", "link-arg=../os/src/linker_loongarch64.lds",
+]

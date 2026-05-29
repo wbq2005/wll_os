@@ -1,0 +1,98 @@
+编译完成
+运行：qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -rtc base=utc 
+运行：qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 -bios default -drive file=sdcard-rv.img,if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -no-reboot -device virtio-net-device,netdev=net -netdev user,id=net -rtc base=utc 
+qemu-system-riscv:
+qemu-system-riscv:OpenSBI v1.5.1
+qemu-system-riscv:   ____                    _____ ____ _____
+qemu-system-riscv:  / __ \                  / ____|  _ \_   _|
+qemu-system-riscv: | |  | |_ __   ___ _ __ | (___ | |_) || |
+qemu-system-riscv: | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+qemu-system-riscv: | |__| | |_) |  __/ | | |____) | |_) || |_
+qemu-system-riscv:  \____/| .__/ \___|_| |_|_____/|____/_____|
+qemu-system-riscv:        | |
+qemu-system-riscv:        |_|
+qemu-system-riscv:
+qemu-system-riscv:Platform Name             : riscv-virtio,qemu
+qemu-system-riscv:Platform Features         : medeleg
+qemu-system-riscv:Platform HART Count       : 1
+qemu-system-riscv:Platform IPI Device       : aclint-mswi
+qemu-system-riscv:Platform Timer Device     : aclint-mtimer @ 10000000Hz
+qemu-system-riscv:Platform Console Device   : uart8250
+qemu-system-riscv:Platform HSM Device       : ---
+qemu-system-riscv:Platform PMU Device       : ---
+qemu-system-riscv:Platform Reboot Device    : syscon-reboot
+qemu-system-riscv:Platform Shutdown Device  : syscon-poweroff
+qemu-system-riscv:Platform Suspend Device   : ---
+qemu-system-riscv:Platform CPPC Device      : ---
+qemu-system-riscv:Firmware Base             : 0x80000000
+qemu-system-riscv:Firmware Size             : 327 KB
+qemu-system-riscv:Firmware RW Offset        : 0x40000
+qemu-system-riscv:Firmware RW Size          : 71 KB
+qemu-system-riscv:Firmware Heap Offset      : 0x49000
+qemu-system-riscv:Firmware Heap Size        : 35 KB (total), 2 KB (reserved), 11 KB (used), 21 KB (free)
+qemu-system-riscv:Firmware Scratch Size     : 4096 B (total), 416 B (used), 3680 B (free)
+qemu-system-riscv:Runtime SBI Version       : 2.0
+qemu-system-riscv:
+qemu-system-riscv:Domain0 Name              : root
+qemu-system-riscv:Domain0 Boot HART         : 0
+qemu-system-riscv:Domain0 HARTs             : 0*
+qemu-system-riscv:Domain0 Region00          : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+qemu-system-riscv:Domain0 Region01          : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+qemu-system-riscv:Domain0 Region02          : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+qemu-system-riscv:Domain0 Region03          : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+qemu-system-riscv:Domain0 Region04          : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+qemu-system-riscv:Domain0 Region05          : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+qemu-system-riscv:Domain0 Region06          : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+qemu-system-riscv:Domain0 Region07          : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+qemu-system-riscv:Domain0 Next Address      : 0x0000000080200000
+qemu-system-riscv:Domain0 Next Arg1         : 0x00000000bfe00000
+qemu-system-riscv:Domain0 Next Mode         : S-mode
+qemu-system-riscv:Domain0 SysReset          : yes
+qemu-system-riscv:Domain0 SysSuspend        : yes
+qemu-system-riscv:
+qemu-system-riscv:Boot HART ID              : 0
+qemu-system-riscv:Boot HART Domain          : root
+qemu-system-riscv:Boot HART Priv Version    : v1.12
+qemu-system-riscv:Boot HART Base ISA        : rv64imafdch
+qemu-system-riscv:Boot HART ISA Extensions  : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+qemu-system-riscv:Boot HART PMP Count       : 16
+qemu-system-riscv:Boot HART PMP Granularity : 2 bits
+qemu-system-riscv:Boot HART PMP Address Bits: 54
+qemu-system-riscv:Boot HART MHPM Info       : 16 (0x0007fff8)
+qemu-system-riscv:Boot HART Debug Triggers  : 2 triggers
+qemu-system-riscv:Boot HART MIDELEG         : 0x0000000000001666
+qemu-system-riscv:Boot HART MEDELEG         : 0x0000000000f0b509
+qemu-system-riscv:ABCDEJ[DTB] raw ptr = 0xbfe00000
+qemu-system-riscv:
+qemu-system-riscv:[DTB] Using low addr direct mapping
+qemu-system-riscv:
+qemu-system-riscv:[DTB] ptr = 0xbfe00000
+qemu-system-riscv:
+qemu-system-riscv:[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+qemu-system-riscv:
+qemu-system-riscv:XY[kernel] Hello, OS!
+qemu-system-riscv:
+qemu-system-riscv:[kernel] Memory init
+qemu-system-riscv:
+qemu-system-riscv:[VIRTIO] Probing..
+qemu-system-riscv:
+qemu-system-riscv:[VIRTIO] mounting ext4..
+qemu-system-riscv:
+qemu-system-riscv:[EXT4] mounted successfully
+qemu-system-riscv:
+qemu-system-riscv:[harness] total files found: 0
+qemu-system-riscv:
+qemu-system-riscv:[harness] scripts after filter: 0
+qemu-system-riscv:
+qemu-system-riscv:
+qemu-system-riscv:
+qemu-system-riscv:[boot-error] No runnable init task.
+qemu-system-riscv:
+qemu-system-riscv:[boot-error] reason: init not found in MemFS
+qemu-system-riscv:
+qemu-system-riscv:[boot-error] hint: ensure ext4 root on virtio-blk is available at boot (e.g. /init on the disk).
+qemu-system-riscv:
+qemu-system-riscv:[boot-error] hint: local dev without runtime disk: place sdcard-rv.img / sdcard-la.img (or run `make unpack-sdcard`) so build.rs preloads MemFS.
+qemu-system-riscv:
+qemu-system-riscv:[boot-error] hint: with virtio disk, kernel mounts ext4 at boot; harness discovers scripts via fs::list_files() (MemFS + ext4).
+qemu-system-riscv:

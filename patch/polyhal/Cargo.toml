@@ -1,0 +1,58 @@
+[package]
+name = "polyhal"
+version = "0.4.0"
+edition = "2021"
+description = "This crate provides the interface for multiple platforms."
+authors = ["Byte-OS Team"]
+license = "MIT"
+repository = "https://github.com/Byte-OS/polyhal"
+
+[features]
+trap = []
+boot = []
+logger = []
+fp_simd = []
+graphic = []
+default = []
+
+[dependencies]
+log = "0.4"
+fdt-parser = "0.4.10"
+bitflags = "2.4"
+cfg-if = "1"
+polyhal-macro = "0.4"
+spin = { version = "0.10.0", features = ["mutex"] }
+lazyinit = "0.2.1"
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+riscv = "0.13"
+sbi-rt = { version = "0.0.2", features = ["legacy"] }
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+loongArch64 = "0.2"
+ns16550a = "0.3"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+aarch64-cpu = "9.4"
+arm_gicv2 = "0.1"
+arm_pl011 = "0.1"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86 = "0.52"
+x86_64 = "0.15"
+x2apic = "0.5"
+raw-cpuid = "11.6"
+multiboot = "0.8"
+acpi = "5.2"
+uart_16550 = "0.2"
+
+[build-dependencies]
+fdt-parser = "0.4"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cpu_family, values("c906"))', 'cfg(board, values("2k1000"))'] }
+
+[target.riscv64gc-unknown-none-elf.rustflags]
+# Required to avoid R_RISCV_PCREL_HI20 relocations that exceed +/-512KB range
+# when the kernel image is large (rodata > 2MB pushes .bss beyond reach).
+# Using inline asm with %hi/%lo linker relocations instead of 'la' pseudo-op.
+rustflags = ["-C", "code-model=medium"]
