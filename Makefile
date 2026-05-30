@@ -62,6 +62,16 @@ check-sdcard:
 prepare-cargo-config:
 	@mkdir -p .cargo
 	@if [ -f scripts/restore_vendor_hidden.sh ]; then sh scripts/restore_vendor_hidden.sh; fi
+	@if [ -f scripts/refresh_vendor_checksums.py ]; then \
+		if command -v python3 >/dev/null 2>&1; then \
+			python3 scripts/refresh_vendor_checksums.py; \
+		elif command -v python >/dev/null 2>&1; then \
+			python scripts/refresh_vendor_checksums.py; \
+		else \
+			echo "error: python3/python is required to refresh vendor checksums"; \
+			exit 1; \
+		fi; \
+	fi
 	cp oscargo/config.toml .cargo/config.toml
 
 unpack-sdcard:
