@@ -71,6 +71,7 @@ impl TaskControlBlock {
 
         let task = Arc::new(Self {
             pid: Pid::alloc(),
+            is_kernel: false,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
                 clone_flags: 0,
@@ -186,12 +187,18 @@ impl TaskControlBlock {
         trap_frame[TrapFrameArgs::ARG0] = launch_argv.len();
         trap_frame[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
 
+        // Set parent to orphan reaper so wait4 can find children.
+        // When exit_current_and_run_next is called, it re-parents children to the
+        // orphan reaper, but we need a valid parent for wait4 to work.
+        let fg_parent = crate::task::orphan_reaper();
+
         let task = Arc::new(Self {
             pid: Pid::alloc(),
+            is_kernel: false,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
                 clone_flags: 0,
-                parent: None,
+                parent: fg_parent.clone(),
                 children: Vec::new(),
                 fd_table: new_shared_fd_table(),
                 cwd: spec.cwd.clone(),
@@ -224,6 +231,7 @@ impl TaskControlBlock {
 
         Arc::new(Self {
             pid: Pid::alloc(),
+            is_kernel: false,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
                 clone_flags: 0,
@@ -257,6 +265,7 @@ impl TaskControlBlock {
 
         Arc::new(Self {
             pid: Pid::alloc(),
+            is_kernel: true,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
                 clone_flags: 0,

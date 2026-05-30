@@ -40,47 +40,58 @@ const THREAD_SHARING_FLAGS: usize =
 const WNOHANG: usize = 0x0000_0001;
 
 /// 从用户态指针数组读取字符串列表（argv 或 envp），遇 NULL 终止。
-fn read_user_str_array(base: usize) -> Vec<String> {
+fn read_user_byte(addr: usize) -> Result<u8, SysErrNo> {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let ms = task.memory_set.lock();
+    let pa = ms
+        .translate(VirtAddr::new(addr))
+        .ok_or(SysErrNo::EFAULT)?;
+    Ok(unsafe { *(pa.raw() as *const u8) })
+}
+
+fn read_user_usize(addr: usize) -> Result<usize, SysErrNo> {
+    let mut bytes = [0u8; core::mem::size_of::<usize>()];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = read_user_byte(addr + i)?;
+    }
+    Ok(usize::from_le_bytes(bytes))
+}
+
+fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
     let mut result = Vec::new();
     if base == 0 {
-        return result;
+        return Ok(result);
     }
-    unsafe {
-        let mut ptr_ptr = base as *const usize;
-        loop {
-            let str_ptr = *ptr_ptr;
-            if str_ptr == 0 {
-                break;
-            }
-            let s = read_user_cstr(str_ptr as *const u8);
-            if s.is_empty() {
-                break;
-            }
-            result.push(String::from(s));
-            ptr_ptr = ptr_ptr.add(1);
+    for i in 0..256 {
+        let str_ptr = read_user_usize(base + i * core::mem::size_of::<usize>())?;
+        if str_ptr == 0 {
+            break;
         }
+        let s = read_user_cstr(str_ptr as *const u8)?;
+        if s.is_empty() {
+            break;
+        }
+        result.push(s);
     }
-    result
+    Ok(result)
 }
 
 const MAX_CSTR_LEN: usize = 4096;
 
-fn read_user_cstr(ptr: *const u8) -> &'static str {
+fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
     if ptr.is_null() {
-        return "";
+        return Ok(String::new());
     }
-    unsafe {
-        let mut len = 0;
-        let mut cur = ptr;
-        while *cur != 0 && len < MAX_CSTR_LEN {
-            len += 1;
-            cur = cur.add(1);
+    let mut bytes = Vec::new();
+    let base = ptr as usize;
+    for i in 0..MAX_CSTR_LEN {
+        let byte = read_user_byte(base + i)?;
+        if byte == 0 {
+            return String::from_utf8(bytes).map_err(|_| SysErrNo::EINVAL);
         }
-        if len >= MAX_CSTR_LEN {
-            return "";
-        }
-        core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len))
+        bytes.push(byte);
     }
+    Err(SysErrNo::EINVAL)
 }
 
 /// 在用户栈上构造 argc/argv/envp/auxv 布局，返回新的栈顶。
@@ -247,21 +258,26 @@ pub(crate) fn setup_user_stack(
 ///
 /// 加载并执行新程序
 pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallRet {
-    if *crate::trap::FOREGROUND_MODE.lock() {
-        return Err(SysErrNo::ENOSYS);
-    }
-
-    let path_str = read_user_cstr(path);
+    let path_str = read_user_cstr(path)?;
     log::info!("[syscall] execve(path='{}')", path_str);
 
     // 在替换地址空间之前，从旧地址空间读取 argv/envp
-    let argv = read_user_str_array(argv_ptr);
-    let envp = read_user_str_array(envp_ptr);
+    let argv = read_user_str_array(argv_ptr)?;
+    let envp = read_user_str_array(envp_ptr)?;
 
-    let elf_data = match read_file(path_str) {
+    let (root, cwd) = if let Some(task) = current_task() {
+        let inner = task.inner.lock();
+        (inner.root.clone(), inner.cwd.clone())
+    } else {
+        (String::from("/"), String::from("/"))
+    };
+    let logical_path = crate::fs::resolve_path(&cwd, &path_str);
+    let host_path = crate::fs::apply_root(&root, &logical_path);
+
+    let elf_data = match read_file(&host_path) {
         Some(data) => data,
         None => {
-            log::error!("[syscall] execve: file not found: {}", path_str);
+            log::error!("[syscall] execve: file not found: {} ({})", path_str, host_path);
             return Err(SysErrNo::ENOENT);
         }
     };
@@ -275,7 +291,71 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     };
 
     // 从 ELF 头中获取 phdr 信息用于 auxv
-    let phdr_vaddr = elf.program_headers.iter()
+    let mut launch_argv = if argv.is_empty() {
+        alloc::vec![logical_path.clone()]
+    } else {
+        argv
+    };
+
+    let (new_memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) =
+        if let Some(interp) = elf.interp_path() {
+            let interp_path = crate::fs::normalize_path(interp);
+            let interp_host_path = crate::fs::apply_root(&root, &interp_path);
+            let interp_data = read_file(&interp_host_path).ok_or_else(|| {
+                log::error!(
+                    "[syscall] execve: interpreter not found: {} ({})",
+                    interp_path,
+                    interp_host_path
+                );
+                SysErrNo::ENOENT
+            })?;
+            let interp_elf = ElfFile::parse(&interp_data)?;
+            let interp_bias = 0x0010_0000usize;
+            let target_bias = if elf.header.e_type == 3 { 0x0040_0000 } else { 0 };
+            let mut memory_set = crate::mm::memory_set::MemorySet::from_kernel();
+            elf.load_segments_into(&mut memory_set, target_bias)?;
+            interp_elf.load_segments_into(&mut memory_set, interp_bias)?;
+
+            let user_stack_top = crate::config::USER_STACK_TOP;
+            let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
+            memory_set.insert_framed_area(
+                VirtAddr::new(user_stack_bottom),
+                VirtAddr::new(user_stack_top),
+                crate::mm::page_table::PTEFlags::U
+                    | crate::mm::page_table::PTEFlags::R
+                    | crate::mm::page_table::PTEFlags::W
+                    | crate::mm::page_table::PTEFlags::V,
+            );
+
+            let mut dyn_argv = alloc::vec![interp_path, logical_path.clone()];
+            dyn_argv.extend(launch_argv.iter().skip(1).cloned());
+            launch_argv = dyn_argv;
+
+            (
+                memory_set,
+                user_stack_top,
+                interp_elf.entry_with_bias(interp_bias),
+                elf.phdr_vaddr(target_bias),
+                elf.phnum(),
+                interp_bias,
+            )
+        } else {
+            let phdr_vaddr = elf.phdr_vaddr(0);
+            let phnum = elf.phnum();
+            let (memory_set, user_stack_top, entry) = match elf.load() {
+                Ok(result) => result,
+                Err(e) => {
+                    log::error!("[syscall] execve: failed to load ELF: {:?}", e);
+                    return Err(e);
+                }
+            };
+            (memory_set, user_stack_top, entry, phdr_vaddr, phnum, 0)
+        };
+
+    let argv_with_path = launch_argv;
+
+    /*
+    let _old_phdr_vaddr = elf.program_headers.iter()
         .find(|ph| ph.p_type == crate::mm::elf_loader::PT_PHDR)
         .map(|ph| ph.p_vaddr)
         .unwrap_or_else(|| {
@@ -298,10 +378,11 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
 
     // 在新地址空间的用户栈上构造 argc/argv/envp/auxv
     let argv_with_path = if argv.is_empty() {
-        alloc::vec![String::from(path_str)]
+        alloc::vec![path_str.clone()]
     } else {
         argv
     };
+    */
     let sp = setup_user_stack(
         &new_memory_set,
         user_stack_top,
@@ -310,7 +391,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         entry,
         phdr_vaddr,
         phnum,
-        0,
+        interp_base,
     );
 
     if let Some(task) = current_task() {
@@ -330,12 +411,22 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         }
 
         {
+            let mut updated_saved_tf = false;
             let mut tf_guard = task.trap_frame.lock();
             if let Some(ref mut tf) = *tf_guard {
                 tf[TrapFrameArgs::SP] = sp;
                 tf[TrapFrameArgs::SEPC] = entry;
                 tf[TrapFrameArgs::ARG0] = argv_with_path.len();
                 tf[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
+                updated_saved_tf = true;
+            }
+            if !updated_saved_tf {
+                crate::trap::update_current_trapframe(|tf| {
+                    tf[TrapFrameArgs::SP] = sp;
+                    tf[TrapFrameArgs::SEPC] = entry;
+                    tf[TrapFrameArgs::ARG0] = argv_with_path.len();
+                    tf[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
+                });
             }
         }
 
@@ -355,18 +446,8 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
 
 pub fn sys_exit(exit_code: i32) -> SyscallRet {
     log::info!("[syscall] exit(code={})", exit_code);
-
-    if let Some(task) = current_task() {
-        log::info!("[syscall] Process {} exiting with code {}", task.pid.0, exit_code);
-    }
-
     exit_current_and_run_next(exit_code);
-
-    if *crate::trap::FOREGROUND_MODE.lock() {
-        return Ok(0);
-    }
-
-    unreachable!("sys_exit should not return")
+    Ok(0)
 }
 
 pub fn sys_exit_group(exit_code: i32) -> SyscallRet {
@@ -399,69 +480,77 @@ pub fn sys_getppid() -> SyscallRet {
 
 pub fn sys_sched_yield() -> SyscallRet {
     log::debug!("[syscall] sched_yield()");
+    if *crate::trap::FOREGROUND_MODE.lock() {
+        return Ok(0);
+    }
     suspend_current_and_run_next();
     Ok(0)
 }
 
-/// wait4：支持 `pid==-1`、`pid==0`（视作任一子进程）、指定 pid，`WNOHANG`，在未持锁状态下阻塞调度。
+/// wait4：支持 `pid==-1`、`pid==0`（视作任一子进程）、指定 pid，`WNOHANG`，
+/// 在未持锁状态下阻塞调度。
+///
+/// ## FOREGROUND_MODE 特殊处理
+/// 在前台测试驱动模式下，父进程调用 wait4 但子进程尚未退出时，不能使用
+/// `suspend_current_and_run_next` 让出 CPU（这会导致父进程被重新放入 FIFO 队首，
+/// 永远抢在子进程之前被调度，形成活锁）。
+/// 因此在 FOREGROUND_MODE 下：
+///   - 如果存在可回收的僵尸子进程，立即回收并返回；
+///   - 否则返回 `-ECHILD`，让父进程返回用户态。
+///   - 子进程获得调度机会运行并退出成为僵尸；
+///   - 父进程再次被调度时调用 wait4 可以成功回收。
 pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let pid = if pid == 0 { -1 } else { pid };
+    // 尝试回收僵尸子进程（两种模式都走同一逻辑）
+    let try_reap = || -> Option<(usize, i32)> {
+        let mut inner = task.inner.lock();
+        if let Some(index) = inner.children.iter().position(|c| {
+            (pid == -1 || c.pid.0 == pid as usize)
+                && c.status() == crate::task::TaskStatus::Zombie
+        }) {
+            let child = inner.children.remove(index);
+            let cpid = child.pid.0;
+            let exit_code = child.exit_code();
+            return Some((cpid, exit_code));
+        }
+        None
+    };
 
+    if let Some((cpid, exit_code)) = try_reap() {
+        if !status.is_null() {
+            unsafe { *status = exit_code << 8; }
+        }
+        return Ok(cpid);
+    }
+
+    // 无僵尸子进程：WNOHANG 立即返回
+    if (options & WNOHANG) != 0 {
+        return Ok(0);
+    }
+
+    // 正常模式：使用调度器阻塞
     loop {
-        enum Step {
-            Reaped {
-                cpid: usize,
-                exit_code: i32,
-            },
-            NoChildren,
-            NoSuchChild,
-            WnoHang,
-            BlockSpin,
-        }
-
-        let step = {
-            let mut inner = task.inner.lock();
+        // 检查是否有子进程
+        {
+            let inner = task.inner.lock();
             if inner.children.is_empty() {
-                Step::NoChildren
-            } else if pid > 0 && !inner.children.iter().any(|c| c.pid.0 == pid as usize) {
-                Step::NoSuchChild
-            } else if let Some(index) =
-                inner
-                    .children
-                    .iter()
-                    .position(|c| {
-                        (pid == -1 || c.pid.0 == pid as usize)
-                            && c.status() == crate::task::TaskStatus::Zombie
-                    })
-            {
-                let child = inner.children.remove(index);
-                let cpid = child.pid.0;
-                let exit_code = child.exit_code();
-                Step::Reaped { cpid, exit_code }
-            } else if (options & WNOHANG) != 0 {
-                Step::WnoHang
-            } else {
-                Step::BlockSpin
+                return Err(SysErrNo::ECHILD);
             }
-        };
-
-        match step {
-            Step::NoChildren => return Err(SysErrNo::ECHILD),
-            Step::NoSuchChild => return Err(SysErrNo::ECHILD),
-            Step::WnoHang => return Ok(0),
-            Step::Reaped { cpid, exit_code } => {
-                if !status.is_null() {
-                    unsafe {
-                        *status = exit_code << 8;
-                    }
-                }
-                return Ok(cpid);
-            }
-            Step::BlockSpin => {
-                suspend_current_and_run_next();
+            if pid > 0 && !inner.children.iter().any(|c| c.pid.0 == pid as usize) {
+                return Err(SysErrNo::ECHILD);
             }
         }
+
+        // 再检查一次僵尸
+        if let Some((cpid, exit_code)) = try_reap() {
+            if !status.is_null() {
+                unsafe { *status = exit_code << 8; }
+            }
+            return Ok(cpid);
+        }
+
+        suspend_current_and_run_next();
     }
 }
 
@@ -475,10 +564,6 @@ pub fn sys_clone(
 ) -> SyscallRet {
     let parent = current_task().ok_or(SysErrNo::ESRCH)?;
     let parent_pid = parent.pid.0;
-
-    if *crate::trap::FOREGROUND_MODE.lock() {
-        return Ok(0);
-    }
 
     let clone_bits = flags & !CSIGNAL;
     if (clone_bits & THREAD_SHARING_FLAGS) != 0 {
@@ -521,6 +606,7 @@ pub fn sys_clone(
 
     let child = Arc::new(crate::task::TaskControlBlock {
         pid: crate::task::pid::Pid::alloc(),
+        is_kernel: false,
         inner: Mutex::new(crate::task::TaskControlBlockInner {
             exit_code: 0,
             clone_flags: clone_bits,
@@ -541,13 +627,7 @@ pub fn sys_clone(
     let child_pid = child.pid.0;
 
     parent.inner.lock().children.push(child.clone());
-    if *crate::trap::FOREGROUND_MODE.lock() {
-        crate::task::run_user_task_foreground(child);
-        *crate::trap::FOREGROUND_MODE.lock() = true;
-        *crate::task::CURRENT_TASK.lock() = Some(parent.clone());
-    } else {
-        crate::task::manager::add_task(child);
-    }
+    crate::task::manager::add_task(child);
 
     log::info!(
         "[syscall] clone(flags={:#x}, stack={:#x}) parent={} child={}",

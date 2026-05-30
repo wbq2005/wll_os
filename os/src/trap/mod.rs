@@ -6,7 +6,8 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::syscall::syscall;
-use crate::task::{suspend_current_and_run_next, exit_current_and_run_next};
+use crate::syscall::SysErrNo;
+use crate::task::{suspend_current_and_run_next, exit_current_and_run_next, run_next_task};
 use crate::timer::set_next_trigger;
 
 lazy_static! {
@@ -20,6 +21,18 @@ lazy_static! {
     /// 标记前台驱动模式：当此标志为 true 时，exit/suspend/timer 不要调用 run_next_task()，
     /// 而是将当前任务置为 Zombie 后直接返回，由前台驱动负责收尾。
     pub static ref FOREGROUND_MODE: Mutex<bool> = Mutex::new(false);
+
+    /// 存储前台驱动的 kernel harness 任务的裸指针。
+    /// 当用户任务 exit 时，exit_current_and_run_next 需要知道将哪个 kernel 任务放回就绪队列。
+    pub static ref FOREGROUND_HARNESS_PTR: Mutex<usize> = Mutex::new(0);
+}
+
+pub fn set_foreground_harness(ptr: usize) {
+    *FOREGROUND_HARNESS_PTR.lock() = ptr;
+}
+
+pub fn get_foreground_harness() -> usize {
+    *FOREGROUND_HARNESS_PTR.lock()
 }
 
 pub fn clone_current_trapframe() -> Option<TrapFrame> {
@@ -28,6 +41,16 @@ pub fn clone_current_trapframe() -> Option<TrapFrame> {
         None
     } else {
         unsafe { Some((*(ptr as *mut TrapFrame)).clone()) }
+    }
+}
+
+pub fn update_current_trapframe(f: impl FnOnce(&mut TrapFrame)) -> bool {
+    let ptr = *CURRENT_SYSCALL_CTX_PTR.lock();
+    if ptr == 0 {
+        false
+    } else {
+        unsafe { f(&mut *(ptr as *mut TrapFrame)); }
+        true
     }
 }
 
@@ -178,6 +201,10 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     *CURRENT_SYSCALL_CTX_PTR.lock() = 0;
 
     // 设置返回值到 a0/x[10]
+    // 检查是否是 execve 刚完成——如果是，跳过 syscall_ok() 的 PC 前进，
+    // 让 CPU sret 到新程序的入口地址（sepc 已在 sys_execve 中设为 entry）。
+    let execve_done = take_execve_done();
+
     match result {
         Ok(ret) => {
             ctx[TrapFrameArgs::RET] = ret;
@@ -188,9 +215,7 @@ fn handle_syscall(ctx: &mut TrapFrame) {
         }
     }
 
-    // 检查是否是 execve 刚完成——如果是，跳过 syscall_ok() 的 PC 前进，
-    // 让 CPU sret 到新程序的入口地址（sepc 已在 sys_execve 中设为 entry）。
-    if take_execve_done() {
+    if execve_done {
         // EXECVE_IN_PROGRESS 已被 take_execve_done() 消费，sepc 已是新程序入口
     } else {
         // 普通系统调用：PC 需要前进（跳过 ecall 指令）

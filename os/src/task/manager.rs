@@ -25,3 +25,8 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
 pub fn has_task() -> bool {
     !READY_QUEUE.lock().is_empty()
 }
+
+/// 返回就绪队列长度（诊断用）
+pub fn queue_len() -> usize {
+    READY_QUEUE.lock().len()
+}

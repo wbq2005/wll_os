@@ -4,7 +4,7 @@ pub mod process;
 pub mod signal;
 pub mod other;
 
-use crate::utils::error::SysErrNo;
+pub use crate::utils::error::SysErrNo;
 
 /// Linux AT_FDCWD = -100, used to indicate "use current working directory" for *at syscalls.
 const AT_FDCWD: isize = -100;

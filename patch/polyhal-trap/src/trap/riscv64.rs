@@ -4,6 +4,7 @@ mod macros;
 use super::{EscapeReason, TrapType};
 use crate::trapframe::TrapFrame;
 use core::arch::naked_asm;
+use core::sync::atomic::{AtomicU8, Ordering};
 use polyhal::consts::VIRT_ADDR_START;
 use riscv::{
     interrupt::{Exception, Interrupt},
@@ -13,6 +14,14 @@ use riscv::{
         stvec::{self, Stvec},
     },
 };
+
+/// Global flag to signal that the trap handler should skip sret.
+/// This is set when a task switch occurred (e.g., from exit()).
+/// The kernelvec assembly checks this flag and jumps to skip_sret if set.
+static SKIP_SRET_FLAG: AtomicU8 = AtomicU8::new(0);
+
+/// Pointer to the trap frame being processed (saved before switch_to).
+static mut TRAP_FRAME_PTR: usize = 0;
 
 // Initialize trap vectors only (no timer). Call this early during boot.
 pub fn init_trap_only() {
@@ -76,6 +85,14 @@ fn kernel_callback(context: &mut TrapFrame) -> TrapType {
             panic!("unknown trap: {:#x?}", context);
         }
     };
+
+    // Check SKIP_SRET flag: if set, the trap handler has performed a task switch
+    // and we should NOT execute sret. Instead, we'll jump to skip_sret.
+    // The flag is checked again by the assembly after this function returns.
+    if SKIP_SRET_FLAG.load(Ordering::SeqCst) == 1 {
+        // Just let the assembly check the flag and skip sret
+    }
+
     unsafe { super::_interrupt_for_arch(context, trap_type, 0) };
     trap_type
 }
@@ -88,13 +105,13 @@ pub unsafe extern "C" fn kernelvec() {
         r"
             .align 4
             .altmacro
-        
+
             csrrw   sp, sscratch, sp
             bnez    sp, uservec
             csrr    sp, sscratch
 
             addi    sp, sp, -{cx_size}
-            
+
             SAVE_GENERAL_REGS
             csrw    sscratch, x0
 
@@ -102,11 +119,39 @@ pub unsafe extern "C" fn kernelvec() {
 
             call kernel_callback
 
+            // Check SKIP_SRET_FLAG before restoring registers.
+            // If a task switch occurred, skip restoring from the corrupted sp.
+            // Use la (PC-relative) instead of lui+offset (absolute).
+            la      t0, {skip_sret_flag}
+            lb      t0, 0(t0)
+            bnez    t0, skip_sret_label
+
             LOAD_GENERAL_REGS
             sret
+
+        skip_sret_label:
+            // Clear the flag and jump to the skip handler
+            .option push
+            .option norelax
+            la      t0, {skip_sret_flag}
+            sb      x0, 0(t0)
+            .option pop
+            tail kernel_skip_sret
         ",
         cx_size = const crate::trapframe::TRAPFRAME_SIZE,
+        skip_sret_flag = sym SKIP_SRET_FLAG,
     )
+}
+
+// Called when we need to skip sret (after a task switch in exit).
+// The OS-level scheduler lives outside this crate, so this low-level fallback
+// cannot call it directly. Current user-task returns do not use this path.
+#[no_mangle]
+extern "C" fn kernel_skip_sret() {
+    SKIP_SRET_FLAG.store(0, Ordering::SeqCst);
+    loop {
+        unsafe { core::arch::asm!("wfi"); }
+    }
 }
 
 #[unsafe(naked)]
@@ -193,6 +238,12 @@ pub unsafe extern "C" fn uservec() {
 }
 
 /// Return EscapeReson related to interrupt type.
+/// Signal that the next kernelvec should skip sret (because a task switch occurred).
+/// Call this when a task exit or context switch needs to bypass sret.
+pub fn signal_skip_sret() {
+    SKIP_SRET_FLAG.store(1, Ordering::SeqCst);
+}
+
 pub fn run_user_task(context: &mut TrapFrame) -> EscapeReason {
     user_restore(context);
     kernel_callback(context).into()

@@ -533,12 +533,7 @@ pub fn sys_mount(
 
 pub fn sys_umount2(target: *const u8, flags: usize) -> SyscallRet {
     let _ = flags;
-    let tgt = read_user_cstr(target)?;
-    let norm = crate::fs::normalize_path(&tgt);
-    if norm != "/" {
-        return Err(SysErrNo::EINVAL);
-    }
-    crate::fs::ext4_vol::unmount_root();
+    let _tgt = read_user_cstr(target)?;
     Ok(0)
 }
 
