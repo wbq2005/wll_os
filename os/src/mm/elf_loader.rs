@@ -327,8 +327,10 @@ impl<'a> ElfFile<'a> {
                                 );
                             }
                             src_offset += copy_len;
+                            vaddr_page += copy_len;
+                            continue;
                         }
-                        vaddr_page += page_size;
+                        vaddr_page += page_size - (vaddr_page % page_size);
                     }
                 }
 

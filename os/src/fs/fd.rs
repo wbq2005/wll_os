@@ -719,6 +719,25 @@ impl Default for FileDescriptorTable {
     }
 }
 
+fn open_dir_descriptor(path_norm: &str) -> Result<FileDescriptor, SysErrNo> {
+    if MEM_FS.lock().is_dir(path_norm) {
+        let entries = fs::list_dir(path_norm)?;
+        return Ok(FileDescriptor::MemDir {
+            path: path_norm.into(),
+            entries,
+            offset: 0,
+        });
+    }
+
+    let Some((ino, is_dir)) = ext4_vol::lookup_path(path_norm) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if !is_dir {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    Ok(FileDescriptor::Ext4Dir { ino, offset: 0 })
+}
+
 /// 打开路径：`flags`/`mode` 语义对齐 Linux `openat` 子集。
 pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, SysErrNo> {
     use open_flags::*;
@@ -732,6 +751,13 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
     let want_excl = (flags & O_EXCL) != 0;
     let want_trunc = (flags & O_TRUNC) != 0;
     let append = (flags & O_APPEND) != 0;
+
+    if fs::dir_exists(&path_norm) {
+        if write_ok || want_trunc || want_create {
+            return Err(SysErrNo::EISDIR);
+        }
+        return open_dir_descriptor(&path_norm);
+    }
 
     if want_dir {
         if !fs::dir_exists(&path_norm) {

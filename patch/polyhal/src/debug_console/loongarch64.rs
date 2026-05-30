@@ -3,7 +3,7 @@ use spin::Mutex;
 use super::DebugConsole;
 
 #[cfg(not(board = "2k1000"))]
-const UART_ADDR: usize = 0x01FE002E0 | crate::arch::consts::VIRT_ADDR_START;
+const UART_ADDR: usize = 0x8000_0000_0000_0000 | 0x01FE_001E0;
 #[cfg(board = "2k1000")]
 const UART_ADDR: usize = 0x800000001fe20000;
 
@@ -56,9 +56,6 @@ impl DebugConsole {
     /// Writes a byte to the console.
     #[inline]
     pub fn putchar(ch: u8) {
-        if ch == b'\n' {
-            COM1.lock().put(b'\r');
-        }
         COM1.lock().put(ch);
     }
 

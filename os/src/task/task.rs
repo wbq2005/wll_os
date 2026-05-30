@@ -168,13 +168,20 @@ impl TaskControlBlock {
             (memory_set, user_stack_top, entry, phdr_vaddr, phnum, 0)
         };
 
+        let at_entry = if interp_base != 0 {
+            let target_bias = if target_elf.header.e_type == 3 { 0x0040_0000 } else { 0 };
+            target_elf.entry_with_bias(target_bias)
+        } else {
+            entry
+        };
+
         // 2. Setup user stack with spec's argv/envp
         let sp = crate::syscall::process::setup_user_stack(
             &memory_set,
             user_stack_top,
             &launch_argv,
             &spec.envp,
-            entry,
+            at_entry,
             phdr_vaddr,
             phnum,
             interp_base,

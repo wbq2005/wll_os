@@ -84,7 +84,7 @@ fn early_sbi_line(msg: &[u8]) {
 }
 
 #[cfg(target_arch = "loongarch64")]
-const EARLY_LA_UART_BASE: usize = 0x9000_0000_1fe0_02e0;
+const EARLY_LA_UART_BASE: usize = 0x8000_0000_1fe0_01e0;
 #[cfg(target_arch = "loongarch64")]
 const EARLY_LA_UART_THR: usize = 0;
 #[cfg(target_arch = "loongarch64")]
@@ -107,9 +107,6 @@ fn early_la_putchar(c: u8) {
 #[cfg(target_arch = "loongarch64")]
 fn early_la_line(msg: &[u8]) {
     for &b in msg {
-        if b == b'\n' {
-            early_la_putchar(b'\r');
-        }
         early_la_putchar(b);
     }
 }

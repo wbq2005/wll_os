@@ -110,7 +110,7 @@ pub(crate) fn setup_user_stack(
     stack_top: usize,
     argv: &[String],
     envp: &[String],
-    elf_entry: usize,
+    at_entry: usize,
     phdr_vaddr: usize,
     phnum: usize,
     interp_base: usize,
@@ -240,7 +240,7 @@ pub(crate) fn setup_user_stack(
         (AT_PHNUM, phnum),
         (AT_PAGESZ, crate::config::PAGE_SIZE),
         (AT_BASE, interp_base),
-        (AT_ENTRY, elf_entry),
+        (AT_ENTRY, at_entry),
         (AT_RANDOM, random_addr),
         (AT_NULL, 0),
     ];
@@ -383,12 +383,19 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         argv
     };
     */
+    let at_entry = if interp_base != 0 {
+        let target_bias = if elf.header.e_type == 3 { 0x0040_0000 } else { 0 };
+        elf.entry_with_bias(target_bias)
+    } else {
+        entry
+    };
+
     let sp = setup_user_stack(
         &new_memory_set,
         user_stack_top,
         &argv_with_path,
         &envp,
-        entry,
+        at_entry,
         phdr_vaddr,
         phnum,
         interp_base,
@@ -582,6 +589,7 @@ pub fn sys_clone(
 
     let mut child_tf = crate::trap::clone_current_trapframe().ok_or(SysErrNo::EINVAL)?;
     child_tf[TrapFrameArgs::RET] = 0;
+    child_tf.syscall_ok();
     if stack != 0 {
         child_tf[TrapFrameArgs::SP] = stack;
     }

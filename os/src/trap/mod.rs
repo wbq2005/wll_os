@@ -186,7 +186,6 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 fn handle_syscall(ctx: &mut TrapFrame) {
     // 获取系统调用号（RISC-V: a7/x[17], LoongArch: r11）
     let syscall_id = ctx[TrapFrameArgs::SYSCALL];
-    
     // 获取系统调用参数（a0-a5）
     let args = ctx.args();
     

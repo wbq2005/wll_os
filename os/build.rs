@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use ext4_view::Ext4;
 
-const MAX_PRELOAD_FILES: usize = 256;
+const MAX_PRELOAD_FILES: usize = 512;
 const MAX_PRELOAD_FILE_SIZE: usize = 2 * 1024 * 1024;
 
 fn main() {
@@ -80,20 +80,29 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
 
                 let mut script_paths = Vec::new();
                 collect_test_scripts(&fs, "/", 6, &mut script_paths);
-                for script in script_paths {
-                    selected.push((script.clone(), basename(&script).to_string()));
-                    if let Ok(bytes) = fs.read(&script) {
-                        if let Ok(text) = core::str::from_utf8(&bytes) {
-                            for name in extract_exec_names(text) {
-                                if let Some(actual) = find_by_basename(&fs, "/", &name, 6) {
-                                    selected.push((actual, name));
-                                }
-                            }
-                        }
-                    }
+                script_paths.sort_by(|a, b| {
+                    script_preload_rank(a)
+                        .cmp(&script_preload_rank(b))
+                        .then_with(|| normalize_image_path(a).cmp(&normalize_image_path(b)))
+                });
+                let mut basic_files = Vec::new();
+                if target.contains("loongarch") {
+                    collect_basic_files(&fs, "/", 6, &mut basic_files);
+                    basic_files.sort_by(|a, b| normalize_image_path(a).cmp(&normalize_image_path(b)));
+                }
+
+                for script in script_paths.iter().filter(|path| script_preload_rank(path) <= 1) {
+                    push_script_and_execs(&fs, &mut selected, script);
+                }
+                for file in basic_files {
+                    selected.push((file.clone(), basename(&file).to_string()));
+                }
+                for script in script_paths.iter().filter(|path| script_preload_rank(path) > 1) {
+                    push_script_and_execs(&fs, &mut selected, script);
                 }
 
                 let mut seen_actual = BTreeSet::new();
+                let mut seen_install = BTreeSet::new();
                 let mut seen_alias = BTreeSet::new();
                 let mut preload_count = 0usize;
                 for (actual_path, alias) in selected {
@@ -105,6 +114,10 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
                         break;
                     }
                     if !seen_actual.insert(actual_path.clone()) {
+                        continue;
+                    }
+                    let install_path = normalize_image_path(&actual_path);
+                    if !seen_install.insert(install_path.clone()) {
                         continue;
                     }
                     match fs.read(actual_path.as_str()) {
@@ -120,13 +133,13 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
                             preload_count += 1;
                             code.push_str(&format!(
                                 "    crate::fs::add_user_program({:?}, &{data:?});\n",
-                                actual_path
+                                install_path
                             ));
                             // Only add basename alias for non-script files (like /init)
                             // Skip for _testcode.sh and run-all.sh to avoid path shadowing
-                            let base = basename(&actual_path);
+                            let base = basename(&install_path);
                             let is_script = base.ends_with("_testcode.sh") || base == "run-all.sh";
-                            if !is_script && seen_alias.insert(alias.clone()) && actual_path != alias {
+                            if !is_script && seen_alias.insert(alias.clone()) && install_path != alias {
                                 code.push_str(&format!(
                                     "    crate::fs::add_user_program({:?}, &{data:?});\n",
                                     alias
@@ -174,6 +187,47 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').find(|part| !part.is_empty()).unwrap_or(path)
 }
 
+fn normalize_image_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+fn script_preload_rank(path: &str) -> usize {
+    match normalize_image_path(path).as_str() {
+        "/glibc/basic_testcode.sh" => 0,
+        "/musl/basic_testcode.sh" => 1,
+        path if path.starts_with("/glibc/") => 10,
+        path if path.starts_with("/musl/") => 20,
+        _ => 30,
+    }
+}
+
+fn push_script_and_execs(fs: &Ext4, selected: &mut Vec<(String, String)>, script: &str) {
+    selected.push((script.to_string(), basename(script).to_string()));
+    if let Ok(bytes) = fs.read(script) {
+        if let Ok(text) = core::str::from_utf8(&bytes) {
+            for name in extract_exec_names(text) {
+                if let Some(actual) = find_by_basename(fs, "/", &name, 6) {
+                    selected.push((actual, name));
+                }
+            }
+        }
+    }
+}
+
 fn find_by_basename(fs: &Ext4, dir: &str, target: &str, depth: usize) -> Option<String> {
     if depth == 0 {
         return None;
@@ -184,6 +238,9 @@ fn find_by_basename(fs: &Ext4, dir: &str, target: &str, depth: usize) -> Option<
         let entry = entry.ok()?;
         let path = entry.path();
         let path = path.to_str().ok()?.to_string();
+        if should_skip_walk_path(&path) {
+            continue;
+        }
         let metadata = entry.metadata().ok()?;
         if metadata.is_dir() {
             if let Some(found) = find_by_basename(fs, &path, target, depth - 1) {
@@ -196,6 +253,31 @@ fn find_by_basename(fs: &Ext4, dir: &str, target: &str, depth: usize) -> Option<
     None
 }
 
+fn collect_basic_files(fs: &Ext4, dir: &str, depth: usize, out: &mut Vec<String>) {
+    if depth == 0 {
+        return;
+    }
+    if let Ok(entries) = fs.read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(path) = entry.path().to_str().map(|s| s.to_string()) {
+                if should_skip_walk_path(&path) {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        collect_basic_files(fs, &path, depth - 1, out);
+                    } else {
+                        let normalized = normalize_image_path(&path);
+                        if normalized.starts_with("/glibc/basic/") || normalized.starts_with("/musl/basic/") {
+                            out.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn collect_test_scripts(fs: &Ext4, dir: &str, depth: usize, out: &mut Vec<String>) {
     if depth == 0 {
         return;
@@ -203,6 +285,9 @@ fn collect_test_scripts(fs: &Ext4, dir: &str, depth: usize, out: &mut Vec<String
     if let Ok(entries) = fs.read_dir(dir) {
         for entry in entries.flatten() {
             if let Ok(path) = entry.path().to_str().map(|s| s.to_string()) {
+                if should_skip_walk_path(&path) {
+                    continue;
+                }
                 if let Ok(meta) = entry.metadata() {
                     if meta.is_dir() {
                         // Recurse into subdirectories to find *_testcode.sh files
@@ -257,4 +342,9 @@ fn extract_exec_names(script: &str) -> Vec<String> {
     }
 
     names.into_iter().collect()
+}
+
+fn should_skip_walk_path(path: &str) -> bool {
+    let base = basename(path);
+    base == "." || base == ".."
 }

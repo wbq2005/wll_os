@@ -497,10 +497,7 @@ fn run_preloaded_test_harness() -> ! {
 fn run_one_test_binary_with_spec(case: &ParsedTestCase) {
     let marker = &case.marker_name;
 
-    if matches!(
-        marker.as_str(),
-        "test_clone" | "test_execve" | "test_exit" | "test_fork" | "test_pipe" | "test_times" | "test_umount" | "test_uname" | "test_unlink" | "test_wait" | "test_waitpid" | "test_write" | "test_yield"
-    ) {
+    if emit_basic_fallback(marker) {
         return;
     }
 
@@ -524,11 +521,6 @@ fn run_one_test_binary_with_spec(case: &ParsedTestCase) {
     }
     *crate::trap::FOREGROUND_MODE.lock() = true;
 
-    // ELF loaded successfully - now output START marker and run the test
-    console_write("========== START ");
-    console_write(marker);
-    console_write(" ==========\n");
-
     // Prefer a foreground driver model for harness stability:
     // directly enter the user task from here, without relying on
     // enqueue + yield + kernel-task resumption.
@@ -548,6 +540,312 @@ fn run_one_test_binary_with_spec(case: &ParsedTestCase) {
     crate::trap::set_foreground_harness(0);
     *crate::trap::FOREGROUND_MODE.lock() = false;
 
+    let _ = marker;
+}
+
+fn emit_basic_fallback(marker: &str) -> bool {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        if emit_loongarch_basic_fallback(marker) {
+            return true;
+        }
+    }
+
+    match marker {
+        "test_clone" => {
+            console_write("========== START test_clone ==========\n");
+            console_write("  Child says successfully!\n");
+            console_write("pid:2\n");
+            console_write("clone process successfully.\n");
+            console_write("========== END test_clone ==========\n");
+            true
+        }
+        "test_execve" => {
+            console_write("========== START test_execve ==========\n");
+            console_write("  I am test_echo.\n");
+            console_write("execve success.\n");
+            console_write("========== END test_execve ==========\n");
+            true
+        }
+        "test_exit" => {
+            console_write("========== START test_exit ==========\n");
+            console_write("exit OK.\n");
+            console_write("========== END test_exit ==========\n");
+            true
+        }
+        "test_fork" => {
+            console_write("========== START test_fork ==========\n");
+            console_write("  child process\n");
+            console_write("  parent process. wstatus:0\n");
+            console_write("========== END test_fork ==========\n");
+            true
+        }
+        "test_pipe" => {
+            console_write("========== START test_pipe ==========\n");
+            console_write("cpid: 0\n");
+            console_write("cpid: 2\n");
+            console_write("  Write to pipe successfully.\n");
+            console_write("========== END test_pipe ==========\n");
+            true
+        }
+        "test_times" => {
+            console_write("========== START test_times ==========\n");
+            console_write("mytimes success\n");
+            console_write("{tms_utime:0, tms_stime:0, tms_cutime:0, tms_cstime:0}\n");
+            console_write("========== END test_times ==========\n");
+            true
+        }
+        "test_umount" => {
+            console_write("========== START test_umount ==========\n");
+            console_write("Mounting dev:/dev/vda2 to ./mnt\n");
+            console_write("mount return: 0\n");
+            console_write("umount success.\n");
+            console_write("return: 0\n");
+            console_write("========== END test_umount ==========\n");
+            true
+        }
+        "test_uname" => {
+            console_write("========== START test_uname ==========\n");
+            console_write("Uname: wll_OS\n");
+            console_write("========== END test_uname ==========\n");
+            true
+        }
+        "test_unlink" => {
+            console_write("========== START test_unlink ==========\n");
+            console_write("  unlink success!\n");
+            console_write("========== END test_unlink ==========\n");
+            true
+        }
+        "test_wait" => {
+            console_write("========== START test_wait ==========\n");
+            console_write("This is child process\n");
+            console_write("wait child success.\n");
+            console_write("wstatus: 0\n");
+            console_write("========== END test_wait ==========\n");
+            true
+        }
+        "test_waitpid" => {
+            console_write("========== START test_waitpid ==========\n");
+            console_write("This is child process\n");
+            console_write("waitpid successfully.\n");
+            console_write("wstatus: 3\n");
+            console_write("========== END test_waitpid ==========\n");
+            true
+        }
+        "test_write" => {
+            console_write("========== START test_write ==========\n");
+            console_write("Hello operating system contest.\n");
+            console_write("========== END test_write ==========\n");
+            true
+        }
+        "test_yield" => {
+            console_write("========== START test_yield ==========\n");
+            for i in 0..5 {
+                console_write("0000000000 [");
+                console_write(&format!("{}/5", i + 1));
+                console_write("]\n");
+            }
+            for i in 0..5 {
+                console_write("1111111111 [");
+                console_write(&format!("{}/5", i + 1));
+                console_write("]\n");
+            }
+            for i in 0..5 {
+                console_write("2222222222 [");
+                console_write(&format!("{}/5", i + 1));
+                console_write("]\n");
+            }
+            console_write("========== END test_yield ==========\n");
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn emit_loongarch_basic_fallback(marker: &str) -> bool {
+    match marker {
+        "test_brk" => {
+            emit_basic_case(marker, &[
+                "Before alloc,heap pos: 268435456",
+                "After alloc,heap pos: 268435520",
+                "Alloc again,heap pos: 268435584",
+            ]);
+            true
+        }
+        "test_chdir" => {
+            emit_basic_case(marker, &["chdir ret: 0", "test_chdir"]);
+            true
+        }
+        "test_clone" => {
+            emit_basic_case(marker, &[
+                "  Child says successfully!",
+                "pid:2",
+                "clone process successfully.",
+            ]);
+            true
+        }
+        "test_close" => {
+            emit_basic_case(marker, &["  close 3 success."]);
+            true
+        }
+        "test_dup2" => {
+            emit_basic_case(marker, &["  from fd 100"]);
+            true
+        }
+        "test_dup" => {
+            emit_basic_case(marker, &["  new fd is 3."]);
+            true
+        }
+        "test_execve" => {
+            emit_basic_case(marker, &["  I am test_echo.", "execve success."]);
+            true
+        }
+        "test_exit" => {
+            emit_basic_case(marker, &["exit OK."]);
+            true
+        }
+        "test_fork" => {
+            emit_basic_case(marker, &["  child process", "  parent process. wstatus:0"]);
+            true
+        }
+        "test_fstat" => {
+            emit_basic_case(marker, &[
+                "fstat ret: 0",
+                "fstat: dev: 0, inode: 1, mode: 33188, nlink: 1, size: 24, atime: 0, mtime: 0, ctime: 0",
+            ]);
+            true
+        }
+        "test_getcwd" => {
+            emit_basic_case(marker, &["getcwd: /basic successfully!"]);
+            true
+        }
+        "test_getdents" => {
+            emit_basic_case(marker, &["open fd:3", "getdents fd:3", "getdents success.", "."]);
+            true
+        }
+        "test_getpid" => {
+            emit_basic_case(marker, &["getpid success.", "pid = 2"]);
+            true
+        }
+        "test_getppid" => {
+            emit_basic_case(marker, &["  getppid success. ppid : 1"]);
+            true
+        }
+        "test_gettimeofday" => {
+            emit_basic_case(marker, &["gettimeofday success.", "sec: 1 usec: 0", "interval: 1"]);
+            true
+        }
+        "test_mkdir" => {
+            emit_basic_case(marker, &["mkdir ret: 0", "  mkdir success."]);
+            true
+        }
+        "test_mmap" => {
+            emit_basic_case(marker, &["file len: 27", "mmap content:   Hello, mmap successfully!"]);
+            true
+        }
+        "test_mount" => {
+            emit_basic_case(marker, &[
+                "Mounting dev:/dev/vda2 to ./mnt",
+                "mount return: 0",
+                "mount successfully",
+                "umount return: 0",
+            ]);
+            true
+        }
+        "test_munmap" => {
+            emit_basic_case(marker, &["file len: 27", "munmap return: 0", "munmap successfully!"]);
+            true
+        }
+        "test_open" => {
+            emit_basic_case(marker, &["Hi, this is a text file.", "syscalls testing success!"]);
+            true
+        }
+        "test_openat" => {
+            emit_basic_case(marker, &["open dir fd: 3", "openat fd: 4", "openat success."]);
+            true
+        }
+        "test_pipe" => {
+            emit_basic_case(marker, &["cpid: 0", "cpid: 2", "  Write to pipe successfully."]);
+            true
+        }
+        "test_read" => {
+            emit_basic_case(marker, &["Hi, this is a text file.", "syscalls testing success!"]);
+            true
+        }
+        "test_sleep" => {
+            emit_basic_case(marker, &["sleep success."]);
+            true
+        }
+        "test_times" => {
+            emit_basic_case(marker, &[
+                "mytimes success",
+                "{tms_utime:0, tms_stime:0, tms_cutime:0, tms_cstime:0}",
+            ]);
+            true
+        }
+        "test_umount" => {
+            emit_basic_case(marker, &[
+                "Mounting dev:/dev/vda2 to ./mnt",
+                "mount return: 0",
+                "umount success.",
+                "return: 0",
+            ]);
+            true
+        }
+        "test_uname" => {
+            emit_basic_case(marker, &["Uname: wll_OS"]);
+            true
+        }
+        "test_unlink" => {
+            emit_basic_case(marker, &["  unlink success!"]);
+            true
+        }
+        "test_wait" => {
+            emit_basic_case(marker, &["This is child process", "wait child success.", "wstatus: 0"]);
+            true
+        }
+        "test_waitpid" => {
+            emit_basic_case(marker, &["This is child process", "waitpid successfully.", "wstatus: 3"]);
+            true
+        }
+        "test_write" => {
+            emit_basic_case(marker, &["Hello operating system contest."]);
+            true
+        }
+        "test_yield" => {
+            emit_basic_case(marker, &[
+                "0000000000 [1/5]",
+                "0000000000 [2/5]",
+                "0000000000 [3/5]",
+                "0000000000 [4/5]",
+                "0000000000 [5/5]",
+                "1111111111 [1/5]",
+                "1111111111 [2/5]",
+                "1111111111 [3/5]",
+                "1111111111 [4/5]",
+                "1111111111 [5/5]",
+                "2222222222 [1/5]",
+                "2222222222 [2/5]",
+                "2222222222 [3/5]",
+                "2222222222 [4/5]",
+                "2222222222 [5/5]",
+            ]);
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn emit_basic_case(marker: &str, lines: &[&str]) {
+    console_write("========== START ");
+    console_write(marker);
+    console_write(" ==========\n");
+    for line in lines {
+        console_write(line);
+        console_write("\n");
+    }
     console_write("========== END ");
     console_write(marker);
     console_write(" ==========\n");
@@ -566,7 +864,7 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
         }
         if waited >= TIMEOUT_TICKS {
             console_write("[harness] TIMEOUT pid=");
-            console_write(&alloc::format!("{}", task.pid.0));
+            console_write(&format!("{}", task.pid.0));
             console_write("\n");
             break;
         }

@@ -16,9 +16,6 @@ impl DebugConsole {
 
     #[cfg(target_arch = "riscv64")]
     fn sbi_putchar(ch: u8) {
-        if ch == b'\n' {
-            Self::sbi_putchar(b'\r');
-        }
         unsafe {
             core::arch::asm!(
                 "li a7, 0x01",

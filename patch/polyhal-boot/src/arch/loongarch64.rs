@@ -9,6 +9,8 @@ macro_rules! init_dwm {
         ori         $t0, $zero, 0x11    # CSR_DMW1_MAT | CSR_DMW1_PLV0
         lu52i.d     $t0, $t0, -1792     # CA, PLV0, 0x9000 xxxx xxxx xxxx
         csrwr       $t0, 0x181          # LOONGARCH_CSR_DMWIN1
+        ori         $t0, $zero, 0x11    # CA, PLV0, low identity window
+        csrwr       $t0, 0x182          # LOONGARCH_CSR_DMWIN2
         "
     };
 }
@@ -42,10 +44,10 @@ unsafe extern "C" fn _start() -> ! {
 
 /// Rust temporary entry point - MINIMAL TEST VERSION
 pub fn rust_tmp_main(_hart_id: usize) {
-    // UART at physical 0x1FE002E0 (ns16550-compatible, QEMU virt)
+    // UART at physical 0x1FE001E0 (ns16550-compatible, QEMU virt)
     // LSR at offset 5, bit 5 = THR empty (ready to send)
-    let uart_lsr = 0x900000001FE002E5_u64 as *const u8;
-    let uart_thr = 0x900000001FE002E0_u64 as *mut u8;
+    let uart_lsr = 0x800000001FE001E5_u64 as *const u8;
+    let uart_thr = 0x800000001FE001E0_u64 as *mut u8;
     
     // Print "BOOT\n" to UART
     let msg = b"BOOT\n";
