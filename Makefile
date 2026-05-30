@@ -1,26 +1,25 @@
-# 操作系统大赛 2026 - Makefile
-# 兼容 Linux 和 Windows 环境
+# OS contest 2026 - Makefile
 
-# 架构设置
 ARCH ?= riscv64
 INIT ?= test
 LOG ?= OFF
+RUSTUP_TOOLCHAIN ?= $(shell rustup default 2>/dev/null | sed 's/ .*//')
+ifeq ($(findstring nightly,$(RUSTUP_TOOLCHAIN)),)
+    RUSTUP_TOOLCHAIN := $(shell rustup toolchain list 2>/dev/null | sed -n 's/^\(nightly[^ ]*\).*/\1/p' | head -n 1)
+endif
+ifeq ($(strip $(RUSTUP_TOOLCHAIN)),)
+    RUSTUP_TOOLCHAIN := nightly
+endif
 
-# 目标三元组与 Cargo feature（LoongArch 需关闭默认 riscv feature）
-# 使用 nightly 工具链：裸机 no_std 目标需要 -Z build-std，该 flag 仅 nightly 可用
 ifeq ($(ARCH),riscv64)
     TARGET := riscv64gc-unknown-none-elf
     CARGO_EXTRA :=
-    RUSTUP_TOOLCHAIN := nightly-2026-05-05-x86_64-unknown-linux-gnu
 else ifeq ($(ARCH),loongarch64)
     TARGET := loongarch64-unknown-none
     CARGO_EXTRA := --no-default-features --features loongarch
-    RUSTUP_TOOLCHAIN := nightly-2026-05-05-x86_64-unknown-linux-gnu
 endif
 
-# 默认目标：编译两个架构
 .PHONY: all build clean check check-sdcard unpack-sdcard print-phase2-gate
-
 all:
 	@echo "Building for RISC-V..."
 	$(MAKE) ARCH=riscv64 build INIT=$(INIT) LOG=$(LOG)

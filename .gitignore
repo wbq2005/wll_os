@@ -29,7 +29,6 @@ testdata/*.img.gz
 Thumbs.db
 
 # Cargo - keep Cargo.lock for reproducible builds
-Cargo.lock
 
 # 调试文件
 *.pdb
@@ -40,6 +39,7 @@ Cargo.lock
 
 # Local nested repositories / test harnesses
 autotest_repo/
+_tmp/
 
 # Build error logs (temporary files)
 os/build_err*.txt
