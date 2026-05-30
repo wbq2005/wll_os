@@ -89,14 +89,12 @@ unpack-sdcard:
 build:
 	@echo "Building kernel for $(ARCH)..."
 	$(MAKE) check-sdcard ARCH=$(ARCH)
-	@# 安装 rust-src（-Z build-std 需要）
-	@rustup component add rust-src --toolchain $(RUSTUP_TOOLCHAIN) 2>/dev/null || true
-	cd os && cargo +$(RUSTUP_TOOLCHAIN) build --release --target $(TARGET) $(CARGO_EXTRA) -Z build-std=core,alloc
+	cd os && cargo +$(RUSTUP_TOOLCHAIN) build --release --target $(TARGET) $(CARGO_EXTRA)
 
 # 快速检查（不做链接，更快，适合开发阶段验证代码）
 check:
 	@echo "Checking kernel for $(ARCH)..."
-	cd os && cargo +$(RUSTUP_TOOLCHAIN) check --release --target $(TARGET) $(CARGO_EXTRA) -Z build-std=core,alloc
+	cd os && cargo +$(RUSTUP_TOOLCHAIN) check --release --target $(TARGET) $(CARGO_EXTRA)
 
 # 清理
 clean:
