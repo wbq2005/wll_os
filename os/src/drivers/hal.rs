@@ -13,9 +13,7 @@ use core::ptr::NonNull;
 
 use virtio_drivers::{BufferDirection, Hal, PhysAddr, PAGE_SIZE as VIRT_PAGE};
 
-use crate::mm::frame_allocator::{
-    alloc_contiguous_frames, dealloc_contiguous_frames,
-};
+use crate::mm::frame_allocator::{alloc_contiguous_frames, dealloc_contiguous_frames};
 
 /// LoongArch DMW1: cached, 用于普通 RAM / DMA 缓冲区
 #[cfg(target_arch = "loongarch64")]
@@ -29,27 +27,39 @@ const DMW_MMIO: usize = 0x8000_0000_0000_0000;
 #[inline]
 pub fn phys_to_virt_ram(paddr: usize) -> *mut u8 {
     #[cfg(target_arch = "loongarch64")]
-    { (paddr | DMW_RAM) as *mut u8 }
+    {
+        (paddr | DMW_RAM) as *mut u8
+    }
     #[cfg(not(target_arch = "loongarch64"))]
-    { paddr as *mut u8 }
+    {
+        paddr as *mut u8
+    }
 }
 
 /// 物理地址 → 可解引用的虚拟指针（MMIO，uncached）
 #[inline]
 pub fn phys_to_virt_mmio(paddr: usize) -> *mut u8 {
     #[cfg(target_arch = "loongarch64")]
-    { (paddr | DMW_MMIO) as *mut u8 }
+    {
+        (paddr | DMW_MMIO) as *mut u8
+    }
     #[cfg(not(target_arch = "loongarch64"))]
-    { paddr as *mut u8 }
+    {
+        paddr as *mut u8
+    }
 }
 
 /// 虚拟指针 → 物理地址（剥除 DMW 前缀）
 #[inline]
 pub fn virt_to_phys(vaddr: usize) -> usize {
     #[cfg(target_arch = "loongarch64")]
-    { vaddr & 0x0FFF_FFFF_FFFF_FFFF }
+    {
+        vaddr & 0x0FFF_FFFF_FFFF_FFFF
+    }
     #[cfg(not(target_arch = "loongarch64"))]
-    { vaddr }
+    {
+        vaddr
+    }
 }
 
 #[derive(Clone, Copy)]

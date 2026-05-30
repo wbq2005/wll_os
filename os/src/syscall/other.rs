@@ -1,7 +1,7 @@
-use crate::utils::error::SysErrNo;
 use super::SyscallRet;
-use crate::timer;
 use crate::task::current_task;
+use crate::timer;
+use crate::utils::error::SysErrNo;
 use polyhal::VirtAddr;
 
 #[repr(C)]
@@ -64,7 +64,9 @@ fn copy_to_user(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
         let pa = memory_set
             .translate(VirtAddr::new(addr))
             .ok_or(SysErrNo::EFAULT)?;
-        unsafe { *(pa.raw() as *mut u8) = byte; }
+        unsafe {
+            *(pa.raw() as *mut u8) = byte;
+        }
         addr += 1;
     }
     Ok(())
@@ -97,10 +99,7 @@ fn copy_object_to_user<T>(dst: usize, obj: &T) -> Result<(), SysErrNo> {
 fn copy_object_from_user<T: Copy>(src: usize) -> Result<T, SysErrNo> {
     let mut obj = core::mem::MaybeUninit::<T>::uninit();
     let bytes = unsafe {
-        core::slice::from_raw_parts_mut(
-            obj.as_mut_ptr() as *mut u8,
-            core::mem::size_of::<T>(),
-        )
+        core::slice::from_raw_parts_mut(obj.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
     };
     copy_from_user(src, bytes)?;
     Ok(unsafe { obj.assume_init() })
@@ -112,12 +111,21 @@ pub fn sys_nanosleep(req: usize, rem: usize) -> SyscallRet {
     }
 
     let req = copy_object_from_user::<TimeSpec>(req)?;
-    let sleep_ms = req.tv_sec.saturating_mul(1000).saturating_add(req.tv_nsec.div_ceil(1_000_000));
+    let sleep_ms = req
+        .tv_sec
+        .saturating_mul(1000)
+        .saturating_add(req.tv_nsec.div_ceil(1_000_000));
     timer::sleep_ms(sleep_ms);
 
     if rem != 0 {
         unsafe {
-            copy_object_to_user(rem, &TimeSpec { tv_sec: 0, tv_nsec: 0 })?;
+            copy_object_to_user(
+                rem,
+                &TimeSpec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            )?;
         }
     }
 
@@ -131,7 +139,13 @@ pub fn sys_gettimeofday(tv: usize, tz: usize) -> SyscallRet {
     }
     let (sec, usec) = timer::get_timeval();
     unsafe {
-        copy_object_to_user(tv, &TimeVal { tv_sec: sec, tv_usec: usec })?;
+        copy_object_to_user(
+            tv,
+            &TimeVal {
+                tv_sec: sec,
+                tv_usec: usec,
+            },
+        )?;
     }
     if tz != 0 {
         unsafe {
@@ -147,10 +161,13 @@ pub fn sys_clock_gettime(_clock_id: usize, tp: usize) -> SyscallRet {
     }
     let time_us = timer::get_time_us();
     unsafe {
-        copy_object_to_user(tp, &TimeSpec {
-            tv_sec: time_us / 1_000_000,
-            tv_nsec: (time_us % 1_000_000) * 1000,
-        })?;
+        copy_object_to_user(
+            tp,
+            &TimeSpec {
+                tv_sec: time_us / 1_000_000,
+                tv_nsec: (time_us % 1_000_000) * 1000,
+            },
+        )?;
     }
     Ok(0)
 }
@@ -160,10 +177,13 @@ pub fn sys_clock_getres(_clock_id: usize, tp: usize) -> SyscallRet {
         return Err(SysErrNo::EFAULT);
     }
     unsafe {
-        copy_object_to_user(tp, &TimeSpec {
-            tv_sec: 0,
-            tv_nsec: 1_000,
-        })?;
+        copy_object_to_user(
+            tp,
+            &TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 1_000,
+            },
+        )?;
     }
     Ok(0)
 }
@@ -200,21 +220,22 @@ pub fn sys_times(buf: usize) -> SyscallRet {
     if buf != 0 {
         let ticks = timer::get_time() as isize;
         unsafe {
-            copy_object_to_user(buf, &Tms {
-                tms_utime: ticks,
-                tms_stime: 0,
-                tms_cutime: 0,
-                tms_cstime: 0,
-            })?;
+            copy_object_to_user(
+                buf,
+                &Tms {
+                    tms_utime: ticks,
+                    tms_stime: 0,
+                    tms_cutime: 0,
+                    tms_cstime: 0,
+                },
+            )?;
         }
     }
     Ok(timer::get_time())
 }
 
 pub fn sys_gettid() -> SyscallRet {
-    current_task()
-        .map(|task| task.pid.0)
-        .ok_or(SysErrNo::ESRCH)
+    current_task().map(|task| task.pid.0).ok_or(SysErrNo::ESRCH)
 }
 
 pub fn sys_getuid() -> SyscallRet {
@@ -233,23 +254,29 @@ pub fn sys_getegid() -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_prlimit64(_pid: usize, _resource: usize, new_limit: usize, old_limit: usize) -> SyscallRet {
+pub fn sys_prlimit64(
+    _pid: usize,
+    _resource: usize,
+    new_limit: usize,
+    old_limit: usize,
+) -> SyscallRet {
     let _ = new_limit;
     if old_limit != 0 {
         unsafe {
-            copy_object_to_user(old_limit, &RLimit {
-                rlim_cur: usize::MAX,
-                rlim_max: usize::MAX,
-            })?;
+            copy_object_to_user(
+                old_limit,
+                &RLimit {
+                    rlim_cur: usize::MAX,
+                    rlim_max: usize::MAX,
+                },
+            )?;
         }
     }
     Ok(0)
 }
 
 pub fn sys_set_tid_address(_tidptr: usize) -> SyscallRet {
-    current_task()
-        .map(|task| task.pid.0)
-        .ok_or(SysErrNo::ESRCH)
+    current_task().map(|task| task.pid.0).ok_or(SysErrNo::ESRCH)
 }
 
 pub fn sys_getrandom(buf: usize, buflen: usize, _flags: usize) -> SyscallRet {
@@ -320,9 +347,7 @@ pub fn sys_umask(_mask: usize) -> SyscallRet {
 }
 
 pub fn sys_getpgid(_pid: usize) -> SyscallRet {
-    current_task()
-        .map(|task| task.pid.0)
-        .ok_or(SysErrNo::ESRCH)
+    current_task().map(|task| task.pid.0).ok_or(SysErrNo::ESRCH)
 }
 
 pub fn sys_setpgid(_pid: usize, _pgid: usize) -> SyscallRet {

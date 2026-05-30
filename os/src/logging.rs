@@ -1,5 +1,5 @@
-use log::{self, Level, LevelFilter, Log, Metadata, Record};
 use crate::println;
+use log::{self, Level, LevelFilter, Log, Metadata, Record};
 
 /// 内核日志实现
 struct SimpleLogger;
@@ -13,7 +13,7 @@ impl Log for SimpleLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        
+
         let color = match record.level() {
             Level::Error => 31, // Red
             Level::Warn => 33,  // Yellow
@@ -21,7 +21,7 @@ impl Log for SimpleLogger {
             Level::Debug => 34, // Blue
             Level::Trace => 35, // Magenta
         };
-        
+
         println!(
             "\x1b[{}m[{:>5}] {}\x1b[0m",
             color,
@@ -43,7 +43,7 @@ pub fn init(level: Option<&str>) {
         Some("trace") => LevelFilter::Trace,
         _ => LevelFilter::Off,
     };
-    
+
     log::set_logger(&SimpleLogger).unwrap();
     log::set_max_level(filter);
 }

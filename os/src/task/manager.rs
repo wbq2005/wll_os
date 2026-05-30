@@ -12,7 +12,6 @@ lazy_static! {
 
 /// 添加任务到就绪队列
 pub fn add_task(task: Arc<TaskControlBlock>) {
-    log::info!("[task] add_task pid={}", task.pid.0);
     READY_QUEUE.lock().push_back(task);
 }
 
@@ -24,6 +23,17 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
 /// 检查就绪队列是否有任务
 pub fn has_task() -> bool {
     !READY_QUEUE.lock().is_empty()
+}
+
+pub fn retain_tasks(mut keep: impl FnMut(&Arc<TaskControlBlock>) -> bool) {
+    let mut queue = READY_QUEUE.lock();
+    let mut kept = VecDeque::new();
+    while let Some(task) = queue.pop_front() {
+        if keep(&task) {
+            kept.push_back(task);
+        }
+    }
+    *queue = kept;
 }
 
 /// 返回就绪队列长度（诊断用）

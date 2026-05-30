@@ -1,25 +1,25 @@
-pub mod task;
-pub mod manager;
-pub mod processor;
 pub mod context;
+pub mod manager;
 pub mod pid;
+pub mod processor;
+pub mod task;
 
-use alloc::sync::Arc;
-use alloc::string::{String, ToString};
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
-use spin::Mutex;
-use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 use polyhal_trap::trap::run_user_task;
+use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
+use spin::Mutex;
 
+use crate::console::putchar;
+use crate::fs::fd::FileDescriptorTable;
 use crate::mm::memory_set::MemorySet;
 use crate::task::context::TaskContext;
 use crate::task::processor::Processor;
-use crate::fs::fd::FileDescriptorTable;
-use crate::console::putchar;
 
 static mut SCHEDULER_CONTEXT: TaskContext = TaskContext {
     ra: 0,
@@ -127,7 +127,10 @@ fn task_ctx_ptr(task: &Arc<TaskControlBlock>) -> *mut TaskContext {
 fn switch_kernel_task_back_to_scheduler(task: &Arc<TaskControlBlock>) {
     let scheduler_ctx_ptr = SCHEDULER_CONTEXT_PTR.load(Ordering::SeqCst);
     if scheduler_ctx_ptr == 0 {
-        log::error!("[task] missing scheduler context for kernel task {}", task.pid.0);
+        log::error!(
+            "[task] missing scheduler context for kernel task {}",
+            task.pid.0
+        );
         return;
     }
     let current_ctx_ptr = task_ctx_ptr(task);
@@ -187,7 +190,6 @@ fn report_no_init_and_maybe_shutdown(reason: &str) {
     console_write("[boot-error] hint: ensure ext4 root on virtio-blk is available at boot (e.g. /init on the disk).\n");
     console_write("[boot-error] hint: local dev without runtime disk: place sdcard-rv.img / sdcard-la.img (or run `make unpack-sdcard`) so build.rs preloads MemFS.\n");
     console_write("[boot-error] hint: with virtio disk, kernel mounts ext4 at boot; harness discovers scripts via fs::list_files() (MemFS + ext4).\n");
-    
 
     // 默认开发模式下直接关机，避免无任务时长时间 idle 看起来像"卡死"。
     // 如需保留 idle，可使用 cargo feature: `--features no-init-idle`.
@@ -203,25 +205,37 @@ fn report_no_init_and_maybe_shutdown(reason: &str) {
 fn collect_script_paths() -> Vec<String> {
     let all_files = crate::fs::list_files();
 
+    let mut scripts = Vec::new();
+    for prefix in ["/glibc", "/musl"] {
+        let run_all = alloc::format!("{}/basic/run-all.sh", prefix);
+        let wrapper = alloc::format!("{}/basic_testcode.sh", prefix);
+        if crate::fs::file_exists(&run_all) || all_files.iter().any(|path| path == &run_all) {
+            scripts.push(run_all);
+        } else if crate::fs::file_exists(&wrapper) || all_files.iter().any(|path| path == &wrapper)
+        {
+            scripts.push(wrapper);
+        }
+    }
+
+    if !scripts.is_empty() {
+        return scripts;
+    }
+
     let mut scripts: Vec<String> = all_files
         .into_iter()
         .filter(|path| {
             let name = path.rsplit('/').next().unwrap_or(path);
-            // Only collect top-level *_testcode.sh files, NOT run-all.sh
-            let matches = name.ends_with("_testcode.sh");
-            matches
+            name == "basic_testcode.sh"
         })
         .collect();
     scripts.sort_by(|a, b| {
         let rank = |path: &String| {
-            if path.starts_with("/glibc/basic") {
+            if path.starts_with("/glibc/") {
                 0usize
-            } else if path.starts_with("/glibc/") {
+            } else if path.starts_with("/musl/") {
                 1
-            } else if path.starts_with("/musl/basic") {
-                2
             } else {
-                3
+                2
             }
         };
         rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
@@ -258,7 +272,11 @@ fn parse_basic_script(script_path: &str, script_text: &str) -> Vec<ParsedTestCas
     let mut results = Vec::new();
     let mut in_tests = false;
     let mut runall_subpath: Option<String> = None;
-    let mut test_dir: Option<String> = None;
+    let mut test_dir: Option<String> = if script_path.ends_with("/basic/run-all.sh") {
+        Some(String::from("basic"))
+    } else {
+        None
+    };
 
     for line in script_text.lines() {
         let t = line.trim();
@@ -324,10 +342,15 @@ fn parse_basic_script(script_path: &str, script_text: &str) -> Vec<ParsedTestCas
     // If the script also invokes ./run-all.sh, append those test names too.
     if let Some(ref runall_name) = runall_subpath {
         // Build the full path to run-all.sh: base_dir + test_dir + runall_name
-        let base_dir = script_path.rsplit('/').next().map(|s| {
-            let idx = script_path.len() - s.len();
-            &script_path[..idx]
-        }).unwrap_or("");
+        let base_dir = script_path
+            .rsplit('/')
+            .next()
+            .map(|s| {
+                let idx = script_path.len() - s.len();
+                &script_path[..idx]
+            })
+            .unwrap_or("");
+        let base_dir = base_dir.trim_end_matches('/');
         let runall_path = if let Some(ref dir) = test_dir {
             alloc::format!("{}/{}/{}", base_dir, dir, runall_name)
         } else {
@@ -349,7 +372,10 @@ fn parse_basic_script(script_path: &str, script_text: &str) -> Vec<ParsedTestCas
                             for name in rest.split_whitespace() {
                                 if !name.is_empty() && name != "\"" {
                                     if let Some(tc) = make_test_case(libc_prefix, Some(dir), name) {
-                                        if !results.iter().any(|x| x.marker_name == tc.marker_name && x.binary_path == tc.binary_path) {
+                                        if !results.iter().any(|x| {
+                                            x.marker_name == tc.marker_name
+                                                && x.binary_path == tc.binary_path
+                                        }) {
                                             results.push(tc);
                                         }
                                     }
@@ -366,7 +392,10 @@ fn parse_basic_script(script_path: &str, script_text: &str) -> Vec<ParsedTestCas
                         for name in t.split_whitespace() {
                             if !name.is_empty() && name != "\"" {
                                 if let Some(tc) = make_test_case(libc_prefix, Some(dir), name) {
-                                    if !results.iter().any(|x| x.marker_name == tc.marker_name && x.binary_path == tc.binary_path) {
+                                    if !results.iter().any(|x| {
+                                        x.marker_name == tc.marker_name
+                                            && x.binary_path == tc.binary_path
+                                    }) {
                                         results.push(tc);
                                     }
                                 }
@@ -387,7 +416,11 @@ fn parse_basic_script(script_path: &str, script_text: &str) -> Vec<ParsedTestCas
 /// - binary_path = /<libc>/<subdir>/<raw_name>
 /// - marker_name = test_<raw_name>
 /// e.g. "brk" with libc="glibc", dir="basic" -> "/glibc/basic/brk", "test_brk"
-fn make_test_case(libc_prefix: &str, test_dir: Option<&str>, raw_name: &str) -> Option<ParsedTestCase> {
+fn make_test_case(
+    libc_prefix: &str,
+    test_dir: Option<&str>,
+    raw_name: &str,
+) -> Option<ParsedTestCase> {
     let name = raw_name.trim();
     if name.is_empty() || name == "\"" {
         return None;
@@ -444,13 +477,7 @@ fn run_preloaded_test_harness() -> ! {
     let scripts = collect_script_paths();
 
     for script in &scripts {
-        // Determine group name from script filename
-        let group = {
-            let base = script.rsplit('/').next().unwrap_or(script);
-            base.strip_suffix("_testcode.sh")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| base.to_string())
-        };
+        let group = basic_group_name(script);
 
         console_write("#### OS COMP TEST GROUP START ");
         console_write(&group);
@@ -461,7 +488,10 @@ fn run_preloaded_test_harness() -> ! {
                 // Try script-aware parsing first (for basic_testcode.sh)
                 let test_cases = parse_basic_script(script, text);
                 if !test_cases.is_empty() {
-                    if test_cases.iter().any(|case| crate::fs::file_exists(&case.binary_path)) {
+                    if test_cases
+                        .iter()
+                        .any(|case| crate::fs::file_exists(&case.binary_path))
+                    {
                         for case in &test_cases {
                             run_one_test_binary_with_spec(case);
                         }
@@ -492,14 +522,20 @@ fn run_preloaded_test_harness() -> ! {
     polyhal::instruction::shutdown();
 }
 
+fn basic_group_name(script: &str) -> &'static str {
+    if script.starts_with("/glibc/") {
+        "basic-glibc"
+    } else if script.starts_with("/musl/") {
+        "basic-musl"
+    } else {
+        "basic"
+    }
+}
+
 /// Execute a single test binary using a ParsedTestCase specification.
 /// Uses UserProgramSpec to set correct path, argv, envp, cwd, and marker name.
 fn run_one_test_binary_with_spec(case: &ParsedTestCase) {
     let marker = &case.marker_name;
-
-    if emit_basic_fallback(marker) {
-        return;
-    }
 
     // Try to load the ELF first (outside marker region for clean output)
     let spec = spec_from_case(case);
@@ -543,312 +579,45 @@ fn run_one_test_binary_with_spec(case: &ParsedTestCase) {
     let _ = marker;
 }
 
-fn emit_basic_fallback(marker: &str) -> bool {
-    #[cfg(target_arch = "loongarch64")]
+fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
+    fn abort_one(task: &Arc<TaskControlBlock>, aborted: &mut Vec<usize>) {
+        if aborted.iter().any(|pid| *pid == task.pid.0) {
+            return;
+        }
+        aborted.push(task.pid.0);
+        task.set_exit_code(-2);
+        task.set_status(TaskStatus::Zombie);
+        *task.trap_frame.lock() = None;
+        crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
+
+        let children = {
+            let mut inner = task.inner.lock();
+            core::mem::take(&mut inner.children)
+        };
+        for child in children {
+            abort_one(&child, aborted);
+        }
+    }
+
+    let mut aborted = Vec::new();
+    abort_one(root, &mut aborted);
+    manager::retain_tasks(|queued| {
+        if queued.is_kernel {
+            true
+        } else {
+            abort_one(queued, &mut aborted);
+            false
+        }
+    });
+
+    let mut current = CURRENT_TASK.lock();
+    if current
+        .as_ref()
+        .map(|task| aborted.iter().any(|pid| *pid == task.pid.0))
+        .unwrap_or(false)
     {
-        if emit_loongarch_basic_fallback(marker) {
-            return true;
-        }
+        *current = None;
     }
-
-    match marker {
-        "test_clone" => {
-            console_write("========== START test_clone ==========\n");
-            console_write("  Child says successfully!\n");
-            console_write("pid:2\n");
-            console_write("clone process successfully.\n");
-            console_write("========== END test_clone ==========\n");
-            true
-        }
-        "test_execve" => {
-            console_write("========== START test_execve ==========\n");
-            console_write("  I am test_echo.\n");
-            console_write("execve success.\n");
-            console_write("========== END test_execve ==========\n");
-            true
-        }
-        "test_exit" => {
-            console_write("========== START test_exit ==========\n");
-            console_write("exit OK.\n");
-            console_write("========== END test_exit ==========\n");
-            true
-        }
-        "test_fork" => {
-            console_write("========== START test_fork ==========\n");
-            console_write("  child process\n");
-            console_write("  parent process. wstatus:0\n");
-            console_write("========== END test_fork ==========\n");
-            true
-        }
-        "test_pipe" => {
-            console_write("========== START test_pipe ==========\n");
-            console_write("cpid: 0\n");
-            console_write("cpid: 2\n");
-            console_write("  Write to pipe successfully.\n");
-            console_write("========== END test_pipe ==========\n");
-            true
-        }
-        "test_times" => {
-            console_write("========== START test_times ==========\n");
-            console_write("mytimes success\n");
-            console_write("{tms_utime:0, tms_stime:0, tms_cutime:0, tms_cstime:0}\n");
-            console_write("========== END test_times ==========\n");
-            true
-        }
-        "test_umount" => {
-            console_write("========== START test_umount ==========\n");
-            console_write("Mounting dev:/dev/vda2 to ./mnt\n");
-            console_write("mount return: 0\n");
-            console_write("umount success.\n");
-            console_write("return: 0\n");
-            console_write("========== END test_umount ==========\n");
-            true
-        }
-        "test_uname" => {
-            console_write("========== START test_uname ==========\n");
-            console_write("Uname: wll_OS\n");
-            console_write("========== END test_uname ==========\n");
-            true
-        }
-        "test_unlink" => {
-            console_write("========== START test_unlink ==========\n");
-            console_write("  unlink success!\n");
-            console_write("========== END test_unlink ==========\n");
-            true
-        }
-        "test_wait" => {
-            console_write("========== START test_wait ==========\n");
-            console_write("This is child process\n");
-            console_write("wait child success.\n");
-            console_write("wstatus: 0\n");
-            console_write("========== END test_wait ==========\n");
-            true
-        }
-        "test_waitpid" => {
-            console_write("========== START test_waitpid ==========\n");
-            console_write("This is child process\n");
-            console_write("waitpid successfully.\n");
-            console_write("wstatus: 3\n");
-            console_write("========== END test_waitpid ==========\n");
-            true
-        }
-        "test_write" => {
-            console_write("========== START test_write ==========\n");
-            console_write("Hello operating system contest.\n");
-            console_write("========== END test_write ==========\n");
-            true
-        }
-        "test_yield" => {
-            console_write("========== START test_yield ==========\n");
-            for i in 0..5 {
-                console_write("0000000000 [");
-                console_write(&format!("{}/5", i + 1));
-                console_write("]\n");
-            }
-            for i in 0..5 {
-                console_write("1111111111 [");
-                console_write(&format!("{}/5", i + 1));
-                console_write("]\n");
-            }
-            for i in 0..5 {
-                console_write("2222222222 [");
-                console_write(&format!("{}/5", i + 1));
-                console_write("]\n");
-            }
-            console_write("========== END test_yield ==========\n");
-            true
-        }
-        _ => false,
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn emit_loongarch_basic_fallback(marker: &str) -> bool {
-    match marker {
-        "test_brk" => {
-            emit_basic_case(marker, &[
-                "Before alloc,heap pos: 268435456",
-                "After alloc,heap pos: 268435520",
-                "Alloc again,heap pos: 268435584",
-            ]);
-            true
-        }
-        "test_chdir" => {
-            emit_basic_case(marker, &["chdir ret: 0", "test_chdir"]);
-            true
-        }
-        "test_clone" => {
-            emit_basic_case(marker, &[
-                "  Child says successfully!",
-                "pid:2",
-                "clone process successfully.",
-            ]);
-            true
-        }
-        "test_close" => {
-            emit_basic_case(marker, &["  close 3 success."]);
-            true
-        }
-        "test_dup2" => {
-            emit_basic_case(marker, &["  from fd 100"]);
-            true
-        }
-        "test_dup" => {
-            emit_basic_case(marker, &["  new fd is 3."]);
-            true
-        }
-        "test_execve" => {
-            emit_basic_case(marker, &["  I am test_echo.", "execve success."]);
-            true
-        }
-        "test_exit" => {
-            emit_basic_case(marker, &["exit OK."]);
-            true
-        }
-        "test_fork" => {
-            emit_basic_case(marker, &["  child process", "  parent process. wstatus:0"]);
-            true
-        }
-        "test_fstat" => {
-            emit_basic_case(marker, &[
-                "fstat ret: 0",
-                "fstat: dev: 0, inode: 1, mode: 33188, nlink: 1, size: 24, atime: 0, mtime: 0, ctime: 0",
-            ]);
-            true
-        }
-        "test_getcwd" => {
-            emit_basic_case(marker, &["getcwd: /basic successfully!"]);
-            true
-        }
-        "test_getdents" => {
-            emit_basic_case(marker, &["open fd:3", "getdents fd:3", "getdents success.", "."]);
-            true
-        }
-        "test_getpid" => {
-            emit_basic_case(marker, &["getpid success.", "pid = 2"]);
-            true
-        }
-        "test_getppid" => {
-            emit_basic_case(marker, &["  getppid success. ppid : 1"]);
-            true
-        }
-        "test_gettimeofday" => {
-            emit_basic_case(marker, &["gettimeofday success.", "sec: 1 usec: 0", "interval: 1"]);
-            true
-        }
-        "test_mkdir" => {
-            emit_basic_case(marker, &["mkdir ret: 0", "  mkdir success."]);
-            true
-        }
-        "test_mmap" => {
-            emit_basic_case(marker, &["file len: 27", "mmap content:   Hello, mmap successfully!"]);
-            true
-        }
-        "test_mount" => {
-            emit_basic_case(marker, &[
-                "Mounting dev:/dev/vda2 to ./mnt",
-                "mount return: 0",
-                "mount successfully",
-                "umount return: 0",
-            ]);
-            true
-        }
-        "test_munmap" => {
-            emit_basic_case(marker, &["file len: 27", "munmap return: 0", "munmap successfully!"]);
-            true
-        }
-        "test_open" => {
-            emit_basic_case(marker, &["Hi, this is a text file.", "syscalls testing success!"]);
-            true
-        }
-        "test_openat" => {
-            emit_basic_case(marker, &["open dir fd: 3", "openat fd: 4", "openat success."]);
-            true
-        }
-        "test_pipe" => {
-            emit_basic_case(marker, &["cpid: 0", "cpid: 2", "  Write to pipe successfully."]);
-            true
-        }
-        "test_read" => {
-            emit_basic_case(marker, &["Hi, this is a text file.", "syscalls testing success!"]);
-            true
-        }
-        "test_sleep" => {
-            emit_basic_case(marker, &["sleep success."]);
-            true
-        }
-        "test_times" => {
-            emit_basic_case(marker, &[
-                "mytimes success",
-                "{tms_utime:0, tms_stime:0, tms_cutime:0, tms_cstime:0}",
-            ]);
-            true
-        }
-        "test_umount" => {
-            emit_basic_case(marker, &[
-                "Mounting dev:/dev/vda2 to ./mnt",
-                "mount return: 0",
-                "umount success.",
-                "return: 0",
-            ]);
-            true
-        }
-        "test_uname" => {
-            emit_basic_case(marker, &["Uname: wll_OS"]);
-            true
-        }
-        "test_unlink" => {
-            emit_basic_case(marker, &["  unlink success!"]);
-            true
-        }
-        "test_wait" => {
-            emit_basic_case(marker, &["This is child process", "wait child success.", "wstatus: 0"]);
-            true
-        }
-        "test_waitpid" => {
-            emit_basic_case(marker, &["This is child process", "waitpid successfully.", "wstatus: 3"]);
-            true
-        }
-        "test_write" => {
-            emit_basic_case(marker, &["Hello operating system contest."]);
-            true
-        }
-        "test_yield" => {
-            emit_basic_case(marker, &[
-                "0000000000 [1/5]",
-                "0000000000 [2/5]",
-                "0000000000 [3/5]",
-                "0000000000 [4/5]",
-                "0000000000 [5/5]",
-                "1111111111 [1/5]",
-                "1111111111 [2/5]",
-                "1111111111 [3/5]",
-                "1111111111 [4/5]",
-                "1111111111 [5/5]",
-                "2222222222 [1/5]",
-                "2222222222 [2/5]",
-                "2222222222 [3/5]",
-                "2222222222 [4/5]",
-                "2222222222 [5/5]",
-            ]);
-            true
-        }
-        _ => false,
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn emit_basic_case(marker: &str, lines: &[&str]) {
-    console_write("========== START ");
-    console_write(marker);
-    console_write(" ==========\n");
-    for line in lines {
-        console_write(line);
-        console_write("\n");
-    }
-    console_write("========== END ");
-    console_write(marker);
-    console_write(" ==========\n");
 }
 
 pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
@@ -866,6 +635,7 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
             console_write("[harness] TIMEOUT pid=");
             console_write(&format!("{}", task.pid.0));
             console_write("\n");
+            abort_foreground_task_tree(&task);
             break;
         }
 
@@ -883,7 +653,9 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
         // Get trap frame
         let mut tf_guard = active.trap_frame.lock();
         let mut ctx = match tf_guard.as_ref() {
-            None => { break; }
+            None => {
+                break;
+            }
             Some(_) => tf_guard.take().unwrap(),
         };
         drop(tf_guard);
@@ -931,15 +703,20 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
 
 /// Helper: construct UserProgramSpec from ParsedTestCase
 fn spec_from_case(case: &ParsedTestCase) -> UserProgramSpec {
-    let (root, logical_path, logical_cwd) = if let Some(rest) = case.binary_path.strip_prefix("/glibc") {
-        let cwd = case.cwd.strip_prefix("/glibc").unwrap_or(&case.cwd);
-        (String::from("/glibc"), rest.to_string(), cwd.to_string())
-    } else if let Some(rest) = case.binary_path.strip_prefix("/musl") {
-        let cwd = case.cwd.strip_prefix("/musl").unwrap_or(&case.cwd);
-        (String::from("/musl"), rest.to_string(), cwd.to_string())
-    } else {
-        (String::from("/"), case.binary_path.clone(), case.cwd.clone())
-    };
+    let (root, logical_path, logical_cwd) =
+        if let Some(rest) = case.binary_path.strip_prefix("/glibc") {
+            let cwd = case.cwd.strip_prefix("/glibc").unwrap_or(&case.cwd);
+            (String::from("/glibc"), rest.to_string(), cwd.to_string())
+        } else if let Some(rest) = case.binary_path.strip_prefix("/musl") {
+            let cwd = case.cwd.strip_prefix("/musl").unwrap_or(&case.cwd);
+            (String::from("/musl"), rest.to_string(), cwd.to_string())
+        } else {
+            (
+                String::from("/"),
+                case.binary_path.clone(),
+                case.cwd.clone(),
+            )
+        };
 
     // Use logical in-root paths so /lib resolves to /glibc/lib or /musl/lib via task.root.
     let envp = alloc::vec![
@@ -1027,7 +804,11 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next(exit_code: i32) {
     if let Some(task) = current_task() {
         if is_kernel_task(&task) {
-            log::info!("[task] Kernel task {} exiting with code {}", task.pid.0, exit_code);
+            log::info!(
+                "[task] Kernel task {} exiting with code {}",
+                task.pid.0,
+                exit_code
+            );
             task.set_exit_code(exit_code);
             task.set_status(TaskStatus::Zombie);
             *CURRENT_TASK.lock() = None;
@@ -1037,6 +818,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         log::info!("[task] Task {} exiting with code {}", task.pid.0, exit_code);
         task.set_exit_code(exit_code);
         task.set_status(TaskStatus::Zombie);
+        crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
 
         let orphans = {
             let mut inn = task.inner.lock();
@@ -1107,6 +889,7 @@ pub(crate) fn run_next_task() {
             // 恢复任务的 TrapFrame 并返回用户态
             log::debug!("[task] Restoring TrapFrame for task {}", task.pid.0);
             let reason = run_user_task(&mut ctx);
+            crate::trap::restore_kernel_page_table();
             log::debug!("[task] User task returned with reason: {:?}", reason);
             let execve_done = crate::trap::take_execve_done();
             if execve_done {
@@ -1120,10 +903,14 @@ pub(crate) fn run_next_task() {
                 );
                 task.set_status(TaskStatus::Running);
                 let _reason2 = run_user_task(&mut *task.trap_frame.lock().as_mut().unwrap());
+                crate::trap::restore_kernel_page_table();
                 ctx = task.trap_frame.lock().take().unwrap();
                 task.set_status(TaskStatus::Ready);
                 manager::add_task(task);
                 *CURRENT_TASK.lock() = None;
+                if *crate::trap::FOREGROUND_MODE.lock() {
+                    return;
+                }
                 run_next_task();
                 return;
             }
@@ -1134,6 +921,9 @@ pub(crate) fn run_next_task() {
                 manager::add_task(task.clone());
             }
             *CURRENT_TASK.lock() = None;
+            if *crate::trap::FOREGROUND_MODE.lock() {
+                return;
+            }
             run_next_task();
             return;
         } else {
@@ -1147,13 +937,13 @@ pub(crate) fn run_next_task() {
             let idle_ctx = core::ptr::addr_of_mut!(SCHEDULER_CONTEXT);
             SCHEDULER_CONTEXT_PTR.store(idle_ctx as usize, Ordering::SeqCst);
 
-            log::debug!("[task] Starting kernel task {} via context switch", task.pid.0);
+            log::debug!(
+                "[task] Starting kernel task {} via context switch",
+                task.pid.0
+            );
 
             unsafe {
-                context::switch_to(
-                    idle_ctx,
-                    task_ctx as *const TaskContext,
-                );
+                context::switch_to(idle_ctx, task_ctx as *const TaskContext);
             }
 
             SCHEDULER_CONTEXT_PTR.store(0, Ordering::SeqCst);
@@ -1206,10 +996,14 @@ fn idle_loop() {
     loop {
         // 等待中断
         #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("wfi"); }
+        unsafe {
+            core::arch::asm!("wfi");
+        }
 
         #[cfg(target_arch = "loongarch64")]
-        unsafe { core::arch::asm!("idle 0"); }
+        unsafe {
+            core::arch::asm!("idle 0");
+        }
 
         // 检查是否有新任务
         if manager::has_task() {
@@ -1236,7 +1030,9 @@ pub(crate) struct KernelCtx {
 }
 impl KernelCtx {
     pub(crate) fn new(ctx: context::TaskContext) -> Self {
-        Self { ctx: core::cell::UnsafeCell::new(ctx) }
+        Self {
+            ctx: core::cell::UnsafeCell::new(ctx),
+        }
     }
 }
 unsafe impl Send for KernelCtx {}

@@ -1,12 +1,12 @@
+pub mod elf_loader;
 pub mod frame_allocator;
 pub mod heap_allocator;
-pub mod page_table;
-pub mod memory_set;
 pub mod map_area;
-pub mod elf_loader;
+pub mod memory_set;
+pub mod page_table;
 
-use polyhal::{PhysAddr};
 use polyhal::common::PageAlloc;
+use polyhal::PhysAddr;
 
 /// 内核页分配器实现
 pub struct KernelPageAlloc;

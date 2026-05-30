@@ -1,10 +1,11 @@
+use alloc::collections::VecDeque;
 /// 文件描述符管理
 ///
 /// 管理进程打开的文件，实现 POSIX 风格的文件描述符表
 use alloc::string::String;
-use alloc::vec::Vec;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::fs;
@@ -22,6 +23,48 @@ pub const STDERR_FD: usize = 2;
 
 /// 文件描述符偏移量
 pub type FileOffset = usize;
+
+const CONSOLE_LINE_CAP: usize = 512;
+
+lazy_static! {
+    static ref CONSOLE_LINE_BUFFERS: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
+}
+
+fn write_console_buffered(buf: &[u8]) {
+    let writer = crate::task::current_task()
+        .map(|task| task.pid.0)
+        .unwrap_or(usize::MAX);
+    let mut buffers = CONSOLE_LINE_BUFFERS.lock();
+    let idx = buffers
+        .iter()
+        .position(|(pid, _)| *pid == writer)
+        .unwrap_or_else(|| {
+            buffers.push((writer, Vec::new()));
+            buffers.len() - 1
+        });
+    let line = &mut buffers[idx].1;
+
+    for &byte in buf {
+        line.push(byte);
+        if byte == b'\n' || line.len() >= CONSOLE_LINE_CAP {
+            for &out in line.iter() {
+                crate::console::putchar(out);
+            }
+            line.clear();
+        }
+    }
+}
+
+/// Flush pending stdout/stderr bytes for a task.
+pub fn flush_console_buffer_for_pid(pid: usize) {
+    let mut buffers = CONSOLE_LINE_BUFFERS.lock();
+    if let Some(idx) = buffers.iter().position(|(owner, _)| *owner == pid) {
+        let (_, line) = buffers.remove(idx);
+        for byte in line {
+            crate::console::putchar(byte);
+        }
+    }
+}
 
 /// 打开标志（与 Linux asm-generic/fcntl.h 常用 ABI 对齐）
 pub mod open_flags {
@@ -74,10 +117,7 @@ pub enum FileDescriptor {
         append: bool,
     },
     /// ext4 目录（运行时块设备挂载）
-    Ext4Dir {
-        ino: u32,
-        offset: usize,
-    },
+    Ext4Dir { ino: u32, offset: usize },
     /// 管道读端
     PipeRead {
         state: Arc<Mutex<PipeState>>,
@@ -105,13 +145,7 @@ pub struct DirEntryRecord {
 
 impl FileDescriptor {
     pub fn pipe_read_nonblocking(&self) -> bool {
-        matches!(
-            self,
-            FileDescriptor::PipeRead {
-                nonblock: true,
-                ..
-            }
-        )
+        matches!(self, FileDescriptor::PipeRead { nonblock: true, .. })
     }
 
     /// 检查文件是否可读
@@ -162,7 +196,9 @@ impl FileDescriptor {
                     Ok(0)
                 }
             }
-            FileDescriptor::MemFile { content, offset, .. } => {
+            FileDescriptor::MemFile {
+                content, offset, ..
+            } => {
                 if *offset >= content.len() {
                     return Ok(0);
                 }
@@ -233,7 +269,9 @@ impl FileDescriptor {
                 ext4_vol::ext4_read_at(*ino, offset, buf)
             }
             FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
-            FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => Err(SysErrNo::ESPIPE),
+            FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
+                Err(SysErrNo::ESPIPE)
+            }
             _ => Err(SysErrNo::EBADF),
         }
     }
@@ -242,18 +280,16 @@ impl FileDescriptor {
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, SysErrNo> {
         match self {
             FileDescriptor::Stdout | FileDescriptor::Stderr => {
-                for &byte in buf {
-                    crate::console::putchar(byte);
-                }
+                write_console_buffered(buf);
                 Ok(buf.len())
             }
             FileDescriptor::MemDir { .. } => Err(SysErrNo::EISDIR),
             FileDescriptor::MemFile {
+                name,
                 content,
                 offset,
                 writable,
                 append,
-                ..
             } => {
                 if !*writable {
                     return Err(SysErrNo::EBADF);
@@ -268,6 +304,7 @@ impl FileDescriptor {
                 }
                 content[start..end].copy_from_slice(buf);
                 *offset = end;
+                MEM_FS.lock().add_file(name, content.clone());
 
                 Ok(buf.len())
             }
@@ -314,7 +351,7 @@ impl FileDescriptor {
                 ..
             } => {
                 let new_offset: isize = match whence {
-                    0 => offset,           // SEEK_SET
+                    0 => offset,                            // SEEK_SET
                     1 => *current_offset as isize + offset, // SEEK_CUR
                     2 => content.len() as isize + offset,   // SEEK_END
                     _ => return Err(SysErrNo::EINVAL),
@@ -350,7 +387,11 @@ impl FileDescriptor {
             FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
                 Err(SysErrNo::ESPIPE)
             }
-            FileDescriptor::MemDir { entries, offset: current_offset, .. } => {
+            FileDescriptor::MemDir {
+                entries,
+                offset: current_offset,
+                ..
+            } => {
                 let end = entries.len() as isize;
                 let new_offset: isize = match whence {
                     0 => offset,
@@ -393,7 +434,11 @@ impl FileDescriptor {
                 *current_offset = new_offset;
                 Ok(new_offset)
             }
-            FileDescriptor::MemDir { entries, offset: current_offset, .. } => {
+            FileDescriptor::MemDir {
+                entries,
+                offset: current_offset,
+                ..
+            } => {
                 let end = entries.len();
                 let new_offset = match whence {
                     0 => offset,
@@ -442,11 +487,9 @@ impl FileDescriptor {
             FileDescriptor::Ext4Regular { ino, .. } => {
                 ext4_vol::regular_file_size(*ino).unwrap_or(0)
             }
-            FileDescriptor::Ext4Dir { ino, .. } => {
-                ext4_vol::ext4_list_dir_by_ino(*ino)
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-            }
+            FileDescriptor::Ext4Dir { ino, .. } => ext4_vol::ext4_list_dir_by_ino(*ino)
+                .map(|v| v.len())
+                .unwrap_or(0),
             FileDescriptor::PipeRead { state, .. } | FileDescriptor::PipeWrite { state, .. } => {
                 state.lock().buf.len()
             }
@@ -456,7 +499,9 @@ impl FileDescriptor {
 
     pub fn read_dirents64(&mut self, buf: &mut [u8]) -> Result<usize, SysErrNo> {
         match self {
-            FileDescriptor::MemDir { entries, offset, .. } => {
+            FileDescriptor::MemDir {
+                entries, offset, ..
+            } => {
                 let mut written = 0usize;
 
                 while *offset < entries.len() {
@@ -546,7 +591,11 @@ impl Clone for FileDescriptor {
                 writable: *writable,
                 append: *append,
             },
-            FileDescriptor::MemDir { path, entries, offset } => FileDescriptor::MemDir {
+            FileDescriptor::MemDir {
+                path,
+                entries,
+                offset,
+            } => FileDescriptor::MemDir {
                 path: path.clone(),
                 entries: entries.clone(),
                 offset: *offset,
@@ -752,6 +801,13 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
     let want_trunc = (flags & O_TRUNC) != 0;
     let append = (flags & O_APPEND) != 0;
 
+    let removed = fs::is_removed(&path_norm);
+    if removed {
+        if !(want_create && write_ok) {
+            return Err(SysErrNo::ENOENT);
+        }
+    }
+
     if fs::dir_exists(&path_norm) {
         if write_ok || want_trunc || want_create {
             return Err(SysErrNo::EISDIR);
@@ -777,10 +833,7 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
             let Some((ino, _)) = ext4_vol::lookup_path(&path_norm) else {
                 return Err(SysErrNo::ENOENT);
             };
-            return Ok(FileDescriptor::Ext4Dir {
-                ino,
-                offset: 0,
-            });
+            return Ok(FileDescriptor::Ext4Dir { ino, offset: 0 });
         }
     }
 
@@ -801,11 +854,7 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
             content.clear();
             fs::MEM_FS.lock().truncate_file(&path_norm, 0)?;
         }
-        let base_off = if append && write_ok {
-            content.len()
-        } else {
-            0
-        };
+        let base_off = if append && write_ok { content.len() } else { 0 };
         return Ok(FileDescriptor::MemFile {
             name: path_norm,
             content,
@@ -815,7 +864,7 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
         });
     }
 
-    if ext4_vol::ext4_regular_file_exists(&path_norm) {
+    if !removed && ext4_vol::ext4_regular_file_exists(&path_norm) {
         if want_excl && want_create {
             return Err(SysErrNo::EEXIST);
         }
@@ -824,6 +873,22 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
         };
         if is_dir {
             return Err(SysErrNo::EISDIR);
+        }
+        if write_ok || want_trunc {
+            let mut content = if want_trunc {
+                Vec::new()
+            } else {
+                ext4_vol::slurp_regular_file(&path_norm).unwrap_or_default()
+            };
+            let base_off = if append && write_ok { content.len() } else { 0 };
+            fs::MEM_FS.lock().add_file(&path_norm, content.clone());
+            return Ok(FileDescriptor::MemFile {
+                name: path_norm,
+                content,
+                offset: base_off,
+                writable: write_ok,
+                append,
+            });
         }
         if want_trunc && write_ok {
             ext4_vol::truncate_regular_ext4(&path_norm, 0)?;
@@ -843,16 +908,6 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
     }
 
     if want_create && write_ok {
-        if ext4_vol::is_ext4_mounted() {
-            let ino = ext4_vol::create_regular_ext4(&path_norm)?;
-            return Ok(FileDescriptor::Ext4Regular {
-                ino,
-                offset: 0,
-                readable: read_ok,
-                writable: write_ok,
-                append,
-            });
-        }
         fs::MEM_FS.lock().add_file(&path_norm, Vec::new());
         return Ok(FileDescriptor::MemFile {
             name: path_norm,
@@ -877,9 +932,6 @@ pub fn create_pipe(nonblock: bool) -> (FileDescriptor, FileDescriptor) {
             state: state.clone(),
             nonblock,
         },
-        FileDescriptor::PipeWrite {
-            state,
-            nonblock,
-        },
+        FileDescriptor::PipeWrite { state, nonblock },
     )
 }

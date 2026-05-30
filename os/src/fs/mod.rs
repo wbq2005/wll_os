@@ -6,14 +6,17 @@ pub mod fd;
 pub mod vfs;
 
 #[allow(unused_imports)]
-pub use vfs::{create_dir, dir_exists, file_exists, list_dir, list_files, read_file, remove_file};
+pub use vfs::{
+    create_dir, dir_exists, file_exists, is_removed, list_dir, list_files, read_file,
+    read_interpreter, remove_file,
+};
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use spin::Mutex;
 use lazy_static::lazy_static;
+use spin::Mutex;
 
 use crate::utils::error::SysErrNo;
 
@@ -111,10 +114,7 @@ impl MemFileSystem {
 
         for subdir in &self.dirs {
             if let Some(name) = child_name(&dir, subdir) {
-                entries.push(fd::DirEntryRecord {
-                    name,
-                    is_dir: true,
-                });
+                entries.push(fd::DirEntryRecord { name, is_dir: true });
             }
         }
 
@@ -154,7 +154,13 @@ impl MemFileSystem {
 
     fn ensure_parent_dirs(&mut self, path: &str) {
         let mut current = String::from("/");
-        for component in path.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>().iter().take_while(|part| **part != file_name(path)) {
+        for component in path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .iter()
+            .take_while(|part| **part != file_name(path))
+        {
             if current != "/" {
                 current.push('/');
             }
@@ -235,7 +241,11 @@ pub fn apply_root(root: &str, logical_path: &str) -> String {
     if logical_path == "/" {
         return root;
     }
-    normalize_path(&format!("{}/{}", root, logical_path.trim_start_matches('/')))
+    normalize_path(&format!(
+        "{}/{}",
+        root,
+        logical_path.trim_start_matches('/')
+    ))
 }
 
 pub fn resolve_path_with_root(root: &str, cwd: &str, path: &str) -> String {

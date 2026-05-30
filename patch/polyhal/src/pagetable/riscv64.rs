@@ -129,7 +129,7 @@ impl From<MappingFlags> for PTEFlags {
                 res |= PTEFlags::W | PTEFlags::D;
             }
             if flags.contains(MappingFlags::X) {
-                res |= PTEFlags::X;
+                res |= PTEFlags::X | PTEFlags::A;
             }
             if flags.contains(MappingFlags::U) {
                 res |= PTEFlags::U;
@@ -173,9 +173,11 @@ impl PageTable {
     pub const PAGE_SIZE: usize = 0x1000;
     pub const PAGE_LEVEL: usize = 3;
     pub const PTE_NUM_IN_PAGE: usize = 0x200;
-    /// 内核映射区域：VPN[2] = 0x100 ~ 0x1FF (0x8000_0000 ~ 0xBFFF_FFFF)
-    /// 这个范围覆盖内核低区（OpenSBI 1:1 映射）和链接内核高区
-    pub(crate) const GLOBAL_ROOT_PTE_RANGE: usize = 0x200;
+    /// Root entries 0 and 1 are user space in this kernel
+    /// (0x0000_0000..0x8000_0000). Kernel identity mappings start at
+    /// 0x8000_0000, so fresh process page tables must not inherit low entries
+    /// from the currently running user page table.
+    pub(crate) const USER_ROOT_PTE_END: usize = 2;
     pub(crate) const VADDR_BITS: usize = 39;
     pub(crate) const USER_VADDR_END: usize = (1 << Self::VADDR_BITS) - 1;
     pub(crate) const KERNEL_VADDR_START: usize = !Self::USER_VADDR_END;
@@ -194,8 +196,8 @@ impl PageTable {
     pub fn restore(&self) {
         let current = Self::current().0;
         let arr = Self::get_pte_list(self.0);
+        arr.fill(PTE(0));
         if current.raw() == 0 {
-            arr.fill(PTE(0));
             arr[2] = PTE::new_page(
                 PhysAddr::new(0x8000_0000),
                 PTEFlags::V | PTEFlags::R | PTEFlags::W | PTEFlags::X | PTEFlags::G | PTEFlags::A | PTEFlags::D,
@@ -206,26 +208,11 @@ impl PageTable {
         // 获取当前（启动）页表的 PTE 列表
         let kernel_arr = Self::get_pte_list(current);
 
-        // SV39 页表结构分析:
-        // - 根页表索引 VPN[2] 范围 0-511
-        // - VPN[2] = 0x000 ~ 0x07F: 低地址空间 (0x0000_0000 ~ 0x3FFF_FFFF)
-        // - VPN[2] = 0x080 ~ 0x0FF: I/O 区域 (0x4000_0000 ~ 0x7FFF_FFFF)
-        // - VPN[2] = 0x100 ~ 0x1FF: 内核低区 (0x8000_0000 ~ 0xBFFF_FFFF, OpenSBI 1:1 映射区)
-        // - VPN[2] = 0x200 ~ 0x2FF: 内核高区 (0xC000_0000 ~ 0xFFFF_FFFF, 链接内核使用)
-        // - VPN[2] = 0x300 ~ 0x3FF: 未使用
-        //
-        // 复制全局内核映射区域到新页表
-        // GLOBAL_ROOT_PTE_RANGE = 0x100，覆盖 OpenSBI 区和链接内核区
-
-        for i in 0..Self::GLOBAL_ROOT_PTE_RANGE {
+        // Copy only kernel/global root entries. Copying user entries from the
+        // active task aliases its lower-level page tables; when the old address
+        // space is dropped, the new one would keep dangling mappings.
+        for i in Self::USER_ROOT_PTE_END..Self::PTE_NUM_IN_PAGE {
             arr[i] = kernel_arr[i];
-        }
-
-        // 清零用户空间区域（索引 0x100 之后，保留给内核）
-        // 注意：这里的清零是安全的，因为我们只复制了 0x100 个条目
-        // 索引 0x100 ~ 0x1FF 已被内核映射覆盖
-        for i in Self::GLOBAL_ROOT_PTE_RANGE..Self::PTE_NUM_IN_PAGE {
-            arr[i] = PTE(0);
         }
     }
 

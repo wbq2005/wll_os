@@ -80,13 +80,13 @@ pub struct ProgramHeader {
 }
 
 /// 段类型
-pub const PT_NULL: u32 = 0;     // 忽略
-pub const PT_LOAD: u32 = 1;     // 可加载段
-pub const PT_DYNAMIC: u32 = 2;  // 动态链接信息
-pub const PT_INTERP: u32 = 3;   // 解释器路径
-pub const PT_NOTE: u32 = 4;     // 辅助信息
-pub const PT_SHLIB: u32 = 5;    // 保留
-pub const PT_PHDR: u32 = 6;     // 程序头表
+pub const PT_NULL: u32 = 0; // 忽略
+pub const PT_LOAD: u32 = 1; // 可加载段
+pub const PT_DYNAMIC: u32 = 2; // 动态链接信息
+pub const PT_INTERP: u32 = 3; // 解释器路径
+pub const PT_NOTE: u32 = 4; // 辅助信息
+pub const PT_SHLIB: u32 = 5; // 保留
+pub const PT_PHDR: u32 = 6; // 程序头表
 
 /// ELF 文件解析器
 pub struct ElfFile<'a> {
@@ -96,6 +96,12 @@ pub struct ElfFile<'a> {
     pub header: &'a ElfHeader,
     /// 程序头列表
     pub program_headers: Vec<&'a ProgramHeader>,
+}
+
+#[repr(C)]
+struct DynamicEntry {
+    tag: isize,
+    val: usize,
 }
 
 impl<'a> ElfFile<'a> {
@@ -124,20 +130,29 @@ impl<'a> ElfFile<'a> {
 
         // 检查是否为可执行文件或共享对象
         if header.e_type != 2 && header.e_type != 3 {
-            log::error!("[elf] Not an executable or shared object: {}", header.e_type);
+            log::error!(
+                "[elf] Not an executable or shared object: {}",
+                header.e_type
+            );
             return Err(SysErrNo::ENOEXEC);
         }
 
         // 检查目标架构 (RISC-V = 243, LoongArch = 258)
         #[cfg(target_arch = "riscv64")]
         if header.e_machine != 243 {
-            log::error!("[elf] Wrong architecture: {}, expected RISC-V (243)", header.e_machine);
+            log::error!(
+                "[elf] Wrong architecture: {}, expected RISC-V (243)",
+                header.e_machine
+            );
             return Err(SysErrNo::ENOEXEC);
         }
 
         #[cfg(target_arch = "loongarch64")]
         if header.e_machine != 258 {
-            log::error!("[elf] Wrong architecture: {}, expected LoongArch (258)", header.e_machine);
+            log::error!(
+                "[elf] Wrong architecture: {}, expected LoongArch (258)",
+                header.e_machine
+            );
             return Err(SysErrNo::ENOEXEC);
         }
 
@@ -157,7 +172,11 @@ impl<'a> ElfFile<'a> {
             program_headers.push(ph);
         }
 
-        log::info!("[elf] Parsed ELF file: entry={:#x}, {} program headers", header.e_entry, phnum);
+        log::info!(
+            "[elf] Parsed ELF file: entry={:#x}, {} program headers",
+            header.e_entry,
+            phnum
+        );
 
         Ok(ElfFile {
             data,
@@ -172,7 +191,10 @@ impl<'a> ElfFile<'a> {
     }
 
     pub fn interp_path(&self) -> Option<&'a str> {
-        let ph = self.program_headers.iter().find(|ph| ph.p_type == PT_INTERP)?;
+        let ph = self
+            .program_headers
+            .iter()
+            .find(|ph| ph.p_type == PT_INTERP)?;
         let start = ph.p_offset;
         let end = start.checked_add(ph.p_filesz)?;
         if start >= end || end > self.data.len() {
@@ -187,11 +209,13 @@ impl<'a> ElfFile<'a> {
     ///
     /// 返回 (MemorySet, 用户栈顶地址, 入口地址)
     pub fn phdr_vaddr(&self, bias: usize) -> usize {
-        self.program_headers.iter()
+        self.program_headers
+            .iter()
             .find(|ph| ph.p_type == PT_PHDR)
             .map(|ph| ph.p_vaddr + bias)
             .unwrap_or_else(|| {
-                self.program_headers.iter()
+                self.program_headers
+                    .iter()
                     .filter(|ph| ph.p_type == PT_LOAD)
                     .map(|ph| ph.p_vaddr)
                     .min()
@@ -209,17 +233,77 @@ impl<'a> ElfFile<'a> {
         self.entry() + bias
     }
 
-    pub fn load_segments_into(&self, memory_set: &mut MemorySet, bias: usize) -> Result<(), SysErrNo> {
+    pub fn can_enter_without_interpreter(&self) -> bool {
+        let Some(dynamic) = self
+            .program_headers
+            .iter()
+            .find(|ph| ph.p_type == PT_DYNAMIC)
+        else {
+            return false;
+        };
+
+        let start = dynamic.p_offset;
+        let end = match start.checked_add(dynamic.p_filesz) {
+            Some(end) if end <= self.data.len() => end,
+            _ => return false,
+        };
+        let entry_size = core::mem::size_of::<DynamicEntry>();
+        let mut offset = start;
+        while offset + entry_size <= end {
+            let entry = unsafe { &*(self.data.as_ptr().add(offset) as *const DynamicEntry) };
+            match entry.tag {
+                0 => return true,  // DT_NULL
+                1 => return false, // DT_NEEDED
+                2 | 8 | 18 => {
+                    // DT_PLTRELSZ / DT_RELASZ / DT_RELSZ
+                    if entry.val != 0 {
+                        return false;
+                    }
+                }
+                23 => return false, // DT_JMPREL
+                _ => {}
+            }
+            offset += entry_size;
+        }
+        false
+    }
+
+    pub fn load_at(&self, bias: usize) -> Result<(MemorySet, usize, usize), SysErrNo> {
+        let mut memory_set = MemorySet::from_kernel();
+        self.load_segments_into(&mut memory_set, bias)?;
+
+        let user_stack_top = crate::config::USER_STACK_TOP;
+        let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
+        memory_set.insert_framed_area(
+            VirtAddr::new(user_stack_bottom),
+            VirtAddr::new(user_stack_top),
+            PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
+        );
+
+        Ok((memory_set, user_stack_top, self.entry_with_bias(bias)))
+    }
+
+    pub fn load_segments_into(
+        &self,
+        memory_set: &mut MemorySet,
+        bias: usize,
+    ) -> Result<(), SysErrNo> {
         for ph in &self.program_headers {
             if ph.p_type != PT_LOAD {
                 continue;
             }
             let start_va = VirtAddr::new(ph.p_vaddr + bias);
             let end_va = VirtAddr::new(ph.p_vaddr + ph.p_memsz + bias);
-            let mut flags = PTEFlags::U | PTEFlags::V;
-            if ph.p_flags & 1 != 0 { flags |= PTEFlags::X; }
-            if ph.p_flags & 2 != 0 { flags |= PTEFlags::W; }
-            if ph.p_flags & 4 != 0 { flags |= PTEFlags::R; }
+            let mut flags = PTEFlags::U | PTEFlags::V | PTEFlags::W;
+            if ph.p_flags & 1 != 0 {
+                flags |= PTEFlags::X;
+            }
+            if ph.p_flags & 2 != 0 {
+                flags |= PTEFlags::W;
+            }
+            if ph.p_flags & 4 != 0 {
+                flags |= PTEFlags::R;
+            }
             memory_set.insert_framed_area(start_va, end_va, flags);
 
             if ph.p_filesz > 0 {
@@ -233,18 +317,19 @@ impl<'a> ElfFile<'a> {
                 let mut vaddr = ph.p_vaddr + bias;
                 let mut src_offset = 0usize;
                 while src_offset < src.len() {
-                    if let Some(paddr) = memory_set.translate(VirtAddr::new(vaddr)) {
-                        let page_offset = vaddr % page_size;
-                        let copy_len = (src.len() - src_offset).min(page_size - page_offset);
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                src[src_offset..].as_ptr(),
-                                paddr.get_mut_ptr::<u8>(),
-                                copy_len,
-                            );
-                        }
-                        src_offset += copy_len;
+                    let Some(paddr) = memory_set.translate(VirtAddr::new(vaddr)) else {
+                        return Err(SysErrNo::ENOMEM);
+                    };
+                    let page_offset = vaddr % page_size;
+                    let copy_len = (src.len() - src_offset).min(page_size - page_offset);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            src[src_offset..].as_ptr(),
+                            paddr.get_mut_ptr::<u8>(),
+                            copy_len,
+                        );
                     }
+                    src_offset += copy_len;
                     vaddr += page_size - (vaddr % page_size);
                 }
             }
@@ -253,8 +338,11 @@ impl<'a> ElfFile<'a> {
                 let bss_start = ph.p_vaddr + ph.p_filesz + bias;
                 let bss_end = ph.p_vaddr + ph.p_memsz + bias;
                 for addr in bss_start..bss_end {
-                    if let Some(pa) = memory_set.translate(VirtAddr::new(addr)) {
-                        unsafe { *(pa.raw() as *mut u8) = 0; }
+                    let Some(pa) = memory_set.translate(VirtAddr::new(addr)) else {
+                        return Err(SysErrNo::ENOMEM);
+                    };
+                    unsafe {
+                        *(pa.raw() as *mut u8) = 0;
                     }
                 }
             }
@@ -271,7 +359,10 @@ impl<'a> ElfFile<'a> {
             if ph.p_type == PT_LOAD {
                 log::info!(
                     "[elf] Loading segment: vaddr={:#x}, filesz={:#x}, memsz={:#x}, offset={:#x}",
-                    ph.p_vaddr, ph.p_filesz, ph.p_memsz, ph.p_offset
+                    ph.p_vaddr,
+                    ph.p_filesz,
+                    ph.p_memsz,
+                    ph.p_offset
                 );
 
                 // 计算虚拟地址范围（页对齐）
@@ -312,25 +403,25 @@ impl<'a> ElfFile<'a> {
 
                     while src_offset < src.len() {
                         let va = VirtAddr::new(vaddr_page);
-                        if let Some(paddr) = memory_set.translate(va) {
-                            // 计算本轮复制量（取整到页边界，最后一轮可能不足一页）
-                            let page_start_in_vaddr = vaddr_page - (vaddr_page / page_size * page_size);
-                            let remaining_in_page = page_size - page_start_in_vaddr;
-                            let copy_len = (src.len() - src_offset).min(remaining_in_page);
+                        let Some(paddr) = memory_set.translate(va) else {
+                            log::error!("[elf] mapped segment missing page at {:#x}", vaddr_page);
+                            return Err(SysErrNo::ENOMEM);
+                        };
+                        // 计算本轮复制量（取整到页边界，最后一轮可能不足一页）
+                        let page_start_in_vaddr = vaddr_page - (vaddr_page / page_size * page_size);
+                        let remaining_in_page = page_size - page_start_in_vaddr;
+                        let copy_len = (src.len() - src_offset).min(remaining_in_page);
 
-                            let dst_ptr = paddr.get_mut_ptr::<u8>();
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    src[src_offset..].as_ptr(),
-                                    dst_ptr,
-                                    copy_len,
-                                );
-                            }
-                            src_offset += copy_len;
-                            vaddr_page += copy_len;
-                            continue;
+                        let dst_ptr = paddr.get_mut_ptr::<u8>();
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                src[src_offset..].as_ptr(),
+                                dst_ptr,
+                                copy_len,
+                            );
                         }
-                        vaddr_page += page_size - (vaddr_page % page_size);
+                        src_offset += copy_len;
+                        vaddr_page += copy_len;
                     }
                 }
 
@@ -344,20 +435,26 @@ impl<'a> ElfFile<'a> {
                     let mut vaddr = (bss_start / page_size) * page_size;
                     while vaddr < bss_end {
                         let va = VirtAddr::new(vaddr);
-                        if let Some(paddr) = memory_set.translate(va) {
-                            let page_start = vaddr;
-                            let page_end = (vaddr + page_size).min(bss_end);
-                            let bss_in_this_page = page_end - bss_start.max(page_start);
-                            if bss_in_this_page > 0 {
-                                let zero_start = if page_start < bss_start {
-                                    bss_start - page_start
-                                } else {
-                                    0
-                                };
-                                let dst_ptr = paddr.get_mut_ptr::<u8>();
-                                unsafe {
-                                    core::ptr::write_bytes(dst_ptr.add(zero_start), 0, bss_in_this_page);
-                                }
+                        let Some(paddr) = memory_set.translate(va) else {
+                            log::error!("[elf] bss missing page at {:#x}", vaddr);
+                            return Err(SysErrNo::ENOMEM);
+                        };
+                        let page_start = vaddr;
+                        let page_end = (vaddr + page_size).min(bss_end);
+                        let bss_in_this_page = page_end - bss_start.max(page_start);
+                        if bss_in_this_page > 0 {
+                            let zero_start = if page_start < bss_start {
+                                bss_start - page_start
+                            } else {
+                                0
+                            };
+                            let dst_ptr = paddr.get_mut_ptr::<u8>();
+                            unsafe {
+                                core::ptr::write_bytes(
+                                    dst_ptr.add(zero_start),
+                                    0,
+                                    bss_in_this_page,
+                                );
                             }
                         }
                         vaddr += page_size;
@@ -370,7 +467,11 @@ impl<'a> ElfFile<'a> {
         // 用户栈从高地址向下增长
         let user_stack_top = crate::config::USER_STACK_TOP;
         let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
-        log::info!("[elf] Allocating user stack: {:#x} - {:#x}", user_stack_bottom, user_stack_top);
+        log::info!(
+            "[elf] Allocating user stack: {:#x} - {:#x}",
+            user_stack_bottom,
+            user_stack_top
+        );
 
         memory_set.insert_framed_area(
             VirtAddr::new(user_stack_bottom),

@@ -1,5 +1,5 @@
-use crate::utils::error::SysErrNo;
 use super::SyscallRet;
+use crate::utils::error::SysErrNo;
 
 /// sigaction 系统调用
 pub fn sys_sigaction(signum: i32, act: usize, oldact: usize) -> SyscallRet {

@@ -53,7 +53,11 @@ pub fn mount_block_device(device: Arc<dyn ext4_rs::BlockDevice>) {
     log::info!("[fs] read_offset(0) returned {} bytes", block0.len());
 
     if block0.len() < 0x438 + 2 {
-        log::error!("[fs] ext4: buffer too small ({} < {})", block0.len(), 0x438 + 2);
+        log::error!(
+            "[fs] ext4: buffer too small ({} < {})",
+            block0.len(),
+            0x438 + 2
+        );
         return;
     }
 
@@ -68,14 +72,14 @@ pub fn mount_block_device(device: Arc<dyn ext4_rs::BlockDevice>) {
     }
 
     // block_size: stored as log2 at superblock offset 0x18 = block0[1024+0x18] = block0[0x418]
-    let log_block_size = u32::from_le_bytes([
-        block0[0x418],
-        block0[0x419],
-        block0[0x41a],
-        block0[0x41b],
-    ]) as usize;
+    let log_block_size =
+        u32::from_le_bytes([block0[0x418], block0[0x419], block0[0x41a], block0[0x41b]]) as usize;
     let block_size = 1024usize << log_block_size;
-    log::info!("[fs] ext4: log_block_size={}, block_size={}", log_block_size, block_size);
+    log::info!(
+        "[fs] ext4: log_block_size={}, block_size={}",
+        log_block_size,
+        block_size
+    );
 
     let fs = Ext4::open(device);
     let root_count = fs.ext4_dir_get_entries(ROOT_INODE).len();

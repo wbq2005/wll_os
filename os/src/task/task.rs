@@ -1,15 +1,15 @@
-use alloc::sync::Arc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
 use super::{
-    TaskControlBlock, TaskControlBlockInner, TaskStatus, new_shared_fd_table,
-    new_shared_memory_set, UserProgramSpec, KernelCtx,
+    new_shared_fd_table, new_shared_memory_set, KernelCtx, TaskControlBlock, TaskControlBlockInner,
+    TaskStatus, UserProgramSpec,
 };
 use crate::mm::memory_set::MemorySet;
-use crate::task::pid::Pid;
 use crate::task::context::TaskContext;
+use crate::task::pid::Pid;
 use crate::utils::error::SysErrNo;
 
 #[cfg(target_arch = "riscv64")]
@@ -38,11 +38,14 @@ impl TaskControlBlock {
 
         let elf = ElfFile::parse(elf_data)?;
 
-        let phdr_vaddr = elf.program_headers.iter()
+        let phdr_vaddr = elf
+            .program_headers
+            .iter()
             .find(|ph| ph.p_type == PT_PHDR)
             .map(|ph| ph.p_vaddr)
             .unwrap_or_else(|| {
-                elf.program_headers.iter()
+                elf.program_headers
+                    .iter()
                     .filter(|ph| ph.p_type == PT_LOAD)
                     .map(|ph| ph.p_vaddr)
                     .min()
@@ -90,7 +93,12 @@ impl TaskControlBlock {
             status: Mutex::new(TaskStatus::Ready),
         });
 
-        log::info!("[task] Created user task pid={} entry={:#x} sp={:#x}", task.pid.0, entry, sp);
+        log::info!(
+            "[task] Created user task pid={} entry={:#x} sp={:#x}",
+            task.pid.0,
+            entry,
+            sp
+        );
         Ok(task)
     }
 
@@ -103,73 +111,100 @@ impl TaskControlBlock {
         use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
         let target_path = resolve_program_path(&spec.root, &spec.path);
-        let target_elf_data = crate::fs::read_file(&target_path)
-            .ok_or_else(|| {
-                log::error!("[task] new_user_with_args: ELF not found: {}", target_path);
-                SysErrNo::ENOENT
-            })?;
+        let target_elf_data = crate::fs::read_file(&target_path).ok_or_else(|| {
+            log::error!("[task] new_user_with_args: ELF not found: {}", target_path);
+            SysErrNo::ENOENT
+        })?;
         let target_elf = ElfFile::parse(&target_elf_data)?;
 
-        let mut launch_path = spec.path.clone();
+        let launch_path = spec.path.clone();
         let mut launch_argv = spec.argv.clone();
         let launch_elf_data;
-        let (memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) = if let Some(interp) = target_elf.interp_path() {
-            let interp_path = crate::fs::normalize_path(interp);
-            let interp_host_path = resolve_program_path(&spec.root, &interp_path);
-            launch_elf_data = crate::fs::read_file(&interp_host_path)
-                .ok_or_else(|| {
-                    log::error!(
-                        "[task] new_user_with_args: interpreter not found: {} (host {})",
-                        interp_path,
-                        interp_host_path
-                    );
-                    SysErrNo::ENOENT
-                })?;
-            launch_path = interp_path.clone();
-            launch_argv = alloc::vec![interp_path, spec.path.clone()];
-            launch_argv.extend(spec.argv.iter().skip(1).cloned());
+        let mut interp_path_opt = target_elf.interp_path();
+        #[cfg(target_arch = "loongarch64")]
+        if target_elf.can_enter_without_interpreter() {
             log::info!(
-                "[task] dynamic ELF detected: target={} interp={} root={}",
-                spec.path,
-                launch_path,
-                spec.root
+                "[task] self-contained PIE detected, entering target directly: {}",
+                spec.path
             );
-            let interp_elf = ElfFile::parse(&launch_elf_data)?;
-            let interp_bias = 0x0010_0000usize;
-            let target_bias = if target_elf.header.e_type == 3 { 0x0040_0000 } else { 0 };
-            let mut memory_set = MemorySet::from_kernel();
-            target_elf.load_segments_into(&mut memory_set, target_bias)?;
-            interp_elf.load_segments_into(&mut memory_set, interp_bias)?;
+            interp_path_opt = None;
+        }
+        let (memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) =
+            if let Some(interp) = interp_path_opt {
+                let (interp_path, interp_host_path, interp_data) =
+                    crate::fs::read_interpreter(&spec.root, interp).ok_or_else(|| {
+                        log::error!(
+                            "[task] new_user_with_args: interpreter not found: {} (host {})",
+                            crate::fs::normalize_path(interp),
+                            resolve_program_path(&spec.root, interp)
+                        );
+                        SysErrNo::ENOENT
+                    })?;
+                launch_elf_data = interp_data;
+                log::info!(
+                    "[task] dynamic ELF detected: target={} interp={} host={} root={}",
+                    spec.path,
+                    interp_path,
+                    interp_host_path,
+                    spec.root
+                );
+                let interp_elf = ElfFile::parse(&launch_elf_data)?;
+                let interp_bias = 0x0010_0000usize;
+                let target_bias = if target_elf.header.e_type == 3 {
+                    0x0040_0000
+                } else {
+                    0
+                };
+                let mut memory_set = MemorySet::from_kernel();
+                target_elf.load_segments_into(&mut memory_set, target_bias)?;
+                interp_elf.load_segments_into(&mut memory_set, interp_bias)?;
 
-            let user_stack_top = crate::config::USER_STACK_TOP;
-            let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
-            memory_set.insert_framed_area(
-                polyhal::VirtAddr::new(user_stack_bottom),
-                polyhal::VirtAddr::new(user_stack_top),
-                crate::mm::page_table::PTEFlags::U
-                    | crate::mm::page_table::PTEFlags::R
-                    | crate::mm::page_table::PTEFlags::W
-                    | crate::mm::page_table::PTEFlags::V,
-            );
+                let user_stack_top = crate::config::USER_STACK_TOP;
+                let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
+                memory_set.insert_framed_area(
+                    polyhal::VirtAddr::new(user_stack_bottom),
+                    polyhal::VirtAddr::new(user_stack_top),
+                    crate::mm::page_table::PTEFlags::U
+                        | crate::mm::page_table::PTEFlags::R
+                        | crate::mm::page_table::PTEFlags::W
+                        | crate::mm::page_table::PTEFlags::V,
+                );
 
-            (
-                memory_set,
-                user_stack_top,
-                interp_elf.entry_with_bias(interp_bias),
-                target_elf.phdr_vaddr(target_bias),
-                target_elf.phnum(),
-                interp_bias,
-            )
-        } else {
-            let elf = ElfFile::parse(&target_elf_data)?;
-            let phdr_vaddr = elf.phdr_vaddr(0);
-            let phnum = elf.phnum();
-            let (memory_set, user_stack_top, entry) = elf.load()?;
-            (memory_set, user_stack_top, entry, phdr_vaddr, phnum, 0)
-        };
+                (
+                    memory_set,
+                    user_stack_top,
+                    interp_elf.entry_with_bias(interp_bias),
+                    target_elf.phdr_vaddr(target_bias),
+                    target_elf.phnum(),
+                    interp_bias,
+                )
+            } else {
+                let elf = ElfFile::parse(&target_elf_data)?;
+                let phdr_vaddr = elf.phdr_vaddr(0);
+                let phnum = elf.phnum();
+                if elf.header.e_type == 3 {
+                    let bias = 0x0040_0000usize;
+                    let (memory_set, user_stack_top, entry) = elf.load_at(bias)?;
+                    (
+                        memory_set,
+                        user_stack_top,
+                        entry,
+                        elf.phdr_vaddr(bias),
+                        phnum,
+                        0,
+                    )
+                } else {
+                    let (memory_set, user_stack_top, entry) = elf.load()?;
+                    (memory_set, user_stack_top, entry, phdr_vaddr, phnum, 0)
+                }
+            };
 
         let at_entry = if interp_base != 0 {
-            let target_bias = if target_elf.header.e_type == 3 { 0x0040_0000 } else { 0 };
+            let target_bias = if target_elf.header.e_type == 3 {
+                0x0040_0000
+            } else {
+                0
+            };
             target_elf.entry_with_bias(target_bias)
         } else {
             entry
@@ -309,7 +344,9 @@ impl TaskControlBlock {
 
     /// 设置任务上下文
     pub fn set_task_ctx(&self, ctx: super::context::TaskContext) {
-        unsafe { *self.task_ctx.ctx.get() = ctx; }
+        unsafe {
+            *self.task_ctx.ctx.get() = ctx;
+        }
     }
 
     /// 获取退出码
@@ -325,7 +362,10 @@ impl TaskControlBlock {
     /// Take the trap frame out (for foreground driver to avoid holding lock across run_user_task).
     /// Panics if there is no trap frame — caller must check has_tf first.
     pub fn take_trap_frame(&self) -> polyhal_trap::trapframe::TrapFrame {
-        self.trap_frame.lock().take().expect("no trap_frame in foreground driver")
+        self.trap_frame
+            .lock()
+            .take()
+            .expect("no trap_frame in foreground driver")
     }
 
     /// Put a trap frame back (for foreground driver).
@@ -345,7 +385,7 @@ impl TaskControlBlock {
 }
 
 /// 分配内核栈
-/// 
+///
 /// 为任务分配一个内核栈
 /// 返回栈顶地址
 fn alloc_kernel_stack() -> usize {

@@ -1,7 +1,7 @@
 use polyhal::timer::current_time;
 
 /// 时钟频率
-/// 
+///
 /// QEMU virt 机器通常使用 10MHz 的时钟
 pub const CLOCK_FREQ: usize = 10000000; // 10MHz for QEMU virt
 
@@ -19,7 +19,7 @@ pub fn get_time_us() -> usize {
 }
 
 /// 设置下一次定时器中断
-/// 
+///
 /// 设置一个 10ms 后的定时器中断
 pub fn set_next_trigger() {
     polyhal::timer::set_next_timer(core::time::Duration::from_millis(TIME_SLICE_MS));
@@ -36,18 +36,30 @@ pub fn init() {
     // This ensures the trap handler is fully set up before enabling SIE[STIE].
     crate::trap::init_timer();
     set_next_trigger();
-    log::info!("[timer] Timer initialized, time slice: {} ms", TIME_SLICE_MS);
+    log::info!(
+        "[timer] Timer initialized, time slice: {} ms",
+        TIME_SLICE_MS
+    );
 }
 
 #[cfg(target_arch = "loongarch64")]
 pub fn init() {
     log::info!("[timer] Initializing timer, clock freq: {} Hz", CLOCK_FREQ);
+    polyhal::timer::init();
     set_next_trigger();
-    log::info!("[timer] Timer initialized, time slice: {} ms", TIME_SLICE_MS);
+    log::info!(
+        "[timer] loongarch ecfg={:?} tcfg={:?}",
+        loongArch64::register::ecfg::read(),
+        loongArch64::register::tcfg::read()
+    );
+    log::info!(
+        "[timer] Timer initialized, time slice: {} ms",
+        TIME_SLICE_MS
+    );
 }
 
 /// 获取当前时间（秒和微秒）
-/// 
+///
 /// 用于 gettimeofday 系统调用
 pub fn get_timeval() -> (usize, usize) {
     let time_us = get_time_us();
@@ -57,7 +69,7 @@ pub fn get_timeval() -> (usize, usize) {
 }
 
 /// 延时指定毫秒数（忙等待）
-/// 
+///
 /// 注意：这是一个简单的忙等待实现，会占用 CPU
 /// 实际实现中应该使用定时器中断
 pub fn sleep_ms(ms: usize) {

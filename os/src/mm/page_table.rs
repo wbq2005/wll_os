@@ -1,7 +1,7 @@
 use bitflags::bitflags;
-use polyhal::{PhysAddr, VirtAddr};
-use polyhal::pagetable::{PageTableWrapper, MappingFlags};
 use lazy_static::lazy_static;
+use polyhal::pagetable::{MappingFlags, PageTableWrapper};
+use polyhal::{PhysAddr, VirtAddr};
 use spin::Mutex;
 
 /// 页表项标志位
@@ -75,5 +75,8 @@ pub fn unmap_page(vpn: usize) {
 
 /// 地址转换
 pub fn translate(vaddr: VirtAddr) -> Option<PhysAddr> {
-    KERNEL_PAGE_TABLE.lock().as_ref().and_then(|pt| pt.translate(vaddr).map(|(paddr, _)| paddr))
+    KERNEL_PAGE_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|pt| pt.translate(vaddr).map(|(paddr, _)| paddr))
 }

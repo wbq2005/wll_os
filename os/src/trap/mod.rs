@@ -1,13 +1,13 @@
 pub mod interrupts;
 
+use lazy_static::lazy_static;
 use polyhal_trap::trap::TrapType;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
-use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::syscall::syscall;
 use crate::syscall::SysErrNo;
-use crate::task::{suspend_current_and_run_next, exit_current_and_run_next, run_next_task};
+use crate::task::{exit_current_and_run_next, run_next_task, suspend_current_and_run_next};
 use crate::timer::set_next_trigger;
 
 lazy_static! {
@@ -49,7 +49,9 @@ pub fn update_current_trapframe(f: impl FnOnce(&mut TrapFrame)) -> bool {
     if ptr == 0 {
         false
     } else {
-        unsafe { f(&mut *(ptr as *mut TrapFrame)); }
+        unsafe {
+            f(&mut *(ptr as *mut TrapFrame));
+        }
         true
     }
 }
@@ -75,6 +77,10 @@ pub fn take_execve_done() -> bool {
     was
 }
 
+pub fn is_execve_done() -> bool {
+    *EXECVE_IN_PROGRESS.lock()
+}
+
 /// 初始化 Trap/中断处理（trap 向量，不含定时器）
 ///
 /// RISC-V: trap 向量已在 ctor 中初始化（polyhal-trap::TRAP_INIT），无需重复。
@@ -83,6 +89,14 @@ pub fn init() {
     // trap 向量已在 polyhal-trap 的 ctor 中初始化
     #[cfg(target_arch = "riscv64")]
     polyhal_trap::trap::init_trap_only();
+    #[cfg(target_arch = "loongarch64")]
+    {
+        polyhal_trap::trap::init();
+        log::info!(
+            "[trap] loongarch eentry={:#x}",
+            loongArch64::register::eentry::read().eentry()
+        );
+    }
     log::info!("[trap] Trap handler initialized");
 }
 
@@ -103,11 +117,21 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             handle_syscall(ctx);
         }
         TrapType::StorePageFault(vaddr) | TrapType::LoadPageFault(vaddr) => {
-            log::error!("[trap] Kernel page fault at {:#x}", vaddr);
+            log::error!(
+                "[trap] Kernel page fault at {:#x}, sepc={:#x}, sp={:#x}",
+                vaddr,
+                ctx[TrapFrameArgs::SEPC],
+                ctx[TrapFrameArgs::SP]
+            );
             exit_current_and_run_next(-2);
         }
         TrapType::InstructionPageFault(vaddr) => {
-            log::error!("[trap] Instruction page fault at {:#x}", vaddr);
+            log::error!(
+                "[trap] Instruction page fault at {:#x}, sepc={:#x}, sp={:#x}",
+                vaddr,
+                ctx[TrapFrameArgs::SEPC],
+                ctx[TrapFrameArgs::SP]
+            );
             exit_current_and_run_next(-2);
         }
         TrapType::Timer => {
@@ -158,12 +182,32 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 suspend_current_and_run_next();
             }
         }
-        TrapType::StorePageFault(vaddr) | TrapType::LoadPageFault(vaddr)
-        | TrapType::InstructionPageFault(vaddr) => {
-            log::error!(
-                "[trap] User page fault at {:#x}, killing process",
-                vaddr
-            );
+        trap @ (TrapType::StorePageFault(vaddr)
+        | TrapType::LoadPageFault(vaddr)
+        | TrapType::InstructionPageFault(vaddr)) => {
+            if let Some(task) = crate::task::current_task() {
+                let sepc = ctx[TrapFrameArgs::SEPC];
+                let sp = ctx[TrapFrameArgs::SP];
+                let ms = task.memory_set.lock();
+                let fault_pa = ms.translate(polyhal::VirtAddr::new(vaddr));
+                let sepc_pa = ms.translate(polyhal::VirtAddr::new(sepc));
+                log::error!(
+                    "[trap] User page fault {:?} pid={} at {:#x}, sepc={:#x}, sp={:#x}, fault_pa={:?}, sepc_pa={:?}",
+                    trap,
+                    task.pid.0,
+                    vaddr,
+                    sepc,
+                    sp,
+                    fault_pa,
+                    sepc_pa
+                );
+            } else {
+                log::error!(
+                    "[trap] User page fault {:?} at {:#x}, killing process",
+                    trap,
+                    vaddr
+                );
+            }
             exit_current_and_run_next(-2);
         }
         TrapType::IllegalInstruction(vaddr) => {
@@ -174,23 +218,26 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             exit_current_and_run_next(-2);
         }
         _ => {
-            log::warn!("[trap] Unhandled user trap {:?}, killing process", trap_type);
+            log::warn!(
+                "[trap] Unhandled user trap {:?}, killing process",
+                trap_type
+            );
             exit_current_and_run_next(-2);
         }
     }
 }
 
 /// 处理系统调用
-/// 
+///
 /// 从 TrapFrame 中提取系统调用参数并分发到对应的处理函数
 fn handle_syscall(ctx: &mut TrapFrame) {
     // 获取系统调用号（RISC-V: a7/x[17], LoongArch: r11）
     let syscall_id = ctx[TrapFrameArgs::SYSCALL];
     // 获取系统调用参数（a0-a5）
     let args = ctx.args();
-    
+
     log::debug!("[syscall] id: {}, args: {:?}", syscall_id, args);
-    
+
     // 暴露当前 syscall 上下文，供 fork/clone 等复制寄存器上下文使用
     *CURRENT_SYSCALL_CTX_PTR.lock() = ctx as *mut TrapFrame as usize;
 
@@ -203,6 +250,9 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     // 检查是否是 execve 刚完成——如果是，跳过 syscall_ok() 的 PC 前进，
     // 让 CPU sret 到新程序的入口地址（sepc 已在 sys_execve 中设为 entry）。
     let execve_done = take_execve_done();
+    if execve_done {
+        return;
+    }
 
     match result {
         Ok(ret) => {
@@ -214,12 +264,8 @@ fn handle_syscall(ctx: &mut TrapFrame) {
         }
     }
 
-    if execve_done {
-        // EXECVE_IN_PROGRESS 已被 take_execve_done() 消费，sepc 已是新程序入口
-    } else {
-        // 普通系统调用：PC 需要前进（跳过 ecall 指令）
-        ctx.syscall_ok();
-    }
+    // 普通系统调用：PC 需要前进（跳过 ecall 指令）
+    ctx.syscall_ok();
 }
 
 /// 处理进程退出系统调用

@@ -7,9 +7,9 @@ extern crate alloc;
 
 use core::arch::global_asm;
 
-use polyhal::{PhysAddr};
-use polyhal::common::PageAlloc;
 use crate::console::putchar;
+use polyhal::common::PageAlloc;
+use polyhal::PhysAddr;
 
 #[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("entry_riscv64.asm"));
@@ -57,9 +57,13 @@ impl PageAlloc for KernelPageAlloc {
 #[inline]
 fn wait_for_interrupt() {
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("wfi"); }
+    unsafe {
+        core::arch::asm!("wfi");
+    }
     #[cfg(target_arch = "loongarch64")]
-    unsafe { core::arch::asm!("idle 0"); }
+    unsafe {
+        core::arch::asm!("idle 0");
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -132,13 +136,17 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     if INIT_GUARD.swap(true, Ordering::SeqCst) {
         #[cfg(target_arch = "loongarch64")]
         early_la_line(b"[DBG] RECURSIVE CALL - halting\n");
-        loop { wait_for_interrupt(); }
+        loop {
+            wait_for_interrupt();
+        }
     }
 
     #[cfg(target_arch = "loongarch64")]
     early_la_line(b"[DBG] B\n");
     if let Err(_e) = polyhal::mem::init_dtb_once(PhysAddr::new(dtb_ptr)) {
-        loop { wait_for_interrupt(); }
+        loop {
+            wait_for_interrupt();
+        }
     }
 
     #[cfg(target_arch = "loongarch64")]
@@ -217,29 +225,149 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
     #[cfg(target_arch = "loongarch64")]
     early_la_line(b"[DBG] K\n");
-    putchar(b'['); putchar(b'k'); putchar(b'e'); putchar(b'r'); putchar(b'n'); putchar(b'e');
-    putchar(b'l'); putchar(b']'); putchar(b' '); putchar(b'H'); putchar(b'e'); putchar(b'l');
-    putchar(b'l'); putchar(b'o'); putchar(b','); putchar(b' '); putchar(b'O'); putchar(b'S');
-    putchar(b'!'); putchar(b'\n');
+    putchar(b'[');
+    putchar(b'k');
+    putchar(b'e');
+    putchar(b'r');
+    putchar(b'n');
+    putchar(b'e');
+    putchar(b'l');
+    putchar(b']');
+    putchar(b' ');
+    putchar(b'H');
+    putchar(b'e');
+    putchar(b'l');
+    putchar(b'l');
+    putchar(b'o');
+    putchar(b',');
+    putchar(b' ');
+    putchar(b'O');
+    putchar(b'S');
+    putchar(b'!');
+    putchar(b'\n');
 
     #[cfg(target_arch = "loongarch64")]
     early_la_line(b"[DBG] L\n");
-    putchar(b'['); putchar(b'k'); putchar(b'e'); putchar(b'r'); putchar(b'n'); putchar(b'e');
-    putchar(b'l'); putchar(b']'); putchar(b' '); putchar(b'M'); putchar(b'e'); putchar(b'm');
-    putchar(b'o'); putchar(b'r'); putchar(b'y'); putchar(b' '); putchar(b'i'); putchar(b'n');
-    putchar(b'i'); putchar(b't'); putchar(b'\n');
+    putchar(b'[');
+    putchar(b'k');
+    putchar(b'e');
+    putchar(b'r');
+    putchar(b'n');
+    putchar(b'e');
+    putchar(b'l');
+    putchar(b']');
+    putchar(b' ');
+    putchar(b'M');
+    putchar(b'e');
+    putchar(b'm');
+    putchar(b'o');
+    putchar(b'r');
+    putchar(b'y');
+    putchar(b' ');
+    putchar(b'i');
+    putchar(b'n');
+    putchar(b'i');
+    putchar(b't');
+    putchar(b'\n');
 
     #[cfg(target_arch = "riscv64")]
     {
         use crate::drivers::virtio_mmio_blk;
         use crate::fs::ext4_vol;
-        putchar(b'['); putchar(b'V'); putchar(b'I'); putchar(b'R'); putchar(b'T'); putchar(b'I'); putchar(b'O'); putchar(b']'); putchar(b' '); putchar(b'P'); putchar(b'r'); putchar(b'o'); putchar(b'b'); putchar(b'i'); putchar(b'n'); putchar(b'g'); putchar(b'.'); putchar(b'.'); putchar(b'\n');
+        putchar(b'[');
+        putchar(b'V');
+        putchar(b'I');
+        putchar(b'R');
+        putchar(b'T');
+        putchar(b'I');
+        putchar(b'O');
+        putchar(b']');
+        putchar(b' ');
+        putchar(b'P');
+        putchar(b'r');
+        putchar(b'o');
+        putchar(b'b');
+        putchar(b'i');
+        putchar(b'n');
+        putchar(b'g');
+        putchar(b'.');
+        putchar(b'.');
+        putchar(b'\n');
         if let Some(device) = unsafe { virtio_mmio_blk::probe_first_virtio_disk_from_dt(dtb_ptr) } {
-            putchar(b'['); putchar(b'V'); putchar(b'I'); putchar(b'R'); putchar(b'T'); putchar(b'I'); putchar(b'O'); putchar(b']'); putchar(b' '); putchar(b'm'); putchar(b'o'); putchar(b'u'); putchar(b'n'); putchar(b't'); putchar(b'i'); putchar(b'n'); putchar(b'g'); putchar(b' '); putchar(b'e'); putchar(b'x'); putchar(b't'); putchar(b'4'); putchar(b'.'); putchar(b'.'); putchar(b'\n');
+            putchar(b'[');
+            putchar(b'V');
+            putchar(b'I');
+            putchar(b'R');
+            putchar(b'T');
+            putchar(b'I');
+            putchar(b'O');
+            putchar(b']');
+            putchar(b' ');
+            putchar(b'm');
+            putchar(b'o');
+            putchar(b'u');
+            putchar(b'n');
+            putchar(b't');
+            putchar(b'i');
+            putchar(b'n');
+            putchar(b'g');
+            putchar(b' ');
+            putchar(b'e');
+            putchar(b'x');
+            putchar(b't');
+            putchar(b'4');
+            putchar(b'.');
+            putchar(b'.');
+            putchar(b'\n');
             ext4_vol::mount_block_device(device);
-            putchar(b'['); putchar(b'E'); putchar(b'X'); putchar(b'T'); putchar(b'4'); putchar(b']'); putchar(b' '); putchar(b'm'); putchar(b'o'); putchar(b'u'); putchar(b'n'); putchar(b't'); putchar(b'e'); putchar(b'd'); putchar(b' '); putchar(b's'); putchar(b'u'); putchar(b'c'); putchar(b'c'); putchar(b'e'); putchar(b's'); putchar(b's'); putchar(b'f'); putchar(b'u'); putchar(b'l'); putchar(b'l'); putchar(b'y'); putchar(b'\n');
+            putchar(b'[');
+            putchar(b'E');
+            putchar(b'X');
+            putchar(b'T');
+            putchar(b'4');
+            putchar(b']');
+            putchar(b' ');
+            putchar(b'm');
+            putchar(b'o');
+            putchar(b'u');
+            putchar(b'n');
+            putchar(b't');
+            putchar(b'e');
+            putchar(b'd');
+            putchar(b' ');
+            putchar(b's');
+            putchar(b'u');
+            putchar(b'c');
+            putchar(b'c');
+            putchar(b'e');
+            putchar(b's');
+            putchar(b's');
+            putchar(b'f');
+            putchar(b'u');
+            putchar(b'l');
+            putchar(b'l');
+            putchar(b'y');
+            putchar(b'\n');
         } else {
-            putchar(b'['); putchar(b'V'); putchar(b'I'); putchar(b'R'); putchar(b'T'); putchar(b'I'); putchar(b'O'); putchar(b']'); putchar(b' '); putchar(b'n'); putchar(b'o'); putchar(b't'); putchar(b' '); putchar(b'f'); putchar(b'o'); putchar(b'u'); putchar(b'n'); putchar(b'd'); putchar(b'\n');
+            putchar(b'[');
+            putchar(b'V');
+            putchar(b'I');
+            putchar(b'R');
+            putchar(b'T');
+            putchar(b'I');
+            putchar(b'O');
+            putchar(b']');
+            putchar(b' ');
+            putchar(b'n');
+            putchar(b'o');
+            putchar(b't');
+            putchar(b' ');
+            putchar(b'f');
+            putchar(b'o');
+            putchar(b'u');
+            putchar(b'n');
+            putchar(b'd');
+            putchar(b'\n');
         }
     }
 
@@ -247,8 +375,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     {
         early_la_line(b"[DBG] M\n");
         early_la_line(b"[VIRTIO] Probing...\n");
-        if let Some(_dev) = crate::drivers::virtio_pci_blk::probe_pci_virtio_blk() {
+        if let Some(dev) = crate::drivers::virtio_pci_blk::probe_pci_virtio_blk() {
             early_la_line(b"[VIRTIO] found\n");
+            crate::fs::ext4_vol::mount_block_device(dev);
+            early_la_line(b"[EXT4] mounted successfully\n");
         } else {
             early_la_line(b"[VIRTIO] not found\n");
         }
@@ -265,10 +395,30 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
     #[cfg(target_arch = "loongarch64")]
     early_la_line(b"[DBG] Q\n");
-    putchar(b'['); putchar(b'k'); putchar(b'e'); putchar(b'r'); putchar(b'n'); putchar(b'e');
-    putchar(b'l'); putchar(b']'); putchar(b' '); putchar(b'S'); putchar(b't'); putchar(b'a');
-    putchar(b'r'); putchar(b't'); putchar(b'i'); putchar(b'n'); putchar(b'g'); putchar(b' ');
-    putchar(b's'); putchar(b'c'); putchar(b'h'); putchar(b'e'); putchar(b'd'); putchar(b'.');
+    putchar(b'[');
+    putchar(b'k');
+    putchar(b'e');
+    putchar(b'r');
+    putchar(b'n');
+    putchar(b'e');
+    putchar(b'l');
+    putchar(b']');
+    putchar(b' ');
+    putchar(b'S');
+    putchar(b't');
+    putchar(b'a');
+    putchar(b'r');
+    putchar(b't');
+    putchar(b'i');
+    putchar(b'n');
+    putchar(b'g');
+    putchar(b' ');
+    putchar(b's');
+    putchar(b'c');
+    putchar(b'h');
+    putchar(b'e');
+    putchar(b'd');
+    putchar(b'.');
     putchar(b'\n');
 
     #[cfg(target_arch = "loongarch64")]
@@ -276,5 +426,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     task::run_tasks();
 
     // Should never reach here
-    loop { wait_for_interrupt(); }
+    loop {
+        wait_for_interrupt();
+    }
 }

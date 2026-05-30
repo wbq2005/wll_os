@@ -1,7 +1,6 @@
-/// 中断处理辅助函数
-
-use polyhal_trap::trapframe::TrapFrame;
 use polyhal_trap::trap::TrapType;
+/// 中断处理辅助函数
+use polyhal_trap::trapframe::TrapFrame;
 
 /// 架构相关中断处理入口
 ///
@@ -39,7 +38,7 @@ pub fn enable_interrupt() {
     unsafe {
         riscv::register::sstatus::set_sie();
     }
-    
+
     #[cfg(all(target_arch = "loongarch64", feature = "loongarch"))]
     {
         use loongArch64::register::prmd;
@@ -54,7 +53,7 @@ pub fn disable_interrupt() {
     unsafe {
         riscv::register::sstatus::clear_sie();
     }
-    
+
     #[cfg(all(target_arch = "loongarch64", feature = "loongarch"))]
     {
         use loongArch64::register::prmd;
@@ -69,14 +68,17 @@ pub fn is_interrupt_enabled() -> bool {
     {
         riscv::register::sstatus::read().sie()
     }
-    
+
     #[cfg(all(target_arch = "loongarch64", feature = "loongarch"))]
     {
         use loongArch64::register::prmd;
         prmd::read().pie()
     }
-    
-    #[cfg(not(any(target_arch = "riscv64", all(target_arch = "loongarch64", feature = "loongarch"))))]
+
+    #[cfg(not(any(
+        target_arch = "riscv64",
+        all(target_arch = "loongarch64", feature = "loongarch")
+    )))]
     {
         false
     }

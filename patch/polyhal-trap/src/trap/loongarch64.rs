@@ -216,7 +216,6 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
             }
         }
         Trap::Exception(Exception::Syscall) => {
-            tf.era += 4;
             TrapType::SysCall
         }
         Trap::Exception(Exception::StorePageFault)

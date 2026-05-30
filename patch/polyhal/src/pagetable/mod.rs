@@ -263,10 +263,10 @@ impl PageTable {
             return;
         }
 
-        // 内核区域起始索引 (VPN[2] >= 0x100)
-        let kernel_start_index = 0x100;
-        // 用户区域结束索引
-        let user_end_index = kernel_start_index;
+        // Architecture-specific end of user root entries. On RISC-V this is 2
+        // because the kernel runs from the 0x8000_0000 root entry while still
+        // using the outgoing user page table during exec/drop.
+        let user_end_index = PageTable::USER_ROOT_PTE_END;
 
         // Helper: recursively release sub-page-tables
         let release_sub_pt = |pte_list: &[PTE]| {

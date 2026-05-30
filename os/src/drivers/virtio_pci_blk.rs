@@ -8,16 +8,14 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use ext4_rs::BLOCK_SIZE as EXT4_BLOCK_SIZE;
 use ext4_rs::BlockDevice;
+use ext4_rs::BLOCK_SIZE as EXT4_BLOCK_SIZE;
 use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
-use virtio_drivers::transport::pci::bus::{
-    BarInfo, Cam, Command, MemoryBarType, PciRoot,
-};
+use virtio_drivers::transport::pci::bus::{BarInfo, Cam, Command, MemoryBarType, PciRoot};
 use virtio_drivers::transport::pci::{virtio_device_type, PciTransport};
 use virtio_drivers::transport::{DeviceType, Transport};
 
-use crate::drivers::hal::{VirtHal, phys_to_virt_mmio};
+use crate::drivers::hal::{phys_to_virt_mmio, VirtHal};
 
 /// QEMU LoongArch virt: PCI ECAM 物理基址
 /// 参考: 2331 loongarch64-qemu-virt.toml  pci-ecam-base = 0x2000_0000
@@ -129,17 +127,21 @@ pub fn probe_pci_virtio_blk() -> Option<Arc<dyn BlockDevice>> {
     let ecam_virt = phys_to_virt_mmio(PCI_ECAM_PHYS);
     log::info!(
         "[virtio-pci] Enumerating PCI bus, ECAM phys {:#x} virt {:p}",
-        PCI_ECAM_PHYS, ecam_virt
+        PCI_ECAM_PHYS,
+        ecam_virt
     );
-    let mut pci_root =
-        unsafe { PciRoot::new(ecam_virt, Cam::Ecam) };
+    let mut pci_root = unsafe { PciRoot::new(ecam_virt, Cam::Ecam) };
 
     for (dev_fn, info) in pci_root.enumerate_bus(0) {
         let Some(vtype) = virtio_device_type(&info) else {
             continue;
         };
         if vtype != DeviceType::Block {
-            log::debug!("[virtio-pci] skip non-block VirtIO {:?} @ {}", vtype, dev_fn);
+            log::debug!(
+                "[virtio-pci] skip non-block VirtIO {:?} @ {}",
+                vtype,
+                dev_fn
+            );
             continue;
         }
         log::info!("[virtio-pci] Found VirtIO Block @ {}", dev_fn);
@@ -179,14 +181,22 @@ pub fn probe_pci_virtio_blk() -> Option<Arc<dyn BlockDevice>> {
             Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER,
         );
 
-        let transport =
-            PciTransport::new::<VirtHal>(&mut pci_root, dev_fn).ok()?;
-        let blk = VirtIOBlk::new(transport).ok()?;
+        let transport = match PciTransport::new::<VirtHal>(&mut pci_root, dev_fn) {
+            Ok(transport) => transport,
+            Err(err) => {
+                log::warn!("[virtio-pci] PciTransport init failed: {:?}", err);
+                return None;
+            }
+        };
+        let blk = match VirtIOBlk::new(transport) {
+            Ok(blk) => blk,
+            Err(err) => {
+                log::warn!("[virtio-pci] VirtIOBlk init failed: {:?}", err);
+                return None;
+            }
+        };
         let cap = blk.capacity();
-        log::info!(
-            "[virtio-pci] VirtIO blk ready, {} sectors × 512B",
-            cap
-        );
+        log::info!("[virtio-pci] VirtIO blk ready, {} sectors × 512B", cap);
 
         return Some(Arc::new(VirtioPciBlock {
             blk: spin::Mutex::new(blk),

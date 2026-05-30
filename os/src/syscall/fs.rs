@@ -1,7 +1,7 @@
-use crate::utils::error::SysErrNo;
 use super::SyscallRet;
 use crate::console::putchar;
 use crate::task::{current_task, suspend_current_and_run_next};
+use crate::utils::error::SysErrNo;
 use alloc::string::String;
 
 use crate::fs::fd::{self, FileDescriptor};
@@ -11,6 +11,7 @@ const FD_STDIN: usize = 0;
 const FD_STDOUT: usize = 1;
 const FD_STDERR: usize = 2;
 const AT_FDCWD: isize = -100;
+const AT_EMPTY_PATH: usize = 0x1000;
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -45,6 +46,43 @@ struct KStat {
     st_ctime_sec: isize,
     st_ctime_nsec: isize,
     __unused: [u32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    __reserved: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Statx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    __spare0: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: StatxTimestamp,
+    stx_btime: StatxTimestamp,
+    stx_ctime: StatxTimestamp,
+    stx_mtime: StatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    __spare3: [u64; 12],
 }
 
 #[repr(C)]
@@ -91,7 +129,9 @@ fn copy_to_user(dst: *mut u8, src: &[u8]) -> Result<(), SysErrNo> {
         let pa = memory_set
             .translate(polyhal::VirtAddr::new(addr))
             .ok_or(SysErrNo::EFAULT)?;
-        unsafe { *(pa.raw() as *mut u8) = byte; }
+        unsafe {
+            *(pa.raw() as *mut u8) = byte;
+        }
         addr += 1;
     }
     Ok(())
@@ -117,10 +157,7 @@ fn copy_from_user(src: *const u8, dst: &mut [u8]) -> Result<(), SysErrNo> {
 fn copy_object_from_user<T: Copy>(src: *const T) -> Result<T, SysErrNo> {
     let mut obj = core::mem::MaybeUninit::<T>::uninit();
     let bytes = unsafe {
-        core::slice::from_raw_parts_mut(
-            obj.as_mut_ptr() as *mut u8,
-            core::mem::size_of::<T>(),
-        )
+        core::slice::from_raw_parts_mut(obj.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
     };
     copy_from_user(src as *const u8, bytes)?;
     Ok(unsafe { obj.assume_init() })
@@ -177,7 +214,7 @@ fn pseudo_inode(path: &str) -> u64 {
         hash ^= b as u64;
         hash = hash.wrapping_mul(1099511628211);
     }
-    hash
+    hash & 0x7fff_ffff
 }
 
 fn regular_blocks(size: usize) -> u64 {
@@ -218,7 +255,12 @@ fn stat_for_fd(file_desc: &FileDescriptor) -> KStat {
     match file_desc {
         FileDescriptor::Stdin => make_kstat(0, S_IFIFO | 0o444, 0),
         FileDescriptor::Stdout | FileDescriptor::Stderr => make_kstat(0, S_IFIFO | 0o222, 0),
-        FileDescriptor::MemFile { name, content, writable, .. } => {
+        FileDescriptor::MemFile {
+            name,
+            content,
+            writable,
+            ..
+        } => {
             let mode = S_IFREG | if *writable { 0o666 } else { 0o444 };
             make_kstat(pseudo_inode(name), mode, content.len())
         }
@@ -236,17 +278,19 @@ fn stat_for_fd(file_desc: &FileDescriptor) -> KStat {
                 (false, true) => 0o222,
                 _ => 0o444,
             };
-            make_kstat(*ino as u64, S_IFREG | perms, crate::fs::ext4_vol::regular_file_size(*ino).unwrap_or(0))
-        }
-        FileDescriptor::Ext4Dir { ino, .. } => {
             make_kstat(
                 *ino as u64,
-                S_IFDIR | 0o755,
-                crate::fs::ext4_vol::ext4_list_dir_by_ino(*ino)
-                    .map(|v| v.len())
-                    .unwrap_or(0),
+                S_IFREG | perms,
+                crate::fs::ext4_vol::regular_file_size(*ino).unwrap_or(0),
             )
         }
+        FileDescriptor::Ext4Dir { ino, .. } => make_kstat(
+            *ino as u64,
+            S_IFDIR | 0o755,
+            crate::fs::ext4_vol::ext4_list_dir_by_ino(*ino)
+                .map(|v| v.len())
+                .unwrap_or(0),
+        ),
         FileDescriptor::PipeRead { .. } => make_kstat(0, S_IFIFO | 0o444, 0),
         FileDescriptor::PipeWrite { .. } => make_kstat(0, S_IFIFO | 0o222, 0),
     }
@@ -256,7 +300,11 @@ fn stat_for_path(path: &str) -> Result<KStat, SysErrNo> {
     let norm = crate::fs::normalize_path(path);
     if crate::fs::dir_exists(&norm) {
         let entries = crate::fs::list_dir(&norm)?;
-        return Ok(make_kstat(pseudo_inode(&norm), S_IFDIR | 0o755, entries.len()));
+        return Ok(make_kstat(
+            pseudo_inode(&norm),
+            S_IFDIR | 0o755,
+            entries.len(),
+        ));
     }
     if crate::fs::file_exists(&norm) {
         let size = crate::fs::read_file(&norm).map(|v| v.len()).unwrap_or(0);
@@ -285,11 +333,62 @@ fn copy_kstat_out(statbuf: *mut u8, st: &KStat) -> Result<(), SysErrNo> {
     copy_to_user(statbuf, bytes)
 }
 
+fn make_statx_timestamp(sec: isize, nsec: isize) -> StatxTimestamp {
+    StatxTimestamp {
+        tv_sec: sec as i64,
+        tv_nsec: nsec.max(0) as u32,
+        __reserved: 0,
+    }
+}
+
+fn make_statx(st: &KStat, mask: usize) -> Statx {
+    const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+
+    Statx {
+        stx_mask: STATX_BASIC_STATS | mask as u32,
+        stx_blksize: st.st_blksize,
+        stx_attributes: 0,
+        stx_nlink: st.st_nlink,
+        stx_uid: st.st_uid,
+        stx_gid: st.st_gid,
+        stx_mode: (st.st_mode & 0xffff) as u16,
+        __spare0: 0,
+        stx_ino: st.st_ino,
+        stx_size: st.st_size.max(0) as u64,
+        stx_blocks: st.st_blocks,
+        stx_attributes_mask: 0,
+        stx_atime: make_statx_timestamp(st.st_atime_sec, st.st_atime_nsec),
+        stx_btime: make_statx_timestamp(st.st_ctime_sec, st.st_ctime_nsec),
+        stx_ctime: make_statx_timestamp(st.st_ctime_sec, st.st_ctime_nsec),
+        stx_mtime: make_statx_timestamp(st.st_mtime_sec, st.st_mtime_nsec),
+        stx_rdev_major: 0,
+        stx_rdev_minor: 0,
+        stx_dev_major: 0,
+        stx_dev_minor: 0,
+        stx_mnt_id: 0,
+        stx_dio_mem_align: 0,
+        stx_dio_offset_align: 0,
+        __spare3: [0; 12],
+    }
+}
+
+fn copy_statx_out(statxbuf: *mut u8, st: &Statx) -> Result<(), SysErrNo> {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            st as *const Statx as *const u8,
+            core::mem::size_of::<Statx>(),
+        )
+    };
+    copy_to_user(statxbuf, bytes)
+}
+
 fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
     match file_desc {
         FileDescriptor::Stdin => fd::open_flags::O_RDONLY as usize,
         FileDescriptor::Stdout | FileDescriptor::Stderr => fd::open_flags::O_WRONLY as usize,
-        FileDescriptor::MemFile { writable, append, .. } => {
+        FileDescriptor::MemFile {
+            writable, append, ..
+        } => {
             let mut flags = if *writable {
                 fd::open_flags::O_RDWR as usize
             } else {
@@ -401,7 +500,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallRet {
         }
         copy_to_user(buf, bytes)?;
         copy_to_user(unsafe { buf.add(bytes.len()) }, &[0])?;
-        Ok(buf as usize)
+        Ok(bytes.len() + 1)
     } else {
         Err(SysErrNo::ESRCH)
     }
@@ -602,12 +701,21 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
                 let nb_pipe = {
                     let inner = task.inner.lock();
                     let fds = inner.fd_table.lock();
-                    fds.get(fd).map(|f| f.pipe_read_nonblocking()).unwrap_or(false)
+                    fds.get(fd)
+                        .map(|f| f.pipe_read_nonblocking())
+                        .unwrap_or(false)
                 };
                 if nb_pipe {
                     return Err(SysErrNo::EAGAIN);
                 }
-                suspend_current_and_run_next();
+                if *crate::trap::FOREGROUND_MODE.lock() {
+                    *crate::task::CURRENT_TASK.lock() = None;
+                    crate::task::run_next_task();
+                    task.memory_set.lock().activate();
+                    *crate::task::CURRENT_TASK.lock() = Some(task.clone());
+                } else {
+                    suspend_current_and_run_next();
+                }
             }
             Err(e) => return Err(e),
         }
@@ -658,7 +766,12 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
 /// - offset: 偏移量
 /// - whence: 起始位置 (0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END)
 pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> SyscallRet {
-    log::debug!("[syscall] lseek(fd={}, offset={}, whence={})", fd, offset, whence);
+    log::debug!(
+        "[syscall] lseek(fd={}, offset={}, whence={})",
+        fd,
+        offset,
+        whence
+    );
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
@@ -712,7 +825,12 @@ pub fn sys_dup(old_fd: usize) -> SyscallRet {
 /// - new_fd: 新文件描述符
 /// - flags: 标志
 pub fn sys_dup3(old_fd: usize, new_fd: usize, _flags: usize) -> SyscallRet {
-    log::debug!("[syscall] dup3(old_fd={}, new_fd={}, flags={})", old_fd, new_fd, _flags);
+    log::debug!(
+        "[syscall] dup3(old_fd={}, new_fd={}, flags={})",
+        old_fd,
+        new_fd,
+        _flags
+    );
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
@@ -816,6 +934,38 @@ pub fn sys_fstat(fd: usize, statbuf: *mut u8) -> SyscallRet {
     } else {
         Err(SysErrNo::ESRCH)
     }
+}
+
+pub fn sys_statx(
+    dirfd: isize,
+    pathname: *const u8,
+    flags: usize,
+    mask: usize,
+    statxbuf: *mut u8,
+) -> SyscallRet {
+    if statxbuf.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+
+    let path = read_user_cstr(pathname)?;
+    let st = if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(SysErrNo::ENOENT);
+        }
+        let fd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let fds = inner.fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        stat_for_fd(file_desc)
+    } else {
+        let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+        stat_for_path(&host_path)?
+    };
+
+    let statx = make_statx(&st, mask);
+    copy_statx_out(statxbuf, &statx)?;
+    Ok(0)
 }
 
 pub fn sys_newfstatat(

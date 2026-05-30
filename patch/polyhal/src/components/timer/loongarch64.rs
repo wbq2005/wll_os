@@ -6,8 +6,6 @@ use loongArch64::register::tcfg;
 use loongArch64::time::{get_timer_freq, Time};
 use spin::Lazy;
 
-use crate::timer::current_time;
-
 // static mut FREQ: usize = 0;
 static FREQ: Lazy<u64> = Lazy::new(|| get_timer_freq() as _);
 
@@ -37,14 +35,9 @@ pub fn get_freq() -> u64 {
 ///
 /// - next [Duration] next time from system boot#[inline]
 pub fn set_next_timer(next: Duration) {
-    let curr = current_time();
-    if next < curr {
-        return;
-    }
-    let interval = next - curr;
     tcfg::set_init_val(
-        (interval.as_secs() * get_freq()
-            + interval.subsec_nanos() as u64 * get_freq() / 1_000_000_000) as _,
+        (next.as_secs() * get_freq() + next.subsec_nanos() as u64 * get_freq() / 1_000_000_000)
+            as _,
     );
     tcfg::set_en(true);
 }

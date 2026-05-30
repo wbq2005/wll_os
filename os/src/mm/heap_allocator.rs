@@ -14,10 +14,7 @@ static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
 pub fn init_heap() {
     unsafe {
         let heap_start = core::ptr::addr_of!(HEAP_SPACE) as usize;
-        HEAP_ALLOCATOR.lock().init(
-            heap_start,
-            KERNEL_HEAP_SIZE,
-        );
+        HEAP_ALLOCATOR.lock().init(heap_start, KERNEL_HEAP_SIZE);
     }
 }
 

@@ -1,10 +1,10 @@
 //!
 //! 链接脚本路径：ld 在 target/deps 下运行时相对路径不可靠，使用 crate 根目录绝对路径。
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::collections::BTreeSet;
 
 use ext4_view::Ext4;
 
@@ -47,7 +47,10 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
         return;
     };
 
-    let image_path = manifest_dir.parent().unwrap_or(manifest_dir).join(image_name);
+    let image_path = manifest_dir
+        .parent()
+        .unwrap_or(manifest_dir)
+        .join(image_name);
     println!("cargo:rerun-if-changed={}", image_path.display());
 
     let mut code = String::from("fn preload_generated_programs() {\n");
@@ -88,16 +91,23 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
                 let mut basic_files = Vec::new();
                 if target.contains("loongarch") {
                     collect_basic_files(&fs, "/", 6, &mut basic_files);
-                    basic_files.sort_by(|a, b| normalize_image_path(a).cmp(&normalize_image_path(b)));
+                    basic_files
+                        .sort_by(|a, b| normalize_image_path(a).cmp(&normalize_image_path(b)));
                 }
 
-                for script in script_paths.iter().filter(|path| script_preload_rank(path) <= 1) {
+                for script in script_paths
+                    .iter()
+                    .filter(|path| script_preload_rank(path) <= 1)
+                {
                     push_script_and_execs(&fs, &mut selected, script);
                 }
                 for file in basic_files {
                     selected.push((file.clone(), basename(&file).to_string()));
                 }
-                for script in script_paths.iter().filter(|path| script_preload_rank(path) > 1) {
+                for script in script_paths
+                    .iter()
+                    .filter(|path| script_preload_rank(path) > 1)
+                {
                     push_script_and_execs(&fs, &mut selected, script);
                 }
 
@@ -139,7 +149,10 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
                             // Skip for _testcode.sh and run-all.sh to avoid path shadowing
                             let base = basename(&install_path);
                             let is_script = base.ends_with("_testcode.sh") || base == "run-all.sh";
-                            if !is_script && seen_alias.insert(alias.clone()) && install_path != alias {
+                            if !is_script
+                                && seen_alias.insert(alias.clone())
+                                && install_path != alias
+                            {
                                 code.push_str(&format!(
                                     "    crate::fs::add_user_program({:?}, &{data:?});\n",
                                     alias
@@ -178,13 +191,13 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
 
 fn candidate_paths(target: &str) -> &'static [(&'static str, &'static str)] {
     let _ = target;
-    &[
-        ("/init", "init"),
-    ]
+    &[("/init", "init")]
 }
 
 fn basename(path: &str) -> &str {
-    path.rsplit('/').find(|part| !part.is_empty()).unwrap_or(path)
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
 }
 
 fn normalize_image_path(path: &str) -> String {
@@ -268,7 +281,9 @@ fn collect_basic_files(fs: &Ext4, dir: &str, depth: usize, out: &mut Vec<String>
                         collect_basic_files(fs, &path, depth - 1, out);
                     } else {
                         let normalized = normalize_image_path(&path);
-                        if normalized.starts_with("/glibc/basic/") || normalized.starts_with("/musl/basic/") {
+                        if normalized.starts_with("/glibc/basic/")
+                            || normalized.starts_with("/musl/basic/")
+                        {
                             out.push(path);
                         }
                     }

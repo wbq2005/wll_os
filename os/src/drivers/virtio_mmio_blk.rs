@@ -6,8 +6,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
-use ext4_rs::BLOCK_SIZE as EXT4_BLOCK_SIZE;
 use ext4_rs::BlockDevice;
+use ext4_rs::BLOCK_SIZE as EXT4_BLOCK_SIZE;
 use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 use virtio_drivers::transport::{DeviceType, Transport};
@@ -37,7 +37,11 @@ impl VirtioMmioBlock {
         let header_ptr = NonNull::new(mmio_pa as *mut VirtIOHeader)?;
         // Debug: read VirtIO magic at offset 0 (should be 0x74726976 = "virt")
         let magic_val = unsafe { core::ptr::read_volatile(mmio_pa as *const u32) };
-        log::info!("[virtio] MMIO @{:#x}: magic = {:#x} (expect 0x74726976)", mmio_pa, magic_val);
+        log::info!(
+            "[virtio] MMIO @{:#x}: magic = {:#x} (expect 0x74726976)",
+            mmio_pa,
+            magic_val
+        );
         let transport = MmioTransport::new(header_ptr).ok()?;
         if transport.device_type() != DeviceType::Block {
             log::warn!(
@@ -49,7 +53,11 @@ impl VirtioMmioBlock {
         }
         let blk = VirtIOBlk::new(transport).ok()?;
         let cap = blk.capacity();
-        log::info!("[virtio] VirtIO blk @ {:#x}, {} sectors × 512B", mmio_pa, cap);
+        log::info!(
+            "[virtio] VirtIO blk @ {:#x}, {} sectors × 512B",
+            mmio_pa,
+            cap
+        );
         Some(Self {
             blk: spin::Mutex::new(blk),
         })
@@ -61,8 +69,7 @@ impl VirtioMmioBlock {
         }
         let sector = offset / SECTOR_SIZE;
         let skip = offset % SECTOR_SIZE;
-        let sectors_needed =
-            skip.saturating_add(buf.len()).div_ceil(SECTOR_SIZE);
+        let sectors_needed = skip.saturating_add(buf.len()).div_ceil(SECTOR_SIZE);
         let mut tmp = vec![0u8; sectors_needed * SECTOR_SIZE];
         self.blk
             .lock()
@@ -116,8 +123,7 @@ impl BlockDevice for VirtioMmioBlock {
 /// 枚举 DTB 中兼容 `virtio,mmio` 的节点并附着第一块 virtio-blk。
 pub unsafe fn probe_first_virtio_disk_from_dt(dtb_ptr: usize) -> Option<Arc<dyn BlockDevice>> {
     let tot = dtb_totalsize(dtb_ptr)?;
-    let blob =
-        unsafe { core::slice::from_raw_parts(dtb_ptr as *const u8, tot) };
+    let blob = unsafe { core::slice::from_raw_parts(dtb_ptr as *const u8, tot) };
     let Ok(fdt) = flat_device_tree::Fdt::new(blob) else {
         log::warn!("[fdt] failed to parse DTB @{:#x}", dtb_ptr);
         return None;
@@ -152,6 +158,9 @@ pub unsafe fn probe_first_virtio_disk_from_dt(dtb_ptr: usize) -> Option<Arc<dyn 
             }
         }
     }
-    log::warn!("[virtio] no virtio,mmio block device enumerated from DTB (found {} virtio nodes)", found_count);
+    log::warn!(
+        "[virtio] no virtio,mmio block device enumerated from DTB (found {} virtio nodes)",
+        found_count
+    );
     None
 }

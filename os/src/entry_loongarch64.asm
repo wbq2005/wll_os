@@ -25,10 +25,10 @@ _start:
     li.w        $t0, 0x00
     csrwr       $t0, 0x2
 
-    la.global   $sp, boot_stack_top
+    la.local    $sp, boot_stack_top
     csrrd       $a0, 0x20
     li.w        $a1, 0x100000
-    la.global   $t0, rust_main
+    la.local    $t0, rust_main
     jirl        $zero, $t0, 0
 
     .section .bss.stack

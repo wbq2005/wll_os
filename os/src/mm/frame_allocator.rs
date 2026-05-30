@@ -73,7 +73,7 @@ pub fn init_frame_allocator() {
 
 /// 添加可用物理内存区域
 pub fn add_frames_range(start: usize, end: usize) {
-    let start_ppn = (start + PAGE_SIZE - 1) / PAGE_SIZE;
+    let start_ppn = ((start + PAGE_SIZE - 1) / PAGE_SIZE).max(1);
     let end_ppn = end / PAGE_SIZE;
     if start_ppn < end_ppn {
         FRAME_ALLOCATOR.lock().add_frame(start_ppn, end_ppn);
@@ -81,19 +81,38 @@ pub fn add_frames_range(start: usize, end: usize) {
     }
 }
 
+fn is_managed_range(start_ppn: usize, pages: usize) -> bool {
+    if pages == 0 {
+        return true;
+    }
+    let Some(end_ppn) = start_ppn.checked_add(pages) else {
+        return false;
+    };
+    MEM_REGIONS
+        .lock()
+        .iter()
+        .any(|(start, end)| start_ppn >= *start && end_ppn <= *end)
+}
+
 /// 分配一个物理页帧
 pub fn alloc_frame() -> Option<FrameTracker> {
-    FRAME_ALLOCATOR
-        .lock()
-        .alloc(1)
-        .map(|ppn| {
-            let tracker = FrameTracker::new(PhysPageNum(ppn));
-            unsafe {
-                let ptr = PhysPageNum(ppn).addr() as *mut u8;
-                core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
-            }
-            tracker
-        })
+    loop {
+        let ppn = FRAME_ALLOCATOR.lock().alloc(1)?;
+        if !is_managed_range(ppn, 1) {
+            log::warn!(
+                "[frame] discard unmanaged allocation ppn={:#x} paddr={:#x}",
+                ppn,
+                ppn * PAGE_SIZE
+            );
+            continue;
+        }
+        let tracker = FrameTracker::new(PhysPageNum(ppn));
+        unsafe {
+            let ptr = PhysPageNum(ppn).addr() as *mut u8;
+            core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
+        }
+        return Some(tracker);
+    }
 }
 
 /// 分配连续的 `pages` 个物理页（用于 virtio DMA）。
@@ -102,18 +121,44 @@ pub fn alloc_contiguous_frames(pages: usize) -> Option<usize> {
     if pages == 0 {
         return Some(0);
     }
-    FRAME_ALLOCATOR.lock().alloc(pages)
+    loop {
+        let ppn = FRAME_ALLOCATOR.lock().alloc(pages)?;
+        if is_managed_range(ppn, pages) {
+            return Some(ppn);
+        }
+        log::warn!(
+            "[frame] discard unmanaged contiguous allocation ppn={:#x}, pages={}",
+            ppn,
+            pages
+        );
+    }
 }
 
 /// 释放连续的 `pages` 个物理页。
 pub fn dealloc_contiguous_frames(start_ppn: usize, pages: usize) {
     if pages != 0 {
+        if !is_managed_range(start_ppn, pages) {
+            log::warn!(
+                "[frame] ignore unmanaged contiguous free ppn={:#x}, pages={}",
+                start_ppn,
+                pages
+            );
+            return;
+        }
         FRAME_ALLOCATOR.lock().dealloc(start_ppn, pages);
     }
 }
 
 /// 释放一个物理页帧
 pub fn dealloc_frame(ppn: PhysPageNum) {
+    if !is_managed_range(ppn.0, 1) {
+        log::warn!(
+            "[frame] ignore unmanaged free ppn={:#x} paddr={:#x}",
+            ppn.0,
+            ppn.addr()
+        );
+        return;
+    }
     FRAME_ALLOCATOR.lock().dealloc(ppn.0, 1);
 }
 

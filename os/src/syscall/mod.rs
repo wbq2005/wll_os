@@ -1,8 +1,8 @@
 pub mod fs;
 pub mod mm;
+pub mod other;
 pub mod process;
 pub mod signal;
-pub mod other;
 
 pub use crate::utils::error::SysErrNo;
 
@@ -115,6 +115,7 @@ pub const SYSCALL_WAIT4: usize = 260;
 pub const SYSCALL_PRLIMIT64: usize = 261;
 pub const SYSCALL_RENAMEAT2: usize = 276;
 pub const SYSCALL_MEMBARRIER: usize = 283;
+pub const SYSCALL_STATX: usize = 291;
 pub const SYSCALL_COPY_FILE_RANGE: usize = 326;
 pub const SYSCALL_GETRANDOM: usize = 318;
 
@@ -124,21 +125,31 @@ pub const SYSCALL_GETRANDOM: usize = 318;
 pub const SYSCALL_OPEN: usize = 1024;
 
 /// 系统调用分发
-/// 
+///
 /// 根据系统调用号分发到对应的处理函数
 /// 参数：
 /// - syscall_id: 系统调用号
 /// - args: 参数数组 [a0, a1, a2, a3, a4, a5]
-/// 
+///
 /// 返回值: 成功返回结果，失败返回错误码
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
     log::debug!("[syscall] id: {}, args: {:?}", syscall_id, args);
-    
+
     match syscall_id {
         // 文件操作
         SYSCALL_GETCWD => fs::sys_getcwd(args[0] as *mut u8, args[1]),
-        SYSCALL_OPENAT => fs::sys_openat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
-        SYSCALL_OPEN => fs::sys_openat(AT_FDCWD, args[0] as *const u8, args[1] as u32, args[2] as u32),
+        SYSCALL_OPENAT => fs::sys_openat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as u32,
+        ),
+        SYSCALL_OPEN => fs::sys_openat(
+            AT_FDCWD,
+            args[0] as *const u8,
+            args[1] as u32,
+            args[2] as u32,
+        ),
         SYSCALL_CLOSE => fs::sys_close(args[0]),
         SYSCALL_PIPE2 => fs::sys_pipe2(args[0] as *mut i32, args[1]),
         SYSCALL_GETDENTS64 => fs::sys_getdents64(args[0], args[1] as *mut u8, args[2]),
@@ -152,12 +163,30 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_DUP3 => fs::sys_dup3(args[0], args[1], args[2]),
         SYSCALL_FCNTL => fs::sys_fcntl(args[0], args[1], args[2]),
         SYSCALL_IOCTL => fs::sys_ioctl(args[0], args[1], args[2]),
-        SYSCALL_NEWFSTATAT => fs::sys_newfstatat(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
+        SYSCALL_NEWFSTATAT => fs::sys_newfstatat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
         SYSCALL_FSTAT => fs::sys_fstat(args[0], args[1] as *mut u8),
+        SYSCALL_STATX => fs::sys_statx(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2],
+            args[3],
+            args[4] as *mut u8,
+        ),
         SYSCALL_CHDIR => fs::sys_chdir(args[0] as *const u8),
         SYSCALL_MKDIRAT => fs::sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_UNLINKAT => fs::sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
-        SYSCALL_MOUNT => fs::sys_mount(args[0] as *const u8, args[1] as *const u8, args[2] as *const u8, args[3], args[4]),
+        SYSCALL_MOUNT => fs::sys_mount(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4],
+        ),
         SYSCALL_UMOUNT2 => fs::sys_umount2(args[0] as *const u8, args[1]),
 
         // 进程管理
@@ -168,11 +197,20 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_SCHED_YIELD => process::sys_sched_yield(),
         SYSCALL_CLONE => process::sys_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_EXECVE => process::sys_execve(args[0] as *const u8, args[1], args[2]),
-        SYSCALL_WAIT4 => process::sys_wait4(args[0] as isize, args[1] as *mut i32, args[2], args[3]),
+        SYSCALL_WAIT4 => {
+            process::sys_wait4(args[0] as isize, args[1] as *mut i32, args[2], args[3])
+        }
 
         // 内存管理
         SYSCALL_BRK => mm::sys_brk(args[0]),
-        SYSCALL_MMAP => mm::sys_mmap(args[0], args[1], args[2] as i32, args[3] as i32, args[4] as i32, args[5]),
+        SYSCALL_MMAP => mm::sys_mmap(
+            args[0],
+            args[1],
+            args[2] as i32,
+            args[3] as i32,
+            args[4] as i32,
+            args[5],
+        ),
         SYSCALL_MUNMAP => mm::sys_munmap(args[0], args[1]),
 
         // 时间和系统信息
@@ -198,7 +236,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_MEMBARRIER => other::sys_membarrier(args[0], args[1]),
         SYSCALL_MPROTECT => mm::sys_mprotect(args[0], args[1], args[2] as i32),
         SYSCALL_MADVISE => Ok(0), // madvise advisory, ignore
-        
+
         // sched stubs
         SYSCALL_SCHED_GETAFFINITY => other::sys_sched_stub(),
         SYSCALL_SCHED_SETAFFINITY => other::sys_sched_stub(),
@@ -213,7 +251,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_READLINKAT => Err(SysErrNo::EINVAL),
         SYSCALL_UTIMENSAT => Ok(0),
         SYSCALL_FSYNC => Ok(0),
-        SYSCALL_FUTEX => other::sys_futex_stub(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_FUTEX => {
+            other::sys_futex_stub(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
         SYSCALL_CLOCK_NANOSLEEP => other::sys_nanosleep(args[2], args[3]),
         SYSCALL_SETSID => other::sys_getpgid(0),
 

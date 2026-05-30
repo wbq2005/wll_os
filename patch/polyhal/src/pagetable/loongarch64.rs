@@ -21,7 +21,9 @@ impl PTE {
 
     #[inline]
     pub fn is_table(&self) -> bool {
-        self.0 != 0
+        // Directory entries are plain page-table physical addresses. Leaf
+        // mappings carry LoongArch's present bit, so do not recurse into them.
+        self.0 != 0 && !self.flags().contains(PTEFlags::P)
     }
 
     #[inline]
@@ -37,7 +39,7 @@ impl PTE {
 
 impl From<MappingFlags> for PTEFlags {
     fn from(value: MappingFlags) -> Self {
-        let mut flags = PTEFlags::V;
+        let mut flags = PTEFlags::V | PTEFlags::P;
         if value.contains(MappingFlags::W) {
             flags |= PTEFlags::W | PTEFlags::D;
         }
@@ -56,6 +58,9 @@ impl From<MappingFlags> for PTEFlags {
 impl From<PTEFlags> for MappingFlags {
     fn from(val: PTEFlags) -> Self {
         let mut flags = MappingFlags::empty();
+        if val.contains(PTEFlags::V) && val.contains(PTEFlags::P) {
+            flags |= MappingFlags::P;
+        }
         if val.contains(PTEFlags::W) {
             flags |= MappingFlags::W;
         }
@@ -114,6 +119,7 @@ impl PageTable {
     pub const PAGE_LEVEL: usize = 3;
     pub const PTE_NUM_IN_PAGE: usize = 0x200;
     pub(crate) const GLOBAL_ROOT_PTE_RANGE: usize = 0x100;
+    pub(crate) const USER_ROOT_PTE_END: usize = 0x100;
     pub(crate) const VADDR_BITS: usize = 39;
     pub(crate) const USER_VADDR_END: usize = (1 << Self::VADDR_BITS) - 1;
     pub(crate) const KERNEL_VADDR_START: usize = !Self::USER_VADDR_END;
@@ -121,14 +127,16 @@ impl PageTable {
     #[inline]
     pub fn restore(&self) {
         let current = Self::current().0;
-        self.release();
+        let arr = Self::get_pte_list(self.0);
+        arr.fill(PTE(0));
         if current.raw() == 0 {
             TLB::flush_all();
             return;
         }
         let current_arr = Self::get_pte_list(current);
-        let arr = Self::get_pte_list(self.0);
-        arr.copy_from_slice(current_arr);
+        for i in Self::USER_ROOT_PTE_END..Self::PTE_NUM_IN_PAGE {
+            arr[i] = current_arr[i];
+        }
         TLB::flush_all();
     }
 

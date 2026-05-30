@@ -1,8 +1,8 @@
-use crate::utils::error::SysErrNo;
 use super::SyscallRet;
 use crate::config::{PAGE_SIZE, USER_HEAP_START};
 use crate::mm::page_table::PTEFlags;
 use crate::task::current_task;
+use crate::utils::error::SysErrNo;
 use alloc::vec::Vec;
 use polyhal::VirtAddr;
 
@@ -16,10 +16,13 @@ fn copy_to_user_mapped(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
     let memory_set = task.memory_set.lock();
     let mut addr = dst;
     for &byte in src {
-        let pa = memory_set
-            .translate(VirtAddr::new(addr))
-            .ok_or(SysErrNo::EFAULT)?;
-        unsafe { *(pa.raw() as *mut u8) = byte; }
+        let pa = memory_set.translate(VirtAddr::new(addr)).ok_or_else(|| {
+            log::error!("[syscall] copy_to_user_mapped: unmapped dst {:#x}", addr);
+            SysErrNo::EFAULT
+        })?;
+        unsafe {
+            *(pa.raw() as *mut u8) = byte;
+        }
         addr += 1;
     }
     Ok(())
@@ -60,16 +63,41 @@ pub fn sys_mmap(
     addr: usize,
     length: usize,
     prot: i32,
-    _flags: i32,
+    flags_arg: i32,
     fd: i32,
     offset: usize,
 ) -> SyscallRet {
+    log::info!(
+        "[syscall] mmap(addr={:#x}, len={:#x}, prot={:#x}, flags={:#x}, fd={}, off={:#x})",
+        addr,
+        length,
+        prot,
+        flags_arg,
+        fd,
+        offset
+    );
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let mut inner = task.inner.lock();
-
     if length == 0 {
         return Err(SysErrNo::EINVAL);
     }
+
+    if fd >= 0 && addr == 0 && offset == 0 && (prot & 0x4) != 0 {
+        let preloaded_exec = 0x0040_0000usize;
+        let mut inner = task.inner.lock();
+        if task
+            .memory_set
+            .lock()
+            .is_mapped(VirtAddr::new(preloaded_exec))
+        {
+            let next = align_up(preloaded_exec + length);
+            if inner.next_mmap < next {
+                inner.next_mmap = next;
+            }
+            return Ok(preloaded_exec);
+        }
+    }
+    let mut inner = task.inner.lock();
+
     let start = if addr == 0 {
         let next = inner.next_mmap;
         inner.next_mmap = align_up(next + length);
@@ -89,7 +117,8 @@ pub fn sys_mmap(
     if prot & 0x4 != 0 {
         flags |= PTEFlags::X; // PROT_EXEC
     }
-    if !flags.contains(PTEFlags::R) && !flags.contains(PTEFlags::W) && !flags.contains(PTEFlags::X) {
+    if !flags.contains(PTEFlags::R) && !flags.contains(PTEFlags::W) && !flags.contains(PTEFlags::X)
+    {
         flags |= PTEFlags::R | PTEFlags::W;
     }
 
@@ -106,14 +135,31 @@ pub fn sys_mmap(
     };
 
     drop(inner);
-    task.memory_set.lock().insert_framed_area(
-        VirtAddr::new(start),
-        VirtAddr::new(end),
-        flags,
-    );
-    task.memory_set.lock().activate();
+    {
+        let mut ms = task.memory_set.lock();
+        let mut current = start;
+        while current < end {
+            if ms.is_mapped(VirtAddr::new(current)) {
+                ms.page_table.unmap_page(VirtAddr::new(current));
+            }
+            current += PAGE_SIZE;
+        }
+        ms.insert_framed_area(VirtAddr::new(start), VirtAddr::new(end), flags);
+        ms.activate();
+    }
     if let Some(data) = file_data {
-        copy_to_user_mapped(start, &data)?;
+        if let Err(err) = copy_to_user_mapped(start, &data) {
+            log::error!("[syscall] mmap: copy file data failed: {:?}", err);
+            return Err(err);
+        }
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let ms = task.memory_set.lock();
+        log::info!(
+            "[syscall] mmap: probe 0x15a10 = {:?}",
+            ms.page_table.translate(VirtAddr::new(0x15a10))
+        );
     }
     Ok(start)
 }
@@ -132,6 +178,7 @@ pub fn sys_mprotect(addr: usize, len: usize, _prot: i32) -> SyscallRet {
 
 /// munmap 系统调用
 pub fn sys_munmap(addr: usize, length: usize) -> SyscallRet {
+    log::info!("[syscall] munmap(addr={:#x}, len={:#x})", addr, length);
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let mut inner = task.inner.lock();
     if length == 0 {

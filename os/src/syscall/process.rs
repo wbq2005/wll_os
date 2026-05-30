@@ -1,20 +1,17 @@
-use crate::utils::error::SysErrNo;
 use super::SyscallRet;
+use crate::fs::read_file;
+use crate::mm::elf_loader::ElfFile;
 use crate::task::{
-    current_task,
-    dup_fd_table,
-    exit_current_and_run_next,
-    new_shared_memory_set,
+    current_task, dup_fd_table, exit_current_and_run_next, new_shared_memory_set,
     suspend_current_and_run_next,
 };
-use crate::mm::elf_loader::ElfFile;
-use crate::fs::read_file;
+use crate::utils::error::SysErrNo;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::Mutex;
 use polyhal::VirtAddr;
-use polyhal_trap::trapframe::TrapFrameArgs;
+use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
+use spin::Mutex;
 
 /// Linux clone 的低 8 位为发往父进程的信号 (`CSIGNAL`)。
 const CSIGNAL: usize = 0xff;
@@ -34,8 +31,7 @@ const CLONE_SIGHAND: usize = 0x00000800;
 
 const CLONE_THREAD: usize = 0x00010000;
 
-const THREAD_SHARING_FLAGS: usize =
-    CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+const THREAD_SHARING_FLAGS: usize = CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 
 const WNOHANG: usize = 0x0000_0001;
 
@@ -43,9 +39,7 @@ const WNOHANG: usize = 0x0000_0001;
 fn read_user_byte(addr: usize) -> Result<u8, SysErrNo> {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let ms = task.memory_set.lock();
-    let pa = ms
-        .translate(VirtAddr::new(addr))
-        .ok_or(SysErrNo::EFAULT)?;
+    let pa = ms.translate(VirtAddr::new(addr)).ok_or(SysErrNo::EFAULT)?;
     Ok(unsafe { *(pa.raw() as *const u8) })
 }
 
@@ -55,6 +49,20 @@ fn read_user_usize(addr: usize) -> Result<usize, SysErrNo> {
         *byte = read_user_byte(addr + i)?;
     }
     Ok(usize::from_le_bytes(bytes))
+}
+
+fn write_user_i32(addr: usize, value: i32) -> Result<(), SysErrNo> {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let ms = task.memory_set.lock();
+    for (i, byte) in value.to_le_bytes().iter().enumerate() {
+        let pa = ms
+            .translate(VirtAddr::new(addr + i))
+            .ok_or(SysErrNo::EFAULT)?;
+        unsafe {
+            *(pa.raw() as *mut u8) = *byte;
+        }
+    }
+    Ok(())
 }
 
 fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
@@ -74,6 +82,23 @@ fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
         result.push(s);
     }
     Ok(result)
+}
+
+fn reset_exec_trapframe(tf: &mut TrapFrame, entry: usize, sp: usize, argc: usize) {
+    #[cfg(target_arch = "riscv64")]
+    {
+        tf.x = [0; 32];
+        tf.fsx = [0; 2];
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        tf.regs = [0; 32];
+    }
+
+    tf[TrapFrameArgs::SP] = sp;
+    tf[TrapFrameArgs::SEPC] = entry;
+    tf[TrapFrameArgs::ARG0] = argc;
+    tf[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
 }
 
 const MAX_CSTR_LEN: usize = 4096;
@@ -123,7 +148,9 @@ pub(crate) fn setup_user_stack(
         for (i, &b) in data.iter().enumerate() {
             let va = VirtAddr::new(*sp + i);
             if let Some(pa) = ms.translate(va) {
-                unsafe { *(pa.raw() as *mut u8) = b; }
+                unsafe {
+                    *(pa.raw() as *mut u8) = b;
+                }
             }
         }
     };
@@ -134,7 +161,9 @@ pub(crate) fn setup_user_stack(
         for (i, &b) in bytes.iter().enumerate() {
             let va = VirtAddr::new(*sp + i);
             if let Some(pa) = ms.translate(va) {
-                unsafe { *(pa.raw() as *mut u8) = b; }
+                unsafe {
+                    *(pa.raw() as *mut u8) = b;
+                }
             }
         }
     };
@@ -162,7 +191,9 @@ pub(crate) fn setup_user_stack(
     for i in 0..16u8 {
         let va = VirtAddr::new(sp + i as usize);
         if let Some(pa) = memory_set.translate(va) {
-            unsafe { *(pa.raw() as *mut u8) = i.wrapping_mul(37).wrapping_add(7); }
+            unsafe {
+                *(pa.raw() as *mut u8) = i.wrapping_mul(37).wrapping_add(7);
+            }
         }
     }
 
@@ -185,7 +216,7 @@ pub(crate) fn setup_user_stack(
     // 4) 从 sp 开始依次写 argc, argv[], NULL, envp[], NULL, auxv[]
     // argc
     write_usize(memory_set, &mut sp, 0); // placeholder, rewrite below
-    // 因为 write_usize 减少 sp，我们改用直接偏移写法
+                                         // 因为 write_usize 减少 sp，我们改用直接偏移写法
 
     // 重新做：用绝对偏移写入
     let mut pos = final_sp;
@@ -194,7 +225,9 @@ pub(crate) fn setup_user_stack(
         for (i, &b) in bytes.iter().enumerate() {
             let va = VirtAddr::new(pos + i);
             if let Some(pa) = ms.translate(va) {
-                unsafe { *(pa.raw() as *mut u8) = b; }
+                unsafe {
+                    *(pa.raw() as *mut u8) = b;
+                }
             }
         }
     };
@@ -263,7 +296,11 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
 
     // 在替换地址空间之前，从旧地址空间读取 argv/envp
     let argv = read_user_str_array(argv_ptr)?;
-    let envp = read_user_str_array(envp_ptr)?;
+    let mut envp = read_user_str_array(envp_ptr)?;
+    if envp.is_empty() {
+        envp.push(String::from("PATH=/bin:/basic:/"));
+        envp.push(String::from("LD_LIBRARY_PATH=/lib"));
+    }
 
     let (root, cwd) = if let Some(task) = current_task() {
         let inner = task.inner.lock();
@@ -277,7 +314,11 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     let elf_data = match read_file(&host_path) {
         Some(data) => data,
         None => {
-            log::error!("[syscall] execve: file not found: {} ({})", path_str, host_path);
+            log::error!(
+                "[syscall] execve: file not found: {} ({})",
+                path_str,
+                host_path
+            );
             return Err(SysErrNo::ENOENT);
         }
     };
@@ -297,24 +338,45 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         argv
     };
 
+    let mut interp_path_opt = elf.interp_path();
+    #[cfg(target_arch = "loongarch64")]
+    if elf.can_enter_without_interpreter() {
+        log::info!(
+            "[syscall] execve: self-contained PIE detected, entering target directly: {}",
+            path_str
+        );
+        interp_path_opt = None;
+    }
+
     let (new_memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) =
-        if let Some(interp) = elf.interp_path() {
-            let interp_path = crate::fs::normalize_path(interp);
-            let interp_host_path = crate::fs::apply_root(&root, &interp_path);
-            let interp_data = read_file(&interp_host_path).ok_or_else(|| {
-                log::error!(
-                    "[syscall] execve: interpreter not found: {} ({})",
-                    interp_path,
-                    interp_host_path
-                );
-                SysErrNo::ENOENT
-            })?;
+        if let Some(interp) = interp_path_opt {
+            let (interp_path, interp_host_path, interp_data) =
+                crate::fs::read_interpreter(&root, interp).ok_or_else(|| {
+                    log::error!(
+                        "[syscall] execve: interpreter not found: {} ({})",
+                        crate::fs::normalize_path(interp),
+                        crate::fs::apply_root(&root, interp)
+                    );
+                    SysErrNo::ENOENT
+                })?;
+            log::info!(
+                "[syscall] execve: interpreter {} resolved to {}",
+                interp_path,
+                interp_host_path
+            );
             let interp_elf = ElfFile::parse(&interp_data)?;
             let interp_bias = 0x0010_0000usize;
-            let target_bias = if elf.header.e_type == 3 { 0x0040_0000 } else { 0 };
+            let target_bias = if elf.header.e_type == 3 {
+                0x0040_0000
+            } else {
+                0
+            };
             let mut memory_set = crate::mm::memory_set::MemorySet::from_kernel();
+            log::info!("[syscall] execve: loading target segments");
             elf.load_segments_into(&mut memory_set, target_bias)?;
+            log::info!("[syscall] execve: loading interpreter segments");
             interp_elf.load_segments_into(&mut memory_set, interp_bias)?;
+            log::info!("[syscall] execve: mapping user stack");
 
             let user_stack_top = crate::config::USER_STACK_TOP;
             let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
@@ -327,10 +389,6 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
                     | crate::mm::page_table::PTEFlags::V,
             );
 
-            let mut dyn_argv = alloc::vec![interp_path, logical_path.clone()];
-            dyn_argv.extend(launch_argv.iter().skip(1).cloned());
-            launch_argv = dyn_argv;
-
             (
                 memory_set,
                 user_stack_top,
@@ -342,14 +400,33 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         } else {
             let phdr_vaddr = elf.phdr_vaddr(0);
             let phnum = elf.phnum();
-            let (memory_set, user_stack_top, entry) = match elf.load() {
-                Ok(result) => result,
-                Err(e) => {
-                    log::error!("[syscall] execve: failed to load ELF: {:?}", e);
-                    return Err(e);
-                }
-            };
-            (memory_set, user_stack_top, entry, phdr_vaddr, phnum, 0)
+            if elf.header.e_type == 3 {
+                let bias = 0x0040_0000usize;
+                let (memory_set, user_stack_top, entry) = match elf.load_at(bias) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        log::error!("[syscall] execve: failed to load ELF: {:?}", e);
+                        return Err(e);
+                    }
+                };
+                (
+                    memory_set,
+                    user_stack_top,
+                    entry,
+                    elf.phdr_vaddr(bias),
+                    phnum,
+                    0,
+                )
+            } else {
+                let (memory_set, user_stack_top, entry) = match elf.load() {
+                    Ok(result) => result,
+                    Err(e) => {
+                        log::error!("[syscall] execve: failed to load ELF: {:?}", e);
+                        return Err(e);
+                    }
+                };
+                (memory_set, user_stack_top, entry, phdr_vaddr, phnum, 0)
+            }
         };
 
     let argv_with_path = launch_argv;
@@ -384,7 +461,11 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     };
     */
     let at_entry = if interp_base != 0 {
-        let target_bias = if elf.header.e_type == 3 { 0x0040_0000 } else { 0 };
+        let target_bias = if elf.header.e_type == 3 {
+            0x0040_0000
+        } else {
+            0
+        };
         elf.entry_with_bias(target_bias)
     } else {
         entry
@@ -400,6 +481,11 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         phnum,
         interp_base,
     );
+    #[cfg(target_arch = "riscv64")]
+    log::info!(
+        "[syscall] execve: probe 0x15a10 before install = {:?}",
+        new_memory_set.page_table.translate(VirtAddr::new(0x15a10))
+    );
 
     if let Some(task) = current_task() {
         {
@@ -413,26 +499,23 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
 
         {
             let mut ms = task.memory_set.lock();
+            log::info!("[syscall] execve: replacing memory set");
             *ms = new_memory_set;
+            log::info!("[syscall] execve: activating new memory set");
             ms.activate();
         }
 
         {
+            log::info!("[syscall] execve: resetting trap frame");
             let mut updated_saved_tf = false;
             let mut tf_guard = task.trap_frame.lock();
             if let Some(ref mut tf) = *tf_guard {
-                tf[TrapFrameArgs::SP] = sp;
-                tf[TrapFrameArgs::SEPC] = entry;
-                tf[TrapFrameArgs::ARG0] = argv_with_path.len();
-                tf[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
+                reset_exec_trapframe(tf, entry, sp, argv_with_path.len());
                 updated_saved_tf = true;
             }
             if !updated_saved_tf {
                 crate::trap::update_current_trapframe(|tf| {
-                    tf[TrapFrameArgs::SP] = sp;
-                    tf[TrapFrameArgs::SEPC] = entry;
-                    tf[TrapFrameArgs::ARG0] = argv_with_path.len();
-                    tf[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
+                    reset_exec_trapframe(tf, entry, sp, argv_with_path.len());
                 });
             }
         }
@@ -476,11 +559,7 @@ pub fn sys_getpid() -> SyscallRet {
 pub fn sys_getppid() -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
-    let ppid = inner
-        .parent
-        .as_ref()
-        .map(|p| p.pid.0)
-        .unwrap_or(1usize);
+    let ppid = inner.parent.as_ref().map(|p| p.pid.0).unwrap_or(1usize);
     log::debug!("[syscall] getppid() = {}", ppid);
     Ok(ppid)
 }
@@ -513,8 +592,7 @@ pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -
     let try_reap = || -> Option<(usize, i32)> {
         let mut inner = task.inner.lock();
         if let Some(index) = inner.children.iter().position(|c| {
-            (pid == -1 || c.pid.0 == pid as usize)
-                && c.status() == crate::task::TaskStatus::Zombie
+            (pid == -1 || c.pid.0 == pid as usize) && c.status() == crate::task::TaskStatus::Zombie
         }) {
             let child = inner.children.remove(index);
             let cpid = child.pid.0;
@@ -526,7 +604,7 @@ pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -
 
     if let Some((cpid, exit_code)) = try_reap() {
         if !status.is_null() {
-            unsafe { *status = exit_code << 8; }
+            write_user_i32(status as usize, exit_code << 8)?;
         }
         return Ok(cpid);
     }
@@ -552,12 +630,19 @@ pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -
         // 再检查一次僵尸
         if let Some((cpid, exit_code)) = try_reap() {
             if !status.is_null() {
-                unsafe { *status = exit_code << 8; }
+                write_user_i32(status as usize, exit_code << 8)?;
             }
             return Ok(cpid);
         }
 
-        suspend_current_and_run_next();
+        if *crate::trap::FOREGROUND_MODE.lock() {
+            *crate::task::CURRENT_TASK.lock() = None;
+            crate::task::run_next_task();
+            task.memory_set.lock().activate();
+            *crate::task::CURRENT_TASK.lock() = Some(task.clone());
+        } else {
+            suspend_current_and_run_next();
+        }
     }
 }
 
@@ -585,7 +670,23 @@ pub fn sys_clone(
         return Err(SysErrNo::EINVAL);
     }
 
-    let parent_inner = parent.inner.lock();
+    let (area_count, page_count) = {
+        let ms = parent.memory_set.lock();
+        let pages = ms.areas.iter().fold(0usize, |sum, area| {
+            let start = area.start_va.raw() / crate::config::PAGE_SIZE;
+            let end = (area.end_va.raw() + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
+            sum + end.saturating_sub(start)
+        });
+        (ms.areas.len(), pages)
+    };
+    log::info!(
+        "[syscall] clone start flags={:#x} stack={:#x} parent={} areas={} pages={}",
+        flags,
+        stack,
+        parent_pid,
+        area_count,
+        page_count
+    );
 
     let mut child_tf = crate::trap::clone_current_trapframe().ok_or(SysErrNo::EINVAL)?;
     child_tf[TrapFrameArgs::RET] = 0;
@@ -607,10 +708,21 @@ pub fn sys_clone(
     }
 
     let memory_set = new_shared_memory_set(parent.memory_set.lock().clone());
-
-    let fd_table = dup_fd_table(&*parent_inner.fd_table.lock());
-
-    drop(parent_inner);
+    let (fd_table, cwd, root, program_break, mapped_break, next_mmap) = {
+        let inner = parent.inner.lock();
+        let fd_table = {
+            let fd_guard = inner.fd_table.lock();
+            dup_fd_table(&*fd_guard)
+        };
+        (
+            fd_table,
+            inner.cwd.clone(),
+            inner.root.clone(),
+            inner.program_break,
+            inner.mapped_break,
+            inner.next_mmap,
+        )
+    };
 
     let child = Arc::new(crate::task::TaskControlBlock {
         pid: crate::task::pid::Pid::alloc(),
@@ -621,11 +733,11 @@ pub fn sys_clone(
             parent: Some(parent.clone()),
             children: Vec::new(),
             fd_table,
-            cwd: parent.inner.lock().cwd.clone(),
-            root: parent.inner.lock().root.clone(),
-            program_break: parent.inner.lock().program_break,
-            mapped_break: parent.inner.lock().mapped_break,
-            next_mmap: parent.inner.lock().next_mmap,
+            cwd,
+            root,
+            program_break,
+            mapped_break,
+            next_mmap,
         }),
         task_ctx: crate::task::KernelCtx::new(crate::task::context::TaskContext::zero_init()),
         memory_set,
@@ -661,5 +773,7 @@ pub fn setup_user_stack_for_init(
         String::from("PATH=/:/bin:/usr/bin"),
         String::from("LD_LIBRARY_PATH=/"),
     ];
-    setup_user_stack(memory_set, stack_top, &argv, &envp, elf_entry, phdr_vaddr, phnum, 0)
+    setup_user_stack(
+        memory_set, stack_top, &argv, &envp, elf_entry, phdr_vaddr, phnum, 0,
+    )
 }

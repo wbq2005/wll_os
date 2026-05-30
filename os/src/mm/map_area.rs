@@ -1,11 +1,14 @@
-use polyhal::VirtAddr;
+use super::frame_allocator::FrameTracker;
 use crate::mm::page_table::PTEFlags;
+use alloc::vec::Vec;
+use polyhal::VirtAddr;
 
 /// 虚拟内存区域 (VMA)
 pub struct MapArea {
     pub start_va: VirtAddr,
     pub end_va: VirtAddr,
     pub flags: PTEFlags,
+    pub frames: Vec<FrameTracker>,
 }
 
 impl MapArea {
@@ -14,6 +17,7 @@ impl MapArea {
             start_va,
             end_va,
             flags,
+            frames: Vec::new(),
         }
     }
 
