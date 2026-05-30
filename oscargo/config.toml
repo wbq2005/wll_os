@@ -1,18 +1,23 @@
 [build]
 target = "riscv64gc-unknown-none-elf"
 
-[unstable]
-build-std = ["core", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
     "-C", "relocation-model=static",
     "-C", "panic=abort",
+    "-C", "target-feature=-c",
+    "-C", "code-model=medium",
 ]
 
 [target.loongarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
+    "-C", "code-model=large",
     "-C", "panic=abort",
 ]

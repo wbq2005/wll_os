@@ -19,7 +19,7 @@ else ifeq ($(ARCH),loongarch64)
     CARGO_EXTRA := --no-default-features --features loongarch
 endif
 
-.PHONY: all build clean check check-sdcard unpack-sdcard print-phase2-gate
+.PHONY: all build clean check check-sdcard prepare-cargo-config unpack-sdcard print-phase2-gate
 all:
 	@echo "Building for RISC-V..."
 	$(MAKE) ARCH=riscv64 build INIT=$(INIT) LOG=$(LOG)
@@ -59,6 +59,11 @@ check-sdcard:
 		echo "警告: 缺少 $$IMG；os/build.rs 将使用空 MemFS 预载。评测/运行时应由 virtio 块设备上的 ext4 提供 /init；本地可 make unpack-sdcard 或放置 sdcard-*.img 用于预载与 QEMU。"; \
 	fi
 
+prepare-cargo-config:
+	@mkdir -p .cargo
+	@if [ -d vendor ]; then find vendor -name cargo-checksum.json -exec sh -c 'for f do cp "$$f" "$$(dirname "$$f")/.cargo-checksum.json"; done' sh {} +; fi
+	cp oscargo/config.toml .cargo/config.toml
+
 unpack-sdcard:
 	@if command -v xz >/dev/null 2>&1; then \
 		if [ -f sdcard-rv.img.xz ] && [ ! -f sdcard-rv.img ]; then \
@@ -87,13 +92,15 @@ unpack-sdcard:
 # rustflags 已全部写入 os/Cargo.toml，无需复制 cargo_config 目录
 build:
 	@echo "Building kernel for $(ARCH)..."
+	$(MAKE) prepare-cargo-config
 	$(MAKE) check-sdcard ARCH=$(ARCH)
-	cd os && cargo +$(RUSTUP_TOOLCHAIN) build --release --target $(TARGET) $(CARGO_EXTRA)
+	cd os && cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA)
 
 # 快速检查（不做链接，更快，适合开发阶段验证代码）
 check:
 	@echo "Checking kernel for $(ARCH)..."
-	cd os && cargo +$(RUSTUP_TOOLCHAIN) check --release --target $(TARGET) $(CARGO_EXTRA)
+	$(MAKE) prepare-cargo-config
+	cd os && cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA)
 
 # 清理
 clean:
