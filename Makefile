@@ -41,23 +41,23 @@ check-sdcard:
 	else \
 		IMG="sdcard-la.img"; \
 	fi; \
-	IMG_XZ="$IMG.xz"; \
-	if [ ! -f "$IMG" ] && [ -f "$IMG_XZ" ]; then \
+	IMG_XZ="$$IMG.xz"; \
+	if [ ! -f "$$IMG" ] && [ -f "$$IMG_XZ" ]; then \
 		if command -v xz >/dev/null 2>&1; then \
-			echo "检测到 $IMG 缺失，正在自动解压 $IMG_XZ ..."; \
-			if xz -dc "$IMG_XZ" > "$IMG.tmp" && mv -f "$IMG.tmp" "$IMG"; then \
-				echo "已自动生成 $IMG"; \
+			echo "检测到 $$IMG 缺失，正在自动解压 $$IMG_XZ ..."; \
+			if xz -dc "$$IMG_XZ" > "$$IMG.tmp" && mv -f "$$IMG.tmp" "$$IMG"; then \
+				echo "已自动生成 $$IMG"; \
 			else \
-				rm -f "$IMG.tmp"; \
-				echo "错误: 自动解压 $IMG_XZ 失败。"; \
+				rm -f "$$IMG.tmp"; \
+				echo "错误: 自动解压 $$IMG_XZ 失败。"; \
 				exit 1; \
 			fi; \
 		else \
-			echo "警告: 缺少 $IMG，且当前环境无 xz，无法从 $IMG_XZ 自动解压。继续编译（评测/运行时依赖 virtio ext4 或本地稍后解压镜像）。"; \
+			echo "警告: 缺少 $$IMG，且当前环境无 xz，无法从 $$IMG_XZ 自动解压。继续编译（评测/运行时依赖 virtio ext4 或本地稍后解压镜像）。"; \
 		fi; \
 	fi; \
-	if [ ! -f "$IMG" ]; then \
-		echo "警告: 缺少 $IMG；os/build.rs 将使用空 MemFS 预载。评测/运行时应由 virtio 块设备上的 ext4 提供 /init；本地可 make unpack-sdcard 或放置 sdcard-*.img 用于预载与 QEMU。"; \
+	if [ ! -f "$$IMG" ]; then \
+		echo "警告: 缺少 $$IMG；os/build.rs 将使用空 MemFS 预载。评测/运行时应由 virtio 块设备上的 ext4 提供 /init；本地可 make unpack-sdcard 或放置 sdcard-*.img 用于预载与 QEMU。"; \
 	fi
 
 unpack-sdcard:
