@@ -61,7 +61,7 @@ check-sdcard:
 
 prepare-cargo-config:
 	@mkdir -p .cargo
-	@if [ -d vendor ]; then find vendor -name cargo-checksum.json -exec sh -c 'for f do cp "$$f" "$$(dirname "$$f")/.cargo-checksum.json"; done' sh {} +; fi
+	@if [ -f scripts/restore_vendor_hidden.sh ]; then sh scripts/restore_vendor_hidden.sh; fi
 	cp oscargo/config.toml .cargo/config.toml
 
 unpack-sdcard:

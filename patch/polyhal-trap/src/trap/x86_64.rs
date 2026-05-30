@@ -95,7 +95,7 @@ fn kernel_callback(context: &mut TrapFrame) {
 /// # Safety
 ///
 /// This function is unsafe because it performs low-level operations
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 pub unsafe extern "C" fn kernelvec() {
     naked_asm!(
@@ -140,7 +140,7 @@ pub unsafe extern "C" fn kernelvec() {
 ///
 /// This function is unsafe because it performs low-level operations
 /// that can lead to undefined behavior if not used correctly.
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 pub unsafe extern "C" fn uservec() {
     naked_asm!(
@@ -175,9 +175,9 @@ pub unsafe extern "C" fn uservec() {
     );
 }
 
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
-pub extern "C" fn user_restore(context: *mut TrapFrame) {
+pub unsafe extern "C" fn user_restore(context: *mut TrapFrame) {
     unsafe {
         naked_asm!(
             // Save callee saved registers and cs and others.
@@ -242,7 +242,7 @@ pub extern "C" fn user_restore(context: *mut TrapFrame) {
     }
 }
 
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn sysretq() {
     naked_asm!(
         "
@@ -290,7 +290,7 @@ pub fn init() {
     init_syscall();
 }
 
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn syscall_entry() {
     naked_asm!(
         includes_trap_macros!(),
@@ -360,7 +360,7 @@ pub fn run_user_task(context: &mut TrapFrame) -> EscapeReason {
         );
     }
     context.fx_area.restore();
-    user_restore(context);
+    unsafe { user_restore(context) };
     context.fx_area.save();
 
     match context.vector {

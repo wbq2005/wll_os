@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(cfg_version)]
 #![feature(used_with_arg)]
+#![feature(naked_functions)]
 #![cfg_attr(target_arch = "riscv64", feature(riscv_ext_intrinsics))]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 

@@ -1,4 +1,4 @@
-﻿use core::arch::naked_asm;
+use core::arch::naked_asm;
 
 macro_rules! init_dwm {
     () => {
@@ -16,7 +16,7 @@ macro_rules! init_dwm {
 }
 
 /// The earliest entry point for the primary CPU.
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 #[link_section = ".text.entry"]
 unsafe extern "C" fn _start() -> ! {

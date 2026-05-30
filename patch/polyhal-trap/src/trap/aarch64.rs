@@ -101,8 +101,8 @@ pub fn init() {
     VBAR_EL1.set(exception_vector_base as _);
 }
 
-#[unsafe(naked)]
-extern "C" fn user_restore(context: *mut TrapFrame) -> TrapKind {
+#[naked]
+unsafe extern "C" fn user_restore(context: *mut TrapFrame) -> TrapKind {
     unsafe {
         naked_asm!(
             r"
@@ -147,6 +147,6 @@ extern "C" fn user_restore(context: *mut TrapFrame) -> TrapKind {
 }
 
 pub fn run_user_task(cx: &mut TrapFrame) -> EscapeReason {
-    let trap_kind = user_restore(cx);
+    let trap_kind = unsafe { user_restore(cx) };
     handle_exception(cx, trap_kind, TrapSource::LowerAArch64).into()
 }

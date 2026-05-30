@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - "x86_64-0.14.x"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: "Release"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    environment: crates_io_release
+
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v4
+
+      # TODO: Remove when Python 3.11 is the default on the Gihtub Actions image
+      - name: "Install Python 3.11"
+        run: sudo apt-get -y install python3.11
+
+      - name: "Run release script"
+        run: "python3.11 scripts/ci-release.py"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

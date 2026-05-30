@@ -97,7 +97,8 @@ fn kernel_callback(context: &mut TrapFrame) -> TrapType {
     trap_type
 }
 
-#[unsafe(naked)]
+#[naked]
+#[allow(named_asm_labels)]
 pub unsafe extern "C" fn kernelvec() {
     naked_asm!(
         includes_trap_macros!(),
@@ -154,9 +155,9 @@ extern "C" fn kernel_skip_sret() {
     }
 }
 
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
-extern "C" fn user_restore(context: *mut TrapFrame) {
+unsafe extern "C" fn user_restore(context: *mut TrapFrame) {
     naked_asm!(
             includes_trap_macros!(),
             // 在内核态栈中开一个空间来存储内核态信�?
@@ -195,7 +196,7 @@ extern "C" fn user_restore(context: *mut TrapFrame) {
         )
 }
 
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 #[allow(named_asm_labels)]
 pub unsafe extern "C" fn uservec() {
@@ -245,14 +246,14 @@ pub fn signal_skip_sret() {
 }
 
 pub fn run_user_task(context: &mut TrapFrame) -> EscapeReason {
-    user_restore(context);
+    unsafe { user_restore(context) };
     kernel_callback(context).into()
 }
 
 /// Run user task until interrupt is received.
 pub fn run_user_task_forever(context: &mut TrapFrame) -> ! {
     loop {
-        user_restore(context);
+        unsafe { user_restore(context) };
         kernel_callback(context);
     }
 }

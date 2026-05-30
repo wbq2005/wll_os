@@ -37,7 +37,7 @@ pub const FLDXS_OP: u32 = 0x7060;
 pub const FLDXD_OP: u32 = 0x7068;
 
 #[allow(binary_asm_labels)]
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn unaligned_read(addr: u64, value: &mut u64, n: u64, symbol: u32) -> i32 {
     naked_asm!(
         includes_trap_macros!(),
@@ -78,7 +78,7 @@ unsafe extern "C" fn unaligned_read(addr: u64, value: &mut u64, n: u64, symbol: 
 }
 
 #[allow(binary_asm_labels)]
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn unaligned_write(_addr: u64, _value: u64, _n: u64) -> i32 {
     naked_asm!(
         includes_trap_macros!(),

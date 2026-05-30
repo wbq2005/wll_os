@@ -1,4 +1,5 @@
 #![no_std]
+#![feature(naked_functions)]
 
 //! Boot Components.
 //!

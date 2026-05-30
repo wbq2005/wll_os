@@ -36,7 +36,7 @@ unsafe extern "C" fn init_mmu() {
 /// Initialize Stack, Page Table and call rust entry.
 /// Note: RISC-V uses entry_riscv64.asm from the OS crate instead
 #[cfg(not(target_arch = "riscv64"))]
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 #[link_section = ".text.entry"]
 unsafe extern "C" fn _start() -> ! {
@@ -74,7 +74,7 @@ unsafe extern "C" fn _start() -> ! {
 /// Initialize Page Information. Call rust_secondary_main entry function.
 /// Note: RISC-V uses entry_riscv64.asm from the OS crate instead
 #[cfg(not(target_arch = "riscv64"))]
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 unsafe extern "C" fn _secondary_start() -> ! {
     naked_asm!(
