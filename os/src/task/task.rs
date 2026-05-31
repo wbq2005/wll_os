@@ -156,6 +156,11 @@ impl TaskControlBlock {
                 } else {
                     0
                 };
+                // Consume auxv-visible ELF metadata before loading segments so
+                // later copy/zero-fill work cannot perturb the launch contract.
+                let interp_entry = interp_elf.entry_with_bias(interp_bias);
+                let target_phdr_vaddr = target_elf.phdr_vaddr(target_bias);
+                let target_phnum = target_elf.phnum();
                 let mut memory_set = MemorySet::from_kernel();
                 target_elf.load_segments_into(&mut memory_set, target_bias)?;
                 interp_elf.load_segments_into(&mut memory_set, interp_bias)?;
@@ -174,9 +179,9 @@ impl TaskControlBlock {
                 (
                     memory_set,
                     user_stack_top,
-                    interp_elf.entry_with_bias(interp_bias),
-                    target_elf.phdr_vaddr(target_bias),
-                    target_elf.phnum(),
+                    interp_entry,
+                    target_phdr_vaddr,
+                    target_phnum,
                     interp_bias,
                 )
             } else {

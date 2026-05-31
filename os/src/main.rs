@@ -67,6 +67,40 @@ fn wait_for_interrupt() {
 }
 
 #[cfg(target_arch = "riscv64")]
+fn add_riscv_available_frames(start: usize, end: usize) -> usize {
+    extern "C" {
+        fn _end();
+    }
+
+    let kernel_start = crate::config::KERNEL_BASE;
+    // The linker _end includes .bss, including the static kernel heap. The DTB
+    // memory list may only exclude a conservative image range, so clip it again
+    // before handing pages to the frame allocator.
+    let kernel_end = ((_end as usize).saturating_add(crate::config::PAGE_SIZE - 1)
+        / crate::config::PAGE_SIZE)
+        * crate::config::PAGE_SIZE;
+
+    if end <= start {
+        return 0;
+    }
+    if end <= kernel_start || start >= kernel_end {
+        mm::frame_allocator::add_frames_range(start, end);
+        return 1;
+    }
+
+    let mut count = 0usize;
+    if start < kernel_start {
+        mm::frame_allocator::add_frames_range(start, kernel_start);
+        count += 1;
+    }
+    if end > kernel_end {
+        mm::frame_allocator::add_frames_range(kernel_end, end);
+        count += 1;
+    }
+    count
+}
+
+#[cfg(target_arch = "riscv64")]
 #[inline]
 fn early_sbi_putchar(c: u8) {
     unsafe {
@@ -170,10 +204,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         for &(start, len) in polyhal::mem::get_mem_areas() {
             if len > 0 {
                 let end = start.saturating_add(len);
-                if end > start {
-                    mm::frame_allocator::add_frames_range(start, end);
-                    count += 1;
-                }
+                count += add_riscv_available_frames(start, end);
             }
         }
         log::info!("[mm] Memory regions added to frame allocator: {}", count);

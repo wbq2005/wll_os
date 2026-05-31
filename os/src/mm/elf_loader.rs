@@ -269,6 +269,9 @@ impl<'a> ElfFile<'a> {
     }
 
     pub fn load_at(&self, bias: usize) -> Result<(MemorySet, usize, usize), SysErrNo> {
+        // Cache the launch PC before copying load segments. The loader should
+        // not depend on rereading ELF header bytes after user mappings are built.
+        let entry = self.entry_with_bias(bias);
         let mut memory_set = MemorySet::from_kernel();
         self.load_segments_into(&mut memory_set, bias)?;
 
@@ -280,7 +283,7 @@ impl<'a> ElfFile<'a> {
             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
         );
 
-        Ok((memory_set, user_stack_top, self.entry_with_bias(bias)))
+        Ok((memory_set, user_stack_top, entry))
     }
 
     pub fn load_segments_into(
@@ -352,6 +355,8 @@ impl<'a> ElfFile<'a> {
 
     pub fn load(&self) -> Result<(MemorySet, usize, usize), SysErrNo> {
         // UART marker: 'A' = elf.load() entry
+        // Keep the original entry stable across segment copy/zero-fill work.
+        let entry = self.entry();
         let mut memory_set = MemorySet::from_kernel();
 
         // 加载所有 LOAD 段
@@ -480,7 +485,7 @@ impl<'a> ElfFile<'a> {
         );
 
         // UART marker: 'E' = all load done
-        Ok((memory_set, user_stack_top, self.entry()))
+        Ok((memory_set, user_stack_top, entry))
     }
 }
 

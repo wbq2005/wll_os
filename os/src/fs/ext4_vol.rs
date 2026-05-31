@@ -238,19 +238,22 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, bool)> {
 pub fn slurp_regular_file(path: &str) -> Option<Vec<u8>> {
     let fs = ROOT_EXT4.lock().clone()?;
     let (ino, is_dir) = resolve_existing(&fs, path)?;
-    if is_dir || !fs.get_inode_ref(ino).inode.is_file() {
+    let inode_ref = fs.get_inode_ref(ino);
+    if is_dir || !inode_ref.inode.is_file() {
         return None;
     }
 
-    let mut out = Vec::new();
+    // Runtime exec paths must get the exact file image. Some ext4 backends do
+    // not make EOF detection by repeated read_at() robust enough for large
+    // static ELFs, so use the inode size as the authoritative bound.
+    let size = inode_ref.inode.size() as usize;
+    let mut out = alloc::vec![0u8; size];
     let mut off = 0usize;
-    loop {
-        let mut chunk = [0u8; 4096];
-        let n = fs.read_at(ino, off, &mut chunk).ok()?;
+    while off < size {
+        let n = fs.read_at(ino, off, &mut out[off..]).ok()?;
         if n == 0 {
-            break;
+            return None;
         }
-        out.extend_from_slice(&chunk[..n]);
         off += n;
     }
     Some(out)
