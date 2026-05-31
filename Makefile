@@ -3,7 +3,12 @@
 ARCH ?= riscv64
 INIT ?= test
 LOG ?= OFF
-RUSTUP_TOOLCHAIN ?= $(shell rustup default 2>/dev/null | sed 's/ .*//')
+RUSTUP_TOOLCHAIN ?= $(shell sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null | head -n 1)
+ifeq ($(strip $(RUSTUP_TOOLCHAIN)),)
+    # Keep judge builds on the repository-pinned compiler. Falling back to the
+    # host default is only for checkouts without rust-toolchain.toml.
+    RUSTUP_TOOLCHAIN := $(shell rustup default 2>/dev/null | sed 's/ .*//')
+endif
 ifeq ($(findstring nightly,$(RUSTUP_TOOLCHAIN)),)
     RUSTUP_TOOLCHAIN := $(shell rustup toolchain list 2>/dev/null | sed -n 's/^\(nightly[^ ]*\).*/\1/p' | head -n 1)
 endif
