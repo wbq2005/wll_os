@@ -163,14 +163,14 @@ pub fn add_initproc() {
             }
             Err(e) => {
                 log::error!("[task] Failed to load init process: {:?}", e);
-                if !try_start_preloaded_test_harness() {
+                if !try_start_runtime_test_harness() {
                     report_no_init_and_maybe_shutdown("init ELF parse/load failed");
                 }
             }
         }
     } else {
         log::warn!("[task] No init program found in filesystem");
-        if !try_start_preloaded_test_harness() {
+        if !try_start_runtime_test_harness() {
             report_no_init_and_maybe_shutdown("init not found in MemFS");
         }
     }
@@ -188,8 +188,8 @@ fn report_no_init_and_maybe_shutdown(reason: &str) {
     console_write(reason);
     console_write("\n");
     console_write("[boot-error] hint: ensure ext4 root on virtio-blk is available at boot (e.g. /init on the disk).\n");
-    console_write("[boot-error] hint: local dev without runtime disk: place sdcard-rv.img / sdcard-la.img (or run `make unpack-sdcard`) so build.rs preloads MemFS.\n");
-    console_write("[boot-error] hint: with virtio disk, kernel mounts ext4 at boot; harness discovers scripts via fs::list_files() (MemFS + ext4).\n");
+    console_write("[boot-error] hint: default builds do not embed sdcard tests; local fallback requires the dev-preload feature.\n");
+    console_write("[boot-error] hint: with virtio disk, kernel mounts ext4 at boot and the harness discovers scripts from that disk.\n");
 
     // 默认开发模式下直接关机，避免无任务时长时间 idle 看起来像"卡死"。
     // 如需保留 idle，可使用 cargo feature: `--features no-init-idle`.
@@ -200,373 +200,86 @@ fn report_no_init_and_maybe_shutdown(reason: &str) {
     }
 }
 
-/// 合并 MemFS + ext4 上的脚本路径（运行时扫描；编译期预载仍写入 MemFS）。
-/// For the score-bearing path, run basic first, then the BusyBox scripts.
-/// Later suites are intentionally not pulled in here yet: their shell scripts can
-/// run for a long time before the required syscall surface is ready.
-fn collect_script_paths() -> Vec<String> {
-    let all_files = crate::fs::list_files();
+/// Discover runtime test scripts from the mounted EXT4 root. Dev preload may
+/// provide a MemFS fallback only when the explicit feature is enabled.
+fn basename(path: &str) -> &str {
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+}
 
-    let mut scripts = Vec::new();
-    for prefix in ["/glibc", "/musl"] {
-        let run_all = alloc::format!("{}/basic/run-all.sh", prefix);
-        let wrapper = alloc::format!("{}/basic_testcode.sh", prefix);
-        if crate::fs::file_exists(&run_all) || all_files.iter().any(|path| path == &run_all) {
-            scripts.push(run_all);
-        } else if crate::fs::file_exists(&wrapper) || all_files.iter().any(|path| path == &wrapper)
-        {
-            scripts.push(wrapper);
-        }
-    }
+fn testcode_stem(path: &str) -> Option<&str> {
+    let name = basename(path);
+    let stem = name.strip_suffix(".sh")?;
+    stem.strip_suffix("_testcode")
+}
 
-    for prefix in ["/glibc", "/musl"] {
-        let busybox = alloc::format!("{}/busybox_testcode.sh", prefix);
-        if crate::fs::file_exists(&busybox) || all_files.iter().any(|path| path == &busybox) {
-            scripts.push(busybox);
-        }
-    }
-
-    if !scripts.is_empty() {
-        return scripts;
-    }
-
-    let mut scripts: Vec<String> = all_files
-        .into_iter()
-        .filter(|path| {
-            let name = path.rsplit('/').next().unwrap_or(path);
-            name == "basic_testcode.sh" || name == "busybox_testcode.sh"
-        })
-        .collect();
-    scripts.sort_by(|a, b| {
-        let rank = |path: &String| script_rank(path);
-        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-    });
-    scripts
+fn is_testcode_script(path: &str) -> bool {
+    testcode_stem(path).is_some()
 }
 
 fn script_rank(path: &str) -> usize {
-    let arch_rank = if path.starts_with("/glibc/") {
+    let libc_rank = if path.starts_with("/glibc/") {
         0usize
     } else if path.starts_with("/musl/") {
         1
     } else {
         2
     };
-    let suite_rank = if path.ends_with("/busybox_testcode.sh") {
-        10usize
-    } else {
-        0
+    let suite_rank = match testcode_stem(path) {
+        Some("basic") => 0usize,
+        Some("busybox") => 10,
+        Some(_) => 20,
+        None => 99,
     };
-    suite_rank + arch_rank
+    suite_rank + libc_rank
 }
 
-/// Parsed information for a single test case.
-pub struct ParsedTestCase {
-    /// The binary path on disk, e.g. "/glibc/basic/test_brk"
-    pub binary_path: String,
-    /// Working directory for the test, e.g. "/glibc/basic"
-    pub cwd: String,
-    /// Marker name for judge output, e.g. "test_brk"
-    pub marker_name: String,
-}
+fn collect_script_paths() -> Vec<String> {
+    let mut scripts: Vec<String> = crate::fs::ext4_vol::ext4_list_all_file_paths()
+        .into_iter()
+        .filter(|path| is_testcode_script(path))
+        .collect();
 
-/// Parse a `basic_testcode.sh` script to extract test cases.
-///
-/// Most `*_testcode.sh` are simple wrappers that cd into a subdirectory and
-/// call `./run-all.sh`. We understand this pattern so we can resolve the
-/// actual binary paths and set the correct CWD for each test.
-///
-/// Returns `Vec<ParsedTestCase>` with fully resolved paths.
-fn parse_basic_script(script_path: &str, script_text: &str) -> Vec<ParsedTestCase> {
-    // Determine libc prefix from script path: "/glibc/basic_testcode.sh" -> "glibc"
-    // or "/musl/basic_testcode.sh" -> "musl"
-    let libc_prefix = script_path
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("");
-
-    let mut results = Vec::new();
-    let mut in_tests = false;
-    let mut runall_subpath: Option<String> = None;
-    let mut test_dir: Option<String> = if script_path.ends_with("/basic/run-all.sh") {
-        Some(String::from("basic"))
-    } else {
-        None
-    };
-
-    for line in script_text.lines() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
-        }
-
-        // Detect "cd ./basic" or "cd ./<subdir>" pattern
-        // Ignore "cd .." since it's used to restore cwd after running tests
-        if t.starts_with("cd ") && !t.contains("..") {
-            let target = t.trim_start_matches("cd ").trim();
-            let stripped = target.trim_start_matches("./");
-            // Store the subdirectory; we'll prepend the libc prefix later
-            // Only update if not going to parent (..)
-            if !stripped.is_empty() && stripped != ".." {
-                test_dir = Some(stripped.to_string());
-            }
-            continue;
-        }
-
-        // Detect "./run-all.sh" or "./<script>.sh" invocation
-        if t.starts_with("./") && t.ends_with(".sh") {
-            // e.g. "./run-all.sh" -> "run-all.sh"
-            let name = t.trim_start_matches("./");
-            let stripped = name.trim_start_matches("./");
-            runall_subpath = Some(stripped.to_string());
-            continue;
-        }
-
-        // Parse tests="..." block (multiline)
-        if t.starts_with("tests=\"") {
-            in_tests = true;
-            let rest = t.trim_start_matches("tests=\"").trim();
-            if !rest.is_empty() && rest != "\"" {
-                // Single-line case: tests="brk chdir ..."
-                for name in rest.split_whitespace() {
-                    if !name.is_empty() && name != "\"" {
-                        if let Some(tc) = make_test_case(libc_prefix, test_dir.as_deref(), name) {
-                            results.push(tc);
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-        if in_tests {
-            if t == "\"" {
-                in_tests = false;
-                continue;
-            }
-            // Each line inside the tests block is a test name
-            for name in t.split_whitespace() {
-                if !name.is_empty() && name != "\"" {
-                    if let Some(tc) = make_test_case(libc_prefix, test_dir.as_deref(), name) {
-                        results.push(tc);
-                    }
-                }
-            }
-            continue;
-        }
+    #[cfg(feature = "dev-preload")]
+    if scripts.is_empty() {
+        scripts = crate::fs::list_files()
+            .into_iter()
+            .filter(|path| is_testcode_script(path))
+            .collect();
     }
 
-    // If the script also invokes ./run-all.sh, append those test names too.
-    if let Some(ref runall_name) = runall_subpath {
-        // Build the full path to run-all.sh: base_dir + test_dir + runall_name
-        let base_dir = script_path
-            .rsplit('/')
-            .next()
-            .map(|s| {
-                let idx = script_path.len() - s.len();
-                &script_path[..idx]
-            })
-            .unwrap_or("");
-        let base_dir = base_dir.trim_end_matches('/');
-        let runall_path = if let Some(ref dir) = test_dir {
-            alloc::format!("{}/{}/{}", base_dir, dir, runall_name)
-        } else {
-            alloc::format!("{}/{}", base_dir, runall_name)
-        };
-
-        if let Some(bytes) = crate::fs::read_file(&runall_path) {
-            if let Ok(runall_text) = core::str::from_utf8(&bytes) {
-                let dir = test_dir.as_deref().unwrap_or("");
-                for line in runall_text.lines() {
-                    let t = line.trim();
-                    if t.is_empty() || t.starts_with('#') {
-                        continue;
-                    }
-                    if t.starts_with("tests=\"") {
-                        in_tests = true;
-                        let rest = t.trim_start_matches("tests=\"").trim();
-                        if !rest.is_empty() && rest != "\"" {
-                            for name in rest.split_whitespace() {
-                                if !name.is_empty() && name != "\"" {
-                                    if let Some(tc) = make_test_case(libc_prefix, Some(dir), name) {
-                                        if !results.iter().any(|x| {
-                                            x.marker_name == tc.marker_name
-                                                && x.binary_path == tc.binary_path
-                                        }) {
-                                            results.push(tc);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    if in_tests {
-                        if t == "\"" {
-                            in_tests = false;
-                            continue;
-                        }
-                        for name in t.split_whitespace() {
-                            if !name.is_empty() && name != "\"" {
-                                if let Some(tc) = make_test_case(libc_prefix, Some(dir), name) {
-                                    if !results.iter().any(|x| {
-                                        x.marker_name == tc.marker_name
-                                            && x.binary_path == tc.binary_path
-                                    }) {
-                                        results.push(tc);
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-
-    results
+    scripts.sort_by(|a, b| script_rank(a).cmp(&script_rank(b)).then_with(|| a.cmp(b)));
+    scripts.dedup();
+    scripts
 }
 
-/// Helper: create a ParsedTestCase from a test name and directory info.
-/// The raw_name is used directly for the binary path:
-/// - binary_path = /<libc>/<subdir>/<raw_name>
-/// - marker_name = test_<raw_name>
-/// e.g. "brk" with libc="glibc", dir="basic" -> "/glibc/basic/brk", "test_brk"
-fn make_test_case(
-    libc_prefix: &str,
-    test_dir: Option<&str>,
-    raw_name: &str,
-) -> Option<ParsedTestCase> {
-    let name = raw_name.trim();
-    if name.is_empty() || name == "\"" {
-        return None;
-    }
-
-    let raw_without_prefix = name.strip_prefix("test_").unwrap_or(name);
-    let marker_stem = raw_without_prefix.trim_end_matches('_');
-    let marker_name = alloc::format!("test_{}", marker_stem);
-
-    let subdir = test_dir.unwrap_or("").trim_end_matches('/');
-    let dir = if subdir.is_empty() {
-        alloc::format!("/{}", libc_prefix)
-    } else {
-        alloc::format!("/{}/{}", libc_prefix, subdir)
-    };
-
-    let raw_path = alloc::format!("{}/{}", dir, raw_without_prefix);
-    let prefixed_path = alloc::format!("{}/{}", dir, marker_name);
-    let binary_path = if crate::fs::file_exists(&raw_path) {
-        raw_path
-    } else if crate::fs::file_exists(&prefixed_path) {
-        prefixed_path
-    } else {
-        raw_path
-    };
-
-    let cwd = if subdir.is_empty() {
-        alloc::format!("/{}", libc_prefix)
-    } else {
-        alloc::format!("/{}/{}", libc_prefix, subdir)
-    };
-
-    Some(ParsedTestCase {
-        binary_path,
-        cwd,
-        marker_name,
-    })
-}
-
-fn try_start_preloaded_test_harness() -> bool {
+fn try_start_runtime_test_harness() -> bool {
     let scripts = collect_script_paths();
 
     if scripts.is_empty() {
         return false;
     }
 
-    let task = TaskControlBlock::new_kernel_task(run_preloaded_test_harness);
+    let task = TaskControlBlock::new_kernel_task(run_runtime_test_harness);
     set_orphan_reaper(task.clone());
     manager::add_task(task);
     true
 }
 
-fn run_preloaded_test_harness() -> ! {
+fn run_runtime_test_harness() -> ! {
     let scripts = collect_script_paths();
 
     for script in &scripts {
-        let group = script_group_name(script);
-
-        console_write("#### OS COMP TEST GROUP START ");
-        console_write(&group);
-        console_write(" ####\n");
-
-        if let Some(bytes) = crate::fs::read_file(script) {
-            if let Ok(text) = core::str::from_utf8(&bytes) {
-                // Try script-aware parsing first (for basic_testcode.sh)
-                let test_cases = parse_basic_script(script, text);
-                if !test_cases.is_empty() {
-                    if test_cases
-                        .iter()
-                        .any(|case| crate::fs::file_exists(&case.binary_path))
-                    {
-                        for case in &test_cases {
-                            run_one_test_binary_with_spec(case);
-                        }
-                    }
-                } else {
-                    // Fallback: treat as non-basic script, try busybox.
-                    // Keep serial output quiet when the shell path is not ready yet; the
-                    // competition judges consume stdout directly.
-                    let _ = run_script_via_busybox(script);
-                }
-            } else {
-                console_write("[harness] skip non-utf8 script: ");
-                console_write(script);
-                console_write("\n");
-            }
-        } else {
-            console_write("[harness] script missing: ");
+        if !run_script_via_busybox(script) {
+            console_write("[harness] failed to launch script: ");
             console_write(script);
             console_write("\n");
         }
-
-        console_write("#### OS COMP TEST GROUP END ");
-        console_write(&group);
-        console_write(" ####\n");
     }
 
     *crate::trap::FOREGROUND_MODE.lock() = false;
     polyhal::instruction::shutdown();
-}
-
-fn script_group_name(script: &str) -> &'static str {
-    if script.ends_with("/busybox_testcode.sh") {
-        if script.starts_with("/glibc/") {
-            "busybox-glibc"
-        } else if script.starts_with("/musl/") {
-            "busybox-musl"
-        } else {
-            "busybox"
-        }
-    } else if script.starts_with("/glibc/") {
-        "basic-glibc"
-    } else if script.starts_with("/musl/") {
-        "basic-musl"
-    } else {
-        "basic"
-    }
-}
-
-/// Execute a single test binary using a ParsedTestCase specification.
-/// Uses UserProgramSpec to set correct path, argv, envp, cwd, and marker name.
-fn run_one_test_binary_with_spec(case: &ParsedTestCase) {
-    let marker = &case.marker_name;
-
-    // Try to load the ELF first (outside marker region for clean output)
-    let spec = spec_from_case(case);
-    let _ = run_user_program_spec_foreground(&spec);
-
-    let _ = marker;
 }
 
 fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
@@ -725,41 +438,6 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
     *CURRENT_TASK.lock() = None;
 }
 
-/// Helper: construct UserProgramSpec from ParsedTestCase
-fn spec_from_case(case: &ParsedTestCase) -> UserProgramSpec {
-    let (root, logical_path, logical_cwd) =
-        if let Some(rest) = case.binary_path.strip_prefix("/glibc") {
-            let cwd = case.cwd.strip_prefix("/glibc").unwrap_or(&case.cwd);
-            (String::from("/glibc"), rest.to_string(), cwd.to_string())
-        } else if let Some(rest) = case.binary_path.strip_prefix("/musl") {
-            let cwd = case.cwd.strip_prefix("/musl").unwrap_or(&case.cwd);
-            (String::from("/musl"), rest.to_string(), cwd.to_string())
-        } else {
-            (
-                String::from("/"),
-                case.binary_path.clone(),
-                case.cwd.clone(),
-            )
-        };
-
-    // Use logical in-root paths so /lib resolves to /glibc/lib or /musl/lib via task.root.
-    let envp = alloc::vec![
-        String::from("PATH=/bin:/basic:/"),
-        String::from("LD_LIBRARY_PATH=/lib"),
-    ];
-
-    let argv = alloc::vec![logical_path.clone()];
-
-    UserProgramSpec {
-        path: logical_path,
-        argv,
-        envp,
-        cwd: logical_cwd,
-        root,
-        marker_name: Some(case.marker_name.clone()),
-    }
-}
-
 fn logical_path_for_script(script_path: &str) -> Option<(String, String)> {
     if let Some(rest) = script_path.strip_prefix("/glibc") {
         Some((String::from("/glibc"), crate::fs::normalize_path(rest)))
@@ -781,60 +459,24 @@ fn dirname(path: &str) -> String {
     }
 }
 
-fn join_logical_dir(dir: &str, name: &str) -> String {
-    if dir == "/" {
-        alloc::format!("/{}", name)
-    } else {
-        alloc::format!("{}/{}", dir, name)
-    }
-}
-
-fn prepare_busybox_workdir(root: &str, logical_script: &str) -> Option<(String, String)> {
-    let workdir = String::from("/busybox-work");
-    let script_dir = dirname(logical_script);
-    let busybox_host = crate::fs::apply_root(root, "/busybox");
-    let script_host = crate::fs::apply_root(root, logical_script);
-    let cmd_host = crate::fs::apply_root(root, &join_logical_dir(&script_dir, "busybox_cmd.txt"));
-
-    let busybox = crate::fs::read_executable_file(&busybox_host)?;
-    let script = crate::fs::read_file(&script_host)?;
-    // Keep the judge command list exactly as provided by the image. The
-    // success/fail markers must come from BusyBox running real commands.
-    let cmd = crate::fs::read_file(&cmd_host)?;
-
-    let work_host = crate::fs::apply_root(root, &workdir);
-    let busybox_work = alloc::format!("{}/busybox", work_host);
-    let ls_work = alloc::format!("{}/ls", work_host);
-    let script_work = alloc::format!("{}/busybox_testcode.sh", work_host);
-    let cmd_work = alloc::format!("{}/busybox_cmd.txt", work_host);
-
-    let mut mem = crate::fs::MEM_FS.lock();
-    mem.add_dir(&work_host);
-    mem.add_file(&busybox_work, busybox.clone());
-    mem.add_file(&ls_work, busybox);
-    mem.add_file(&script_work, script);
-    mem.add_file(&cmd_work, cmd);
-
-    Some((
-        workdir.clone(),
-        join_logical_dir(&workdir, "busybox_testcode.sh"),
-    ))
-}
-
 fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
     let (root, logical_script) = logical_path_for_script(script_path)?;
-    let (workdir, work_script) = prepare_busybox_workdir(&root, &logical_script)?;
-    let busybox_path = join_logical_dir(&workdir, "busybox");
+    let busybox_path = String::from("/busybox");
+    let busybox_host = crate::fs::apply_root(&root, &busybox_path);
+    let script_host = crate::fs::apply_root(&root, &logical_script);
+
+    crate::fs::read_executable_file(&busybox_host)?;
+    crate::fs::read_file(&script_host)?;
 
     Some(UserProgramSpec {
         path: busybox_path.clone(),
-        argv: alloc::vec![busybox_path.clone(), String::from("sh"), work_script,],
+        argv: alloc::vec![busybox_path.clone(), String::from("sh"), logical_script.clone(),],
         envp: alloc::vec![
             String::from("PATH=.:/:/bin:/usr/bin"),
             String::from("LD_LIBRARY_PATH=/lib"),
             alloc::format!("SHELL={}", busybox_path),
         ],
-        cwd: workdir,
+        cwd: dirname(&logical_script),
         root,
         marker_name: None,
     })

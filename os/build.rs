@@ -38,6 +38,13 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let generated = out_dir.join("preloaded_apps.rs");
 
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DEV_PRELOAD");
+    if env::var_os("CARGO_FEATURE_DEV_PRELOAD").is_none() {
+        fs::write(&generated, "fn preload_generated_programs() {}\n")
+            .expect("write empty preload source");
+        return;
+    }
+
     let image_name = if target.contains("riscv64") {
         "sdcard-rv.img"
     } else if target.contains("loongarch") {

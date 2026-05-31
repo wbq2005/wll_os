@@ -75,6 +75,60 @@ fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
     Ok(result)
 }
 
+struct ScriptInterpreter {
+    path: String,
+    arg: Option<String>,
+}
+
+fn parse_shebang(data: &[u8]) -> Option<ScriptInterpreter> {
+    if data.len() < 2 || &data[..2] != b"#!" {
+        return None;
+    }
+    let end = data.iter().position(|byte| *byte == b'\n').unwrap_or(data.len());
+    let line = core::str::from_utf8(&data[2..end]).ok()?.trim();
+    let mut parts = line.split_whitespace();
+    let path = String::from(parts.next()?);
+    let arg = parts.next().map(String::from);
+    Some(ScriptInterpreter { path, arg })
+}
+
+fn script_interpreter_spec(
+    root: &str,
+    cwd: &str,
+    script_logical_path: &str,
+    interp: ScriptInterpreter,
+    original_argv: &[String],
+) -> Option<(String, Vec<String>)> {
+    let mut interp_logical = crate::fs::resolve_path(cwd, &interp.path);
+    let mut argv = Vec::new();
+
+    let interp_exists =
+        super::with_kernel_page_table(|| crate::fs::file_exists(&crate::fs::apply_root(root, &interp_logical)));
+    let busybox_exists =
+        super::with_kernel_page_table(|| crate::fs::file_exists(&crate::fs::apply_root(root, "/busybox")));
+
+    if !interp_exists && interp_logical == "/bin/sh" && busybox_exists {
+        interp_logical = String::from("/busybox");
+        argv.push(interp_logical.clone());
+        argv.push(String::from("sh"));
+        if let Some(arg) = interp.arg {
+            argv.push(arg);
+        }
+    } else {
+        argv.push(interp_logical.clone());
+        if let Some(arg) = interp.arg {
+            argv.push(arg);
+        }
+    }
+
+    argv.push(String::from(script_logical_path));
+    for arg in original_argv.iter().skip(1) {
+        argv.push(arg.clone());
+    }
+
+    Some((interp_logical, argv))
+}
+
 pub(crate) fn set_user_entry_registers(tf: &mut TrapFrame, sp: usize, argc: usize) {
     let _ = argc;
     // Linux-style ELF entry for RISC-V and LoongArch gets argc/argv from the
@@ -319,7 +373,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     let logical_path = crate::fs::resolve_path(&cwd, &path_str);
     let host_path = crate::fs::apply_root(&root, &logical_path);
 
-    let elf_data = match super::with_kernel_page_table(|| read_executable_file(&host_path)) {
+    let mut elf_data = match super::with_kernel_page_table(|| read_executable_file(&host_path)) {
         Some(data) => data,
         None => {
             log::error!(
@@ -331,19 +385,42 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         }
     };
 
+    // 从 ELF 头中获取 phdr 信息用于 auxv
+    let mut launch_argv = if argv.is_empty() {
+        alloc::vec![logical_path.clone()]
+    } else {
+        argv
+    };
+    let mut exec_logical_path = logical_path.clone();
+
+    if let Some(interp) = parse_shebang(&elf_data) {
+        let Some((interp_logical, script_argv)) =
+            script_interpreter_spec(&root, &cwd, &logical_path, interp, &launch_argv)
+        else {
+            return Err(SysErrNo::ENOEXEC);
+        };
+        let interp_host = crate::fs::apply_root(&root, &interp_logical);
+        elf_data = match super::with_kernel_page_table(|| read_executable_file(&interp_host)) {
+            Some(data) => data,
+            None => {
+                log::error!(
+                    "[syscall] execve: script interpreter not found: {} ({})",
+                    interp_logical,
+                    interp_host
+                );
+                return Err(SysErrNo::ENOENT);
+            }
+        };
+        launch_argv = script_argv;
+        exec_logical_path = interp_logical;
+    }
+
     let elf = match ElfFile::parse(&elf_data) {
         Ok(elf) => elf,
         Err(e) => {
             log::error!("[syscall] execve: failed to parse ELF: {:?}", e);
             return Err(e);
         }
-    };
-
-    // 从 ELF 头中获取 phdr 信息用于 auxv
-    let mut launch_argv = if argv.is_empty() {
-        alloc::vec![logical_path.clone()]
-    } else {
-        argv
     };
 
     let mut interp_path_opt = elf.interp_path();
@@ -498,7 +575,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             inner.program_break = crate::config::USER_HEAP_START;
             inner.mapped_break = crate::config::USER_HEAP_START;
             inner.next_mmap = 0x4000_0000;
-            inner.exec_path = logical_path.clone();
+            inner.exec_path = exec_logical_path.clone();
         }
 
         {

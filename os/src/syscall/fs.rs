@@ -470,7 +470,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallRet {
 
 pub fn sys_chdir(pathname: *const u8) -> SyscallRet {
     let (logical_path, host_path) = resolve_host_path(AT_FDCWD, pathname)?;
-    if !crate::fs::dir_exists(&host_path) {
+    if !super::with_kernel_page_table(|| crate::fs::dir_exists(&host_path)) {
         return Err(SysErrNo::ENOENT);
     }
     if let Some(task) = current_task() {

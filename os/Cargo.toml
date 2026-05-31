@@ -39,6 +39,7 @@ default = ["riscv"]
 riscv = []
 loongarch = ["dep:loongArch64"]
 no-init-idle = []
+dev-preload = []
 
 [[bin]]
 name = "wll_OS"
