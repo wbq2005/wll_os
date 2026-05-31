@@ -12,20 +12,15 @@ fn align_up(value: usize) -> usize {
 
 /// brk 系统调用
 fn copy_to_user_mapped(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
-    let mut addr = dst;
-    for &byte in src {
-        let pa = memory_set.translate(VirtAddr::new(addr)).ok_or_else(|| {
-            log::error!("[syscall] copy_to_user_mapped: unmapped dst {:#x}", addr);
-            SysErrNo::EFAULT
-        })?;
-        unsafe {
-            *(pa.raw() as *mut u8) = byte;
-        }
-        addr += 1;
-    }
-    Ok(())
+    super::user::copy_to_user(dst, src).map_err(|err| {
+        log::error!(
+            "[syscall] copy_to_user_mapped: failed dst={:#x} len={:#x}: {:?}",
+            dst,
+            src.len(),
+            err
+        );
+        err
+    })
 }
 
 pub fn sys_brk(new_brk: usize) -> SyscallRet {

@@ -2,7 +2,6 @@ use super::SyscallRet;
 use crate::task::current_task;
 use crate::timer;
 use crate::utils::error::SysErrNo;
-use polyhal::VirtAddr;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -54,55 +53,15 @@ fn write_c_string(dst: &mut [u8; 65], value: &str) {
 
 /// nanosleep 系统调用
 fn copy_to_user(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
-    if dst == 0 {
-        return Err(SysErrNo::EFAULT);
-    }
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
-    let mut addr = dst;
-    for &byte in src {
-        let pa = memory_set
-            .translate(VirtAddr::new(addr))
-            .ok_or(SysErrNo::EFAULT)?;
-        unsafe {
-            *(pa.raw() as *mut u8) = byte;
-        }
-        addr += 1;
-    }
-    Ok(())
-}
-
-fn copy_from_user(src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
-    if src == 0 {
-        return Err(SysErrNo::EFAULT);
-    }
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
-    let mut addr = src;
-    for byte in dst {
-        let pa = memory_set
-            .translate(VirtAddr::new(addr))
-            .ok_or(SysErrNo::EFAULT)?;
-        *byte = unsafe { *(pa.raw() as *const u8) };
-        addr += 1;
-    }
-    Ok(())
+    super::user::copy_to_user(dst, src)
 }
 
 fn copy_object_to_user<T>(dst: usize, obj: &T) -> Result<(), SysErrNo> {
-    let bytes = unsafe {
-        core::slice::from_raw_parts(obj as *const T as *const u8, core::mem::size_of::<T>())
-    };
-    copy_to_user(dst, bytes)
+    super::user::copy_object_to_user(dst, obj)
 }
 
 fn copy_object_from_user<T: Copy>(src: usize) -> Result<T, SysErrNo> {
-    let mut obj = core::mem::MaybeUninit::<T>::uninit();
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut(obj.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
-    };
-    copy_from_user(src, bytes)?;
-    Ok(unsafe { obj.assume_init() })
+    super::user::copy_object_from_user(src)
 }
 
 pub fn sys_nanosleep(req: usize, rem: usize) -> SyscallRet {
@@ -118,15 +77,13 @@ pub fn sys_nanosleep(req: usize, rem: usize) -> SyscallRet {
     timer::sleep_ms(sleep_ms);
 
     if rem != 0 {
-        unsafe {
-            copy_object_to_user(
-                rem,
-                &TimeSpec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                },
-            )?;
-        }
+        copy_object_to_user(
+            rem,
+            &TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        )?;
     }
 
     Ok(0)
@@ -138,19 +95,15 @@ pub fn sys_gettimeofday(tv: usize, tz: usize) -> SyscallRet {
         return Err(SysErrNo::EFAULT);
     }
     let (sec, usec) = timer::get_timeval();
-    unsafe {
-        copy_object_to_user(
-            tv,
-            &TimeVal {
-                tv_sec: sec,
-                tv_usec: usec,
-            },
-        )?;
-    }
+    copy_object_to_user(
+        tv,
+        &TimeVal {
+            tv_sec: sec,
+            tv_usec: usec,
+        },
+    )?;
     if tz != 0 {
-        unsafe {
-            copy_to_user(tz, &[0; 8])?;
-        }
+        copy_to_user(tz, &[0; 8])?;
     }
     Ok(0)
 }
@@ -160,15 +113,13 @@ pub fn sys_clock_gettime(_clock_id: usize, tp: usize) -> SyscallRet {
         return Err(SysErrNo::EFAULT);
     }
     let time_us = timer::get_time_us();
-    unsafe {
-        copy_object_to_user(
-            tp,
-            &TimeSpec {
-                tv_sec: time_us / 1_000_000,
-                tv_nsec: (time_us % 1_000_000) * 1000,
-            },
-        )?;
-    }
+    copy_object_to_user(
+        tp,
+        &TimeSpec {
+            tv_sec: time_us / 1_000_000,
+            tv_nsec: (time_us % 1_000_000) * 1000,
+        },
+    )?;
     Ok(0)
 }
 
@@ -176,15 +127,13 @@ pub fn sys_clock_getres(_clock_id: usize, tp: usize) -> SyscallRet {
     if tp == 0 {
         return Err(SysErrNo::EFAULT);
     }
-    unsafe {
-        copy_object_to_user(
-            tp,
-            &TimeSpec {
-                tv_sec: 0,
-                tv_nsec: 1_000,
-            },
-        )?;
-    }
+    copy_object_to_user(
+        tp,
+        &TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 1_000,
+        },
+    )?;
     Ok(0)
 }
 
@@ -210,26 +159,22 @@ pub fn sys_uname(buf: usize) -> SyscallRet {
     #[cfg(target_arch = "loongarch64")]
     write_c_string(&mut uts.machine, "loongarch64");
     write_c_string(&mut uts.domainname, "localdomain");
-    unsafe {
-        copy_object_to_user(buf, &uts)?;
-    }
+    copy_object_to_user(buf, &uts)?;
     Ok(0)
 }
 
 pub fn sys_times(buf: usize) -> SyscallRet {
     if buf != 0 {
         let ticks = timer::get_time() as isize;
-        unsafe {
-            copy_object_to_user(
-                buf,
-                &Tms {
-                    tms_utime: ticks,
-                    tms_stime: 0,
-                    tms_cutime: 0,
-                    tms_cstime: 0,
-                },
-            )?;
-        }
+        copy_object_to_user(
+            buf,
+            &Tms {
+                tms_utime: ticks,
+                tms_stime: 0,
+                tms_cutime: 0,
+                tms_cstime: 0,
+            },
+        )?;
     }
     Ok(timer::get_time())
 }
@@ -262,15 +207,13 @@ pub fn sys_prlimit64(
 ) -> SyscallRet {
     let _ = new_limit;
     if old_limit != 0 {
-        unsafe {
-            copy_object_to_user(
-                old_limit,
-                &RLimit {
-                    rlim_cur: usize::MAX,
-                    rlim_max: usize::MAX,
-                },
-            )?;
-        }
+        copy_object_to_user(
+            old_limit,
+            &RLimit {
+                rlim_cur: usize::MAX,
+                rlim_max: usize::MAX,
+            },
+        )?;
     }
     Ok(0)
 }

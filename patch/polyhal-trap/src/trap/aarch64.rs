@@ -101,7 +101,7 @@ pub fn init() {
     VBAR_EL1.set(exception_vector_base as _);
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn user_restore(context: *mut TrapFrame) -> TrapKind {
     unsafe {
         naked_asm!(

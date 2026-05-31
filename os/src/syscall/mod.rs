@@ -3,6 +3,7 @@ pub mod mm;
 pub mod other;
 pub mod process;
 pub mod signal;
+pub(crate) mod user;
 
 pub use crate::utils::error::SysErrNo;
 

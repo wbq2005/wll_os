@@ -285,7 +285,7 @@ impl IndexMut<KContextArgs> for KContext {
 /// Context Switch
 ///
 /// Save the context of current task and switch to new task.
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn context_switch(from: *mut KContext, to: *const KContext) {
     naked_asm!(
         // Save Kernel Context.
@@ -312,7 +312,7 @@ pub unsafe extern "C" fn context_switch_pt(
 /// Context Switch With Page Table Implement
 ///
 /// The detail implementation of [context_switch_pt].
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn context_switch_pt_impl(
     from: *mut KContext,
     to: *const KContext,
@@ -336,7 +336,7 @@ unsafe extern "C" fn context_switch_pt_impl(
 }
 
 #[cfg(feature = "fp_simd")]
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn save_fp_regs(from: *mut KContext) {
     naked_asm!(
         // Save floating point registers.
@@ -348,7 +348,7 @@ pub unsafe extern "C" fn save_fp_regs(from: *mut KContext) {
 }
 
 #[cfg(feature = "fp_simd")]
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn restore_fp_regs(to: *const KContext) {
     naked_asm!(
         "addi.d    $a0, $a0, {fp_offset}",
@@ -358,7 +358,7 @@ pub unsafe extern "C" fn restore_fp_regs(to: *const KContext) {
     )
 }
 
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn read_current_tp() -> usize {
     naked_asm!(
         "

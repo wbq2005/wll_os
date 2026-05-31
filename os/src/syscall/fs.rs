@@ -93,74 +93,19 @@ struct IoVec {
 }
 
 fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
-    if ptr.is_null() {
-        return Err(SysErrNo::EFAULT);
-    }
-
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
-    let mut bytes = alloc::vec::Vec::new();
-    let mut addr = ptr as usize;
-    const MAX_PATH_LEN: usize = 4096;
-
-    for _ in 0..MAX_PATH_LEN {
-        let pa = memory_set
-            .translate(polyhal::VirtAddr::new(addr))
-            .ok_or(SysErrNo::EFAULT)?;
-        let byte = unsafe { *(pa.raw() as *const u8) };
-        if byte == 0 {
-            return String::from_utf8(bytes).map_err(|_| SysErrNo::EINVAL);
-        }
-        bytes.push(byte);
-        addr += 1;
-    }
-
-    Err(SysErrNo::EFAULT)
+    super::user::read_cstr(ptr as usize)
 }
 
 fn copy_to_user(dst: *mut u8, src: &[u8]) -> Result<(), SysErrNo> {
-    if dst.is_null() {
-        return Err(SysErrNo::EFAULT);
-    }
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
-    let mut addr = dst as usize;
-    for &byte in src {
-        let pa = memory_set
-            .translate(polyhal::VirtAddr::new(addr))
-            .ok_or(SysErrNo::EFAULT)?;
-        unsafe {
-            *(pa.raw() as *mut u8) = byte;
-        }
-        addr += 1;
-    }
-    Ok(())
+    super::user::copy_to_user(dst as usize, src)
 }
 
 fn copy_from_user(src: *const u8, dst: &mut [u8]) -> Result<(), SysErrNo> {
-    if src.is_null() {
-        return Err(SysErrNo::EFAULT);
-    }
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
-    let mut addr = src as usize;
-    for byte in dst {
-        let pa = memory_set
-            .translate(polyhal::VirtAddr::new(addr))
-            .ok_or(SysErrNo::EFAULT)?;
-        *byte = unsafe { *(pa.raw() as *const u8) };
-        addr += 1;
-    }
-    Ok(())
+    super::user::copy_from_user(src as usize, dst)
 }
 
 fn copy_object_from_user<T: Copy>(src: *const T) -> Result<T, SysErrNo> {
-    let mut obj = core::mem::MaybeUninit::<T>::uninit();
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut(obj.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
-    };
-    copy_from_user(src as *const u8, bytes)?;
-    Ok(unsafe { obj.assume_init() })
+    super::user::copy_object_from_user(src as usize)
 }
 
 fn resolve_path(dirfd: isize, pathname: *const u8) -> Result<String, SysErrNo> {

@@ -122,7 +122,7 @@ impl IndexMut<KContextArgs> for KContext {
 /// Context Switch
 ///
 /// Save the context of current task and switch to new task.
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn context_switch(from: *mut KContext, to: *const KContext) {
     naked_asm!(
         // Save Kernel Context.
@@ -149,7 +149,7 @@ pub unsafe extern "C" fn context_switch_pt(
 /// Context Switch With Page Table Implement
 ///
 /// The detail implementation of [context_switch_pt].
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn context_switch_pt_impl(
     from: *mut KContext,
     to: *const KContext,
@@ -173,7 +173,7 @@ unsafe extern "C" fn context_switch_pt_impl(
 }
 
 /// Read thread pointer currently.
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn read_current_tp() -> usize {
     unsafe {
         naked_asm!(

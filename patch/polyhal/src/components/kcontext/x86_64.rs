@@ -147,7 +147,7 @@ impl IndexMut<KContextArgs> for KContext {
 /// # Safety
 ///
 /// This function is unsafe because it performs a context switch, which can lead to undefined behavior if not used correctly.
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn context_switch(from: *mut KContext, to: *const KContext) {
     naked_asm!(
         // Save Kernel Context.
@@ -185,7 +185,7 @@ pub unsafe extern "C" fn context_switch_pt(
 /// Context Switch With Page Table Implement
 ///
 /// The detail implementation of [context_switch_pt].
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn context_switch_pt_impl(
     from: *mut KContext,
     to: *const KContext,

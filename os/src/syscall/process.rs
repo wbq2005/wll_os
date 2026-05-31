@@ -35,34 +35,12 @@ const THREAD_SHARING_FLAGS: usize = CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLO
 
 const WNOHANG: usize = 0x0000_0001;
 
-/// 从用户态指针数组读取字符串列表（argv 或 envp），遇 NULL 终止。
-fn read_user_byte(addr: usize) -> Result<u8, SysErrNo> {
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let ms = task.memory_set.lock();
-    let pa = ms.translate(VirtAddr::new(addr)).ok_or(SysErrNo::EFAULT)?;
-    Ok(unsafe { *(pa.raw() as *const u8) })
-}
-
 fn read_user_usize(addr: usize) -> Result<usize, SysErrNo> {
-    let mut bytes = [0u8; core::mem::size_of::<usize>()];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = read_user_byte(addr + i)?;
-    }
-    Ok(usize::from_le_bytes(bytes))
+    super::user::read_usize(addr)
 }
 
 fn write_user_i32(addr: usize, value: i32) -> Result<(), SysErrNo> {
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let ms = task.memory_set.lock();
-    for (i, byte) in value.to_le_bytes().iter().enumerate() {
-        let pa = ms
-            .translate(VirtAddr::new(addr + i))
-            .ok_or(SysErrNo::EFAULT)?;
-        unsafe {
-            *(pa.raw() as *mut u8) = *byte;
-        }
-    }
-    Ok(())
+    super::user::write_i32(addr, value)
 }
 
 fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
@@ -101,22 +79,8 @@ fn reset_exec_trapframe(tf: &mut TrapFrame, entry: usize, sp: usize, argc: usize
     tf[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
 }
 
-const MAX_CSTR_LEN: usize = 4096;
-
 fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
-    if ptr.is_null() {
-        return Ok(String::new());
-    }
-    let mut bytes = Vec::new();
-    let base = ptr as usize;
-    for i in 0..MAX_CSTR_LEN {
-        let byte = read_user_byte(base + i)?;
-        if byte == 0 {
-            return String::from_utf8(bytes).map_err(|_| SysErrNo::EINVAL);
-        }
-        bytes.push(byte);
-    }
-    Err(SysErrNo::EINVAL)
+    super::user::read_cstr_null_empty(ptr as usize)
 }
 
 /// 在用户栈上构造 argc/argv/envp/auxv 布局，返回新的栈顶。
