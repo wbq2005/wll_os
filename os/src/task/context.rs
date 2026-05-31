@@ -47,7 +47,7 @@ impl TaskContext {
 /// 保存当前任务的上下文到 `current_task_ctx`，
 /// 从 `next_task_ctx` 恢复下一个任务的上下文
 #[cfg(target_arch = "riscv64")]
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 pub unsafe extern "C" fn switch_to(
     _current_task_ctx: *mut TaskContext,
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn switch_to(
 
 /// 上下文切换 (LoongArch)
 #[cfg(target_arch = "loongarch64")]
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 pub unsafe extern "C" fn switch_to(
     _current_task_ctx: *mut TaskContext,

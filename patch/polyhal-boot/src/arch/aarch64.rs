@@ -71,7 +71,7 @@ unsafe extern "C" fn init_boot_page_table() {
     }
 }
 /// The earliest entry point for the primary CPU.
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 #[link_section = ".text.entry"]
 unsafe extern "C" fn _start() -> ! {
@@ -103,7 +103,7 @@ unsafe extern "C" fn _start() -> ! {
 }
 
 /// The secondary core boot entry point.
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 unsafe extern "C" fn _secondary_start() -> ! {
     naked_asm!("

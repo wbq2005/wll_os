@@ -97,7 +97,7 @@ fn kernel_callback(context: &mut TrapFrame) -> TrapType {
     trap_type
 }
 
-#[unsafe(naked)]
+#[naked]
 #[allow(named_asm_labels)]
 pub unsafe extern "C" fn kernelvec() {
     naked_asm!(
@@ -155,7 +155,7 @@ extern "C" fn kernel_skip_sret() {
     }
 }
 
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 unsafe extern "C" fn user_restore(context: *mut TrapFrame) {
     naked_asm!(
@@ -196,7 +196,7 @@ unsafe extern "C" fn user_restore(context: *mut TrapFrame) {
         )
 }
 
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 #[allow(named_asm_labels)]
 pub unsafe extern "C" fn uservec() {

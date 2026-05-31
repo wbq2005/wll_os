@@ -95,7 +95,7 @@ fn kernel_callback(context: &mut TrapFrame) {
 /// # Safety
 ///
 /// This function is unsafe because it performs low-level operations
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 pub unsafe extern "C" fn kernelvec() {
     naked_asm!(
@@ -140,7 +140,7 @@ pub unsafe extern "C" fn kernelvec() {
 ///
 /// This function is unsafe because it performs low-level operations
 /// that can lead to undefined behavior if not used correctly.
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 pub unsafe extern "C" fn uservec() {
     naked_asm!(
@@ -175,7 +175,7 @@ pub unsafe extern "C" fn uservec() {
     );
 }
 
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 pub unsafe extern "C" fn user_restore(context: *mut TrapFrame) {
     unsafe {
@@ -242,7 +242,7 @@ pub unsafe extern "C" fn user_restore(context: *mut TrapFrame) {
     }
 }
 
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn sysretq() {
     naked_asm!(
         "
@@ -290,7 +290,7 @@ pub fn init() {
     init_syscall();
 }
 
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn syscall_entry() {
     naked_asm!(
         includes_trap_macros!(),

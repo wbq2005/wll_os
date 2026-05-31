@@ -12,7 +12,7 @@ use loongArch64::register::{
 use polyhal::irq::TIMER_IRQ;
 use unaligned::emulate_load_store_insn;
 
-#[unsafe(naked)]
+#[naked]
 pub unsafe extern "C" fn user_vec() {
     naked_asm!(
         includes_trap_macros!(),
@@ -41,7 +41,7 @@ pub unsafe extern "C" fn user_vec() {
     );
 }
 
-#[unsafe(naked)]
+#[naked]
 #[no_mangle]
 pub unsafe extern "C" fn user_restore(context: *mut TrapFrame) {
     naked_asm!(
@@ -91,7 +91,7 @@ pub fn run_user_task(cx: &mut TrapFrame) -> EscapeReason {
     loongarch64_trap_handler(cx).into()
 }
 
-#[unsafe(naked)]
+#[naked]
 pub unsafe extern "C" fn trap_vector_base() {
     naked_asm!(
         includes_trap_macros!(),
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn trap_vector_base() {
     );
 }
 
-#[unsafe(naked)]
+#[naked]
 pub unsafe extern "C" fn tlb_fill() {
     naked_asm!(
         "
