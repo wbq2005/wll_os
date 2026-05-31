@@ -35,6 +35,7 @@ pub enum SysErrNo {
     EPIPE = 32,     // Broken pipe
     EDOM = 33,      // Math argument out of domain of func
     ERANGE = 34,    // Math result not representable
+    ENOTEMPTY = 39, // Directory not empty
     ECANCELED = 47, // Operation canceled (used by exit in foreground mode)
     ENOSYS = 38,    // Invalid system call number
 }

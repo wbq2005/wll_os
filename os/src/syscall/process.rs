@@ -31,6 +31,8 @@ const CLONE_SIGHAND: usize = 0x00000800;
 
 const CLONE_THREAD: usize = 0x00010000;
 
+const CLONE_SETTLS: usize = 0x00080000;
+
 const THREAD_SHARING_FLAGS: usize = CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 
 const WNOHANG: usize = 0x0000_0001;
@@ -275,7 +277,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     let logical_path = crate::fs::resolve_path(&cwd, &path_str);
     let host_path = crate::fs::apply_root(&root, &logical_path);
 
-    let elf_data = match read_file(&host_path) {
+    let elf_data = match super::with_kernel_page_table(|| read_file(&host_path)) {
         Some(data) => data,
         None => {
             log::error!(
@@ -315,14 +317,15 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     let (new_memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) =
         if let Some(interp) = interp_path_opt {
             let (interp_path, interp_host_path, interp_data) =
-                crate::fs::read_interpreter(&root, interp).ok_or_else(|| {
-                    log::error!(
-                        "[syscall] execve: interpreter not found: {} ({})",
-                        crate::fs::normalize_path(interp),
-                        crate::fs::apply_root(&root, interp)
-                    );
-                    SysErrNo::ENOENT
-                })?;
+                super::with_kernel_page_table(|| crate::fs::read_interpreter(&root, interp))
+                    .ok_or_else(|| {
+                        log::error!(
+                            "[syscall] execve: interpreter not found: {} ({})",
+                            crate::fs::normalize_path(interp),
+                            crate::fs::apply_root(&root, interp)
+                        );
+                        SysErrNo::ENOENT
+                    })?;
             log::info!(
                 "[syscall] execve: interpreter {} resolved to {}",
                 interp_path,
@@ -658,17 +661,8 @@ pub fn sys_clone(
     if stack != 0 {
         child_tf[TrapFrameArgs::SP] = stack;
     }
-    #[cfg(target_arch = "riscv64")]
-    {
-        if tls != 0 {
-            child_tf[TrapFrameArgs::TLS] = tls;
-        }
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        if tls != 0 {
-            child_tf[TrapFrameArgs::TLS] = tls;
-        }
+    if (clone_bits & CLONE_SETTLS) != 0 {
+        child_tf[TrapFrameArgs::TLS] = tls;
     }
 
     let memory_set = new_shared_memory_set(parent.memory_set.lock().clone());

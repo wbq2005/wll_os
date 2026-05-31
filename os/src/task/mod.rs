@@ -201,7 +201,9 @@ fn report_no_init_and_maybe_shutdown(reason: &str) {
 }
 
 /// 合并 MemFS + ext4 上的脚本路径（运行时扫描；编译期预载仍写入 MemFS）。
-/// 只匹配顶层 *_testcode.sh，忽略 run-all.sh（由 *_testcode.sh 间接调用）。
+/// For the score-bearing path, run basic first, then the BusyBox scripts.
+/// Later suites are intentionally not pulled in here yet: their shell scripts can
+/// run for a long time before the required syscall surface is ready.
 fn collect_script_paths() -> Vec<String> {
     let all_files = crate::fs::list_files();
 
@@ -217,6 +219,13 @@ fn collect_script_paths() -> Vec<String> {
         }
     }
 
+    for prefix in ["/glibc", "/musl"] {
+        let busybox = alloc::format!("{}/busybox_testcode.sh", prefix);
+        if crate::fs::file_exists(&busybox) || all_files.iter().any(|path| path == &busybox) {
+            scripts.push(busybox);
+        }
+    }
+
     if !scripts.is_empty() {
         return scripts;
     }
@@ -225,22 +234,30 @@ fn collect_script_paths() -> Vec<String> {
         .into_iter()
         .filter(|path| {
             let name = path.rsplit('/').next().unwrap_or(path);
-            name == "basic_testcode.sh"
+            name == "basic_testcode.sh" || name == "busybox_testcode.sh"
         })
         .collect();
     scripts.sort_by(|a, b| {
-        let rank = |path: &String| {
-            if path.starts_with("/glibc/") {
-                0usize
-            } else if path.starts_with("/musl/") {
-                1
-            } else {
-                2
-            }
-        };
+        let rank = |path: &String| script_rank(path);
         rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
     });
     scripts
+}
+
+fn script_rank(path: &str) -> usize {
+    let arch_rank = if path.starts_with("/glibc/") {
+        0usize
+    } else if path.starts_with("/musl/") {
+        1
+    } else {
+        2
+    };
+    let suite_rank = if path.ends_with("/busybox_testcode.sh") {
+        10usize
+    } else {
+        0
+    };
+    suite_rank + arch_rank
 }
 
 /// Parsed information for a single test case.
@@ -477,7 +494,7 @@ fn run_preloaded_test_harness() -> ! {
     let scripts = collect_script_paths();
 
     for script in &scripts {
-        let group = basic_group_name(script);
+        let group = script_group_name(script);
 
         console_write("#### OS COMP TEST GROUP START ");
         console_write(&group);
@@ -522,8 +539,16 @@ fn run_preloaded_test_harness() -> ! {
     polyhal::instruction::shutdown();
 }
 
-fn basic_group_name(script: &str) -> &'static str {
-    if script.starts_with("/glibc/") {
+fn script_group_name(script: &str) -> &'static str {
+    if script.ends_with("/busybox_testcode.sh") {
+        if script.starts_with("/glibc/") {
+            "busybox-glibc"
+        } else if script.starts_with("/musl/") {
+            "busybox-musl"
+        } else {
+            "busybox"
+        }
+    } else if script.starts_with("/glibc/") {
         "basic-glibc"
     } else if script.starts_with("/musl/") {
         "basic-musl"
@@ -539,17 +564,21 @@ fn run_one_test_binary_with_spec(case: &ParsedTestCase) {
 
     // Try to load the ELF first (outside marker region for clean output)
     let spec = spec_from_case(case);
-    let task = match TaskControlBlock::new_user_with_args_env_cwd(&spec) {
+    let _ = run_user_program_spec_foreground(&spec);
+
+    let _ = marker;
+}
+
+fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
+    let task = match TaskControlBlock::new_user_with_args_env_cwd(spec) {
         Ok(task) => task,
         Err(_err) => {
-            return;
+            return false;
         }
     };
 
-    // From the START marker until the foreground runner exits, timer interrupts
-    // must not reschedule the kernel harness task away.
-    // Tell exit_current_and_run_next which kernel task to re-add to the ready queue.
-    // Keep the harness Arc alive for the duration of the foreground task.
+    // From launch until the foreground runner exits, timer interrupts must not
+    // reschedule the kernel harness task away.
     let harness = current_task();
     if let Some(ref h) = harness {
         let ptr = Arc::into_raw(h.clone()) as usize;
@@ -557,26 +586,21 @@ fn run_one_test_binary_with_spec(case: &ParsedTestCase) {
     }
     *crate::trap::FOREGROUND_MODE.lock() = true;
 
-    // Prefer a foreground driver model for harness stability:
-    // directly enter the user task from here, without relying on
-    // enqueue + yield + kernel-task resumption.
     run_user_task_foreground(task.clone());
     if let Some(ref h) = harness {
         h.set_status(TaskStatus::Running);
         *CURRENT_TASK.lock() = Some(h.clone());
     }
 
-    // Foreground task done. Clear the harness pointer so future non-FG scheduling doesn't use it.
     let ptr = crate::trap::get_foreground_harness();
     if ptr != 0 {
-        // SAFETY: ptr was created by Arc::into_raw, owning the TCB.
-        // Reconstruct and drop it.
+        // SAFETY: ptr was created by Arc::into_raw above for this foreground run.
         let _harness = unsafe { Arc::from_raw(ptr as *const TaskControlBlock) };
     }
     crate::trap::set_foreground_harness(0);
     *crate::trap::FOREGROUND_MODE.lock() = false;
 
-    let _ = marker;
+    true
 }
 
 fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
@@ -736,22 +760,107 @@ fn spec_from_case(case: &ParsedTestCase) -> UserProgramSpec {
     }
 }
 
-/// Execute a script via busybox shell.
-///
-/// This is a Phase 2 placeholder. For the first round (basic tests),
-/// we rely on parse_basic_script + run_one_test_binary_with_spec instead.
-///
-/// Returns `true` if the script was executed, `false` if not available.
+fn logical_path_for_script(script_path: &str) -> Option<(String, String)> {
+    if let Some(rest) = script_path.strip_prefix("/glibc") {
+        Some((String::from("/glibc"), crate::fs::normalize_path(rest)))
+    } else if let Some(rest) = script_path.strip_prefix("/musl") {
+        Some((String::from("/musl"), crate::fs::normalize_path(rest)))
+    } else if script_path.starts_with('/') {
+        Some((String::from("/"), crate::fs::normalize_path(script_path)))
+    } else {
+        None
+    }
+}
+
+fn dirname(path: &str) -> String {
+    let norm = crate::fs::normalize_path(path);
+    match norm.rfind('/') {
+        Some(0) => String::from("/"),
+        Some(idx) => norm[..idx].to_string(),
+        None => String::from("/"),
+    }
+}
+
+fn join_logical_dir(dir: &str, name: &str) -> String {
+    if dir == "/" {
+        alloc::format!("/{}", name)
+    } else {
+        alloc::format!("{}/{}", dir, name)
+    }
+}
+
+fn normalize_busybox_cmds(mut cmd: Vec<u8>) -> Vec<u8> {
+    let Ok(text) = core::str::from_utf8(&cmd) else {
+        return cmd;
+    };
+    if text.lines().any(|line| line.trim() == "kill 10") {
+        return cmd;
+    }
+
+    if !cmd.ends_with(b"\n") {
+        cmd.push(b'\n');
+    }
+    cmd.extend_from_slice(b"kill 10\n");
+    cmd
+}
+
+fn prepare_busybox_workdir(root: &str, logical_script: &str) -> Option<(String, String)> {
+    let workdir = String::from("/busybox-work");
+    let script_dir = dirname(logical_script);
+    let busybox_host = crate::fs::apply_root(root, "/busybox");
+    let script_host = crate::fs::apply_root(root, logical_script);
+    let cmd_host = crate::fs::apply_root(root, &join_logical_dir(&script_dir, "busybox_cmd.txt"));
+
+    let busybox = crate::fs::read_file(&busybox_host)?;
+    let script = crate::fs::read_file(&script_host)?;
+    let cmd = normalize_busybox_cmds(crate::fs::read_file(&cmd_host)?);
+
+    let work_host = crate::fs::apply_root(root, &workdir);
+    let busybox_work = alloc::format!("{}/busybox", work_host);
+    let ls_work = alloc::format!("{}/ls", work_host);
+    let script_work = alloc::format!("{}/busybox_testcode.sh", work_host);
+    let cmd_work = alloc::format!("{}/busybox_cmd.txt", work_host);
+
+    let mut mem = crate::fs::MEM_FS.lock();
+    mem.add_dir(&work_host);
+    mem.add_file(&busybox_work, busybox.clone());
+    mem.add_file(&ls_work, busybox);
+    mem.add_file(&script_work, script);
+    mem.add_file(&cmd_work, cmd);
+
+    Some((
+        workdir.clone(),
+        join_logical_dir(&workdir, "busybox_testcode.sh"),
+    ))
+}
+
+fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
+    let (root, logical_script) = logical_path_for_script(script_path)?;
+    let (workdir, work_script) = prepare_busybox_workdir(&root, &logical_script)?;
+    let busybox_path = join_logical_dir(&workdir, "busybox");
+
+    Some(UserProgramSpec {
+        path: busybox_path.clone(),
+        argv: alloc::vec![busybox_path.clone(), String::from("sh"), work_script,],
+        envp: alloc::vec![
+            String::from("PATH=.:/:/bin:/usr/bin"),
+            String::from("LD_LIBRARY_PATH=/lib"),
+            alloc::format!("SHELL={}", busybox_path),
+        ],
+        cwd: workdir,
+        root,
+        marker_name: None,
+    })
+}
+
+/// Execute a script through the real BusyBox shell in the matching libc root.
+/// Returns `true` if the shell task was launched, `false` if required files are
+/// missing or the script is outside a known root.
 pub fn run_script_via_busybox(script_path: &str) -> bool {
-    // Phase 2 implementation will:
-    // - Read /musl/busybox or /glibc/busybox ELF
-    // - Set argv = ["/musl/busybox", "sh", script_path]
-    // - Set cwd = dirname(script_path)
-    // - Set envp = PATH=/bin
-    // - Create user task and wait for completion
-    // For now, always fail so we fall back gracefully
-    let _ = script_path;
-    false
+    let Some(spec) = busybox_script_spec(script_path) else {
+        return false;
+    };
+    run_user_program_spec_foreground(&spec)
 }
 
 /// 开始运行任务

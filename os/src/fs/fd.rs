@@ -148,6 +148,41 @@ impl FileDescriptor {
         matches!(self, FileDescriptor::PipeRead { nonblock: true, .. })
     }
 
+    pub fn poll_read_ready(&self) -> bool {
+        match self {
+            FileDescriptor::Stdin => true,
+            FileDescriptor::MemFile {
+                content, offset, ..
+            } => *offset < content.len(),
+            FileDescriptor::Ext4Regular {
+                ino,
+                offset,
+                readable,
+                ..
+            } => {
+                *readable
+                    && ext4_vol::regular_file_size(*ino)
+                        .map(|size| *offset < size)
+                        .unwrap_or(false)
+            }
+            FileDescriptor::PipeRead { state, .. } => {
+                let pipe = state.lock();
+                !pipe.buf.is_empty() || pipe.writers == 0
+            }
+            _ => false,
+        }
+    }
+
+    pub fn poll_write_ready(&self) -> bool {
+        match self {
+            FileDescriptor::Stdout | FileDescriptor::Stderr => true,
+            FileDescriptor::MemFile { writable, .. } => *writable,
+            FileDescriptor::Ext4Regular { writable, .. } => *writable,
+            FileDescriptor::PipeWrite { state, .. } => state.lock().readers > 0,
+            _ => false,
+        }
+    }
+
     /// 检查文件是否可读
     pub fn readable(&self) -> bool {
         match self {
@@ -808,6 +843,32 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
         }
     }
 
+    let mem = fs::MEM_FS.lock();
+    let mem_has_file = mem.get_file(&path_norm).is_some();
+    drop(mem);
+
+    if mem_has_file {
+        if want_dir {
+            return Err(SysErrNo::ENOTDIR);
+        }
+        if want_excl && want_create {
+            return Err(SysErrNo::EEXIST);
+        }
+        let mut content = fs::read_file(&path_norm).unwrap_or_default();
+        if want_trunc && write_ok {
+            content.clear();
+            fs::MEM_FS.lock().truncate_file(&path_norm, 0)?;
+        }
+        let base_off = if append && write_ok { content.len() } else { 0 };
+        return Ok(FileDescriptor::MemFile {
+            name: path_norm,
+            content,
+            offset: base_off,
+            writable: write_ok,
+            append,
+        });
+    }
+
     if fs::dir_exists(&path_norm) {
         if write_ok || want_trunc || want_create {
             return Err(SysErrNo::EISDIR);
@@ -839,29 +900,6 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
 
     if fs::dir_exists(&path_norm) {
         return Err(SysErrNo::EISDIR);
-    }
-
-    let mem = fs::MEM_FS.lock();
-    let mem_has_file = mem.get_file(&path_norm).is_some();
-    drop(mem);
-
-    if mem_has_file {
-        if want_excl && want_create {
-            return Err(SysErrNo::EEXIST);
-        }
-        let mut content = fs::read_file(&path_norm).unwrap_or_default();
-        if want_trunc && write_ok {
-            content.clear();
-            fs::MEM_FS.lock().truncate_file(&path_norm, 0)?;
-        }
-        let base_off = if append && write_ok { content.len() } else { 0 };
-        return Ok(FileDescriptor::MemFile {
-            name: path_norm,
-            content,
-            offset: base_off,
-            writable: write_ok,
-            append,
-        });
     }
 
     if !removed && ext4_vol::ext4_regular_file_exists(&path_norm) {

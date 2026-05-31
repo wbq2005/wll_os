@@ -112,6 +112,66 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
     Err(SysErrNo::ENOENT)
 }
 
+pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
+    let norm = normalize_path(path);
+    let mut m = MEM_FS.lock();
+    if m.is_dir(&norm) {
+        return m.remove_dir(&norm);
+    }
+    drop(m);
+    if ext4_vol::ext4_regular_file_exists(&norm) {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    if ext4_vol::ext4_dir_path_exists(&norm) {
+        if !list_dir(&norm)?.is_empty() {
+            return Err(SysErrNo::ENOTEMPTY);
+        }
+        WHITEOUTS.lock().insert(norm);
+        return Ok(());
+    }
+    Err(SysErrNo::ENOENT)
+}
+
+pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrNo> {
+    let old = normalize_path(old);
+    let new = normalize_path(new);
+    if no_replace && (file_exists(&new) || dir_exists(&new)) {
+        return Err(SysErrNo::EEXIST);
+    }
+
+    let mut m = MEM_FS.lock();
+    if m.exists(&old) {
+        if !no_replace
+            && (ext4_vol::ext4_regular_file_exists(&new) || ext4_vol::ext4_dir_path_exists(&new))
+        {
+            return Err(SysErrNo::EEXIST);
+        }
+        let result = m.rename_path(&old, &new);
+        if result.is_ok() {
+            clear_whiteout(&new);
+        }
+        return result;
+    }
+    drop(m);
+
+    if ext4_vol::ext4_regular_file_exists(&old) {
+        if dir_exists(&new) {
+            return Err(SysErrNo::EISDIR);
+        }
+        let content = read_file(&old).ok_or(SysErrNo::ENOENT)?;
+        WHITEOUTS.lock().insert(old);
+        clear_whiteout(&new);
+        MEM_FS.lock().add_file(&new, content);
+        return Ok(());
+    }
+
+    if ext4_vol::ext4_dir_path_exists(&old) {
+        return Err(SysErrNo::EXDEV);
+    }
+
+    Err(SysErrNo::ENOENT)
+}
+
 pub fn create_dir(path: &str) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
     if file_exists(&norm) || dir_exists(&norm) {

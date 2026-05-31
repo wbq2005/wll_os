@@ -13,6 +13,17 @@ const AT_FDCWD: isize = -100;
 /// 系统调用返回值类型
 pub type SyscallRet = Result<usize, SysErrNo>;
 
+pub(crate) fn with_kernel_page_table<T>(f: impl FnOnce() -> T) -> T {
+    crate::trap::restore_kernel_page_table();
+    let result = f();
+    if let Some(task) = crate::task::current_task() {
+        if !task.is_kernel {
+            task.memory_set.lock().activate();
+        }
+    }
+    result
+}
+
 /// 系统调用号定义
 pub const SYSCALL_GETCWD: usize = 17;
 pub const SYSCALL_DUP: usize = 23;
@@ -24,6 +35,7 @@ pub const SYSCALL_UNLINKAT: usize = 35;
 pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_UMOUNT2: usize = 39;
 pub const SYSCALL_MOUNT: usize = 40;
+pub const SYSCALL_FACCESSAT: usize = 48;
 pub const SYSCALL_CHDIR: usize = 49;
 pub const SYSCALL_OPENAT: usize = 56;
 pub const SYSCALL_CLOSE: usize = 57;
@@ -153,12 +165,23 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         ),
         SYSCALL_CLOSE => fs::sys_close(args[0]),
         SYSCALL_PIPE2 => fs::sys_pipe2(args[0] as *mut i32, args[1]),
+        SYSCALL_FACCESSAT => {
+            fs::sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3])
+        }
         SYSCALL_GETDENTS64 => fs::sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_READ => fs::sys_read(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_WRITE => fs::sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_READV => fs::sys_readv(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITEV => fs::sys_writev(args[0], args[1] as *const u8, args[2]),
         SYSCALL_PREAD64 => fs::sys_pread64(args[0], args[1] as *mut u8, args[2], args[3]),
+        SYSCALL_SENDFILE => fs::sys_sendfile(args[0], args[1], args[2], args[3]),
+        SYSCALL_PPOLL => fs::sys_ppoll(
+            args[0] as *mut fs::PollFd,
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+        ),
         SYSCALL_LSEEK => fs::sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_DUP => fs::sys_dup(args[0]),
         SYSCALL_DUP3 => fs::sys_dup3(args[0], args[1], args[2]),
@@ -181,6 +204,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_CHDIR => fs::sys_chdir(args[0] as *const u8),
         SYSCALL_MKDIRAT => fs::sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_UNLINKAT => fs::sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
+        SYSCALL_RENAMEAT2 => fs::sys_renameat2(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as isize,
+            args[3] as *const u8,
+            args[4],
+        ),
         SYSCALL_MOUNT => fs::sys_mount(
             args[0] as *const u8,
             args[1] as *const u8,
@@ -230,6 +260,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_SET_TID_ADDRESS => other::sys_set_tid_address(args[0]),
         SYSCALL_GETRANDOM => other::sys_getrandom(args[0], args[1], args[2]),
         SYSCALL_SYSINFO => other::sys_sysinfo(args[0]),
+        SYSCALL_SYSLOG => other::sys_syslog(args[0], args[1], args[2]),
         SYSCALL_GETRUSAGE => other::sys_getrusage(args[0], args[1]),
         SYSCALL_UMASK => other::sys_umask(args[0]),
         SYSCALL_GETPGID => other::sys_getpgid(args[0]),
@@ -247,6 +278,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_SCHED_SETPARAM => Ok(0),
         SYSCALL_SCHED_GET_PRIORITY_MAX => Ok(0),
         SYSCALL_SCHED_GET_PRIORITY_MIN => Ok(0),
+
+        // signal stubs
+        SYSCALL_KILL => signal::sys_kill(args[0] as i32, args[1] as i32),
+        SYSCALL_TKILL => signal::sys_kill(args[0] as i32, args[1] as i32),
+        SYSCALL_TGKILL => signal::sys_kill(args[1] as i32, args[2] as i32),
+        SYSCALL_SIGACTION => signal::sys_sigaction(args[0] as i32, args[1], args[2]),
+        SYSCALL_SIGPROCMASK => signal::sys_sigprocmask(args[0] as i32, args[1], args[2], args[3]),
 
         // readlinkat stub
         SYSCALL_READLINKAT => Err(SysErrNo::EINVAL),

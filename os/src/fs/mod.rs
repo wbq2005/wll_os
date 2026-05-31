@@ -8,7 +8,7 @@ pub mod vfs;
 #[allow(unused_imports)]
 pub use vfs::{
     create_dir, dir_exists, file_exists, is_removed, list_dir, list_files, read_file,
-    read_interpreter, remove_file,
+    read_interpreter, remove_dir, remove_file, rename_path,
 };
 
 use alloc::format;
@@ -141,6 +141,76 @@ impl MemFileSystem {
         Ok(())
     }
 
+    pub fn remove_dir(&mut self, name: &str) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        if name == "/" {
+            return Err(SysErrNo::EINVAL);
+        }
+        if !self.is_dir(&name) {
+            return Err(SysErrNo::ENOENT);
+        }
+        if self
+            .files
+            .iter()
+            .any(|file| is_descendant(&name, &file.name))
+            || self
+                .dirs
+                .iter()
+                .any(|dir| dir != &name && is_descendant(&name, dir))
+        {
+            return Err(SysErrNo::ENOTEMPTY);
+        }
+        self.dirs.retain(|dir| dir != &name);
+        Ok(())
+    }
+
+    pub fn rename_path(&mut self, old: &str, new: &str) -> Result<(), SysErrNo> {
+        let old = normalize_path(old);
+        let new = normalize_path(new);
+        if old == new {
+            return Ok(());
+        }
+        if old == "/" || is_descendant(&old, &new) {
+            return Err(SysErrNo::EINVAL);
+        }
+        if self.is_dir(&old) {
+            if self.exists(&new) {
+                return Err(SysErrNo::EEXIST);
+            }
+            self.ensure_parent_dirs(&new);
+            for dir in &mut self.dirs {
+                if *dir == old {
+                    *dir = new.clone();
+                } else if is_descendant(&old, dir) {
+                    let suffix = dir.strip_prefix(&old).unwrap_or("");
+                    *dir = alloc::format!("{}{}", new, suffix);
+                }
+            }
+            for file in &mut self.files {
+                if is_descendant(&old, &file.name) {
+                    let suffix = file.name.strip_prefix(&old).unwrap_or("");
+                    file.name = alloc::format!("{}{}", new, suffix);
+                }
+            }
+            return Ok(());
+        }
+
+        let content = self
+            .files
+            .iter()
+            .find(|file| file.name == old)
+            .map(|file| file.content.clone())
+            .ok_or(SysErrNo::ENOENT)?;
+        if self.is_dir(&new) {
+            return Err(SysErrNo::EISDIR);
+        }
+        self.ensure_parent_dirs(&new);
+        self.files
+            .retain(|file| file.name != old && file.name != new);
+        self.files.push(MemFile::new(&new, content));
+        Ok(())
+    }
+
     pub fn truncate_file(&mut self, name: &str, new_len: usize) -> Result<(), SysErrNo> {
         let name = normalize_path(name);
         let file = self
@@ -183,6 +253,20 @@ lazy_static! {
 pub fn init() {
     log::info!("[fs] Initializing memory filesystem...");
     preload_generated_programs();
+    init_pseudo_files();
+}
+
+fn init_pseudo_files() {
+    let mounts = b"rootfs / ext4 rw 0 0\n";
+    let meminfo = b"MemTotal:       131072 kB\nMemFree:         65536 kB\nMemAvailable:    65536 kB\nBuffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\nSwapFree:            0 kB\n";
+    let mut fs = MEM_FS.lock();
+    for root in ["", "/musl", "/glibc"] {
+        fs.add_file(&alloc::format!("{}/proc/mounts", root), mounts.to_vec());
+        fs.add_file(&alloc::format!("{}/etc/mtab", root), mounts.to_vec());
+        fs.add_file(&alloc::format!("{}/proc/meminfo", root), meminfo.to_vec());
+        fs.add_file(&alloc::format!("{}/dev/null", root), Vec::new());
+        fs.add_file(&alloc::format!("{}/dev/misc/rtc", root), Vec::new());
+    }
 }
 
 /// 添加用户程序到文件系统
@@ -273,6 +357,13 @@ fn child_name(parent: &str, child: &str) -> Option<String> {
     }
 
     Some(rest.to_string())
+}
+
+fn is_descendant(parent: &str, child: &str) -> bool {
+    child
+        .strip_prefix(parent)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some()
 }
 
 include!(concat!(env!("OUT_DIR"), "/preloaded_apps.rs"));

@@ -122,7 +122,7 @@ pub fn sys_mmap(
         let file_desc = fds.get_mut(fd as usize).ok_or(SysErrNo::EBADF)?;
         let mut data = Vec::new();
         data.resize(length, 0);
-        let n = file_desc.read_at(offset, &mut data)?;
+        let n = super::with_kernel_page_table(|| file_desc.read_at(offset, &mut data))?;
         data.truncate(n);
         Some(data)
     } else {

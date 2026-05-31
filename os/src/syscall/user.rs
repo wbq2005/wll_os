@@ -59,8 +59,9 @@ pub fn copy_object_to_user<T>(dst: usize, obj: &T) -> Result<(), SysErrNo> {
 
 pub fn copy_object_from_user<T: Copy>(src: usize) -> Result<T, SysErrNo> {
     let mut obj = MaybeUninit::<T>::uninit();
-    let bytes =
-        unsafe { core::slice::from_raw_parts_mut(obj.as_mut_ptr() as *mut u8, mem::size_of::<T>()) };
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(obj.as_mut_ptr() as *mut u8, mem::size_of::<T>())
+    };
     copy_from_user(src, bytes)?;
     Ok(unsafe { obj.assume_init() })
 }

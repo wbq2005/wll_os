@@ -92,6 +92,19 @@ struct IoVec {
     iov_len: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 0x0001;
+const POLLOUT: i16 = 0x0004;
+const POLLHUP: i16 = 0x0010;
+const POLLNVAL: i16 = 0x0020;
+
 fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
     super::user::read_cstr(ptr as usize)
 }
@@ -106,6 +119,10 @@ fn copy_from_user(src: *const u8, dst: &mut [u8]) -> Result<(), SysErrNo> {
 
 fn copy_object_from_user<T: Copy>(src: *const T) -> Result<T, SysErrNo> {
     super::user::copy_object_from_user(src as usize)
+}
+
+fn copy_object_to_user<T>(dst: *mut T, obj: &T) -> Result<(), SysErrNo> {
+    super::user::copy_object_to_user(dst as usize, obj)
 }
 
 fn resolve_path(dirfd: isize, pathname: *const u8) -> Result<String, SysErrNo> {
@@ -253,7 +270,7 @@ fn stat_for_path(path: &str) -> Result<KStat, SysErrNo> {
     }
     if crate::fs::file_exists(&norm) {
         let size = crate::fs::read_file(&norm).map(|v| v.len()).unwrap_or(0);
-        return Ok(make_kstat(pseudo_inode(&norm), S_IFREG | 0o444, size));
+        return Ok(make_kstat(pseudo_inode(&norm), S_IFREG | 0o666, size));
     }
     if let Some((ino, is_dir)) = crate::fs::ext4_vol::lookup_path(&norm) {
         if is_dir {
@@ -406,7 +423,7 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
     if let Some(task) = current_task() {
         let mut inner = task.inner.lock();
 
-        match crate::fs::fd::open_file(&host_path, flags, mode) {
+        match super::with_kernel_page_table(|| crate::fs::fd::open_file(&host_path, flags, mode)) {
             Ok(fd_desc) => {
                 let mut fds = inner.fd_table.lock();
                 match fds.alloc(fd_desc) {
@@ -466,14 +483,58 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallRet {
 
 pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, _mode: u32) -> SyscallRet {
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-    crate::fs::create_dir(&host_path)?;
+    super::with_kernel_page_table(|| crate::fs::create_dir(&host_path))?;
     Ok(0)
 }
 
-pub fn sys_unlinkat(dirfd: isize, pathname: *const u8, _flags: usize) -> SyscallRet {
+pub fn sys_unlinkat(dirfd: isize, pathname: *const u8, flags: usize) -> SyscallRet {
+    const AT_REMOVEDIR: usize = 0x200;
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-    crate::fs::remove_file(&host_path)?;
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if flags & AT_REMOVEDIR != 0 {
+        super::with_kernel_page_table(|| crate::fs::remove_dir(&host_path))?;
+    } else {
+        super::with_kernel_page_table(|| crate::fs::remove_file(&host_path))?;
+    }
     Ok(0)
+}
+
+pub fn sys_renameat2(
+    olddirfd: isize,
+    oldpath: *const u8,
+    newdirfd: isize,
+    newpath: *const u8,
+    flags: usize,
+) -> SyscallRet {
+    const RENAME_NOREPLACE: usize = 1;
+    if flags & !RENAME_NOREPLACE != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let (_old_logical, old_host) = resolve_host_path(olddirfd, oldpath)?;
+    let (_new_logical, new_host) = resolve_host_path(newdirfd, newpath)?;
+    super::with_kernel_page_table(|| {
+        crate::fs::rename_path(&old_host, &new_host, flags & RENAME_NOREPLACE != 0)
+    })?;
+    Ok(0)
+}
+
+pub fn sys_faccessat(dirfd: isize, pathname: *const u8, mode: usize, _flags: usize) -> SyscallRet {
+    const R_OK: usize = 4;
+    const W_OK: usize = 2;
+    const X_OK: usize = 1;
+    if mode & !(R_OK | W_OK | X_OK) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    if super::with_kernel_page_table(|| {
+        crate::fs::file_exists(&host_path) || crate::fs::dir_exists(&host_path)
+    }) {
+        Ok(0)
+    } else {
+        Err(SysErrNo::ENOENT)
+    }
 }
 
 pub fn sys_getdents64(fd: usize, dirp: *mut u8, count: usize) -> SyscallRet {
@@ -486,7 +547,7 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, count: usize) -> SyscallRet {
         match fds.get_mut(fd) {
             Some(file_desc) => {
                 let mut kbuf = alloc::vec![0u8; count];
-                let n = file_desc.read_dirents64(&mut kbuf)?;
+                let n = super::with_kernel_page_table(|| file_desc.read_dirents64(&mut kbuf))?;
                 copy_to_user(dirp, &kbuf[..n])?;
                 Ok(n)
             }
@@ -628,7 +689,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
             match fds.get_mut(fd) {
                 Some(file_desc) => {
                     let mut kbuf = alloc::vec![0u8; count];
-                    match file_desc.read(&mut kbuf) {
+                    match super::with_kernel_page_table(|| file_desc.read(&mut kbuf)) {
                         Ok(n) => {
                             copy_to_user(buf, &kbuf[..n])?;
                             Ok(n)
@@ -696,7 +757,7 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
         let mut fds = inner.fd_table.lock();
 
         match fds.get_mut(fd) {
-            Some(file_desc) => file_desc.write(&kbuf),
+            Some(file_desc) => super::with_kernel_page_table(|| file_desc.write(&kbuf)),
             None => Err(SysErrNo::EBADF),
         }
     } else {
@@ -723,7 +784,7 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> SyscallRet {
     let mut fds = inner.fd_table.lock();
 
     match fds.get_mut(fd) {
-        Some(file_desc) => file_desc.seek_signed(offset, whence),
+        Some(file_desc) => super::with_kernel_page_table(|| file_desc.seek_signed(offset, whence)),
         None => Err(SysErrNo::EBADF),
     }
 }
@@ -746,7 +807,7 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, count: usize, offset: usize) -> Sysc
     match fds.get_mut(fd) {
         Some(file_desc) => {
             let mut kbuf = alloc::vec![0u8; count];
-            let n = file_desc.read_at(offset, &mut kbuf)?;
+            let n = super::with_kernel_page_table(|| file_desc.read_at(offset, &mut kbuf))?;
             copy_to_user(buf, &kbuf[..n])?;
             Ok(n)
         }
@@ -856,6 +917,137 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {
     Ok(total)
 }
 
+fn poll_once(fds: *mut PollFd, nfds: usize) -> Result<usize, SysErrNo> {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fd_table = inner.fd_table.lock();
+    let mut ready = 0usize;
+
+    for i in 0..nfds {
+        let pollfd_ptr = unsafe { fds.add(i) };
+        let mut pfd = copy_object_from_user(pollfd_ptr)?;
+        pfd.revents = 0;
+
+        if pfd.fd < 0 {
+            copy_object_to_user(pollfd_ptr, &pfd)?;
+            continue;
+        }
+
+        match fd_table.get(pfd.fd as usize) {
+            Some(file_desc) => {
+                if (pfd.events & POLLIN) != 0
+                    && super::with_kernel_page_table(|| file_desc.poll_read_ready())
+                {
+                    pfd.revents |= POLLIN;
+                }
+                if (pfd.events & POLLOUT) != 0
+                    && super::with_kernel_page_table(|| file_desc.poll_write_ready())
+                {
+                    pfd.revents |= POLLOUT;
+                }
+                if matches!(file_desc, FileDescriptor::PipeRead { .. })
+                    && super::with_kernel_page_table(|| file_desc.poll_read_ready())
+                    && !file_desc.readable()
+                {
+                    pfd.revents |= POLLHUP;
+                }
+            }
+            None => {
+                pfd.revents = POLLNVAL;
+            }
+        }
+
+        if pfd.revents != 0 {
+            ready += 1;
+        }
+        copy_object_to_user(pollfd_ptr, &pfd)?;
+    }
+
+    Ok(ready)
+}
+
+pub fn sys_ppoll(
+    fds: *mut PollFd,
+    nfds: usize,
+    timeout: usize,
+    _sigmask: usize,
+    _sigsetsize: usize,
+) -> SyscallRet {
+    if nfds == 0 {
+        return Ok(0);
+    }
+    if fds.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+
+    loop {
+        let ready = poll_once(fds, nfds)?;
+        if ready != 0 || timeout != 0 {
+            return Ok(ready);
+        }
+
+        if *crate::trap::FOREGROUND_MODE.lock() {
+            let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            *crate::task::CURRENT_TASK.lock() = None;
+            crate::task::run_next_task();
+            task.memory_set.lock().activate();
+            *crate::task::CURRENT_TASK.lock() = Some(task);
+        } else {
+            suspend_current_and_run_next();
+        }
+    }
+}
+
+pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut copied = 0usize;
+    let mut file_offset = if offset != 0 {
+        Some(super::user::copy_object_from_user::<usize>(offset)?)
+    } else {
+        None
+    };
+
+    while copied < count {
+        let chunk_len = (count - copied).min(4096);
+        let mut kbuf = alloc::vec![0u8; chunk_len];
+        let nread = {
+            let inner = task.inner.lock();
+            let mut fds = inner.fd_table.lock();
+            let input = fds.get_mut(in_fd).ok_or(SysErrNo::EBADF)?;
+            if let Some(off) = file_offset {
+                super::with_kernel_page_table(|| input.read_at(off, &mut kbuf))?
+            } else {
+                super::with_kernel_page_table(|| input.read(&mut kbuf))?
+            }
+        };
+
+        if nread == 0 {
+            break;
+        }
+        kbuf.truncate(nread);
+
+        let nwritten = {
+            let inner = task.inner.lock();
+            let mut fds = inner.fd_table.lock();
+            let output = fds.get_mut(out_fd).ok_or(SysErrNo::EBADF)?;
+            super::with_kernel_page_table(|| output.write(&kbuf))?
+        };
+
+        copied += nwritten;
+        if let Some(off) = file_offset.as_mut() {
+            *off += nwritten;
+        }
+        if nwritten < nread {
+            break;
+        }
+    }
+
+    if let Some(off) = file_offset {
+        super::user::copy_object_to_user(offset, &off)?;
+    }
+    Ok(copied)
+}
+
 /// fstat 系统调用
 ///
 /// 获取文件状态
@@ -869,8 +1061,7 @@ pub fn sys_fstat(fd: usize, statbuf: *mut u8) -> SyscallRet {
         let fds = inner.fd_table.lock();
         match fds.get(fd) {
             Some(file_desc) => {
-                log::debug!("[syscall] fstat: fd={} size={}", fd, file_desc.size());
-                let st = stat_for_fd(file_desc);
+                let st = super::with_kernel_page_table(|| stat_for_fd(file_desc));
                 copy_kstat_out(statbuf, &st)?;
                 Ok(0)
             }
@@ -902,10 +1093,10 @@ pub fn sys_statx(
         let inner = task.inner.lock();
         let fds = inner.fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-        stat_for_fd(file_desc)
+        super::with_kernel_page_table(|| stat_for_fd(file_desc))
     } else {
         let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-        stat_for_path(&host_path)?
+        super::with_kernel_page_table(|| stat_for_path(&host_path))?
     };
 
     let statx = make_statx(&st, mask);
@@ -920,7 +1111,7 @@ pub fn sys_newfstatat(
     _flags: usize,
 ) -> SyscallRet {
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-    let st = stat_for_path(&host_path)?;
+    let st = super::with_kernel_page_table(|| stat_for_path(&host_path))?;
     copy_kstat_out(statbuf, &st)?;
     Ok(0)
 }

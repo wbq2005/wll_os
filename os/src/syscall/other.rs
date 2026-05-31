@@ -278,6 +278,34 @@ pub fn sys_sysinfo(info: usize) -> SyscallRet {
     Ok(0)
 }
 
+pub fn sys_syslog(action: usize, buf: usize, len: usize) -> SyscallRet {
+    const SYSLOG_ACTION_READ: usize = 2;
+    const SYSLOG_ACTION_READ_ALL: usize = 3;
+    const SYSLOG_ACTION_READ_CLEAR: usize = 4;
+    const SYSLOG_ACTION_CLEAR: usize = 5;
+    const SYSLOG_ACTION_CONSOLE_OFF: usize = 6;
+    const SYSLOG_ACTION_CONSOLE_ON: usize = 7;
+    const SYSLOG_ACTION_CONSOLE_LEVEL: usize = 8;
+    const SYSLOG_ACTION_SIZE_UNREAD: usize = 9;
+    const SYSLOG_ACTION_SIZE_BUFFER: usize = 10;
+
+    match action {
+        SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
+            if buf == 0 && len != 0 {
+                return Err(SysErrNo::EFAULT);
+            }
+            Ok(0)
+        }
+        SYSLOG_ACTION_CLEAR
+        | SYSLOG_ACTION_CONSOLE_OFF
+        | SYSLOG_ACTION_CONSOLE_ON
+        | SYSLOG_ACTION_CONSOLE_LEVEL
+        | SYSLOG_ACTION_SIZE_UNREAD
+        | SYSLOG_ACTION_SIZE_BUFFER => Ok(0),
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
 pub fn sys_getrusage(_who: usize, usage: usize) -> SyscallRet {
     if usage != 0 {
         copy_to_user(usage, &[0; 144])?;
