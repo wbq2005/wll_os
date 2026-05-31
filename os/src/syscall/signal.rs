@@ -2,7 +2,7 @@ use super::SyscallRet;
 use crate::utils::error::SysErrNo;
 
 const MAX_SIGNAL: i32 = 64;
-const KERNEL_SIGACTION_SIZE: usize = 32;
+const KERNEL_SIGSET_SIZE: usize = core::mem::size_of::<usize>();
 const MAX_SIGSET_SIZE: usize = 128;
 
 fn valid_signal(signum: i32) -> bool {
@@ -14,13 +14,19 @@ fn valid_signal(signum: i32) -> bool {
 /// Userland such as BusyBox installs handlers during startup. The kernel does
 /// not deliver signals yet, but returning a default old action keeps libc from
 /// falling back into error paths.
-pub fn sys_sigaction(signum: i32, _act: usize, oldact: usize) -> SyscallRet {
+pub fn sys_sigaction(signum: i32, _act: usize, oldact: usize, sigset_size: usize) -> SyscallRet {
     if !valid_signal(signum) {
         return Err(SysErrNo::EINVAL);
     }
+    if sigset_size != KERNEL_SIGSET_SIZE {
+        return Err(SysErrNo::EINVAL);
+    }
     if oldact != 0 {
-        let empty = [0u8; KERNEL_SIGACTION_SIZE];
-        super::user::copy_to_user(oldact, &empty)?;
+        // RISC-V and LoongArch use the generic kernel layout:
+        // handler, flags, then a kernel-sized signal mask.  They do not carry
+        // the obsolete sa_restorer field in rt_sigaction.
+        let empty = [0u8; 2 * core::mem::size_of::<usize>() + KERNEL_SIGSET_SIZE];
+        super::user::copy_to_user(oldact, &empty[..])?;
     }
     Ok(0)
 }

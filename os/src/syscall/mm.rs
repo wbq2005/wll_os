@@ -148,26 +148,27 @@ pub fn sys_mmap(
             return Err(err);
         }
     }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let ms = task.memory_set.lock();
-        log::info!(
-            "[syscall] mmap: probe 0x15a10 = {:?}",
-            ms.page_table.translate(VirtAddr::new(0x15a10))
-        );
-    }
     Ok(start)
 }
 
 /// mprotect 系统调用
-pub fn sys_mprotect(addr: usize, len: usize, _prot: i32) -> SyscallRet {
+pub fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallRet {
+    log::debug!(
+        "[syscall] mprotect(addr={:#x}, len={:#x}, prot={:#x})",
+        addr,
+        len,
+        prot
+    );
     if addr % PAGE_SIZE != 0 {
         return Err(SysErrNo::EINVAL);
     }
     if len == 0 {
         return Err(SysErrNo::EINVAL);
     }
-    // 简化实现：暂不修改页表权限，返回成功
+    // glibc marks RELRO pages read-only during startup.  The current page-table
+    // layer does not split VMAs yet, so accept valid ranges without changing
+    // permissions; this preserves Linux-visible success without losing mappings.
+    log::debug!("[syscall] mprotect: accepted");
     Ok(0)
 }
 

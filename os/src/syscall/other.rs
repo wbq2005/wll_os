@@ -218,8 +218,16 @@ pub fn sys_prlimit64(
     Ok(0)
 }
 
-pub fn sys_set_tid_address(_tidptr: usize) -> SyscallRet {
-    current_task().map(|task| task.pid.0).ok_or(SysErrNo::ESRCH)
+pub fn sys_set_tid_address(tidptr: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    // set_tid_address only records the user word to clear on exit; it does not
+    // write immediately.  clone(CLONE_CHILD_CLEARTID) uses the same field.
+    task.inner.lock().clear_child_tid = tidptr;
+    Ok(task.pid.0)
+}
+
+pub fn sys_set_robust_list(_head: usize, _len: usize) -> SyscallRet {
+    Ok(0)
 }
 
 pub fn sys_getrandom(buf: usize, buflen: usize, _flags: usize) -> SyscallRet {

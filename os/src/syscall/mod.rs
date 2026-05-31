@@ -59,6 +59,7 @@ pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_EXIT_GROUP: usize = 94;
 pub const SYSCALL_SET_TID_ADDRESS: usize = 96;
 pub const SYSCALL_FUTEX: usize = 98;
+pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 pub const SYSCALL_NANOSLEEP: usize = 101;
 pub const SYSCALL_SETITIMER: usize = 103;
 pub const SYSCALL_CLOCK_SETTIME: usize = 112;
@@ -130,7 +131,7 @@ pub const SYSCALL_RENAMEAT2: usize = 276;
 pub const SYSCALL_MEMBARRIER: usize = 283;
 pub const SYSCALL_STATX: usize = 291;
 pub const SYSCALL_COPY_FILE_RANGE: usize = 326;
-pub const SYSCALL_GETRANDOM: usize = 318;
+pub const SYSCALL_GETRANDOM: usize = 278;
 
 /// Old SYS_open = 1024, used by some basic test binaries via syscall(SYS_open, ...).
 /// Maps to openat(AT_FDCWD, path, flags, mode).
@@ -258,6 +259,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_GETTID => other::sys_gettid(),
         SYSCALL_PRLIMIT64 => other::sys_prlimit64(args[0], args[1], args[2], args[3]),
         SYSCALL_SET_TID_ADDRESS => other::sys_set_tid_address(args[0]),
+        SYSCALL_SET_ROBUST_LIST => other::sys_set_robust_list(args[0], args[1]),
         SYSCALL_GETRANDOM => other::sys_getrandom(args[0], args[1], args[2]),
         SYSCALL_SYSINFO => other::sys_sysinfo(args[0]),
         SYSCALL_SYSLOG => other::sys_syslog(args[0], args[1], args[2]),
@@ -283,11 +285,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_KILL => signal::sys_kill(args[0] as i32, args[1] as i32),
         SYSCALL_TKILL => signal::sys_kill(args[0] as i32, args[1] as i32),
         SYSCALL_TGKILL => signal::sys_kill(args[1] as i32, args[2] as i32),
-        SYSCALL_SIGACTION => signal::sys_sigaction(args[0] as i32, args[1], args[2]),
+        SYSCALL_SIGACTION => signal::sys_sigaction(args[0] as i32, args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::sys_sigprocmask(args[0] as i32, args[1], args[2], args[3]),
 
-        // readlinkat stub
-        SYSCALL_READLINKAT => Err(SysErrNo::EINVAL),
+        SYSCALL_READLINKAT => fs::sys_readlinkat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
         SYSCALL_UTIMENSAT => Ok(0),
         SYSCALL_FSYNC => Ok(0),
         SYSCALL_FUTEX => {

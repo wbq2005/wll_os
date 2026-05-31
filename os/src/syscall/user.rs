@@ -4,6 +4,7 @@ use core::mem::{self, MaybeUninit};
 
 use polyhal::VirtAddr;
 
+use crate::mm::memory_set::MemorySet;
 use crate::task::current_task;
 use crate::utils::error::SysErrNo;
 
@@ -25,6 +26,17 @@ pub fn copy_to_user(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let memory_set = task.memory_set.lock();
+    copy_to_user_in_memory_set(&memory_set, dst, src)
+}
+
+pub fn copy_to_user_in_memory_set(
+    memory_set: &MemorySet,
+    dst: usize,
+    src: &[u8],
+) -> Result<(), SysErrNo> {
+    if dst == 0 && !src.is_empty() {
+        return Err(SysErrNo::EFAULT);
+    }
     for (i, &byte) in src.iter().enumerate() {
         let pa = memory_set
             .translate(VirtAddr::new(dst + i))

@@ -69,8 +69,7 @@ impl TaskControlBlock {
         init_user_trapframe(&mut trap_frame);
         trap_frame[TrapFrameArgs::SP] = sp;
         trap_frame[TrapFrameArgs::SEPC] = entry;
-        trap_frame[TrapFrameArgs::ARG0] = 1;
-        trap_frame[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
+        crate::syscall::process::set_user_entry_registers(&mut trap_frame, sp, 1);
 
         let task = Arc::new(Self {
             pid: Pid::alloc(),
@@ -83,9 +82,11 @@ impl TaskControlBlock {
                 fd_table: new_shared_fd_table(),
                 cwd: String::from("/"),
                 root: String::from("/"),
+                exec_path: String::from("/init"),
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
+                clear_child_tid: 0,
             }),
             task_ctx: KernelCtx::new(TaskContext::zero_init()),
             memory_set: new_shared_memory_set(memory_set),
@@ -111,7 +112,7 @@ impl TaskControlBlock {
         use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
         let target_path = resolve_program_path(&spec.root, &spec.path);
-        let target_elf_data = crate::fs::read_file(&target_path).ok_or_else(|| {
+        let target_elf_data = crate::fs::read_executable_file(&target_path).ok_or_else(|| {
             log::error!("[task] new_user_with_args: ELF not found: {}", target_path);
             SysErrNo::ENOENT
         })?;
@@ -226,8 +227,7 @@ impl TaskControlBlock {
         init_user_trapframe(&mut trap_frame);
         trap_frame[TrapFrameArgs::SP] = sp;
         trap_frame[TrapFrameArgs::SEPC] = entry;
-        trap_frame[TrapFrameArgs::ARG0] = launch_argv.len();
-        trap_frame[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
+        crate::syscall::process::set_user_entry_registers(&mut trap_frame, sp, launch_argv.len());
 
         // Set parent to orphan reaper so wait4 can find children.
         // When exit_current_and_run_next is called, it re-parents children to the
@@ -245,9 +245,11 @@ impl TaskControlBlock {
                 fd_table: new_shared_fd_table(),
                 cwd: spec.cwd.clone(),
                 root: spec.root.clone(),
+                exec_path: spec.path.clone(),
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
+                clear_child_tid: 0,
             }),
             task_ctx: KernelCtx::new(TaskContext::zero_init()),
             memory_set: new_shared_memory_set(memory_set),
@@ -282,9 +284,11 @@ impl TaskControlBlock {
                 fd_table: new_shared_fd_table(),
                 cwd: String::from("/"),
                 root: String::from("/"),
+                exec_path: String::new(),
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
+                clear_child_tid: 0,
             }),
             task_ctx: KernelCtx::new(TaskContext::zero_init()),
             memory_set: new_shared_memory_set(memory_set),
@@ -316,9 +320,11 @@ impl TaskControlBlock {
                 fd_table: new_shared_fd_table(),
                 cwd: String::from("/"),
                 root: String::from("/"),
+                exec_path: String::new(),
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
+                clear_child_tid: 0,
             }),
             task_ctx: KernelCtx::new(task_ctx_val),
             memory_set: new_shared_memory_set(memory_set),

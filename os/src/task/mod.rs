@@ -152,7 +152,7 @@ pub fn add_initproc() {
     let init_candidates = ["init", "/init"];
     let elf_data = init_candidates
         .iter()
-        .find_map(|path| crate::fs::read_file(path));
+        .find_map(|path| crate::fs::read_executable_file(path));
 
     if let Some(elf_data) = elf_data {
         match TaskControlBlock::new_user(&elf_data) {
@@ -789,21 +789,6 @@ fn join_logical_dir(dir: &str, name: &str) -> String {
     }
 }
 
-fn normalize_busybox_cmds(mut cmd: Vec<u8>) -> Vec<u8> {
-    let Ok(text) = core::str::from_utf8(&cmd) else {
-        return cmd;
-    };
-    if text.lines().any(|line| line.trim() == "kill 10") {
-        return cmd;
-    }
-
-    if !cmd.ends_with(b"\n") {
-        cmd.push(b'\n');
-    }
-    cmd.extend_from_slice(b"kill 10\n");
-    cmd
-}
-
 fn prepare_busybox_workdir(root: &str, logical_script: &str) -> Option<(String, String)> {
     let workdir = String::from("/busybox-work");
     let script_dir = dirname(logical_script);
@@ -811,9 +796,11 @@ fn prepare_busybox_workdir(root: &str, logical_script: &str) -> Option<(String, 
     let script_host = crate::fs::apply_root(root, logical_script);
     let cmd_host = crate::fs::apply_root(root, &join_logical_dir(&script_dir, "busybox_cmd.txt"));
 
-    let busybox = crate::fs::read_file(&busybox_host)?;
+    let busybox = crate::fs::read_executable_file(&busybox_host)?;
     let script = crate::fs::read_file(&script_host)?;
-    let cmd = normalize_busybox_cmds(crate::fs::read_file(&cmd_host)?);
+    // Keep the judge command list exactly as provided by the image. The
+    // success/fail markers must come from BusyBox running real commands.
+    let cmd = crate::fs::read_file(&cmd_host)?;
 
     let work_host = crate::fs::apply_root(root, &workdir);
     let busybox_work = alloc::format!("{}/busybox", work_host);
@@ -925,6 +912,24 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             return;
         }
         log::info!("[task] Task {} exiting with code {}", task.pid.0, exit_code);
+        let clear_child_tid = task.inner.lock().clear_child_tid;
+        if clear_child_tid != 0 {
+            // Linux clears this user word for set_tid_address/CLONE_CHILD_CLEARTID
+            // before the parent observes task exit.  A real futex wake can be
+            // added later; clearing the word already matches glibc's ABI check.
+            let bytes = 0i32.to_ne_bytes();
+            let memory_set = task.memory_set.lock();
+            if let Err(err) =
+                crate::syscall::user::copy_to_user_in_memory_set(&memory_set, clear_child_tid, &bytes)
+            {
+                log::debug!(
+                    "[task] clear_child_tid failed pid={} addr={:#x} err={:?}",
+                    task.pid.0,
+                    clear_child_tid,
+                    err
+                );
+            }
+        }
         task.set_exit_code(exit_code);
         task.set_status(TaskStatus::Zombie);
         crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
@@ -1178,9 +1183,11 @@ pub struct TaskControlBlockInner {
     pub fd_table: SharedFdTable,
     pub cwd: String,
     pub root: String,
+    pub exec_path: String,
     pub program_break: usize,
     pub mapped_break: usize,
     pub next_mmap: usize,
+    pub clear_child_tid: usize,
 }
 
 /// 任务状态

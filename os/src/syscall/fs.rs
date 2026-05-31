@@ -537,6 +537,45 @@ pub fn sys_faccessat(dirfd: isize, pathname: *const u8, mode: usize, _flags: usi
     }
 }
 
+pub fn sys_readlinkat(
+    dirfd: isize,
+    pathname: *const u8,
+    buf: *mut u8,
+    bufsiz: usize,
+) -> SyscallRet {
+    if buf.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+    if bufsiz == 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let path = read_user_cstr(pathname)?;
+    // glibc asks /proc/self/exe during startup to name the executable used for
+    // diagnostics and pointer-guard setup.  Model this as a real procfs symlink
+    // backed by task metadata instead of returning a BusyBox-specific string.
+    if path == "/proc/self/exe" || path == "/proc/thread-self/exe" {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let exec_path = task.inner.lock().exec_path.clone();
+        if exec_path.is_empty() {
+            return Err(SysErrNo::ENOENT);
+        }
+        let bytes = exec_path.as_bytes();
+        let n = bytes.len().min(bufsiz);
+        copy_to_user(buf, &bytes[..n])?;
+        return Ok(n);
+    }
+
+    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    if super::with_kernel_page_table(|| {
+        crate::fs::file_exists(&host_path) || crate::fs::dir_exists(&host_path)
+    }) {
+        Err(SysErrNo::EINVAL)
+    } else {
+        Err(SysErrNo::ENOENT)
+    }
+}
+
 pub fn sys_getdents64(fd: usize, dirp: *mut u8, count: usize) -> SyscallRet {
     if dirp.is_null() {
         return Err(SysErrNo::EFAULT);
@@ -1108,10 +1147,25 @@ pub fn sys_newfstatat(
     dirfd: isize,
     pathname: *const u8,
     statbuf: *mut u8,
-    _flags: usize,
+    flags: usize,
 ) -> SyscallRet {
-    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-    let st = super::with_kernel_page_table(|| stat_for_path(&host_path))?;
+    let path = read_user_cstr(pathname)?;
+    let st = if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(SysErrNo::ENOENT);
+        }
+        // glibc may implement fstat(fd) as newfstatat(fd, "", ..., AT_EMPTY_PATH),
+        // so empty pathname must stat the supplied file descriptor.
+        let fd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let fds = inner.fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        super::with_kernel_page_table(|| stat_for_fd(file_desc))
+    } else {
+        let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+        super::with_kernel_page_table(|| stat_for_path(&host_path))?
+    };
     copy_kstat_out(statbuf, &st)?;
     Ok(0)
 }

@@ -7,6 +7,10 @@ pub const CLOCK_FREQ: usize = 10000000; // 10MHz for QEMU virt
 
 /// 时间片大小（毫秒）
 pub const TIME_SLICE_MS: u64 = 10;
+/// Foreground judge runs one user task tree synchronously.  A longer tick keeps
+/// static libc startup from spending most of its time bouncing through the
+/// harness, while normal scheduler time slices stay at 10ms.
+pub const FOREGROUND_TIME_SLICE_MS: u64 = 50;
 
 /// 获取当前时间戳（毫秒）
 pub fn get_time() -> usize {
@@ -23,6 +27,12 @@ pub fn get_time_us() -> usize {
 /// 设置一个 10ms 后的定时器中断
 pub fn set_next_trigger() {
     polyhal::timer::set_next_timer(core::time::Duration::from_millis(TIME_SLICE_MS));
+}
+
+pub fn set_next_foreground_trigger() {
+    polyhal::timer::set_next_timer(core::time::Duration::from_millis(
+        FOREGROUND_TIME_SLICE_MS,
+    ));
 }
 
 /// 初始化定时器

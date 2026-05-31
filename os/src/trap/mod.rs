@@ -6,8 +6,8 @@ use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 use spin::Mutex;
 
 use crate::syscall::syscall;
-use crate::syscall::SysErrNo;
-use crate::task::{exit_current_and_run_next, run_next_task, suspend_current_and_run_next};
+use crate::task::TaskStatus;
+use crate::task::{exit_current_and_run_next, suspend_current_and_run_next};
 use crate::timer::set_next_trigger;
 
 lazy_static! {
@@ -92,6 +92,10 @@ pub fn init() {
     #[cfg(target_arch = "loongarch64")]
     {
         polyhal_trap::trap::init();
+        // LoongArch glibc binaries in the tests use the double-float ABI.  Keep
+        // the base FPU enabled so user FP instructions do not trap as FPD after
+        // libc has finished its integer-only startup path.
+        loongArch64::register::euen::set_fpe(true);
         log::info!(
             "[trap] loongarch eentry={:#x}",
             loongArch64::register::eentry::read().eentry()
@@ -173,12 +177,13 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             handle_syscall(ctx);
         }
         TrapType::Timer => {
-            set_next_trigger();
             // Foreground mode: don't suspend. Trap frame is unchanged, foreground
-            // loop will re-run the task immediately. Only break if FOREGROUND_MODE.
+            // loop will re-run the task immediately. Use a longer tick here so
+            // CPU-heavy static libc startup is not dominated by harness traps.
             if *FOREGROUND_MODE.lock() {
-                // just return, trap frame unchanged, foreground loop re-runs
+                crate::timer::set_next_foreground_trigger();
             } else {
+                set_next_trigger();
                 suspend_current_and_run_next();
             }
         }
@@ -192,12 +197,14 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 let fault_pa = ms.translate(polyhal::VirtAddr::new(vaddr));
                 let sepc_pa = ms.translate(polyhal::VirtAddr::new(sepc));
                 log::error!(
-                    "[trap] User page fault {:?} pid={} at {:#x}, sepc={:#x}, sp={:#x}, fault_pa={:?}, sepc_pa={:?}",
+                    "[trap] User page fault {:?} pid={} at {:#x}, sepc={:#x}, sp={:#x}, ra={:#x}, tp={:#x}, fault_pa={:?}, sepc_pa={:?}",
                     trap,
                     task.pid.0,
                     vaddr,
                     sepc,
                     sp,
+                    ctx[TrapFrameArgs::RA],
+                    ctx[TrapFrameArgs::TLS],
                     fault_pa,
                     sepc_pa
                 );
@@ -242,6 +249,7 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     *CURRENT_SYSCALL_CTX_PTR.lock() = ctx as *mut TrapFrame as usize;
 
     // 调用系统调用分发函数
+    let syscall_task = crate::task::current_task();
     let result = syscall(syscall_id, args);
 
     *CURRENT_SYSCALL_CTX_PTR.lock() = 0;
@@ -253,7 +261,13 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     if execve_done {
         return;
     }
-
+    if syscall_task
+        .as_ref()
+        .map(|task| task.status() == TaskStatus::Zombie)
+        .unwrap_or(false)
+    {
+        return;
+    }
     match result {
         Ok(ret) => {
             ctx[TrapFrameArgs::RET] = ret;

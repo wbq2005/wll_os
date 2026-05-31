@@ -7,8 +7,8 @@ pub mod vfs;
 
 #[allow(unused_imports)]
 pub use vfs::{
-    create_dir, dir_exists, file_exists, is_removed, list_dir, list_files, read_file,
-    read_interpreter, remove_dir, remove_file, rename_path,
+    create_dir, dir_exists, file_exists, is_removed, list_dir, list_files, read_executable_file,
+    read_file, read_interpreter, remove_dir, remove_file, rename_path,
 };
 
 use alloc::format;

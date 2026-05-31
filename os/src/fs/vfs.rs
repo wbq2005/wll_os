@@ -37,6 +37,38 @@ pub fn read_file(name: &str) -> Option<Vec<u8>> {
     ext4_vol::slurp_regular_file(&norm)
 }
 
+fn is_elf_image(data: &[u8]) -> bool {
+    data.len() >= 4 && &data[..4] == b"\x7fELF"
+}
+
+pub fn read_executable_file(name: &str) -> Option<Vec<u8>> {
+    let norm = normalize_path(name);
+    if is_removed(&norm) {
+        return None;
+    }
+
+    let mem_data = MEM_FS.lock().get_file(&norm).map(|f| f.content.clone());
+    if mem_data.as_ref().is_some_and(|data| is_elf_image(data)) {
+        return mem_data;
+    }
+
+    let ext4_data = ext4_vol::slurp_regular_file(&norm);
+    if let Some(data) = ext4_data {
+        if is_elf_image(&data) {
+            if mem_data.is_some() {
+                log::warn!(
+                    "[fs] executable overlay for '{}' is not ELF; using ext4 backing",
+                    norm
+                );
+            }
+            return Some(data);
+        }
+        return mem_data.or(Some(data));
+    }
+
+    mem_data
+}
+
 fn basename(path: &str) -> &str {
     path.rsplit('/')
         .find(|part| !part.is_empty())
@@ -46,13 +78,13 @@ fn basename(path: &str) -> &str {
 fn read_interpreter_logical(root: &str, logical: &str) -> Option<(String, String, Vec<u8>)> {
     let logical = normalize_path(logical);
     let host = super::apply_root(root, &logical);
-    read_file(&host).map(|data| (logical, host, data))
+    read_executable_file(&host).map(|data| (logical, host, data))
 }
 
 fn read_interpreter_host(logical: &str, host: &str) -> Option<(String, String, Vec<u8>)> {
     let logical = normalize_path(logical);
     let host = normalize_path(host);
-    read_file(&host).map(|data| (logical, host, data))
+    read_executable_file(&host).map(|data| (logical, host, data))
 }
 
 pub fn read_interpreter(root: &str, interp: &str) -> Option<(String, String, Vec<u8>)> {

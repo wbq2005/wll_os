@@ -1,5 +1,5 @@
 use super::SyscallRet;
-use crate::fs::read_file;
+use crate::fs::read_executable_file;
 use crate::mm::elf_loader::ElfFile;
 use crate::task::{
     current_task, dup_fd_table, exit_current_and_run_next, new_shared_memory_set,
@@ -17,13 +17,16 @@ use spin::Mutex;
 const CSIGNAL: usize = 0xff;
 /// fork/__clone 可忽略的附加位（不提供 pthread 共享语义）。
 /// **不包含** `CLONE_VM` / `CLONE_FILES` / `CLONE_SIGHAND` / `CLONE_THREAD`：遇到即 `EINVAL`。
-const ALLOWED_CLONE_FLAGS: usize = 0x00000200 /* CLONE_FS */
-    | 0x00040000 /* CLONE_SYSVSEM */
-    | 0x00080000 /* CLONE_SETTLS */
-    | 0x00200000 /* CLONE_PARENT_SETTID */
-    | 0x01000000; /* CLONE_CHILD_CLEARTID */
+const ALLOWED_CLONE_FLAGS: usize = CLONE_FS
+    | CLONE_SYSVSEM
+    | CLONE_SETTLS
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_CHILD_SETTID;
 
 const CLONE_VM: usize = 0x00000100;
+
+const CLONE_FS: usize = 0x00000200;
 
 const CLONE_FILES: usize = 0x00000400;
 
@@ -31,7 +34,15 @@ const CLONE_SIGHAND: usize = 0x00000800;
 
 const CLONE_THREAD: usize = 0x00010000;
 
+const CLONE_SYSVSEM: usize = 0x00040000;
+
 const CLONE_SETTLS: usize = 0x00080000;
+
+const CLONE_PARENT_SETTID: usize = 0x00100000;
+
+const CLONE_CHILD_CLEARTID: usize = 0x00200000;
+
+const CLONE_CHILD_SETTID: usize = 0x01000000;
 
 const THREAD_SHARING_FLAGS: usize = CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 
@@ -64,6 +75,17 @@ fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
     Ok(result)
 }
 
+pub(crate) fn set_user_entry_registers(tf: &mut TrapFrame, sp: usize, argc: usize) {
+    let _ = argc;
+    // Linux-style ELF entry for RISC-V and LoongArch gets argc/argv from the
+    // initial user stack.  glibc treats the incoming first argument register as
+    // the optional rtld_fini hook, so passing argc there corrupts the exit path.
+    tf[TrapFrameArgs::ARG0] = 0;
+    tf[TrapFrameArgs::ARG1] = 0;
+
+    tf[TrapFrameArgs::SP] = sp;
+}
+
 fn reset_exec_trapframe(tf: &mut TrapFrame, entry: usize, sp: usize, argc: usize) {
     #[cfg(target_arch = "riscv64")]
     {
@@ -75,10 +97,8 @@ fn reset_exec_trapframe(tf: &mut TrapFrame, entry: usize, sp: usize, argc: usize
         tf.regs = [0; 32];
     }
 
-    tf[TrapFrameArgs::SP] = sp;
     tf[TrapFrameArgs::SEPC] = entry;
-    tf[TrapFrameArgs::ARG0] = argc;
-    tf[TrapFrameArgs::ARG1] = sp + core::mem::size_of::<usize>();
+    set_user_entry_registers(tf, sp, argc);
 }
 
 fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
@@ -121,19 +141,6 @@ pub(crate) fn setup_user_stack(
         }
     };
 
-    let write_usize = |ms: &crate::mm::memory_set::MemorySet, sp: &mut usize, val: usize| {
-        *sp -= core::mem::size_of::<usize>();
-        let bytes = val.to_le_bytes();
-        for (i, &b) in bytes.iter().enumerate() {
-            let va = VirtAddr::new(*sp + i);
-            if let Some(pa) = ms.translate(va) {
-                unsafe {
-                    *(pa.raw() as *mut u8) = b;
-                }
-            }
-        }
-    };
-
     // 1) 将所有 argv/envp 字符串写到栈顶区域，记录各自地址
     let mut argv_ptrs: Vec<usize> = Vec::new();
     for arg in argv.iter().rev() {
@@ -151,7 +158,19 @@ pub(crate) fn setup_user_stack(
     }
     envp_ptrs.reverse();
 
-    // 随机数据（16 bytes for AT_RANDOM）
+    let platform = if cfg!(target_arch = "loongarch64") {
+        "loongarch64"
+    } else if cfg!(target_arch = "riscv64") {
+        "riscv64"
+    } else {
+        "unknown"
+    };
+    write_bytes(memory_set, &mut sp, &[0u8]);
+    write_bytes(memory_set, &mut sp, platform.as_bytes());
+    let platform_addr = sp;
+
+    // Reserve stable bytes for AT_RANDOM; glibc uses them for stack/pointer
+    // guards during startup and later exit-handler validation.
     sp -= 16;
     let random_addr = sp;
     for i in 0..16u8 {
@@ -171,7 +190,57 @@ pub(crate) fn setup_user_stack(
     //    envp: envp_ptrs.len() + 1 (NULL)
     //    argv: argv_ptrs.len() + 1 (NULL)
     //    argc: 1
-    let auxv_entries = 8; // AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_BASE, AT_ENTRY, AT_RANDOM, AT_NULL
+    const AT_NULL: usize = 0;
+    const AT_PHDR: usize = 3;
+    const AT_PHENT: usize = 4;
+    const AT_PHNUM: usize = 5;
+    const AT_PAGESZ: usize = 6;
+    const AT_BASE: usize = 7;
+    const AT_FLAGS: usize = 8;
+    const AT_ENTRY: usize = 9;
+    const AT_UID: usize = 11;
+    const AT_EUID: usize = 12;
+    const AT_GID: usize = 13;
+    const AT_EGID: usize = 14;
+    const AT_PLATFORM: usize = 15;
+    const AT_HWCAP: usize = 16;
+    const AT_CLKTCK: usize = 17;
+    const AT_SECURE: usize = 23;
+    const AT_RANDOM: usize = 25;
+    const AT_HWCAP2: usize = 26;
+    const AT_EXECFN: usize = 31;
+
+    #[cfg(target_arch = "loongarch64")]
+    const LINUX_AT_HWCAP: usize = 0x1 | 0x8; // CPUCFG | FPU
+    #[cfg(not(target_arch = "loongarch64"))]
+    const LINUX_AT_HWCAP: usize = 0;
+
+    let execfn_addr = argv_ptrs.first().copied().unwrap_or(0);
+    // glibc reads more of the Linux auxv contract than musl. Keep these
+    // generic process credentials/capabilities here rather than teaching
+    // individual tests about libc startup quirks.
+    let auxv_pairs: [(usize, usize); 19] = [
+        (AT_PHDR, phdr_vaddr),
+        (AT_PHENT, 56), // sizeof(Elf64_Phdr)
+        (AT_PHNUM, phnum),
+        (AT_PAGESZ, crate::config::PAGE_SIZE),
+        (AT_BASE, interp_base),
+        (AT_FLAGS, 0),
+        (AT_ENTRY, at_entry),
+        (AT_UID, 0),
+        (AT_EUID, 0),
+        (AT_GID, 0),
+        (AT_EGID, 0),
+        (AT_PLATFORM, platform_addr),
+        (AT_HWCAP, LINUX_AT_HWCAP),
+        (AT_CLKTCK, 100),
+        (AT_SECURE, 0),
+        (AT_RANDOM, random_addr),
+        (AT_HWCAP2, 0),
+        (AT_EXECFN, execfn_addr),
+        (AT_NULL, 0),
+    ];
+    let auxv_entries = auxv_pairs.len();
     let total_slots = 1 + (argv_ptrs.len() + 1) + (envp_ptrs.len() + 1) + auxv_entries * 2;
     // 确保 sp 在写完后 16 字节对齐
     sp -= total_slots * core::mem::size_of::<usize>();
@@ -179,12 +248,8 @@ pub(crate) fn setup_user_stack(
 
     let final_sp = sp;
 
-    // 4) 从 sp 开始依次写 argc, argv[], NULL, envp[], NULL, auxv[]
-    // argc
-    write_usize(memory_set, &mut sp, 0); // placeholder, rewrite below
-                                         // 因为 write_usize 减少 sp，我们改用直接偏移写法
-
-    // 重新做：用绝对偏移写入
+    // Write argc/argv/envp/auxv from low to high addresses. The strings and
+    // random bytes were already placed above this table on the same stack.
     let mut pos = final_sp;
     let write_at = |ms: &crate::mm::memory_set::MemorySet, pos: usize, val: usize| {
         let bytes = val.to_le_bytes();
@@ -197,9 +262,6 @@ pub(crate) fn setup_user_stack(
             }
         }
     };
-
-    // 重置 sp 回 final_sp 再重新用绝对方式
-    sp = final_sp; // 不再用 write_usize
 
     let sz = core::mem::size_of::<usize>();
 
@@ -223,26 +285,6 @@ pub(crate) fn setup_user_stack(
     write_at(memory_set, pos, 0); // envp NULL terminator
     pos += sz;
 
-    // auxv
-    const AT_NULL: usize = 0;
-    const AT_PHDR: usize = 3;
-    const AT_PHENT: usize = 4;
-    const AT_PHNUM: usize = 5;
-    const AT_PAGESZ: usize = 6;
-    const AT_BASE: usize = 7;
-    const AT_ENTRY: usize = 9;
-    const AT_RANDOM: usize = 25;
-
-    let auxv_pairs: [(usize, usize); 8] = [
-        (AT_PHDR, phdr_vaddr),
-        (AT_PHENT, 56), // sizeof(Elf64_Phdr)
-        (AT_PHNUM, phnum),
-        (AT_PAGESZ, crate::config::PAGE_SIZE),
-        (AT_BASE, interp_base),
-        (AT_ENTRY, at_entry),
-        (AT_RANDOM, random_addr),
-        (AT_NULL, 0),
-    ];
     for (key, val) in auxv_pairs {
         write_at(memory_set, pos, key);
         pos += sz;
@@ -277,7 +319,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     let logical_path = crate::fs::resolve_path(&cwd, &path_str);
     let host_path = crate::fs::apply_root(&root, &logical_path);
 
-    let elf_data = match super::with_kernel_page_table(|| read_file(&host_path)) {
+    let elf_data = match super::with_kernel_page_table(|| read_executable_file(&host_path)) {
         Some(data) => data,
         None => {
             log::error!(
@@ -448,12 +490,6 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         phnum,
         interp_base,
     );
-    #[cfg(target_arch = "riscv64")]
-    log::info!(
-        "[syscall] execve: probe 0x15a10 before install = {:?}",
-        new_memory_set.page_table.translate(VirtAddr::new(0x15a10))
-    );
-
     if let Some(task) = current_task() {
         {
             let mut inner = task.inner.lock();
@@ -462,6 +498,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             inner.program_break = crate::config::USER_HEAP_START;
             inner.mapped_break = crate::config::USER_HEAP_START;
             inner.next_mmap = 0x4000_0000;
+            inner.exec_path = logical_path.clone();
         }
 
         {
@@ -617,9 +654,9 @@ pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -
 pub fn sys_clone(
     flags: usize,
     stack: usize,
-    _parent_tid: usize,
+    parent_tid: usize,
     tls: usize,
-    _child_tid: usize,
+    child_tid: usize,
 ) -> SyscallRet {
     let parent = current_task().ok_or(SysErrNo::ESRCH)?;
     let parent_pid = parent.pid.0;
@@ -666,7 +703,7 @@ pub fn sys_clone(
     }
 
     let memory_set = new_shared_memory_set(parent.memory_set.lock().clone());
-    let (fd_table, cwd, root, program_break, mapped_break, next_mmap) = {
+    let (fd_table, cwd, root, exec_path, program_break, mapped_break, next_mmap) = {
         let inner = parent.inner.lock();
         let fd_table = {
             let fd_guard = inner.fd_table.lock();
@@ -676,6 +713,7 @@ pub fn sys_clone(
             fd_table,
             inner.cwd.clone(),
             inner.root.clone(),
+            inner.exec_path.clone(),
             inner.program_break,
             inner.mapped_break,
             inner.next_mmap,
@@ -693,9 +731,15 @@ pub fn sys_clone(
             fd_table,
             cwd,
             root,
+            exec_path,
             program_break,
             mapped_break,
             next_mmap,
+            clear_child_tid: if (clone_bits & CLONE_CHILD_CLEARTID) != 0 {
+                child_tid
+            } else {
+                0
+            },
         }),
         task_ctx: crate::task::KernelCtx::new(crate::task::context::TaskContext::zero_init()),
         memory_set,
@@ -703,6 +747,16 @@ pub fn sys_clone(
         status: Mutex::new(crate::task::TaskStatus::Ready),
     });
     let child_pid = child.pid.0;
+    // RISC-V clone uses Linux's order:
+    // clone(flags, stack, parent_tidptr, tls, child_tidptr).
+    if (clone_bits & CLONE_PARENT_SETTID) != 0 && parent_tid != 0 {
+        write_user_i32(parent_tid, child_pid as i32)?;
+    }
+    if (clone_bits & CLONE_CHILD_SETTID) != 0 && child_tid != 0 {
+        let bytes = (child_pid as i32).to_ne_bytes();
+        let child_memory = child.memory_set.lock();
+        super::user::copy_to_user_in_memory_set(&child_memory, child_tid, &bytes)?;
+    }
 
     parent.inner.lock().children.push(child.clone());
     crate::task::manager::add_task(child);
