@@ -2,12 +2,26 @@ use super::SyscallRet;
 use crate::task::current_task;
 use crate::timer;
 use crate::utils::error::SysErrNo;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use lazy_static::lazy_static;
+use spin::Mutex;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TimeSpec {
     tv_sec: usize,
     tv_nsec: usize,
+}
+
+struct FutexWaiter {
+    uaddr: usize,
+    task: Arc<crate::task::TaskControlBlock>,
+    token: usize,
+}
+
+lazy_static! {
+    static ref FUTEX_WAITERS: Mutex<Vec<FutexWaiter>> = Mutex::new(Vec::new());
 }
 
 #[repr(C)]
@@ -64,17 +78,40 @@ fn copy_object_from_user<T: Copy>(src: usize) -> Result<T, SysErrNo> {
     super::user::copy_object_from_user(src)
 }
 
+fn duration_us_from_timespec(ts: TimeSpec) -> Result<usize, SysErrNo> {
+    if ts.tv_nsec >= 1_000_000_000 {
+        return Err(SysErrNo::EINVAL);
+    }
+    Ok(ts
+        .tv_sec
+        .saturating_mul(1_000_000)
+        .saturating_add(ts.tv_nsec.div_ceil(1000)))
+}
+
+fn deadline_from_timespec_ptr(ptr: usize) -> Result<Option<usize>, SysErrNo> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let duration_us = duration_us_from_timespec(copy_object_from_user::<TimeSpec>(ptr)?)?;
+    Ok(Some(timer::deadline_after_us(duration_us)))
+}
+
+fn read_user_i32(addr: usize) -> Result<i32, SysErrNo> {
+    let mut bytes = [0u8; core::mem::size_of::<i32>()];
+    super::user::copy_from_user(addr, &mut bytes)?;
+    Ok(i32::from_le_bytes(bytes))
+}
+
 pub fn sys_nanosleep(req: usize, rem: usize) -> SyscallRet {
     if req == 0 {
         return Err(SysErrNo::EFAULT);
     }
 
     let req = copy_object_from_user::<TimeSpec>(req)?;
-    let sleep_ms = req
-        .tv_sec
-        .saturating_mul(1000)
-        .saturating_add(req.tv_nsec.div_ceil(1_000_000));
-    timer::sleep_ms(sleep_ms);
+    let sleep_us = duration_us_from_timespec(req)?;
+    if sleep_us != 0 {
+        let _ = timer::sleep_until_us(timer::deadline_after_us(sleep_us))?;
+    }
 
     if rem != 0 {
         copy_object_to_user(
@@ -341,24 +378,91 @@ pub fn sys_sched_stub() -> SyscallRet {
     Ok(0)
 }
 
+pub fn futex_wake_addr(uaddr: usize, n: usize) -> usize {
+    if uaddr == 0 || n == 0 {
+        return 0;
+    }
+    let mut woke = 0usize;
+    while woke < n {
+        let waiter = {
+            let mut waiters = FUTEX_WAITERS.lock();
+            let Some(index) = waiters.iter().position(|waiter| waiter.uaddr == uaddr) else {
+                break;
+            };
+            waiters.remove(index)
+        };
+        if crate::task::wake_task_token(&waiter.task, waiter.token) {
+            woke += 1;
+        }
+    }
+    woke
+}
+
+fn remove_futex_waiter(uaddr: usize, pid: usize, token: usize) -> bool {
+    let mut waiters = FUTEX_WAITERS.lock();
+    if let Some(index) = waiters.iter().position(|waiter| {
+        waiter.uaddr == uaddr && waiter.task.pid.0 == pid && waiter.token == token
+    }) {
+        waiters.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
 pub fn sys_futex_stub(
-    _uaddr: usize,
+    uaddr: usize,
     futex_op: usize,
-    _val: usize,
-    _timeout: usize,
+    val: usize,
+    timeout: usize,
     _uaddr2: usize,
     _val3: usize,
 ) -> SyscallRet {
     const FUTEX_WAIT: usize = 0;
     const FUTEX_WAKE: usize = 1;
-    const FUTEX_PRIVATE_FLAG: usize = 128;
-    let op = futex_op & !(FUTEX_PRIVATE_FLAG);
+    const FUTEX_CMD_MASK: usize = 0x7f;
+    let op = futex_op & FUTEX_CMD_MASK;
     match op {
         FUTEX_WAIT => {
-            crate::task::suspend_current_and_run_next();
-            Ok(0)
+            if uaddr == 0 {
+                return Err(SysErrNo::EFAULT);
+            }
+            if read_user_i32(uaddr)? != val as i32 {
+                return Err(SysErrNo::EAGAIN);
+            }
+            let deadline = deadline_from_timespec_ptr(timeout)?;
+            if deadline
+                .map(|deadline| timer::get_time_us() >= deadline)
+                .unwrap_or(false)
+            {
+                return Err(SysErrNo::ETIMEDOUT);
+            }
+
+            let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            let token = task.next_wait_token();
+            FUTEX_WAITERS.lock().push(FutexWaiter {
+                uaddr,
+                task: task.clone(),
+                token,
+            });
+            if let Some(deadline) = deadline {
+                timer::add_timeout(deadline, task.clone(), token);
+            }
+
+            crate::task::block_current_and_run_next();
+
+            let still_waiting = remove_futex_waiter(uaddr, task.pid.0, token);
+            if still_waiting
+                && deadline
+                    .map(|deadline| timer::get_time_us() >= deadline)
+                    .unwrap_or(false)
+            {
+                Err(SysErrNo::ETIMEDOUT)
+            } else {
+                Ok(0)
+            }
         }
-        FUTEX_WAKE => Ok(0),
+        FUTEX_WAKE => Ok(futex_wake_addr(uaddr, val)),
         _ => Ok(0),
     }
 }

@@ -1,4 +1,11 @@
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use lazy_static::lazy_static;
 use polyhal::timer::current_time;
+use spin::Mutex;
+
+use crate::task::wait_queue::{WaitOutcome, WaitQueue};
+use crate::task::TaskControlBlock;
 
 /// 时钟频率
 ///
@@ -12,6 +19,17 @@ pub const TIME_SLICE_MS: u64 = 10;
 /// harness, while normal scheduler time slices stay at 10ms.
 pub const FOREGROUND_TIME_SLICE_MS: u64 = 50;
 
+struct TimerWaiter {
+    deadline_us: usize,
+    task: Arc<TaskControlBlock>,
+    token: usize,
+}
+
+lazy_static! {
+    static ref TIMER_WAITERS: Mutex<Vec<TimerWaiter>> = Mutex::new(Vec::new());
+    static ref SLEEP_QUEUE: WaitQueue = WaitQueue::new();
+}
+
 /// 获取当前时间戳（毫秒）
 pub fn get_time() -> usize {
     current_time().as_millis() as usize
@@ -22,17 +40,67 @@ pub fn get_time_us() -> usize {
     current_time().as_micros() as usize
 }
 
+fn next_timer_delay_us(now_us: usize, default_us: usize) -> usize {
+    let waiters = TIMER_WAITERS.lock();
+    let next_deadline = waiters.iter().map(|waiter| waiter.deadline_us).min();
+    match next_deadline {
+        Some(deadline) if deadline <= now_us => 1,
+        Some(deadline) => default_us.min(deadline.saturating_sub(now_us)).max(1),
+        None => default_us,
+    }
+}
+
+fn program_next_timer(default_ms: u64) {
+    let default_us = (default_ms as usize).saturating_mul(1000);
+    let delay_us = next_timer_delay_us(get_time_us(), default_us);
+    polyhal::timer::set_next_timer(core::time::Duration::from_micros(delay_us as u64));
+}
+
 /// 设置下一次定时器中断
 ///
 /// 设置一个 10ms 后的定时器中断
 pub fn set_next_trigger() {
-    polyhal::timer::set_next_timer(core::time::Duration::from_millis(TIME_SLICE_MS));
+    program_next_timer(TIME_SLICE_MS);
 }
 
 pub fn set_next_foreground_trigger() {
-    polyhal::timer::set_next_timer(core::time::Duration::from_millis(
-        FOREGROUND_TIME_SLICE_MS,
-    ));
+    program_next_timer(FOREGROUND_TIME_SLICE_MS);
+}
+
+pub fn add_timeout(deadline_us: usize, task: Arc<TaskControlBlock>, token: usize) {
+    TIMER_WAITERS.lock().push(TimerWaiter {
+        deadline_us,
+        task,
+        token,
+    });
+    set_next_trigger();
+}
+
+pub fn wake_expired_timers() {
+    let now = get_time_us();
+    let mut expired = Vec::new();
+    {
+        let mut waiters = TIMER_WAITERS.lock();
+        let mut index = 0usize;
+        while index < waiters.len() {
+            if waiters[index].deadline_us <= now {
+                expired.push(waiters.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+    }
+    for waiter in expired {
+        crate::task::wake_task_token(&waiter.task, waiter.token);
+    }
+}
+
+pub fn deadline_after_us(duration_us: usize) -> usize {
+    get_time_us().saturating_add(duration_us)
+}
+
+pub fn sleep_until_us(deadline_us: usize) -> Result<WaitOutcome, crate::utils::error::SysErrNo> {
+    SLEEP_QUEUE.sleep_until(Some(deadline_us))
 }
 
 /// 初始化定时器
@@ -78,13 +146,7 @@ pub fn get_timeval() -> (usize, usize) {
     (sec, usec)
 }
 
-/// 延时指定毫秒数（忙等待）
-///
-/// 注意：这是一个简单的忙等待实现，会占用 CPU
-/// 实际实现中应该使用定时器中断
+/// Sleep for the requested number of milliseconds using the timer wait queue.
 pub fn sleep_ms(ms: usize) {
-    let start = get_time();
-    while get_time() < start + ms {
-        core::hint::spin_loop();
-    }
+    let _ = sleep_until_us(deadline_after_us(ms.saturating_mul(1000)));
 }

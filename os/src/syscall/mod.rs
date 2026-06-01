@@ -183,6 +183,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[3],
             args[4],
         ),
+        SYSCALL_PSELECT6 => fs::sys_pselect6(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_LSEEK => fs::sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_DUP => fs::sys_dup(args[0]),
         SYSCALL_DUP3 => fs::sys_dup3(args[0], args[1], args[2]),

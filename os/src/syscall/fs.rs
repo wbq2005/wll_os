@@ -1,10 +1,12 @@
 use super::SyscallRet;
 use crate::console::putchar;
-use crate::task::{current_task, suspend_current_and_run_next};
+use crate::task::current_task;
+use crate::task::wait_queue::{sleep_on_io, WaitOutcome};
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
 
 use crate::fs::fd::{self, FileDescriptor};
+use alloc::vec::Vec;
 
 /// 标准文件描述符
 const FD_STDIN: usize = 0;
@@ -100,6 +102,13 @@ pub(crate) struct PollFd {
     revents: i16,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TimeSpec {
+    tv_sec: usize,
+    tv_nsec: usize,
+}
+
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
 const POLLHUP: i16 = 0x0010;
@@ -123,6 +132,25 @@ fn copy_object_from_user<T: Copy>(src: *const T) -> Result<T, SysErrNo> {
 
 fn copy_object_to_user<T>(dst: *mut T, obj: &T) -> Result<(), SysErrNo> {
     super::user::copy_object_to_user(dst as usize, obj)
+}
+
+fn duration_us_from_timespec(ts: TimeSpec) -> Result<usize, SysErrNo> {
+    if ts.tv_nsec >= 1_000_000_000 {
+        return Err(SysErrNo::EINVAL);
+    }
+    Ok(ts
+        .tv_sec
+        .saturating_mul(1_000_000)
+        .saturating_add(ts.tv_nsec.div_ceil(1000)))
+}
+
+fn deadline_from_timespec_ptr(ptr: usize) -> Result<Option<usize>, SysErrNo> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let duration_us =
+        duration_us_from_timespec(super::user::copy_object_from_user::<TimeSpec>(ptr)?)?;
+    Ok(Some(crate::timer::deadline_after_us(duration_us)))
 }
 
 fn resolve_path(dirfd: isize, pathname: *const u8) -> Result<String, SysErrNo> {
@@ -266,7 +294,11 @@ fn stat_for_path(path: &str) -> Result<KStat, SysErrNo> {
             ));
         }
         if let Some(file) = mem.get_file(&norm) {
-            return Ok(make_kstat(pseudo_inode(&norm), S_IFREG | 0o666, file.size()));
+            return Ok(make_kstat(
+                pseudo_inode(&norm),
+                S_IFREG | 0o666,
+                file.size(),
+            ));
         }
     }
 
@@ -752,14 +784,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
                 if nb_pipe {
                     return Err(SysErrNo::EAGAIN);
                 }
-                if *crate::trap::FOREGROUND_MODE.lock() {
-                    *crate::task::CURRENT_TASK.lock() = None;
-                    crate::task::run_next_task();
-                    task.memory_set.lock().activate();
-                    *crate::task::CURRENT_TASK.lock() = Some(task.clone());
-                } else {
-                    suspend_current_and_run_next();
-                }
+                let _ = sleep_on_io(None)?;
             }
             Err(e) => return Err(e),
         }
@@ -1011,7 +1036,11 @@ pub fn sys_ppoll(
     _sigmask: usize,
     _sigsetsize: usize,
 ) -> SyscallRet {
+    let deadline = deadline_from_timespec_ptr(timeout)?;
     if nfds == 0 {
+        if let Some(deadline) = deadline {
+            let _ = crate::timer::sleep_until_us(deadline)?;
+        }
         return Ok(0);
     }
     if fds.is_null() {
@@ -1020,18 +1049,146 @@ pub fn sys_ppoll(
 
     loop {
         let ready = poll_once(fds, nfds)?;
-        if ready != 0 || timeout != 0 {
+        if ready != 0 {
             return Ok(ready);
         }
-
-        if *crate::trap::FOREGROUND_MODE.lock() {
-            let task = current_task().ok_or(SysErrNo::ESRCH)?;
-            *crate::task::CURRENT_TASK.lock() = None;
-            crate::task::run_next_task();
-            task.memory_set.lock().activate();
-            *crate::task::CURRENT_TASK.lock() = Some(task);
+        if let Some(deadline) = deadline {
+            if crate::timer::get_time_us() >= deadline {
+                return Ok(0);
+            }
+            if sleep_on_io(Some(deadline))? == WaitOutcome::TimedOut {
+                return Ok(0);
+            }
         } else {
-            suspend_current_and_run_next();
+            let _ = sleep_on_io(None)?;
+        }
+    }
+}
+
+fn load_fdset(base: usize, nfds: usize) -> Result<Vec<usize>, SysErrNo> {
+    let bits = core::mem::size_of::<usize>() * 8;
+    let words = nfds.div_ceil(bits);
+    let mut set = alloc::vec![0usize; words];
+    if base == 0 {
+        return Ok(set);
+    }
+    for (i, word) in set.iter_mut().enumerate() {
+        *word =
+            super::user::copy_object_from_user::<usize>(base + i * core::mem::size_of::<usize>())?;
+    }
+    Ok(set)
+}
+
+fn fdset_contains(set: &[usize], fd: usize) -> bool {
+    let bits = core::mem::size_of::<usize>() * 8;
+    let word = fd / bits;
+    let bit = fd % bits;
+    set.get(word)
+        .map(|value| (value & (1usize << bit)) != 0)
+        .unwrap_or(false)
+}
+
+fn fdset_insert(set: &mut [usize], fd: usize) {
+    let bits = core::mem::size_of::<usize>() * 8;
+    let word = fd / bits;
+    let bit = fd % bits;
+    if let Some(value) = set.get_mut(word) {
+        *value |= 1usize << bit;
+    }
+}
+
+fn store_fdset(base: usize, set: &[usize]) -> Result<(), SysErrNo> {
+    if base == 0 {
+        return Ok(());
+    }
+    for (i, word) in set.iter().enumerate() {
+        super::user::copy_object_to_user(base + i * core::mem::size_of::<usize>(), word)?;
+    }
+    Ok(())
+}
+
+fn pselect_once(
+    nfds: usize,
+    readfds: usize,
+    writefds: usize,
+    exceptfds: usize,
+) -> Result<usize, SysErrNo> {
+    if nfds > fd::MAX_FD_NUM {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let read_in = load_fdset(readfds, nfds)?;
+    let write_in = load_fdset(writefds, nfds)?;
+    let except_in = load_fdset(exceptfds, nfds)?;
+    let mut read_out = alloc::vec![0usize; read_in.len()];
+    let mut write_out = alloc::vec![0usize; write_in.len()];
+    let except_out = alloc::vec![0usize; except_in.len()];
+    let mut ready = 0usize;
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fd_table = inner.fd_table.lock();
+    for fdno in 0..nfds {
+        let want_read = fdset_contains(&read_in, fdno);
+        let want_write = fdset_contains(&write_in, fdno);
+        let want_except = fdset_contains(&except_in, fdno);
+        if !want_read && !want_write && !want_except {
+            continue;
+        }
+
+        let file_desc = fd_table.get(fdno).ok_or(SysErrNo::EBADF)?;
+        let mut fd_ready = false;
+        if want_read && super::with_kernel_page_table(|| file_desc.poll_read_ready()) {
+            fdset_insert(&mut read_out, fdno);
+            fd_ready = true;
+        }
+        if want_write && super::with_kernel_page_table(|| file_desc.poll_write_ready()) {
+            fdset_insert(&mut write_out, fdno);
+            fd_ready = true;
+        }
+        if fd_ready {
+            ready += 1;
+        }
+    }
+    drop(fd_table);
+    drop(inner);
+
+    store_fdset(readfds, &read_out)?;
+    store_fdset(writefds, &write_out)?;
+    store_fdset(exceptfds, &except_out)?;
+    Ok(ready)
+}
+
+pub fn sys_pselect6(
+    nfds: usize,
+    readfds: usize,
+    writefds: usize,
+    exceptfds: usize,
+    timeout: usize,
+    _sigmask: usize,
+) -> SyscallRet {
+    let deadline = deadline_from_timespec_ptr(timeout)?;
+    if nfds == 0 {
+        if let Some(deadline) = deadline {
+            let _ = crate::timer::sleep_until_us(deadline)?;
+        }
+        return Ok(0);
+    }
+
+    loop {
+        let ready = pselect_once(nfds, readfds, writefds, exceptfds)?;
+        if ready != 0 {
+            return Ok(ready);
+        }
+        if let Some(deadline) = deadline {
+            if crate::timer::get_time_us() >= deadline {
+                return Ok(0);
+            }
+            if sleep_on_io(Some(deadline))? == WaitOutcome::TimedOut {
+                return Ok(0);
+            }
+        } else {
+            let _ = sleep_on_io(None)?;
         }
     }
 }

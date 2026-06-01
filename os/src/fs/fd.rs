@@ -366,13 +366,16 @@ impl FileDescriptor {
             }
             FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
             FileDescriptor::PipeWrite { state, .. } => {
-                let mut pipe = state.lock();
-                if pipe.readers == 0 {
-                    return Err(SysErrNo::EPIPE);
+                {
+                    let mut pipe = state.lock();
+                    if pipe.readers == 0 {
+                        return Err(SysErrNo::EPIPE);
+                    }
+                    for &b in buf {
+                        pipe.buf.push_back(b);
+                    }
                 }
-                for &b in buf {
-                    pipe.buf.push_back(b);
-                }
+                crate::task::wait_queue::wake_io_waiters();
                 Ok(buf.len())
             }
             FileDescriptor::PipeRead { .. } => Err(SysErrNo::EBADF),
@@ -675,20 +678,26 @@ impl Clone for FileDescriptor {
 
 impl Drop for FileDescriptor {
     fn drop(&mut self) {
+        let mut wake_io = false;
         match self {
             FileDescriptor::PipeRead { state, .. } => {
                 let mut pipe = state.lock();
                 if pipe.readers > 0 {
                     pipe.readers -= 1;
                 }
+                wake_io = true;
             }
             FileDescriptor::PipeWrite { state, .. } => {
                 let mut pipe = state.lock();
                 if pipe.writers > 0 {
                     pipe.writers -= 1;
                 }
+                wake_io = true;
             }
             _ => {}
+        }
+        if wake_io {
+            crate::task::wait_queue::wake_io_waiters();
         }
     }
 }

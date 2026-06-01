@@ -1,6 +1,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use super::{
@@ -92,6 +93,7 @@ impl TaskControlBlock {
             memory_set: new_shared_memory_set(memory_set),
             trap_frame: Mutex::new(Some(trap_frame)),
             status: Mutex::new(TaskStatus::Ready),
+            wait_token: AtomicUsize::new(0),
         });
 
         log::info!(
@@ -260,6 +262,7 @@ impl TaskControlBlock {
             memory_set: new_shared_memory_set(memory_set),
             trap_frame: Mutex::new(Some(trap_frame)),
             status: Mutex::new(TaskStatus::Ready),
+            wait_token: AtomicUsize::new(0),
         });
 
         log::info!(
@@ -299,6 +302,7 @@ impl TaskControlBlock {
             memory_set: new_shared_memory_set(memory_set),
             trap_frame: Mutex::new(None),
             status: Mutex::new(TaskStatus::Ready),
+            wait_token: AtomicUsize::new(0),
         })
     }
 
@@ -335,6 +339,7 @@ impl TaskControlBlock {
             memory_set: new_shared_memory_set(memory_set),
             trap_frame: Mutex::new(None),
             status: Mutex::new(TaskStatus::Ready),
+            wait_token: AtomicUsize::new(0),
         })
     }
 
@@ -346,6 +351,16 @@ impl TaskControlBlock {
     /// 设置任务状态
     pub fn set_status(&self, status: TaskStatus) {
         *self.status.lock() = status;
+    }
+
+    pub fn next_wait_token(&self) -> usize {
+        self.wait_token
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    pub fn current_wait_token(&self) -> usize {
+        self.wait_token.load(Ordering::SeqCst)
     }
 
     /// 获取任务上下文

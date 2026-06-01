@@ -3,6 +3,7 @@ pub mod manager;
 pub mod pid;
 pub mod processor;
 pub mod task;
+pub mod wait_queue;
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -122,6 +123,16 @@ fn is_kernel_task(task: &Arc<TaskControlBlock>) -> bool {
 
 fn task_ctx_ptr(task: &Arc<TaskControlBlock>) -> *mut TaskContext {
     task.task_ctx_ptr()
+}
+
+fn requeue_after_user_run(task: Arc<TaskControlBlock>) {
+    match task.status() {
+        TaskStatus::Zombie | TaskStatus::Blocked => {}
+        TaskStatus::Running | TaskStatus::Ready => {
+            task.set_status(TaskStatus::Ready);
+            manager::add_task(task);
+        }
+    }
 }
 
 fn switch_kernel_task_back_to_scheduler(task: &Arc<TaskControlBlock>) {
@@ -369,6 +380,7 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
     manager::add_task(task.clone());
 
     loop {
+        crate::timer::wake_expired_timers();
         if task.status() == TaskStatus::Zombie && !manager::has_task() {
             break;
         }
@@ -384,7 +396,7 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
             waited += 1;
             continue;
         };
-        if active.status() == TaskStatus::Zombie {
+        if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
             continue;
         }
 
@@ -431,10 +443,7 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
             }
         }
 
-        if active.status() != TaskStatus::Zombie {
-            active.set_status(TaskStatus::Ready);
-            manager::add_task(active);
-        }
+        requeue_after_user_run(active);
 
         waited += 1;
     }
@@ -485,7 +494,11 @@ fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
 
     Some(UserProgramSpec {
         path: busybox_path.clone(),
-        argv: alloc::vec![busybox_path.clone(), String::from("sh"), logical_script.clone(),],
+        argv: alloc::vec![
+            busybox_path.clone(),
+            String::from("sh"),
+            logical_script.clone(),
+        ],
         envp: alloc::vec![
             String::from("PATH=.:/:/bin:/usr/bin"),
             String::from("LD_LIBRARY_PATH=/lib"),
@@ -550,6 +563,47 @@ pub fn suspend_current_and_run_next() {
     }
 }
 
+pub fn block_current_and_run_next() {
+    let Some(task) = current_task() else {
+        return;
+    };
+    if is_kernel_task(&task) {
+        task.set_status(TaskStatus::Blocked);
+        *CURRENT_TASK.lock() = None;
+        switch_kernel_task_back_to_scheduler(&task);
+        return;
+    }
+    if let Some(tf) = crate::trap::clone_current_trapframe() {
+        *task.trap_frame.lock() = Some(tf);
+    }
+    task.set_status(TaskStatus::Blocked);
+    *CURRENT_TASK.lock() = None;
+
+    while task.status() == TaskStatus::Blocked {
+        crate::timer::wake_expired_timers();
+        if task.status() != TaskStatus::Blocked {
+            break;
+        }
+        if run_ready_task_once() {
+            continue;
+        }
+        if *crate::trap::FOREGROUND_MODE.lock() {
+            core::hint::spin_loop();
+        } else {
+            wait_for_interrupt();
+        }
+    }
+
+    let _ = manager::remove_task(task.pid.0);
+    if task.status() == TaskStatus::Ready {
+        task.set_status(TaskStatus::Running);
+    }
+    if task.status() != TaskStatus::Zombie {
+        task.memory_set.lock().activate();
+        *CURRENT_TASK.lock() = Some(task);
+    }
+}
+
 /// 退出当前任务并运行下一个
 ///
 /// 将当前任务标记为 Zombie，然后切换到下一个任务
@@ -576,9 +630,11 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             // added later; clearing the word already matches glibc's ABI check.
             let bytes = 0i32.to_ne_bytes();
             let memory_set = task.memory_set.lock();
-            if let Err(err) =
-                crate::syscall::user::copy_to_user_in_memory_set(&memory_set, clear_child_tid, &bytes)
-            {
+            if let Err(err) = crate::syscall::user::copy_to_user_in_memory_set(
+                &memory_set,
+                clear_child_tid,
+                &bytes,
+            ) {
                 log::debug!(
                     "[task] clear_child_tid failed pid={} addr={:#x} err={:?}",
                     task.pid.0,
@@ -586,10 +642,12 @@ pub fn exit_current_and_run_next(exit_code: i32) {
                     err
                 );
             }
+            crate::syscall::other::futex_wake_addr(clear_child_tid, usize::MAX);
         }
         task.set_exit_code(exit_code);
         task.set_status(TaskStatus::Zombie);
         crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
+        crate::task::wait_queue::wake_child_waiters();
 
         let orphans = {
             let mut inn = task.inner.lock();
@@ -628,6 +686,13 @@ pub(crate) fn run_next_task() {
     // UART marker: 'S' = scheduler entry
 
     if let Some(task) = manager::fetch_task() {
+        if matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+            if *crate::trap::FOREGROUND_MODE.lock() {
+                return;
+            }
+            run_next_task();
+            return;
+        }
         // 设置当前任务
         *CURRENT_TASK.lock() = Some(task.clone());
 
@@ -676,8 +741,7 @@ pub(crate) fn run_next_task() {
                 let _reason2 = run_user_task(&mut *task.trap_frame.lock().as_mut().unwrap());
                 crate::trap::restore_kernel_page_table();
                 ctx = task.trap_frame.lock().take().unwrap();
-                task.set_status(TaskStatus::Ready);
-                manager::add_task(task);
+                requeue_after_user_run(task);
                 *CURRENT_TASK.lock() = None;
                 if *crate::trap::FOREGROUND_MODE.lock() {
                     return;
@@ -687,10 +751,7 @@ pub(crate) fn run_next_task() {
             }
             // Normal case: put ctx back and requeue task
             *task.trap_frame.lock() = Some(ctx);
-            if task.status() != TaskStatus::Zombie {
-                task.set_status(TaskStatus::Ready);
-                manager::add_task(task.clone());
-            }
+            requeue_after_user_run(task.clone());
             *CURRENT_TASK.lock() = None;
             if *crate::trap::FOREGROUND_MODE.lock() {
                 return;
@@ -777,12 +838,98 @@ fn idle_loop() {
         }
 
         // 检查是否有新任务
+        crate::timer::wake_expired_timers();
         if manager::has_task() {
             run_next_task();
         }
         // In non-FOREGROUND_MODE, this loops forever (WFI).
         // WFI永远不会返回...
     }
+}
+
+/// Wait for the next interrupt while there is no runnable task.
+fn wait_for_interrupt() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("wfi");
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("idle 0");
+    }
+}
+
+pub(crate) fn run_ready_task_once() -> bool {
+    let Some(active) = manager::fetch_task() else {
+        return false;
+    };
+    if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+        return true;
+    }
+
+    active.set_status(TaskStatus::Running);
+    *CURRENT_TASK.lock() = Some(active.clone());
+
+    let (has_user_ctx, tf_opt, ms_arc) = {
+        let tf = active.trap_frame.lock().take();
+        let has_user = tf.is_some();
+        let ms = active.memory_set.clone();
+        (has_user, tf, ms)
+    };
+    if has_user_ctx {
+        ms_arc.lock().activate();
+    }
+
+    if let Some(mut ctx) = tf_opt {
+        let _reason = run_user_task(&mut ctx);
+        crate::trap::restore_kernel_page_table();
+        let execve_done = crate::trap::take_execve_done();
+        if execve_done {
+            *active.trap_frame.lock() = Some(ctx);
+            active.memory_set.lock().activate();
+            let mut tf = active.trap_frame.lock().take().unwrap();
+            let _ = run_user_task(&mut tf);
+            crate::trap::restore_kernel_page_table();
+            if active.status() != TaskStatus::Zombie {
+                *active.trap_frame.lock() = Some(tf);
+            }
+        } else if active.status() != TaskStatus::Zombie {
+            *active.trap_frame.lock() = Some(ctx);
+        }
+
+        requeue_after_user_run(active);
+        *CURRENT_TASK.lock() = None;
+        true
+    } else {
+        let task_ctx = task_ctx_ptr(&active);
+        unsafe {
+            SCHEDULER_CONTEXT.ra = kernel_task_return as usize;
+            SCHEDULER_CONTEXT.sp = 0;
+            SCHEDULER_CONTEXT.s = [0; 12];
+        }
+        let idle_ctx = core::ptr::addr_of_mut!(SCHEDULER_CONTEXT);
+        SCHEDULER_CONTEXT_PTR.store(idle_ctx as usize, Ordering::SeqCst);
+        unsafe {
+            context::switch_to(idle_ctx, task_ctx as *const TaskContext);
+        }
+        SCHEDULER_CONTEXT_PTR.store(0, Ordering::SeqCst);
+        true
+    }
+}
+
+pub(crate) fn wake_task_token(task: &Arc<TaskControlBlock>, token: usize) -> bool {
+    if task.current_wait_token() != token {
+        return false;
+    }
+    let mut status = task.status.lock();
+    if *status != TaskStatus::Blocked {
+        return false;
+    }
+    *status = TaskStatus::Ready;
+    drop(status);
+    manager::add_task(task.clone());
+    true
 }
 
 /// 获取当前任务
@@ -826,6 +973,8 @@ pub struct TaskControlBlock {
     pub trap_frame: Mutex<Option<TrapFrame>>,
     /// Task status. Outside inner to avoid deadlock.
     pub status: Mutex<TaskStatus>,
+    /// Monotonic wait token used to reject stale timeout wakeups.
+    pub wait_token: AtomicUsize,
 }
 
 unsafe impl Send for TaskControlBlock {}

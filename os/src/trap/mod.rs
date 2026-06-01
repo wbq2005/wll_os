@@ -140,6 +140,7 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         }
         TrapType::Timer => {
             // 定时器中断 - 设置下一次定时器并触发调度
+            crate::timer::wake_expired_timers();
             set_next_trigger();
             if !*FOREGROUND_MODE.lock() {
                 suspend_current_and_run_next();
@@ -180,6 +181,7 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // Foreground mode: don't suspend. Trap frame is unchanged, foreground
             // loop will re-run the task immediately. Use a longer tick here so
             // CPU-heavy static libc startup is not dominated by harness traps.
+            crate::timer::wake_expired_timers();
             if *FOREGROUND_MODE.lock() {
                 crate::timer::set_next_foreground_trigger();
             } else {

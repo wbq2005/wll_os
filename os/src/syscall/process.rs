@@ -9,6 +9,7 @@ use crate::utils::error::SysErrNo;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicUsize;
 use polyhal::VirtAddr;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 use spin::Mutex;
@@ -84,7 +85,10 @@ fn parse_shebang(data: &[u8]) -> Option<ScriptInterpreter> {
     if data.len() < 2 || &data[..2] != b"#!" {
         return None;
     }
-    let end = data.iter().position(|byte| *byte == b'\n').unwrap_or(data.len());
+    let end = data
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(data.len());
     let line = core::str::from_utf8(&data[2..end]).ok()?.trim();
     let mut parts = line.split_whitespace();
     let path = String::from(parts.next()?);
@@ -102,10 +106,12 @@ fn script_interpreter_spec(
     let mut interp_logical = crate::fs::resolve_path(cwd, &interp.path);
     let mut argv = Vec::new();
 
-    let interp_exists =
-        super::with_kernel_page_table(|| crate::fs::file_exists(&crate::fs::apply_root(root, &interp_logical)));
-    let busybox_exists =
-        super::with_kernel_page_table(|| crate::fs::file_exists(&crate::fs::apply_root(root, "/busybox")));
+    let interp_exists = super::with_kernel_page_table(|| {
+        crate::fs::file_exists(&crate::fs::apply_root(root, &interp_logical))
+    });
+    let busybox_exists = super::with_kernel_page_table(|| {
+        crate::fs::file_exists(&crate::fs::apply_root(root, "/busybox"))
+    });
 
     if !interp_exists && interp_logical == "/bin/sh" && busybox_exists {
         interp_logical = String::from("/busybox");
@@ -716,14 +722,7 @@ pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -
             return Ok(cpid);
         }
 
-        if *crate::trap::FOREGROUND_MODE.lock() {
-            *crate::task::CURRENT_TASK.lock() = None;
-            crate::task::run_next_task();
-            task.memory_set.lock().activate();
-            *crate::task::CURRENT_TASK.lock() = Some(task.clone());
-        } else {
-            suspend_current_and_run_next();
-        }
+        let _ = crate::task::wait_queue::sleep_on_child_exit()?;
     }
 }
 
@@ -822,6 +821,7 @@ pub fn sys_clone(
         memory_set,
         trap_frame: Mutex::new(Some(child_tf)),
         status: Mutex::new(crate::task::TaskStatus::Ready),
+        wait_token: AtomicUsize::new(0),
     });
     let child_pid = child.pid.0;
     // RISC-V clone uses Linux's order:
