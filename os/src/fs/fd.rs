@@ -32,7 +32,7 @@ lazy_static! {
 
 fn write_console_buffered(buf: &[u8]) {
     let writer = crate::task::current_task()
-        .map(|task| task.pid.0)
+        .map(|task| task.thread_group.tgid())
         .unwrap_or(usize::MAX);
     let mut buffers = CONSOLE_LINE_BUFFERS.lock();
     let idx = buffers

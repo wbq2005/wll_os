@@ -2,8 +2,9 @@ use super::SyscallRet;
 use crate::fs::read_executable_file;
 use crate::mm::elf_loader::ElfFile;
 use crate::task::{
-    current_task, dup_fd_table, exit_current_and_run_next, new_shared_memory_set,
-    suspend_current_and_run_next,
+    current_task, dup_fd_table, dup_fs_context, dup_mm_context, exit_current_and_run_next,
+    exit_thread_group_and_run_next, new_shared_memory_set, suspend_current_and_run_next,
+    ThreadGroup,
 };
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
@@ -16,9 +17,11 @@ use spin::Mutex;
 
 /// Linux clone 的低 8 位为发往父进程的信号 (`CSIGNAL`)。
 const CSIGNAL: usize = 0xff;
-/// fork/__clone 可忽略的附加位（不提供 pthread 共享语义）。
-/// **不包含** `CLONE_VM` / `CLONE_FILES` / `CLONE_SIGHAND` / `CLONE_THREAD`：遇到即 `EINVAL`。
-const ALLOWED_CLONE_FLAGS: usize = CLONE_FS
+const ALLOWED_CLONE_FLAGS: usize = CLONE_VM
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SIGHAND
+    | CLONE_THREAD
     | CLONE_SYSVSEM
     | CLONE_SETTLS
     | CLONE_PARENT_SETTID
@@ -44,8 +47,6 @@ const CLONE_PARENT_SETTID: usize = 0x00100000;
 const CLONE_CHILD_CLEARTID: usize = 0x00200000;
 
 const CLONE_CHILD_SETTID: usize = 0x01000000;
-
-const THREAD_SHARING_FLAGS: usize = CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 
 const WNOHANG: usize = 0x0000_0001;
 
@@ -371,8 +372,8 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     }
 
     let (root, cwd) = if let Some(task) = current_task() {
-        let inner = task.inner.lock();
-        (inner.root.clone(), inner.cwd.clone())
+        let fs = task.fs.lock();
+        (fs.root.clone(), fs.cwd.clone())
     } else {
         (String::from("/"), String::from("/"))
     };
@@ -578,10 +579,13 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             let mut inner = task.inner.lock();
 
             // 重置堆
-            inner.program_break = crate::config::USER_HEAP_START;
-            inner.mapped_break = crate::config::USER_HEAP_START;
-            inner.next_mmap = 0x4000_0000;
             inner.exec_path = exec_logical_path.clone();
+        }
+        {
+            let mut mm = task.mm.lock();
+            mm.program_break = crate::config::USER_HEAP_START;
+            mm.mapped_break = crate::config::USER_HEAP_START;
+            mm.next_mmap = 0x4000_0000;
         }
 
         {
@@ -629,13 +633,13 @@ pub fn sys_exit(exit_code: i32) -> SyscallRet {
 
 pub fn sys_exit_group(exit_code: i32) -> SyscallRet {
     log::info!("[syscall] exit_group(code={})", exit_code);
-    // 暂未实现线程组：与 exit 等价
-    sys_exit(exit_code)
+    exit_thread_group_and_run_next(exit_code);
+    Ok(0)
 }
 
 pub fn sys_getpid() -> SyscallRet {
     if let Some(task) = current_task() {
-        let pid = task.pid.0;
+        let pid = task.thread_group.tgid();
         log::debug!("[syscall] getpid() = {}", pid);
         Ok(pid)
     } else {
@@ -646,7 +650,11 @@ pub fn sys_getpid() -> SyscallRet {
 pub fn sys_getppid() -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
-    let ppid = inner.parent.as_ref().map(|p| p.pid.0).unwrap_or(1usize);
+    let ppid = inner
+        .parent
+        .as_ref()
+        .map(|p| p.thread_group.tgid())
+        .unwrap_or(1usize);
     log::debug!("[syscall] getppid() = {}", ppid);
     Ok(ppid)
 }
@@ -679,11 +687,12 @@ pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -
     let try_reap = || -> Option<(usize, i32)> {
         let mut inner = task.inner.lock();
         if let Some(index) = inner.children.iter().position(|c| {
-            (pid == -1 || c.pid.0 == pid as usize) && c.status() == crate::task::TaskStatus::Zombie
+            (pid == -1 || c.thread_group.tgid() == pid as usize)
+                && c.thread_group.is_process_zombie()
         }) {
             let child = inner.children.remove(index);
-            let cpid = child.pid.0;
-            let exit_code = child.exit_code();
+            let cpid = child.thread_group.tgid();
+            let exit_code = child.thread_group.exit_code();
             return Some((cpid, exit_code));
         }
         None
@@ -709,7 +718,12 @@ pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -
             if inner.children.is_empty() {
                 return Err(SysErrNo::ECHILD);
             }
-            if pid > 0 && !inner.children.iter().any(|c| c.pid.0 == pid as usize) {
+            if pid > 0
+                && !inner
+                    .children
+                    .iter()
+                    .any(|c| c.thread_group.tgid() == pid as usize)
+            {
                 return Err(SysErrNo::ECHILD);
             }
         }
@@ -735,18 +749,18 @@ pub fn sys_clone(
     child_tid: usize,
 ) -> SyscallRet {
     let parent = current_task().ok_or(SysErrNo::ESRCH)?;
-    let parent_pid = parent.pid.0;
+    let parent_tid_num = parent.pid.0;
+    let parent_pid = parent.thread_group.tgid();
 
     let clone_bits = flags & !CSIGNAL;
-    if (clone_bits & THREAD_SHARING_FLAGS) != 0 {
-        log::warn!(
-            "[syscall] clone: thread-sharing clone bits not supported ({:#x})",
-            clone_bits & THREAD_SHARING_FLAGS
-        );
-        return Err(SysErrNo::EINVAL);
-    }
     if clone_bits != 0 && (clone_bits & !ALLOWED_CLONE_FLAGS) != 0 {
         log::warn!("[syscall] clone: unsupported clone bits {:#x}", clone_bits);
+        return Err(SysErrNo::EINVAL);
+    }
+    if (clone_bits & CLONE_SIGHAND) != 0 && (clone_bits & CLONE_VM) == 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if (clone_bits & CLONE_THREAD) != 0 && (clone_bits & CLONE_SIGHAND) == 0 {
         return Err(SysErrNo::EINVAL);
     }
 
@@ -778,39 +792,64 @@ pub fn sys_clone(
         child_tf[TrapFrameArgs::TLS] = tls;
     }
 
-    let memory_set = new_shared_memory_set(parent.memory_set.lock().clone());
-    let (fd_table, cwd, root, exec_path, program_break, mapped_break, next_mmap) = {
+    let share_vm = (clone_bits & CLONE_VM) != 0;
+    let is_thread = (clone_bits & CLONE_THREAD) != 0;
+    let memory_set = if share_vm {
+        parent.memory_set.clone()
+    } else {
+        new_shared_memory_set(parent.memory_set.lock().clone())
+    };
+    let mm = if share_vm {
+        parent.mm.clone()
+    } else {
+        dup_mm_context(&parent.mm)
+    };
+    let (fd_table, exec_path, thread_parent) = {
         let inner = parent.inner.lock();
-        let fd_table = {
+        let fd_table = if (clone_bits & CLONE_FILES) != 0 {
+            inner.fd_table.clone()
+        } else {
             let fd_guard = inner.fd_table.lock();
             dup_fd_table(&*fd_guard)
         };
-        (
-            fd_table,
-            inner.cwd.clone(),
-            inner.root.clone(),
-            inner.exec_path.clone(),
-            inner.program_break,
-            inner.mapped_break,
-            inner.next_mmap,
-        )
+        (fd_table, inner.exec_path.clone(), inner.parent.clone())
+    };
+    let fs = if (clone_bits & CLONE_FS) != 0 {
+        parent.fs.clone()
+    } else {
+        dup_fs_context(&parent.fs)
+    };
+    let fs_snapshot = fs.lock().clone();
+    let mm_snapshot = *mm.lock();
+    let child_pid_obj = crate::task::pid::Pid::alloc();
+    let child_pid = child_pid_obj.0;
+    let thread_group = if is_thread {
+        parent.thread_group.clone()
+    } else {
+        ThreadGroup::new(child_pid)
+    };
+    let child_parent = if is_thread {
+        thread_parent
+    } else {
+        Some(parent.clone())
     };
 
     let child = Arc::new(crate::task::TaskControlBlock {
-        pid: crate::task::pid::Pid::alloc(),
+        pid: child_pid_obj,
+        thread_group: thread_group.clone(),
         is_kernel: false,
         inner: Mutex::new(crate::task::TaskControlBlockInner {
             exit_code: 0,
             clone_flags: clone_bits,
-            parent: Some(parent.clone()),
+            parent: child_parent,
             children: Vec::new(),
             fd_table,
-            cwd,
-            root,
+            cwd: fs_snapshot.cwd.clone(),
+            root: fs_snapshot.root.clone(),
             exec_path,
-            program_break,
-            mapped_break,
-            next_mmap,
+            program_break: mm_snapshot.program_break,
+            mapped_break: mm_snapshot.mapped_break,
+            next_mmap: mm_snapshot.next_mmap,
             clear_child_tid: if (clone_bits & CLONE_CHILD_CLEARTID) != 0 {
                 child_tid
             } else {
@@ -819,11 +858,13 @@ pub fn sys_clone(
         }),
         task_ctx: crate::task::KernelCtx::new(crate::task::context::TaskContext::zero_init()),
         memory_set,
+        fs,
+        mm,
         trap_frame: Mutex::new(Some(child_tf)),
         status: Mutex::new(crate::task::TaskStatus::Ready),
         wait_token: AtomicUsize::new(0),
     });
-    let child_pid = child.pid.0;
+    thread_group.add_member(&child);
     // RISC-V clone uses Linux's order:
     // clone(flags, stack, parent_tidptr, tls, child_tidptr).
     if (clone_bits & CLONE_PARENT_SETTID) != 0 && parent_tid != 0 {
@@ -835,14 +876,17 @@ pub fn sys_clone(
         super::user::copy_to_user_in_memory_set(&child_memory, child_tid, &bytes)?;
     }
 
-    parent.inner.lock().children.push(child.clone());
+    if !is_thread {
+        parent.inner.lock().children.push(child.clone());
+    }
     crate::task::manager::add_task(child);
 
     log::info!(
-        "[syscall] clone(flags={:#x}, stack={:#x}) parent={} child={}",
+        "[syscall] clone(flags={:#x}, stack={:#x}) parent_pid={} parent_tid={} child_tid={}",
         flags,
         stack,
         parent_pid,
+        parent_tid_num,
         child_pid
     );
     Ok(child_pid)

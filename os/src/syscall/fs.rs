@@ -168,7 +168,7 @@ fn resolve_path(dirfd: isize, pathname: *const u8) -> Result<String, SysErrNo> {
 
 fn current_root() -> Result<String, SysErrNo> {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let root = task.inner.lock().root.clone();
+    let root = task.fs.lock().root.clone();
     Ok(root)
 }
 
@@ -181,10 +181,10 @@ fn resolve_host_path(dirfd: isize, pathname: *const u8) -> Result<(String, Strin
 
 fn resolve_base_dir(dirfd: isize) -> Result<String, SysErrNo> {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let inner = task.inner.lock();
     if dirfd == AT_FDCWD {
-        return Ok(inner.cwd.clone());
+        return Ok(task.fs.lock().cwd.clone());
     }
+    let inner = task.inner.lock();
     let dirfd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
     let result = match inner.fd_table.lock().get(dirfd) {
         Some(FileDescriptor::MemDir { path, .. }) => Ok(path.clone()),
@@ -486,7 +486,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallRet {
     }
 
     if let Some(task) = current_task() {
-        let cwd = task.inner.lock().cwd.clone();
+        let cwd = task.fs.lock().cwd.clone();
         let bytes = cwd.as_bytes();
         if bytes.len() + 1 > size {
             return Err(SysErrNo::ERANGE);
@@ -505,6 +505,7 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallRet {
         return Err(SysErrNo::ENOENT);
     }
     if let Some(task) = current_task() {
+        task.fs.lock().cwd = logical_path.clone();
         task.inner.lock().cwd = logical_path;
         Ok(0)
     } else {

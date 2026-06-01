@@ -5,8 +5,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use super::{
-    new_shared_fd_table, new_shared_memory_set, KernelCtx, TaskControlBlock, TaskControlBlockInner,
-    TaskStatus, UserProgramSpec,
+    new_shared_fd_table, new_shared_fs_context, new_shared_memory_set, new_shared_mm_context,
+    KernelCtx, TaskControlBlock, TaskControlBlockInner, TaskStatus, ThreadGroup, UserProgramSpec,
 };
 use crate::mm::memory_set::MemorySet;
 use crate::task::context::TaskContext;
@@ -72,8 +72,11 @@ impl TaskControlBlock {
         trap_frame[TrapFrameArgs::SEPC] = entry;
         crate::syscall::process::set_user_entry_registers(&mut trap_frame, sp, 1);
 
+        let pid = Pid::alloc();
+        let thread_group = ThreadGroup::new(pid.0);
         let task = Arc::new(Self {
-            pid: Pid::alloc(),
+            pid,
+            thread_group: thread_group.clone(),
             is_kernel: false,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
@@ -91,10 +94,17 @@ impl TaskControlBlock {
             }),
             task_ctx: KernelCtx::new(TaskContext::zero_init()),
             memory_set: new_shared_memory_set(memory_set),
+            fs: new_shared_fs_context(String::from("/"), String::from("/")),
+            mm: new_shared_mm_context(
+                crate::config::USER_HEAP_START,
+                crate::config::USER_HEAP_START,
+                0x4000_0000,
+            ),
             trap_frame: Mutex::new(Some(trap_frame)),
             status: Mutex::new(TaskStatus::Ready),
             wait_token: AtomicUsize::new(0),
         });
+        thread_group.add_member(&task);
 
         log::info!(
             "[task] Created user task pid={} entry={:#x} sp={:#x}",
@@ -241,8 +251,11 @@ impl TaskControlBlock {
         // orphan reaper, but we need a valid parent for wait4 to work.
         let fg_parent = crate::task::orphan_reaper();
 
+        let pid = Pid::alloc();
+        let thread_group = ThreadGroup::new(pid.0);
         let task = Arc::new(Self {
-            pid: Pid::alloc(),
+            pid,
+            thread_group: thread_group.clone(),
             is_kernel: false,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
@@ -260,10 +273,17 @@ impl TaskControlBlock {
             }),
             task_ctx: KernelCtx::new(TaskContext::zero_init()),
             memory_set: new_shared_memory_set(memory_set),
+            fs: new_shared_fs_context(spec.cwd.clone(), spec.root.clone()),
+            mm: new_shared_mm_context(
+                crate::config::USER_HEAP_START,
+                crate::config::USER_HEAP_START,
+                0x4000_0000,
+            ),
             trap_frame: Mutex::new(Some(trap_frame)),
             status: Mutex::new(TaskStatus::Ready),
             wait_token: AtomicUsize::new(0),
         });
+        thread_group.add_member(&task);
 
         log::info!(
             "[task] new_user_with_args: pid={} path={} cwd={} argc={}",
@@ -281,8 +301,11 @@ impl TaskControlBlock {
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         let memory_set = MemorySet::new_bare();
 
-        Arc::new(Self {
-            pid: Pid::alloc(),
+        let pid = Pid::alloc();
+        let thread_group = ThreadGroup::new(pid.0);
+        let task = Arc::new(Self {
+            pid,
+            thread_group: thread_group.clone(),
             is_kernel: false,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
@@ -300,10 +323,18 @@ impl TaskControlBlock {
             }),
             task_ctx: KernelCtx::new(TaskContext::zero_init()),
             memory_set: new_shared_memory_set(memory_set),
+            fs: new_shared_fs_context(String::from("/"), String::from("/")),
+            mm: new_shared_mm_context(
+                crate::config::USER_HEAP_START,
+                crate::config::USER_HEAP_START,
+                0x4000_0000,
+            ),
             trap_frame: Mutex::new(None),
             status: Mutex::new(TaskStatus::Ready),
             wait_token: AtomicUsize::new(0),
-        })
+        });
+        thread_group.add_member(&task);
+        task
     }
 
     /// 创建一个新的内核任务
@@ -318,8 +349,11 @@ impl TaskControlBlock {
         task_ctx_val.set_sp(kernel_stack);
         task_ctx_val.set_ra(entry as usize);
 
-        Arc::new(Self {
-            pid: Pid::alloc(),
+        let pid = Pid::alloc();
+        let thread_group = ThreadGroup::new(pid.0);
+        let task = Arc::new(Self {
+            pid,
+            thread_group: thread_group.clone(),
             is_kernel: true,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
@@ -337,10 +371,18 @@ impl TaskControlBlock {
             }),
             task_ctx: KernelCtx::new(task_ctx_val),
             memory_set: new_shared_memory_set(memory_set),
+            fs: new_shared_fs_context(String::from("/"), String::from("/")),
+            mm: new_shared_mm_context(
+                crate::config::USER_HEAP_START,
+                crate::config::USER_HEAP_START,
+                0x4000_0000,
+            ),
             trap_frame: Mutex::new(None),
             status: Mutex::new(TaskStatus::Ready),
             wait_token: AtomicUsize::new(0),
-        })
+        });
+        thread_group.add_member(&task);
+        task
     }
 
     /// 获取任务状态

@@ -59,31 +59,30 @@ fn prot_to_pte_flags(prot: i32) -> Result<PTEFlags, SysErrNo> {
 /// brk system call.
 pub fn sys_brk(new_brk: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let mut inner = task.inner.lock();
+    let mut mm = task.mm.lock();
 
     if new_brk == 0 {
-        return Ok(inner.program_break);
+        return Ok(mm.program_break);
     }
     if new_brk < USER_HEAP_START {
         return Err(SysErrNo::EINVAL);
     }
 
     let new_mapped_end = align_up(new_brk)?;
-    if new_mapped_end > inner.mapped_break {
-        let mapped_break = inner.mapped_break;
+    if new_mapped_end > mm.mapped_break {
+        let mapped_break = mm.mapped_break;
         task.memory_set.lock().insert_framed_area(
             VirtAddr::new(mapped_break),
             VirtAddr::new(new_mapped_end),
             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
         )?;
-        inner.mapped_break = new_mapped_end;
+        mm.mapped_break = new_mapped_end;
     }
-    drop(inner);
+    drop(mm);
 
     task.memory_set.lock().activate();
 
-    let mut inner = task.inner.lock();
-    inner.program_break = new_brk;
+    task.mm.lock().program_break = new_brk;
     Ok(new_brk)
 }
 
@@ -136,7 +135,7 @@ pub fn sys_mmap(
         return Err(SysErrNo::EINVAL);
     }
 
-    let next_hint = task.inner.lock().next_mmap;
+    let next_hint = task.mm.lock().next_mmap;
     let start = {
         let ms = task.memory_set.lock();
         if fixed {
@@ -210,9 +209,9 @@ pub fn sys_mmap(
         ms.activate();
     }
 
-    let mut inner = task.inner.lock();
-    if inner.next_mmap < end {
-        inner.next_mmap = end;
+    let mut mm = task.mm.lock();
+    if mm.next_mmap < end {
+        mm.next_mmap = end;
     }
     Ok(start)
 }

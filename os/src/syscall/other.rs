@@ -16,6 +16,7 @@ struct TimeSpec {
 
 struct FutexWaiter {
     uaddr: usize,
+    key: usize,
     task: Arc<crate::task::TaskControlBlock>,
     token: usize,
 }
@@ -100,6 +101,10 @@ fn read_user_i32(addr: usize) -> Result<i32, SysErrNo> {
     let mut bytes = [0u8; core::mem::size_of::<i32>()];
     super::user::copy_from_user(addr, &mut bytes)?;
     Ok(i32::from_le_bytes(bytes))
+}
+
+fn futex_key_for_task(task: &Arc<crate::task::TaskControlBlock>) -> usize {
+    Arc::as_ptr(&task.memory_set) as usize
 }
 
 pub fn sys_nanosleep(req: usize, rem: usize) -> SyscallRet {
@@ -363,7 +368,9 @@ pub fn sys_umask(_mask: usize) -> SyscallRet {
 }
 
 pub fn sys_getpgid(_pid: usize) -> SyscallRet {
-    current_task().map(|task| task.pid.0).ok_or(SysErrNo::ESRCH)
+    current_task()
+        .map(|task| task.thread_group.tgid())
+        .ok_or(SysErrNo::ESRCH)
 }
 
 pub fn sys_setpgid(_pid: usize, _pgid: usize) -> SyscallRet {
@@ -382,11 +389,18 @@ pub fn futex_wake_addr(uaddr: usize, n: usize) -> usize {
     if uaddr == 0 || n == 0 {
         return 0;
     }
+    let Some(task) = current_task() else {
+        return 0;
+    };
+    let key = futex_key_for_task(&task);
     let mut woke = 0usize;
     while woke < n {
         let waiter = {
             let mut waiters = FUTEX_WAITERS.lock();
-            let Some(index) = waiters.iter().position(|waiter| waiter.uaddr == uaddr) else {
+            let Some(index) = waiters
+                .iter()
+                .position(|waiter| waiter.uaddr == uaddr && waiter.key == key)
+            else {
                 break;
             };
             waiters.remove(index)
@@ -398,10 +412,13 @@ pub fn futex_wake_addr(uaddr: usize, n: usize) -> usize {
     woke
 }
 
-fn remove_futex_waiter(uaddr: usize, pid: usize, token: usize) -> bool {
+fn remove_futex_waiter(uaddr: usize, key: usize, pid: usize, token: usize) -> bool {
     let mut waiters = FUTEX_WAITERS.lock();
     if let Some(index) = waiters.iter().position(|waiter| {
-        waiter.uaddr == uaddr && waiter.task.pid.0 == pid && waiter.token == token
+        waiter.uaddr == uaddr
+            && waiter.key == key
+            && waiter.task.pid.0 == pid
+            && waiter.token == token
     }) {
         waiters.remove(index);
         true
@@ -439,9 +456,11 @@ pub fn sys_futex_stub(
             }
 
             let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            let key = futex_key_for_task(&task);
             let token = task.next_wait_token();
             FUTEX_WAITERS.lock().push(FutexWaiter {
                 uaddr,
+                key,
                 task: task.clone(),
                 token,
             });
@@ -451,7 +470,7 @@ pub fn sys_futex_stub(
 
             crate::task::block_current_and_run_next();
 
-            let still_waiting = remove_futex_waiter(uaddr, task.pid.0, token);
+            let still_waiting = remove_futex_waiter(uaddr, key, task.pid.0, token);
             if still_waiting
                 && deadline
                     .map(|deadline| timer::get_time_us() >= deadline)

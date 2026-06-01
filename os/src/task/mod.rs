@@ -7,7 +7,7 @@ pub mod wait_queue;
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -92,6 +92,88 @@ impl UserProgramSpec {
 /// `MemorySet` / `FdTable` 在 `CLONE_VM` / `CLONE_FILES` 下跨任务共享（`fork` 时各自深拷贝）。
 pub type SharedMemorySet = Arc<Mutex<MemorySet>>;
 pub type SharedFdTable = Arc<Mutex<FileDescriptorTable>>;
+pub type SharedFsContext = Arc<Mutex<FsContext>>;
+pub type SharedMmContext = Arc<Mutex<MmContext>>;
+
+#[derive(Clone)]
+pub struct FsContext {
+    pub cwd: String,
+    pub root: String,
+}
+
+#[derive(Clone, Copy)]
+pub struct MmContext {
+    pub program_break: usize,
+    pub mapped_break: usize,
+    pub next_mmap: usize,
+}
+
+pub struct ThreadGroup {
+    tgid: usize,
+    members: Mutex<Vec<Weak<TaskControlBlock>>>,
+    exit_code: Mutex<i32>,
+    process_zombie: AtomicUsize,
+}
+
+impl ThreadGroup {
+    pub fn new(tgid: usize) -> Arc<Self> {
+        Arc::new(Self {
+            tgid,
+            members: Mutex::new(Vec::new()),
+            exit_code: Mutex::new(0),
+            process_zombie: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn tgid(&self) -> usize {
+        self.tgid
+    }
+
+    pub fn add_member(&self, task: &Arc<TaskControlBlock>) {
+        self.members.lock().push(Arc::downgrade(task));
+    }
+
+    pub fn user_members(&self) -> Vec<Arc<TaskControlBlock>> {
+        let mut out = Vec::new();
+        let mut members = self.members.lock();
+        let mut index = 0usize;
+        while index < members.len() {
+            if let Some(task) = members[index].upgrade() {
+                if !task.is_kernel {
+                    out.push(task);
+                }
+                index += 1;
+            } else {
+                members.remove(index);
+            }
+        }
+        out
+    }
+
+    pub fn all_user_members_zombie(&self) -> bool {
+        let members = self.user_members();
+        !members.is_empty()
+            && members
+                .iter()
+                .all(|task| task.status() == TaskStatus::Zombie)
+    }
+
+    pub fn mark_process_zombie(&self, exit_code: i32) -> bool {
+        let first = self.process_zombie.swap(1, Ordering::SeqCst) == 0;
+        if first {
+            *self.exit_code.lock() = exit_code;
+        }
+        first
+    }
+
+    pub fn is_process_zombie(&self) -> bool {
+        self.process_zombie.load(Ordering::SeqCst) != 0
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        *self.exit_code.lock()
+    }
+}
 
 #[inline]
 pub fn new_shared_memory_set(ms: MemorySet) -> SharedMemorySet {
@@ -101,6 +183,35 @@ pub fn new_shared_memory_set(ms: MemorySet) -> SharedMemorySet {
 #[inline]
 pub fn new_shared_fd_table() -> SharedFdTable {
     Arc::new(Mutex::new(FileDescriptorTable::new()))
+}
+
+#[inline]
+pub fn new_shared_fs_context(cwd: String, root: String) -> SharedFsContext {
+    Arc::new(Mutex::new(FsContext { cwd, root }))
+}
+
+#[inline]
+pub fn dup_fs_context(src: &SharedFsContext) -> SharedFsContext {
+    Arc::new(Mutex::new(src.lock().clone()))
+}
+
+#[inline]
+pub fn new_shared_mm_context(
+    program_break: usize,
+    mapped_break: usize,
+    next_mmap: usize,
+) -> SharedMmContext {
+    Arc::new(Mutex::new(MmContext {
+        program_break,
+        mapped_break,
+        next_mmap,
+    }))
+}
+
+#[inline]
+pub fn dup_mm_context(src: &SharedMmContext) -> SharedMmContext {
+    let ctx = *src.lock();
+    new_shared_mm_context(ctx.program_break, ctx.mapped_break, ctx.next_mmap)
 }
 
 /// 拷贝一份 fd 表（`fork` 未带 `CLONE_FILES` 时使用）
@@ -332,22 +443,36 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
 }
 
 fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
-    fn abort_one(task: &Arc<TaskControlBlock>, aborted: &mut Vec<usize>) {
+    fn abort_task_state(task: &Arc<TaskControlBlock>, aborted: &mut Vec<usize>) -> bool {
         if aborted.iter().any(|pid| *pid == task.pid.0) {
-            return;
+            return false;
         }
         aborted.push(task.pid.0);
         task.set_exit_code(-2);
         task.set_status(TaskStatus::Zombie);
         *task.trap_frame.lock() = None;
         crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
+        crate::fs::fd::flush_console_buffer_for_pid(task.thread_group.tgid());
+        true
+    }
 
-        let children = {
-            let mut inner = task.inner.lock();
-            core::mem::take(&mut inner.children)
-        };
-        for child in children {
-            abort_one(&child, aborted);
+    fn abort_one(task: &Arc<TaskControlBlock>, aborted: &mut Vec<usize>) {
+        let mut targets = task.thread_group.user_members();
+        if targets.is_empty() {
+            targets.push(task.clone());
+        }
+        task.thread_group.mark_process_zombie(-2);
+
+        for target in targets {
+            if abort_task_state(&target, aborted) {
+                let children = {
+                    let mut inner = target.inner.lock();
+                    core::mem::take(&mut inner.children)
+                };
+                for child in children {
+                    abort_one(&child, aborted);
+                }
+            }
         }
     }
 
@@ -623,52 +748,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             return;
         }
         log::info!("[task] Task {} exiting with code {}", task.pid.0, exit_code);
-        let clear_child_tid = task.inner.lock().clear_child_tid;
-        if clear_child_tid != 0 {
-            // Linux clears this user word for set_tid_address/CLONE_CHILD_CLEARTID
-            // before the parent observes task exit.  A real futex wake can be
-            // added later; clearing the word already matches glibc's ABI check.
-            let bytes = 0i32.to_ne_bytes();
-            let memory_set = task.memory_set.lock();
-            if let Err(err) = crate::syscall::user::copy_to_user_in_memory_set(
-                &memory_set,
-                clear_child_tid,
-                &bytes,
-            ) {
-                log::debug!(
-                    "[task] clear_child_tid failed pid={} addr={:#x} err={:?}",
-                    task.pid.0,
-                    clear_child_tid,
-                    err
-                );
-            }
-            crate::syscall::other::futex_wake_addr(clear_child_tid, usize::MAX);
-        }
-        task.set_exit_code(exit_code);
-        task.set_status(TaskStatus::Zombie);
-        crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
-        crate::task::wait_queue::wake_child_waiters();
-
-        let orphans = {
-            let mut inn = task.inner.lock();
-            core::mem::take(&mut inn.children)
-        };
-        if !orphans.is_empty() {
-            if let Some(reaper) = orphan_reaper() {
-                let mut rinner = reaper.inner.lock();
-                for child in orphans {
-                    {
-                        let mut cin = child.inner.lock();
-                        cin.parent = Some(reaper.clone());
-                    }
-                    rinner.children.push(child);
-                }
-            } else {
-                for child in orphans {
-                    let mut cin = child.inner.lock();
-                    cin.parent = None;
-                }
-            }
+        finish_task_exit(&task, exit_code);
+        if task.thread_group.all_user_members_zombie() {
+            finish_process_exit(&task, exit_code);
         }
         *CURRENT_TASK.lock() = None;
     }
@@ -676,6 +758,83 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         return;
     }
     run_next_task();
+}
+
+pub fn exit_thread_group_and_run_next(exit_code: i32) {
+    if let Some(task) = current_task() {
+        if is_kernel_task(&task) {
+            exit_current_and_run_next(exit_code);
+            return;
+        }
+        log::info!(
+            "[task] Thread group {} exiting with code {}",
+            task.thread_group.tgid(),
+            exit_code
+        );
+        let members = task.thread_group.user_members();
+        for member in &members {
+            finish_task_exit(member, exit_code);
+        }
+        finish_process_exit(&task, exit_code);
+        *CURRENT_TASK.lock() = None;
+    }
+    if *crate::trap::FOREGROUND_MODE.lock() {
+        return;
+    }
+    run_next_task();
+}
+
+fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
+    let clear_child_tid = task.inner.lock().clear_child_tid;
+    if clear_child_tid != 0 {
+        let bytes = 0i32.to_ne_bytes();
+        let memory_set = task.memory_set.lock();
+        if let Err(err) =
+            crate::syscall::user::copy_to_user_in_memory_set(&memory_set, clear_child_tid, &bytes)
+        {
+            log::debug!(
+                "[task] clear_child_tid failed tid={} addr={:#x} err={:?}",
+                task.pid.0,
+                clear_child_tid,
+                err
+            );
+        }
+        crate::syscall::other::futex_wake_addr(clear_child_tid, usize::MAX);
+    }
+    task.set_exit_code(exit_code);
+    task.set_status(TaskStatus::Zombie);
+    crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
+    crate::fs::fd::flush_console_buffer_for_pid(task.thread_group.tgid());
+}
+
+fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
+    if !task.thread_group.mark_process_zombie(exit_code) {
+        return;
+    }
+
+    let mut orphans = Vec::new();
+    for member in task.thread_group.user_members() {
+        let mut inner = member.inner.lock();
+        orphans.extend(core::mem::take(&mut inner.children));
+    }
+    if !orphans.is_empty() {
+        if let Some(reaper) = orphan_reaper() {
+            let mut rinner = reaper.inner.lock();
+            for child in orphans {
+                {
+                    let mut cin = child.inner.lock();
+                    cin.parent = Some(reaper.clone());
+                }
+                rinner.children.push(child);
+            }
+        } else {
+            for child in orphans {
+                let mut cin = child.inner.lock();
+                cin.parent = None;
+            }
+        }
+    }
+    crate::task::wait_queue::wake_child_waiters();
 }
 
 /// 运行下一个任务
@@ -961,6 +1120,7 @@ unsafe impl Sync for KernelCtx {}
 /// 每个进程/线程对应一个 TaskControlBlock
 pub struct TaskControlBlock {
     pub pid: pid::Pid,
+    pub thread_group: Arc<ThreadGroup>,
     /// True for kernel-only tasks that are switched by TaskContext instead of TrapFrame.
     pub is_kernel: bool,
     /// Inner data protected by mutex (fd_table, children, cwd, etc.)
@@ -969,6 +1129,8 @@ pub struct TaskControlBlock {
     pub(crate) task_ctx: KernelCtx,
     /// User address space. Outside inner to avoid deadlock with activate().
     pub memory_set: SharedMemorySet,
+    pub fs: SharedFsContext,
+    pub mm: SharedMmContext,
     /// User trap frame. Outside inner for foreground driver.
     pub trap_frame: Mutex<Option<TrapFrame>>,
     /// Task status. Outside inner to avoid deadlock.
