@@ -473,7 +473,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
                     | crate::mm::page_table::PTEFlags::R
                     | crate::mm::page_table::PTEFlags::W
                     | crate::mm::page_table::PTEFlags::V,
-            );
+            )?;
 
             (
                 memory_set,

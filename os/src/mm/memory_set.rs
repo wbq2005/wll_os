@@ -1,11 +1,56 @@
 use alloc::vec::Vec;
+use core::mem;
 use polyhal::pagetable::{MappingFlags, MappingSize, PageTableWrapper};
 use polyhal::{PhysAddr, VirtAddr};
 
 use super::frame_allocator::{self, FrameTracker};
-use super::map_area::MapArea;
+use super::map_area::{MapArea, MapAreaBacking};
 use super::page_table::{self, PTEFlags};
 use crate::config::PAGE_SIZE;
+use crate::utils::error::SysErrNo;
+
+fn align_down(value: usize) -> usize {
+    value / PAGE_SIZE * PAGE_SIZE
+}
+
+fn align_up(value: usize) -> Option<usize> {
+    value
+        .checked_add(PAGE_SIZE - 1)
+        .map(|value| value / PAGE_SIZE * PAGE_SIZE)
+}
+
+fn has_leaf_permission(flags: PTEFlags) -> bool {
+    flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X)
+}
+
+fn ranges_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
+    if !has_leaf_permission(area.flags) {
+        return;
+    }
+
+    let mf: MappingFlags = area.flags.into();
+    for (idx, frame) in area.frames.iter().enumerate() {
+        let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
+        let paddr = PhysAddr::new(frame.ppn().addr());
+        page_table.map_page(vaddr, paddr, mf, MappingSize::Page4KB);
+    }
+}
+
+fn unmap_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
+    for idx in 0..area.page_count() {
+        let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
+        page_table.unmap_page(vaddr);
+    }
+}
+
+fn remap_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
+    unmap_area_pages(page_table, area);
+    map_area_pages(page_table, area);
+}
 
 /// Per-process address space.
 pub struct MemorySet {
@@ -29,24 +74,59 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: PTEFlags,
-    ) {
-        let start_vpn = start_va.raw() / PAGE_SIZE;
-        let end_vpn = (end_va.raw() + PAGE_SIZE - 1) / PAGE_SIZE;
-        let mut area = MapArea::new(start_va, end_va, permission);
+    ) -> Result<(), SysErrNo> {
+        self.insert_framed_area_with_backing(
+            start_va,
+            end_va,
+            permission,
+            MapAreaBacking::Anonymous,
+        )
+    }
 
+    pub fn insert_framed_area_with_backing(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: PTEFlags,
+        backing: MapAreaBacking,
+    ) -> Result<(), SysErrNo> {
+        let start = align_down(start_va.raw());
+        let end = align_up(end_va.raw()).ok_or(SysErrNo::EINVAL)?;
+        if start >= end {
+            return Err(SysErrNo::EINVAL);
+        }
+
+        let mut area = MapArea::with_backing(
+            VirtAddr::new(start),
+            VirtAddr::new(end),
+            permission,
+            backing,
+        );
+
+        let start_vpn = start / PAGE_SIZE;
+        let end_vpn = end / PAGE_SIZE;
         for vpn in start_vpn..end_vpn {
-            if let Some(frame) = frame_allocator::alloc_frame() {
-                let ppn = frame.ppn();
-                let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
-                let paddr = PhysAddr::new(ppn.addr());
+            let Some(frame) = frame_allocator::alloc_frame() else {
+                for mapped_vpn in start_vpn..vpn {
+                    self.page_table
+                        .unmap_page(VirtAddr::new(mapped_vpn * PAGE_SIZE));
+                }
+                return Err(SysErrNo::ENOMEM);
+            };
+            let ppn = frame.ppn();
+            let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
+            let paddr = PhysAddr::new(ppn.addr());
+            if has_leaf_permission(permission) {
                 let mf: MappingFlags = permission.into();
                 self.page_table
                     .map_page(vaddr, paddr, mf, MappingSize::Page4KB);
-                area.frames.push(frame);
             }
+            area.frames.push(frame);
         }
 
         self.areas.push(area);
+        self.coalesce_areas();
+        Ok(())
     }
 
     /// Map a framed range and return the data frames to the caller.
@@ -59,11 +139,16 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: PTEFlags,
     ) -> Vec<FrameTracker> {
-        let start_vpn = start_va.raw() / PAGE_SIZE;
-        let end_vpn = (end_va.raw() + PAGE_SIZE - 1) / PAGE_SIZE;
+        let start = align_down(start_va.raw());
+        let end = align_up(end_va.raw()).unwrap_or(start);
+        let start_vpn = start / PAGE_SIZE;
+        let end_vpn = end / PAGE_SIZE;
 
-        let area = MapArea::new(start_va, end_va, permission);
-        self.areas.push(area);
+        self.areas.push(MapArea::new(
+            VirtAddr::new(start),
+            VirtAddr::new(end),
+            permission,
+        ));
 
         let mut frames: Vec<FrameTracker> = Vec::new();
         for vpn in start_vpn..end_vpn {
@@ -71,9 +156,11 @@ impl MemorySet {
                 let ppn = frame.ppn();
                 let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
                 let paddr = PhysAddr::new(ppn.addr());
-                let mf: MappingFlags = permission.into();
-                self.page_table
-                    .map_page(vaddr, paddr, mf, MappingSize::Page4KB);
+                if has_leaf_permission(permission) {
+                    let mf: MappingFlags = permission.into();
+                    self.page_table
+                        .map_page(vaddr, paddr, mf, MappingSize::Page4KB);
+                }
                 frames.push(frame);
             }
         }
@@ -119,20 +206,15 @@ impl MemorySet {
     }
 
     pub fn unmap_area(&mut self, start_va: VirtAddr) {
-        if let Some(area) = self
+        let Some(end_va) = self
             .areas
             .iter()
             .find(|a| a.start_va.raw() == start_va.raw())
-        {
-            let start_vpn = area.start_va.raw() / PAGE_SIZE;
-            let end_vpn = (area.end_va.raw() + PAGE_SIZE - 1) / PAGE_SIZE;
-
-            for vpn in start_vpn..end_vpn {
-                let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
-                self.page_table.unmap_page(vaddr);
-            }
-        }
-        self.remove_area(start_va);
+            .map(|area| area.end_va)
+        else {
+            return;
+        };
+        let _ = self.unmap_range(start_va, end_va);
     }
 
     pub fn translate(&self, vaddr: VirtAddr) -> Option<PhysAddr> {
@@ -142,6 +224,165 @@ impl MemorySet {
     pub fn is_mapped(&self, vaddr: VirtAddr) -> bool {
         self.translate(vaddr).is_some()
     }
+
+    pub fn range_overlaps(&self, start: usize, end: usize) -> bool {
+        self.areas.iter().any(|area| area.overlaps(start, end))
+    }
+
+    pub fn range_covered(&self, start: usize, end: usize) -> bool {
+        let mut cursor = start;
+        while cursor < end {
+            let mut next = cursor;
+            for area in &self.areas {
+                let area_start = area.start_va.raw();
+                let area_end = area.end_va.raw();
+                if area_start <= cursor && cursor < area_end && area_end > next {
+                    next = area_end;
+                }
+            }
+            if next == cursor {
+                return false;
+            }
+            cursor = next;
+        }
+        true
+    }
+
+    pub fn find_free_area(&self, hint: usize, length: usize, limit: usize) -> Option<usize> {
+        if length == 0 {
+            return None;
+        }
+        let mut candidate = align_up(hint.max(PAGE_SIZE))?;
+        loop {
+            let end = candidate.checked_add(length)?;
+            if end > limit {
+                return None;
+            }
+
+            let mut bumped = false;
+            for area in &self.areas {
+                if ranges_overlap(candidate, end, area.start_va.raw(), area.end_va.raw()) {
+                    candidate = align_up(area.end_va.raw())?;
+                    bumped = true;
+                    break;
+                }
+            }
+            if !bumped {
+                return Some(candidate);
+            }
+        }
+    }
+
+    pub fn unmap_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> Result<(), SysErrNo> {
+        let start = start_va.raw();
+        let end = end_va.raw();
+        if start >= end || start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
+            return Err(SysErrNo::EINVAL);
+        }
+
+        self.split_area_at(start);
+        self.split_area_at(end);
+
+        let mut kept = Vec::new();
+        for area in mem::take(&mut self.areas) {
+            if area.overlaps(start, end) {
+                unmap_area_pages(&self.page_table, &area);
+            } else {
+                kept.push(area);
+            }
+        }
+        self.areas = kept;
+        self.coalesce_areas();
+        Ok(())
+    }
+
+    pub fn protect_range(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        flags: PTEFlags,
+    ) -> Result<(), SysErrNo> {
+        let start = start_va.raw();
+        let end = end_va.raw();
+        if start >= end || start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
+            return Err(SysErrNo::EINVAL);
+        }
+        if !self.range_covered(start, end) {
+            return Err(SysErrNo::ENOMEM);
+        }
+
+        self.split_area_at(start);
+        self.split_area_at(end);
+
+        for area in &mut self.areas {
+            if area.start_va.raw() >= start && area.end_va.raw() <= end {
+                area.flags = flags;
+                remap_area_pages(&self.page_table, area);
+            }
+        }
+        self.coalesce_areas();
+        Ok(())
+    }
+
+    pub fn write_bytes(&mut self, dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
+        let mut copied = 0usize;
+        while copied < src.len() {
+            let addr = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
+            let Some(area) = self.areas.iter().find(|area| area.contains(VirtAddr::new(addr)))
+            else {
+                return Err(SysErrNo::EFAULT);
+            };
+
+            let page_idx = (align_down(addr) - area.start_va.raw()) / PAGE_SIZE;
+            let page_off = addr % PAGE_SIZE;
+            let copy_len = (src.len() - copied).min(PAGE_SIZE - page_off);
+            let frame = area.frames.get(page_idx).ok_or(SysErrNo::EFAULT)?;
+            let dst_ptr = (frame.ppn().addr() + page_off) as *mut u8;
+            unsafe {
+                core::ptr::copy_nonoverlapping(src[copied..].as_ptr(), dst_ptr, copy_len);
+            }
+            copied += copy_len;
+        }
+        Ok(())
+    }
+
+    fn split_area_at(&mut self, addr: usize) {
+        if addr % PAGE_SIZE != 0 {
+            return;
+        }
+
+        let mut split = Vec::new();
+        for mut area in mem::take(&mut self.areas) {
+            if let Some(right) = area.split_at(VirtAddr::new(addr)) {
+                split.push(area);
+                split.push(right);
+            } else {
+                split.push(area);
+            }
+        }
+        self.areas = split;
+        self.sort_areas();
+    }
+
+    fn sort_areas(&mut self) {
+        self.areas
+            .sort_by(|left, right| left.start_va.raw().cmp(&right.start_va.raw()));
+    }
+
+    fn coalesce_areas(&mut self) {
+        self.sort_areas();
+        let mut merged: Vec<MapArea> = Vec::new();
+        for area in mem::take(&mut self.areas) {
+            if let Some(last) = merged.last_mut() {
+                if last.can_merge_with(&area) {
+                    last.merge_with(area);
+                    continue;
+                }
+            }
+            merged.push(area);
+        }
+        self.areas = merged;
+    }
 }
 
 impl Clone for MemorySet {
@@ -149,39 +390,39 @@ impl Clone for MemorySet {
         let mut new_ms = Self::from_kernel();
 
         for area in &self.areas {
-            let start_vpn = area.start_va.raw() / PAGE_SIZE;
-            let end_vpn = (area.end_va.raw() + PAGE_SIZE - 1) / PAGE_SIZE;
-            let mut new_area = MapArea::new(area.start_va, area.end_va, area.flags);
+            let mut new_area = MapArea::with_backing(
+                area.start_va,
+                area.end_va,
+                area.flags,
+                area.backing.clone(),
+            );
 
-            for vpn in start_vpn..end_vpn {
+            for (idx, src_frame) in area.frames.iter().enumerate() {
                 if let Some(frame) = frame_allocator::alloc_frame() {
-                    let new_ppn = frame.ppn();
-                    let new_paddr = PhysAddr::new(new_ppn.addr());
-                    let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
-
-                    if let Some(src_paddr) = self.translate(vaddr) {
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                src_paddr.raw() as *const u8,
-                                new_paddr.raw() as *mut u8,
-                                PAGE_SIZE,
-                            );
-                        }
-                    } else {
-                        new_paddr.clear_len(PAGE_SIZE);
+                    let new_paddr = PhysAddr::new(frame.ppn().addr());
+                    let src_paddr = PhysAddr::new(src_frame.ppn().addr());
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            src_paddr.raw() as *const u8,
+                            new_paddr.raw() as *mut u8,
+                            PAGE_SIZE,
+                        );
                     }
 
-                    let mf: MappingFlags = area.flags.into();
-                    new_ms
-                        .page_table
-                        .map_page(vaddr, new_paddr, mf, MappingSize::Page4KB);
+                    if has_leaf_permission(area.flags) {
+                        let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
+                        let mf: MappingFlags = area.flags.into();
+                        new_ms
+                            .page_table
+                            .map_page(vaddr, new_paddr, mf, MappingSize::Page4KB);
+                    }
                     new_area.frames.push(frame);
                 }
             }
 
             new_ms.areas.push(new_area);
         }
-
+        new_ms.coalesce_areas();
         new_ms
     }
 }

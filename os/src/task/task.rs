@@ -174,7 +174,7 @@ impl TaskControlBlock {
                         | crate::mm::page_table::PTEFlags::R
                         | crate::mm::page_table::PTEFlags::W
                         | crate::mm::page_table::PTEFlags::V,
-                );
+                )?;
 
                 (
                     memory_set,
