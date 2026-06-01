@@ -17,6 +17,7 @@ lazy_static! {
     /// 标记当前是否处于 execve 调用上下文中。
     /// 置位时 handle_syscall 跳过 syscall_ok() PC 前进，让 execve 直接返回到新程序入口。
     pub static ref EXECVE_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
+    pub static ref SIGRETURN_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
 
     /// 标记前台驱动模式：当此标志为 true 时，exit/suspend/timer 不要调用 run_next_task()，
     /// 而是将当前任务置为 Zombie 后直接返回，由前台驱动负责收尾。
@@ -68,10 +69,21 @@ pub fn signal_execve_done() {
     *EXECVE_IN_PROGRESS.lock() = true;
 }
 
+pub fn signal_rt_sigreturn_done() {
+    *SIGRETURN_IN_PROGRESS.lock() = true;
+}
+
 /// Returns true if the current trap was caused by execve completing.
 /// Consumes the flag so it can only be observed once per trap.
 pub fn take_execve_done() -> bool {
     let mut guard = EXECVE_IN_PROGRESS.lock();
+    let was = *guard;
+    *guard = false;
+    was
+}
+
+pub fn take_sigreturn_done() -> bool {
+    let mut guard = SIGRETURN_IN_PROGRESS.lock();
     let was = *guard;
     *guard = false;
     was
@@ -261,6 +273,10 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     // 让 CPU sret 到新程序的入口地址（sepc 已在 sys_execve 中设为 entry）。
     let execve_done = take_execve_done();
     if execve_done {
+        return;
+    }
+    let sigreturn_done = take_sigreturn_done();
+    if sigreturn_done {
         return;
     }
     if syscall_task

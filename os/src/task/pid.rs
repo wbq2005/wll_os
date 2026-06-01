@@ -31,7 +31,7 @@ impl PidAllocator {
     }
 
     pub fn dealloc(&mut self, pid: usize) {
-        self.recycled.push(pid);
+        let _ = pid;
     }
 }
 
@@ -42,6 +42,11 @@ impl Pid {
     pub fn alloc() -> Self {
         Self(PID_ALLOCATOR.lock().alloc())
     }
+}
+
+pub fn has_ever_allocated(pid: usize) -> bool {
+    let allocator = PID_ALLOCATOR.lock();
+    pid > 0 && pid < allocator.current
 }
 
 impl Drop for Pid {

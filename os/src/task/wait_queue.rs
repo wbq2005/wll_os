@@ -55,6 +55,9 @@ impl WaitQueue {
         block_current_and_run_next();
 
         let still_waiting = self.remove_waiter(task.pid.0, token);
+        if crate::syscall::signal::current_has_unblocked_pending() {
+            return Err(SysErrNo::EINTR);
+        }
         if still_waiting
             && deadline_us
                 .map(|deadline| crate::timer::get_time_us() >= deadline)

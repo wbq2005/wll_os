@@ -282,12 +282,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_SCHED_GET_PRIORITY_MAX => Ok(0),
         SYSCALL_SCHED_GET_PRIORITY_MIN => Ok(0),
 
-        // signal stubs
+        // signals
         SYSCALL_KILL => signal::sys_kill(args[0] as i32, args[1] as i32),
-        SYSCALL_TKILL => signal::sys_kill(args[0] as i32, args[1] as i32),
-        SYSCALL_TGKILL => signal::sys_kill(args[1] as i32, args[2] as i32),
+        SYSCALL_TKILL => signal::sys_tkill(args[0] as i32, args[1] as i32),
+        SYSCALL_TGKILL => signal::sys_tgkill(args[0] as i32, args[1] as i32, args[2] as i32),
         SYSCALL_SIGACTION => signal::sys_sigaction(args[0] as i32, args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::sys_sigprocmask(args[0] as i32, args[1], args[2], args[3]),
+        SYSCALL_SIGRETURN => signal::sys_sigreturn(),
 
         SYSCALL_READLINKAT => fs::sys_readlinkat(
             args[0] as isize,

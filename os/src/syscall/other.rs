@@ -471,6 +471,9 @@ pub fn sys_futex_stub(
             crate::task::block_current_and_run_next();
 
             let still_waiting = remove_futex_waiter(uaddr, key, task.pid.0, token);
+            if crate::syscall::signal::current_has_unblocked_pending() {
+                return Err(SysErrNo::EINTR);
+            }
             if still_waiting
                 && deadline
                     .map(|deadline| timer::get_time_us() >= deadline)

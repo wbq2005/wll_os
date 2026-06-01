@@ -544,6 +544,16 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
             ms.activate();
         }
 
+        if !crate::syscall::signal::handle_pending_for_user(&mut ctx) {
+            crate::trap::restore_kernel_page_table();
+            if active.status() != TaskStatus::Zombie {
+                *active.trap_frame.lock() = Some(ctx);
+            }
+            requeue_after_user_run(active);
+            waited += 1;
+            continue;
+        }
+
         let _reason = run_user_task(&mut ctx);
         crate::trap::restore_kernel_page_table();
 
@@ -556,7 +566,9 @@ pub(crate) fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
                 ms.activate();
             }
             let mut tf = active.trap_frame.lock().take().unwrap();
-            let _ = run_user_task(&mut tf);
+            if crate::syscall::signal::handle_pending_for_user(&mut tf) {
+                let _ = run_user_task(&mut tf);
+            }
             crate::trap::restore_kernel_page_table();
             if active.status() != TaskStatus::Zombie {
                 *active.trap_frame.lock() = Some(tf);
@@ -784,6 +796,17 @@ pub fn exit_thread_group_and_run_next(exit_code: i32) {
     run_next_task();
 }
 
+pub(crate) fn terminate_task_group(task: &Arc<TaskControlBlock>, exit_code: i32) {
+    if task.is_kernel {
+        return;
+    }
+    let members = task.thread_group.user_members();
+    for member in &members {
+        finish_task_exit(member, exit_code);
+    }
+    finish_process_exit(task, exit_code);
+}
+
 fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     let clear_child_tid = task.inner.lock().clear_child_tid;
     if clear_child_tid != 0 {
@@ -803,6 +826,7 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     }
     task.set_exit_code(exit_code);
     task.set_status(TaskStatus::Zombie);
+    crate::task::manager::record_exited_task(task.pid.0, task.thread_group.tgid());
     crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
     crate::fs::fd::flush_console_buffer_for_pid(task.thread_group.tgid());
 }
@@ -883,6 +907,19 @@ pub(crate) fn run_next_task() {
         if let Some(mut ctx) = tf_opt {
             // 恢复任务的 TrapFrame 并返回用户态
             log::debug!("[task] Restoring TrapFrame for task {}", task.pid.0);
+            if !crate::syscall::signal::handle_pending_for_user(&mut ctx) {
+                crate::trap::restore_kernel_page_table();
+                if task.status() != TaskStatus::Zombie {
+                    *task.trap_frame.lock() = Some(ctx);
+                }
+                requeue_after_user_run(task.clone());
+                *CURRENT_TASK.lock() = None;
+                if *crate::trap::FOREGROUND_MODE.lock() {
+                    return;
+                }
+                run_next_task();
+                return;
+            }
             let reason = run_user_task(&mut ctx);
             crate::trap::restore_kernel_page_table();
             log::debug!("[task] User task returned with reason: {:?}", reason);
@@ -897,7 +934,13 @@ pub(crate) fn run_next_task() {
                     sepc
                 );
                 task.set_status(TaskStatus::Running);
-                let _reason2 = run_user_task(&mut *task.trap_frame.lock().as_mut().unwrap());
+                {
+                    let mut guard = task.trap_frame.lock();
+                    let tf = guard.as_mut().unwrap();
+                    if crate::syscall::signal::handle_pending_for_user(tf) {
+                        let _reason2 = run_user_task(tf);
+                    }
+                }
                 crate::trap::restore_kernel_page_table();
                 ctx = task.trap_frame.lock().take().unwrap();
                 requeue_after_user_run(task);
@@ -1041,6 +1084,15 @@ pub(crate) fn run_ready_task_once() -> bool {
     }
 
     if let Some(mut ctx) = tf_opt {
+        if !crate::syscall::signal::handle_pending_for_user(&mut ctx) {
+            crate::trap::restore_kernel_page_table();
+            if active.status() != TaskStatus::Zombie {
+                *active.trap_frame.lock() = Some(ctx);
+            }
+            requeue_after_user_run(active);
+            *CURRENT_TASK.lock() = None;
+            return true;
+        }
         let _reason = run_user_task(&mut ctx);
         crate::trap::restore_kernel_page_table();
         let execve_done = crate::trap::take_execve_done();
@@ -1048,7 +1100,9 @@ pub(crate) fn run_ready_task_once() -> bool {
             *active.trap_frame.lock() = Some(ctx);
             active.memory_set.lock().activate();
             let mut tf = active.trap_frame.lock().take().unwrap();
-            let _ = run_user_task(&mut tf);
+            if crate::syscall::signal::handle_pending_for_user(&mut tf) {
+                let _ = run_user_task(&mut tf);
+            }
             crate::trap::restore_kernel_page_table();
             if active.status() != TaskStatus::Zombie {
                 *active.trap_frame.lock() = Some(tf);
@@ -1131,6 +1185,8 @@ pub struct TaskControlBlock {
     pub memory_set: SharedMemorySet,
     pub fs: SharedFsContext,
     pub mm: SharedMmContext,
+    pub signal_actions: crate::syscall::signal::SharedSignalActions,
+    pub signal_state: Mutex<crate::syscall::signal::SignalState>,
     /// User trap frame. Outside inner for foreground driver.
     pub trap_frame: Mutex<Option<TrapFrame>>,
     /// Task status. Outside inner to avoid deadlock.

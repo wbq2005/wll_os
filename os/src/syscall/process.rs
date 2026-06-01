@@ -440,7 +440,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         interp_path_opt = None;
     }
 
-    let (new_memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) =
+    let (mut new_memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) =
         if let Some(interp) = interp_path_opt {
             let (interp_path, interp_host_path, interp_data) =
                 super::with_kernel_page_table(|| crate::fs::read_interpreter(&root, interp))
@@ -574,7 +574,9 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         phnum,
         interp_base,
     );
+    crate::syscall::signal::install_signal_trampoline(&mut new_memory_set)?;
     if let Some(task) = current_task() {
+        crate::syscall::signal::reset_signal_handlers_for_exec(&task);
         {
             let mut inner = task.inner.lock();
 
@@ -821,6 +823,12 @@ pub fn sys_clone(
     };
     let fs_snapshot = fs.lock().clone();
     let mm_snapshot = *mm.lock();
+    let signal_actions = if (clone_bits & CLONE_SIGHAND) != 0 {
+        parent.signal_actions.clone()
+    } else {
+        crate::syscall::signal::dup_signal_actions(&parent.signal_actions)
+    };
+    let signal_blocked = parent.signal_state.lock().blocked;
     let child_pid_obj = crate::task::pid::Pid::alloc();
     let child_pid = child_pid_obj.0;
     let thread_group = if is_thread {
@@ -860,10 +868,15 @@ pub fn sys_clone(
         memory_set,
         fs,
         mm,
+        signal_actions,
+        signal_state: Mutex::new(crate::syscall::signal::SignalState::fork_from(
+            signal_blocked,
+        )),
         trap_frame: Mutex::new(Some(child_tf)),
         status: Mutex::new(crate::task::TaskStatus::Ready),
         wait_token: AtomicUsize::new(0),
     });
+    crate::task::manager::register_task(&child);
     thread_group.add_member(&child);
     // RISC-V clone uses Linux's order:
     // clone(flags, stack, parent_tidptr, tls, child_tidptr).

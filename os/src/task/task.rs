@@ -55,7 +55,7 @@ impl TaskControlBlock {
             });
         let phnum = elf.header.e_phnum as usize;
 
-        let (memory_set, user_stack_top, entry) = elf.load()?;
+        let (mut memory_set, user_stack_top, entry) = elf.load()?;
 
         // 在用户栈上构造最小的 argc/argv/auxv
         let sp = crate::syscall::process::setup_user_stack_for_init(
@@ -71,6 +71,7 @@ impl TaskControlBlock {
         trap_frame[TrapFrameArgs::SP] = sp;
         trap_frame[TrapFrameArgs::SEPC] = entry;
         crate::syscall::process::set_user_entry_registers(&mut trap_frame, sp, 1);
+        crate::syscall::signal::install_signal_trampoline(&mut memory_set)?;
 
         let pid = Pid::alloc();
         let thread_group = ThreadGroup::new(pid.0);
@@ -100,10 +101,13 @@ impl TaskControlBlock {
                 crate::config::USER_HEAP_START,
                 0x4000_0000,
             ),
+            signal_actions: crate::syscall::signal::new_shared_signal_actions(),
+            signal_state: Mutex::new(crate::syscall::signal::SignalState::new()),
             trap_frame: Mutex::new(Some(trap_frame)),
             status: Mutex::new(TaskStatus::Ready),
             wait_token: AtomicUsize::new(0),
         });
+        crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
 
         log::info!(
@@ -142,7 +146,7 @@ impl TaskControlBlock {
             );
             interp_path_opt = None;
         }
-        let (memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) =
+        let (mut memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) =
             if let Some(interp) = interp_path_opt {
                 let (interp_path, interp_host_path, interp_data) =
                     crate::fs::read_interpreter(&spec.root, interp).ok_or_else(|| {
@@ -239,6 +243,7 @@ impl TaskControlBlock {
             phnum,
             interp_base,
         );
+        crate::syscall::signal::install_signal_trampoline(&mut memory_set)?;
 
         let mut trap_frame = TrapFrame::new();
         init_user_trapframe(&mut trap_frame);
@@ -279,10 +284,13 @@ impl TaskControlBlock {
                 crate::config::USER_HEAP_START,
                 0x4000_0000,
             ),
+            signal_actions: crate::syscall::signal::new_shared_signal_actions(),
+            signal_state: Mutex::new(crate::syscall::signal::SignalState::new()),
             trap_frame: Mutex::new(Some(trap_frame)),
             status: Mutex::new(TaskStatus::Ready),
             wait_token: AtomicUsize::new(0),
         });
+        crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
 
         log::info!(
@@ -329,10 +337,13 @@ impl TaskControlBlock {
                 crate::config::USER_HEAP_START,
                 0x4000_0000,
             ),
+            signal_actions: crate::syscall::signal::new_shared_signal_actions(),
+            signal_state: Mutex::new(crate::syscall::signal::SignalState::new()),
             trap_frame: Mutex::new(None),
             status: Mutex::new(TaskStatus::Ready),
             wait_token: AtomicUsize::new(0),
         });
+        crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
         task
     }
@@ -377,10 +388,13 @@ impl TaskControlBlock {
                 crate::config::USER_HEAP_START,
                 0x4000_0000,
             ),
+            signal_actions: crate::syscall::signal::new_shared_signal_actions(),
+            signal_state: Mutex::new(crate::syscall::signal::SignalState::new()),
             trap_frame: Mutex::new(None),
             status: Mutex::new(TaskStatus::Ready),
             wait_token: AtomicUsize::new(0),
         });
+        crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
         task
     }
