@@ -160,10 +160,7 @@ fn resolve_base_dir(dirfd: isize) -> Result<String, SysErrNo> {
     let dirfd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
     let result = match inner.fd_table.lock().get(dirfd) {
         Some(FileDescriptor::MemDir { path, .. }) => Ok(path.clone()),
-        Some(FileDescriptor::Ext4Dir { .. }) => {
-            // ext4 directories don't store a path string; use cwd as fallback
-            Ok(inner.cwd.clone())
-        }
+        Some(FileDescriptor::Ext4Dir { path, .. }) => Ok(path.clone()),
         Some(_) => Err(SysErrNo::ENOTDIR),
         None => Err(SysErrNo::EBADF),
     };
@@ -246,13 +243,7 @@ fn stat_for_fd(file_desc: &FileDescriptor) -> KStat {
                 crate::fs::ext4_vol::regular_file_size(*ino).unwrap_or(0),
             )
         }
-        FileDescriptor::Ext4Dir { ino, .. } => make_kstat(
-            *ino as u64,
-            S_IFDIR | 0o755,
-            crate::fs::ext4_vol::ext4_list_dir_by_ino(*ino)
-                .map(|v| v.len())
-                .unwrap_or(0),
-        ),
+        FileDescriptor::Ext4Dir { ino, .. } => make_kstat(*ino as u64, S_IFDIR | 0o755, 0),
         FileDescriptor::PipeRead { .. } => make_kstat(0, S_IFIFO | 0o444, 0),
         FileDescriptor::PipeWrite { .. } => make_kstat(0, S_IFIFO | 0o222, 0),
     }
@@ -260,22 +251,28 @@ fn stat_for_fd(file_desc: &FileDescriptor) -> KStat {
 
 fn stat_for_path(path: &str) -> Result<KStat, SysErrNo> {
     let norm = crate::fs::normalize_path(path);
-    if crate::fs::dir_exists(&norm) {
-        let entries = crate::fs::list_dir(&norm)?;
-        return Ok(make_kstat(
-            pseudo_inode(&norm),
-            S_IFDIR | 0o755,
-            entries.len(),
-        ));
+    if crate::fs::is_removed(&norm) {
+        return Err(SysErrNo::ENOENT);
     }
-    if crate::fs::file_exists(&norm) {
-        let size = crate::fs::read_file(&norm).map(|v| v.len()).unwrap_or(0);
-        return Ok(make_kstat(pseudo_inode(&norm), S_IFREG | 0o666, size));
+
+    {
+        let mem = crate::fs::MEM_FS.lock();
+        if mem.is_dir(&norm) {
+            let entries = mem.list_dir(&norm)?;
+            return Ok(make_kstat(
+                pseudo_inode(&norm),
+                S_IFDIR | 0o755,
+                entries.len(),
+            ));
+        }
+        if let Some(file) = mem.get_file(&norm) {
+            return Ok(make_kstat(pseudo_inode(&norm), S_IFREG | 0o666, file.size()));
+        }
     }
+
     if let Some((ino, is_dir)) = crate::fs::ext4_vol::lookup_path(&norm) {
         if is_dir {
-            let entries = crate::fs::ext4_vol::ext4_list_dir(&norm)?;
-            Ok(make_kstat(ino as u64, S_IFDIR | 0o755, entries.len()))
+            Ok(make_kstat(ino as u64, S_IFDIR | 0o755, 0))
         } else {
             let size = crate::fs::ext4_vol::regular_file_size(ino)?;
             Ok(make_kstat(ino as u64, S_IFREG | 0o666, size))
@@ -423,7 +420,9 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
     if let Some(task) = current_task() {
         let mut inner = task.inner.lock();
 
-        match super::with_kernel_page_table(|| crate::fs::fd::open_file(&host_path, flags, mode)) {
+        match super::with_kernel_page_table(|| {
+            crate::fs::fd::open_file(&host_path, &logical_path, flags, mode)
+        }) {
             Ok(fd_desc) => {
                 let mut fds = inner.fd_table.lock();
                 match fds.alloc(fd_desc) {

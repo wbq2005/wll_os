@@ -3,7 +3,7 @@
 //! `ext4_rs::ext4_file_open` 在 crates.io 版中有误（打开类型被写成目录），此处不用它；
 //! 目录项逐级 `ext4_dir_get_entries`/`compare_name`，文件内容 [`Ext4::read_at`]。
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -37,6 +37,14 @@ use crate::utils::error::SysErrNo;
 lazy_static! {
     /// 挂载后的 Ext4（无盘或未探测到 virtio 时为 `None`）
     pub static ref ROOT_EXT4: Mutex<Option<Arc<Ext4>>> = Mutex::new(None);
+    static ref PATH_CACHE: Mutex<BTreeMap<String, (u32, bool)>> = Mutex::new(BTreeMap::new());
+    static ref DIR_CACHE: Mutex<BTreeMap<u32, Vec<(u32, String, bool)>>> =
+        Mutex::new(BTreeMap::new());
+}
+
+fn clear_metadata_cache() {
+    PATH_CACHE.lock().clear();
+    DIR_CACHE.lock().clear();
 }
 
 pub fn is_ext4_mounted() -> bool {
@@ -87,12 +95,14 @@ pub fn mount_block_device(device: Arc<dyn ext4_rs::BlockDevice>) {
         0 => log::warn!("[fs] EXT4 root dir appears empty — expected test scripts here"),
         n => log::info!("[fs] EXT4 root dir has {} entries", n),
     }
+    clear_metadata_cache();
     *ROOT_EXT4.lock() = Some(Arc::new(fs));
     log::info!("[fs] EXT4 mounted as runtime root backing");
 }
 
 /// 卸载运行时 ext4 根（`umount2` / 回退 MemFS）。
 pub fn unmount_root() {
+    clear_metadata_cache();
     *ROOT_EXT4.lock() = None;
     log::info!("[fs] EXT4 unmounted");
 }
@@ -131,12 +141,32 @@ pub fn unlink_regular_file(path: &str) -> Result<(), SysErrNo> {
     let mut child_ref = fs.get_inode_ref(child_ino);
     fs.unlink(&mut parent_ref, &mut child_ref, &name)
         .map_err(map_ext4_err)?;
+    clear_metadata_cache();
     Ok(())
 }
 
 pub fn mkdir_ext4(path: &str) -> Result<(), SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     fs.dir_mk(path).map_err(map_ext4_err)?;
+    clear_metadata_cache();
+    Ok(())
+}
+
+pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let norm = normalize_path(path);
+    let (parent_path, name) = split_parent_name(&norm)?;
+    let Some((parent_ino, _)) = resolve_existing(&fs, &parent_path) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    let Some((_child_ino, is_dir)) = resolve_existing(&fs, &norm) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if !is_dir {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    fs.dir_remove(parent_ino, &name).map_err(map_ext4_err)?;
+    clear_metadata_cache();
     Ok(())
 }
 
@@ -146,14 +176,17 @@ pub fn create_regular_ext4(path: &str) -> Result<u32, SysErrNo> {
     let norm = normalize_path(path);
     let mut parent = ROOT_INODE;
     let mut nameoff = 0u32;
-    fs.generic_open(
+    let ino = fs
+        .generic_open(
         &norm,
         &mut parent,
         true,
         InodeFileType::S_IFREG.bits(),
         &mut nameoff,
     )
-    .map_err(map_ext4_err)
+    .map_err(map_ext4_err)?;
+    clear_metadata_cache();
+    Ok(ino)
 }
 
 pub fn truncate_regular_ext4(path: &str, size: u64) -> Result<(), SysErrNo> {
@@ -189,13 +222,32 @@ pub fn regular_file_size(ino: u32) -> Result<usize, SysErrNo> {
     Ok(fs.get_inode_ref(ino).inode.size() as usize)
 }
 
-fn find_child_ino(fs: &Ext4, parent_ino: u32, name: &str) -> Option<u32> {
-    for e in fs.ext4_dir_get_entries(parent_ino) {
+fn cached_dir_entries(fs: &Ext4, ino: u32) -> Vec<(u32, String, bool)> {
+    if let Some(entries) = DIR_CACHE.lock().get(&ino).cloned() {
+        return entries;
+    }
+
+    let mut out = Vec::new();
+    for e in fs.ext4_dir_get_entries(ino) {
         if e.unused() {
             continue;
         }
-        if e.compare_name(name) {
-            return Some(e.inode);
+        let name = e.get_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let child_ino = e.inode;
+        let is_subdir = fs.get_inode_ref(child_ino).inode.is_dir();
+        out.push((child_ino, name, is_subdir));
+    }
+    DIR_CACHE.lock().insert(ino, out.clone());
+    out
+}
+
+fn find_child_ino(fs: &Ext4, parent_ino: u32, name: &str) -> Option<u32> {
+    for (child_ino, child_name, _) in cached_dir_entries(fs, parent_ino) {
+        if child_name == name {
+            return Some(child_ino);
         }
     }
     None
@@ -207,6 +259,9 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, bool)> {
     if !n.starts_with('/') {
         return None;
     }
+    if let Some(found) = PATH_CACHE.lock().get(&n).copied() {
+        return Some(found);
+    }
     let tail = n.trim_matches('/');
     let parts: Vec<&str> = if tail.is_empty() {
         Vec::new()
@@ -216,7 +271,9 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, bool)> {
 
     if parts.is_empty() {
         let r = fs.get_inode_ref(ROOT_INODE);
-        return Some((ROOT_INODE, r.inode.is_dir()));
+        let found = (ROOT_INODE, r.inode.is_dir());
+        PATH_CACHE.lock().insert(n, found);
+        return Some(found);
     }
 
     let mut parent = ROOT_INODE;
@@ -224,7 +281,9 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, bool)> {
         let ino = find_child_ino(fs, parent, comp)?;
         if i + 1 == parts.len() {
             let r = fs.get_inode_ref(ino);
-            return Some((ino, r.inode.is_dir()));
+            let found = (ino, r.inode.is_dir());
+            PATH_CACHE.lock().insert(n, found);
+            return Some(found);
         }
         if !fs.get_inode_ref(ino).inode.is_dir() {
             return None;
@@ -285,19 +344,10 @@ pub fn ext4_list_dir(dir_path: &str) -> Result<Vec<(String, bool)>, SysErrNo> {
         return Err(SysErrNo::ENOTDIR);
     }
 
-    let mut out = Vec::new();
-    for e in fs.ext4_dir_get_entries(ino) {
-        if e.unused() {
-            continue;
-        }
-        let name = e.get_name();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let child_ino = e.inode;
-        let is_subdir = fs.get_inode_ref(child_ino).inode.is_dir();
-        out.push((name, is_subdir));
-    }
+    let mut out: Vec<(String, bool)> = cached_dir_entries(&fs, ino)
+        .into_iter()
+        .map(|(_, name, is_dir)| (name, is_dir))
+        .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
@@ -306,42 +356,20 @@ pub fn ext4_list_dir(dir_path: &str) -> Result<Vec<(String, bool)>, SysErrNo> {
 /// 返回 `(child_ino, name, is_dir)` 元组的 `Vec`，跳过 `.` 和 `..`。
 pub fn ext4_list_dir_by_ino(ino: u32) -> Result<Vec<(u32, String, bool)>, SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    let mut out = Vec::new();
-    for e in fs.ext4_dir_get_entries(ino) {
-        if e.unused() {
-            continue;
-        }
-        let name = e.get_name();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let child_ino = e.inode;
-        let is_subdir = fs.get_inode_ref(child_ino).inode.is_dir();
-        out.push((child_ino, name, is_subdir));
-    }
-    Ok(out)
+    Ok(cached_dir_entries(&fs, ino))
 }
 
 fn ext4_gather_file_paths(fs: &Ext4, dir_path: &str, parent_ino: u32, out: &mut Vec<String>) {
-    for e in fs.ext4_dir_get_entries(parent_ino) {
-        if e.unused() {
-            continue;
-        }
-        let name = e.get_name();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let child_ino = e.inode;
+    for (child_ino, name, is_dir) in cached_dir_entries(fs, parent_ino) {
         let full_path = if dir_path == "/" {
             format!("/{}", name)
         } else {
             format!("{}/{}", dir_path, name)
         };
 
-        let inode_ref = fs.get_inode_ref(child_ino);
-        if inode_ref.inode.is_dir() {
+        if is_dir {
             ext4_gather_file_paths(fs, &full_path, child_ino, out);
-        } else if inode_ref.inode.is_file() {
+        } else {
             out.push(full_path);
         }
     }

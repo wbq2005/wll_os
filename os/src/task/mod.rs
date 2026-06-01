@@ -218,6 +218,10 @@ fn is_testcode_script(path: &str) -> bool {
     testcode_stem(path).is_some()
 }
 
+fn is_default_regression_script(path: &str) -> bool {
+    matches!(testcode_stem(path), Some("basic" | "busybox"))
+}
+
 fn script_rank(path: &str) -> usize {
     let libc_rank = if path.starts_with("/glibc/") {
         0usize
@@ -238,14 +242,14 @@ fn script_rank(path: &str) -> usize {
 fn collect_script_paths() -> Vec<String> {
     let mut scripts: Vec<String> = crate::fs::ext4_vol::ext4_list_all_file_paths()
         .into_iter()
-        .filter(|path| is_testcode_script(path))
+        .filter(|path| is_testcode_script(path) && is_default_regression_script(path))
         .collect();
 
     #[cfg(feature = "dev-preload")]
     if scripts.is_empty() {
         scripts = crate::fs::list_files()
             .into_iter()
-            .filter(|path| is_testcode_script(path))
+            .filter(|path| is_testcode_script(path) && is_default_regression_script(path))
             .collect();
     }
 
@@ -459,6 +463,16 @@ fn dirname(path: &str) -> String {
     }
 }
 
+fn ensure_busybox_applet_alias(root: &str, busybox_host: &str, applet: &str) -> Option<()> {
+    let alias_host = crate::fs::apply_root(root, &alloc::format!("/{}", applet));
+    if crate::fs::file_exists(&alias_host) {
+        return Some(());
+    }
+    let busybox = crate::fs::read_executable_file(busybox_host)?;
+    crate::fs::MEM_FS.lock().add_file(&alias_host, busybox);
+    Some(())
+}
+
 fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
     let (root, logical_script) = logical_path_for_script(script_path)?;
     let busybox_path = String::from("/busybox");
@@ -467,6 +481,7 @@ fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
 
     crate::fs::read_executable_file(&busybox_host)?;
     crate::fs::read_file(&script_host)?;
+    ensure_busybox_applet_alias(&root, &busybox_host, "ls")?;
 
     Some(UserProgramSpec {
         path: busybox_path.clone(),

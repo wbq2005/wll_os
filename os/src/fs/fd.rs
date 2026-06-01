@@ -117,7 +117,11 @@ pub enum FileDescriptor {
         append: bool,
     },
     /// ext4 目录（运行时块设备挂载）
-    Ext4Dir { ino: u32, offset: usize },
+    Ext4Dir {
+        path: String,
+        ino: u32,
+        offset: usize,
+    },
     /// 管道读端
     PipeRead {
         state: Arc<Mutex<PipeState>>,
@@ -522,9 +526,7 @@ impl FileDescriptor {
             FileDescriptor::Ext4Regular { ino, .. } => {
                 ext4_vol::regular_file_size(*ino).unwrap_or(0)
             }
-            FileDescriptor::Ext4Dir { ino, .. } => ext4_vol::ext4_list_dir_by_ino(*ino)
-                .map(|v| v.len())
-                .unwrap_or(0),
+            FileDescriptor::Ext4Dir { .. } => 0,
             FileDescriptor::PipeRead { state, .. } | FileDescriptor::PipeWrite { state, .. } => {
                 state.lock().buf.len()
             }
@@ -569,7 +571,7 @@ impl FileDescriptor {
 
                 Ok(written)
             }
-            FileDescriptor::Ext4Dir { ino, offset } => {
+            FileDescriptor::Ext4Dir { ino, offset, .. } => {
                 let entries = ext4_vol::ext4_list_dir_by_ino(*ino)?;
                 let mut written = 0usize;
 
@@ -648,7 +650,8 @@ impl Clone for FileDescriptor {
                 writable: *writable,
                 append: *append,
             },
-            FileDescriptor::Ext4Dir { ino, offset } => FileDescriptor::Ext4Dir {
+            FileDescriptor::Ext4Dir { path, ino, offset } => FileDescriptor::Ext4Dir {
+                path: path.clone(),
                 ino: *ino,
                 offset: *offset,
             },
@@ -803,30 +806,40 @@ impl Default for FileDescriptorTable {
     }
 }
 
-fn open_dir_descriptor(path_norm: &str) -> Result<FileDescriptor, SysErrNo> {
-    if MEM_FS.lock().is_dir(path_norm) {
-        let entries = fs::list_dir(path_norm)?;
+fn open_dir_descriptor(host_path: &str, logical_path: &str) -> Result<FileDescriptor, SysErrNo> {
+    if MEM_FS.lock().is_dir(host_path) {
+        let entries = fs::list_dir(host_path)?;
         return Ok(FileDescriptor::MemDir {
-            path: path_norm.into(),
+            path: logical_path.into(),
             entries,
             offset: 0,
         });
     }
 
-    let Some((ino, is_dir)) = ext4_vol::lookup_path(path_norm) else {
+    let Some((ino, is_dir)) = ext4_vol::lookup_path(host_path) else {
         return Err(SysErrNo::ENOENT);
     };
     if !is_dir {
         return Err(SysErrNo::ENOTDIR);
     }
-    Ok(FileDescriptor::Ext4Dir { ino, offset: 0 })
+    Ok(FileDescriptor::Ext4Dir {
+        path: logical_path.into(),
+        ino,
+        offset: 0,
+    })
 }
 
 /// 打开路径：`flags`/`mode` 语义对齐 Linux `openat` 子集。
-pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, SysErrNo> {
+pub fn open_file(
+    host_path: &str,
+    logical_path: &str,
+    flags: u32,
+    _mode: u32,
+) -> Result<FileDescriptor, SysErrNo> {
     use open_flags::*;
 
-    let path_norm = fs::normalize_path(path);
+    let path_norm = fs::normalize_path(host_path);
+    let logical_norm = fs::normalize_path(logical_path);
     let accmode = flags & O_ACCMODE;
     let read_ok = accmode == O_RDONLY || accmode == O_RDWR;
     let write_ok = accmode == O_WRONLY || accmode == O_RDWR;
@@ -873,7 +886,7 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
         if write_ok || want_trunc || want_create {
             return Err(SysErrNo::EISDIR);
         }
-        return open_dir_descriptor(&path_norm);
+        return open_dir_descriptor(&path_norm, &logical_norm);
     }
 
     if want_dir {
@@ -885,7 +898,7 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
         if MEM_FS.lock().is_dir(&path_norm) {
             let entries = fs::list_dir(&path_norm)?;
             return Ok(FileDescriptor::MemDir {
-                path: path_norm,
+                path: logical_norm,
                 entries,
                 offset: 0,
             });
@@ -894,7 +907,11 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
             let Some((ino, _)) = ext4_vol::lookup_path(&path_norm) else {
                 return Err(SysErrNo::ENOENT);
             };
-            return Ok(FileDescriptor::Ext4Dir { ino, offset: 0 });
+            return Ok(FileDescriptor::Ext4Dir {
+                path: logical_norm,
+                ino,
+                offset: 0,
+            });
         }
     }
 
@@ -911,22 +928,6 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
         };
         if is_dir {
             return Err(SysErrNo::EISDIR);
-        }
-        if write_ok || want_trunc {
-            let mut content = if want_trunc {
-                Vec::new()
-            } else {
-                ext4_vol::slurp_regular_file(&path_norm).unwrap_or_default()
-            };
-            let base_off = if append && write_ok { content.len() } else { 0 };
-            fs::MEM_FS.lock().add_file(&path_norm, content.clone());
-            return Ok(FileDescriptor::MemFile {
-                name: path_norm,
-                content,
-                offset: base_off,
-                writable: write_ok,
-                append,
-            });
         }
         if want_trunc && write_ok {
             ext4_vol::truncate_regular_ext4(&path_norm, 0)?;
@@ -946,14 +947,24 @@ pub fn open_file(path: &str, flags: u32, _mode: u32) -> Result<FileDescriptor, S
     }
 
     if want_create && write_ok {
-        fs::MEM_FS.lock().add_file(&path_norm, Vec::new());
-        return Ok(FileDescriptor::MemFile {
-            name: path_norm,
-            content: Vec::new(),
-            offset: 0,
-            writable: true,
-            append,
-        });
+        if let Ok(ino) = ext4_vol::create_regular_ext4(&path_norm) {
+            return Ok(FileDescriptor::Ext4Regular {
+                ino,
+                offset: 0,
+                readable: read_ok,
+                writable: true,
+                append,
+            });
+        } else {
+            fs::MEM_FS.lock().add_file(&path_norm, Vec::new());
+            return Ok(FileDescriptor::MemFile {
+                name: path_norm,
+                content: Vec::new(),
+                offset: 0,
+                writable: true,
+                append,
+            });
+        }
     }
 
     Err(SysErrNo::ENOENT)
