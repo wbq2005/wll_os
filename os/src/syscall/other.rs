@@ -468,7 +468,7 @@ pub fn sys_futex_stub(
                 timer::add_timeout(deadline, task.clone(), token);
             }
 
-            crate::task::block_current_and_run_next();
+            crate::task::wait_queue::block_current_for(crate::task::wait_queue::BlockReason::Futex);
 
             let still_waiting = remove_futex_waiter(uaddr, key, task.pid.0, token);
             if crate::syscall::signal::current_has_unblocked_pending() {

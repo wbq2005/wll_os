@@ -12,8 +12,37 @@ use super::ext4_vol;
 use super::fd;
 use super::{normalize_path, MEM_FS};
 
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+
 lazy_static! {
     static ref WHITEOUTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VfsNodeKind {
+    Regular,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct VfsMetadata {
+    pub ino: u64,
+    pub kind: VfsNodeKind,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub blocks: u64,
+    pub atime_sec: isize,
+    pub atime_nsec: isize,
+    pub mtime_sec: isize,
+    pub mtime_nsec: isize,
+    pub ctime_sec: isize,
+    pub ctime_nsec: isize,
 }
 
 pub fn is_removed(name: &str) -> bool {
@@ -35,6 +64,124 @@ fn parent_path(path: &str) -> String {
         Some(pos) => String::from(&trimmed[..pos]),
         None => String::from("/"),
     }
+}
+
+fn pseudo_inode(path: &str) -> u64 {
+    let mut hash = 1469598103934665603u64;
+    for &b in path.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash & 0x7fff_ffff
+}
+
+fn regular_blocks(size: u64) -> u64 {
+    size.div_ceil(512)
+}
+
+fn current_times() -> (isize, isize) {
+    let (sec, usec) = crate::timer::get_timeval();
+    (sec as isize, (usec * 1000) as isize)
+}
+
+fn kind_from_ext4(kind: ext4_vol::Ext4NodeKind) -> VfsNodeKind {
+    match kind {
+        ext4_vol::Ext4NodeKind::Regular => VfsNodeKind::Regular,
+        ext4_vol::Ext4NodeKind::Directory => VfsNodeKind::Directory,
+        ext4_vol::Ext4NodeKind::Symlink => VfsNodeKind::Symlink,
+        ext4_vol::Ext4NodeKind::Other => VfsNodeKind::Other,
+    }
+}
+
+fn metadata_from_ext4(meta: ext4_vol::Ext4Metadata) -> VfsMetadata {
+    let kind = match meta.mode & 0o170000 {
+        S_IFREG => VfsNodeKind::Regular,
+        S_IFDIR => VfsNodeKind::Directory,
+        0o120000 => VfsNodeKind::Symlink,
+        _ => VfsNodeKind::Other,
+    };
+    VfsMetadata {
+        ino: meta.ino as u64,
+        kind,
+        mode: meta.mode,
+        nlink: meta.nlink,
+        uid: meta.uid,
+        gid: meta.gid,
+        size: meta.size,
+        blocks: meta.blocks.max(regular_blocks(meta.size)),
+        atime_sec: meta.atime_sec,
+        atime_nsec: meta.atime_nsec,
+        mtime_sec: meta.mtime_sec,
+        mtime_nsec: meta.mtime_nsec,
+        ctime_sec: meta.ctime_sec,
+        ctime_nsec: meta.ctime_nsec,
+    }
+}
+
+pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrNo> {
+    let norm = normalize_path(path);
+    if is_removed(&norm) {
+        return Err(SysErrNo::ENOENT);
+    }
+
+    {
+        let mem = MEM_FS.lock();
+        if mem.is_dir(&norm) {
+            let entries = mem.list_dir(&norm)?;
+            let (sec, nsec) = current_times();
+            return Ok(VfsMetadata {
+                ino: pseudo_inode(&norm),
+                kind: VfsNodeKind::Directory,
+                mode: S_IFDIR | 0o755,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                size: entries.len() as u64,
+                blocks: regular_blocks(entries.len() as u64),
+                atime_sec: sec,
+                atime_nsec: nsec,
+                mtime_sec: sec,
+                mtime_nsec: nsec,
+                ctime_sec: sec,
+                ctime_nsec: nsec,
+            });
+        }
+        if let Some(file) = mem.get_file(&norm) {
+            let (sec, nsec) = current_times();
+            let size = file.size() as u64;
+            return Ok(VfsMetadata {
+                ino: pseudo_inode(&norm),
+                kind: VfsNodeKind::Regular,
+                mode: S_IFREG | 0o666,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                size,
+                blocks: regular_blocks(size),
+                atime_sec: sec,
+                atime_nsec: nsec,
+                mtime_sec: sec,
+                mtime_nsec: nsec,
+                ctime_sec: sec,
+                ctime_nsec: nsec,
+            });
+        }
+    }
+
+    let ext_path = match ext4_vol::lookup_kind(&norm) {
+        Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
+            ext4_vol::resolve_symlinks(&norm)?
+        }
+        Some((_ino, kind)) => {
+            let meta = ext4_vol::metadata(&norm)?;
+            let mut out = metadata_from_ext4(meta);
+            out.kind = kind_from_ext4(kind);
+            return Ok(out);
+        }
+        None => return Err(SysErrNo::ENOENT),
+    };
+
+    ext4_vol::metadata(&ext_path).map(metadata_from_ext4)
 }
 
 pub fn read_file(name: &str) -> Option<Vec<u8>> {
@@ -290,6 +437,178 @@ pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
 
 pub fn create_dir(path: &str) -> Result<(), SysErrNo> {
     create_dir_with_mode(path, 0o755)
+}
+
+pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
+    let norm = normalize_path(path);
+    if file_exists(&norm) || dir_exists(&norm) {
+        return Err(SysErrNo::EEXIST);
+    }
+    clear_whiteout(&norm);
+    let parent = parent_path(&norm);
+    if ext4_vol::ext4_dir_path_exists(&parent) {
+        return ext4_vol::create_regular_ext4_with_mode(&norm, mode);
+    }
+    if MEM_FS.lock().is_dir(&parent) {
+        MEM_FS.lock().add_file(&norm, Vec::new());
+        return Ok(pseudo_inode(&norm) as u32);
+    }
+    Err(SysErrNo::ENOENT)
+}
+
+fn open_dir_descriptor(
+    host_path: &str,
+    logical_path: &str,
+) -> Result<fd::FileDescriptor, SysErrNo> {
+    if MEM_FS.lock().is_dir(host_path) {
+        let entries = list_dir(host_path)?;
+        return Ok(fd::FileDescriptor::MemDir {
+            path: logical_path.into(),
+            entries,
+            offset: 0,
+        });
+    }
+
+    let Some((ino, is_dir)) = ext4_vol::lookup_path(host_path) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if !is_dir {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    Ok(fd::FileDescriptor::Ext4Dir {
+        path: logical_path.into(),
+        ino,
+        offset: 0,
+    })
+}
+
+pub fn open_path(
+    host_path: &str,
+    logical_path: &str,
+    flags: u32,
+    mode: u32,
+) -> Result<fd::FileDescriptor, SysErrNo> {
+    use fd::open_flags::*;
+
+    let path_norm = normalize_path(host_path);
+    let logical_norm = normalize_path(logical_path);
+    let accmode = flags & O_ACCMODE;
+    let read_ok = accmode == O_RDONLY || accmode == O_RDWR;
+    let write_ok = accmode == O_WRONLY || accmode == O_RDWR;
+    let want_dir = (flags & O_DIRECTORY) != 0;
+    let want_create = (flags & O_CREAT) != 0;
+    let want_excl = (flags & O_EXCL) != 0;
+    let want_trunc = (flags & O_TRUNC) != 0;
+    let append = (flags & O_APPEND) != 0;
+
+    let removed = is_removed(&path_norm);
+    if removed && !(want_create && write_ok) {
+        return Err(SysErrNo::ENOENT);
+    }
+
+    let mem_has_file = MEM_FS.lock().get_file(&path_norm).is_some();
+    let ext_path_norm = if !removed {
+        match ext4_vol::lookup_kind(&path_norm) {
+            Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => {
+                ext4_vol::resolve_symlinks(&path_norm)?
+            }
+            _ => path_norm.clone(),
+        }
+    } else {
+        path_norm.clone()
+    };
+
+    if mem_has_file {
+        if want_dir {
+            return Err(SysErrNo::ENOTDIR);
+        }
+        if want_excl && want_create {
+            return Err(SysErrNo::EEXIST);
+        }
+        let mut content = read_file(&path_norm).unwrap_or_default();
+        if want_trunc && write_ok {
+            content.clear();
+            MEM_FS.lock().truncate_file(&path_norm, 0)?;
+        }
+        let base_off = if append && write_ok { content.len() } else { 0 };
+        return Ok(fd::FileDescriptor::MemFile {
+            name: path_norm,
+            content,
+            offset: base_off,
+            writable: write_ok,
+            append,
+        });
+    }
+
+    if MEM_FS.lock().is_dir(&path_norm) || ext4_vol::ext4_dir_path_exists(&ext_path_norm) {
+        if write_ok || want_trunc || want_create {
+            return Err(SysErrNo::EISDIR);
+        }
+        let open_path = if MEM_FS.lock().is_dir(&path_norm) {
+            path_norm.clone()
+        } else {
+            ext_path_norm.clone()
+        };
+        return open_dir_descriptor(&open_path, &logical_norm);
+    }
+
+    if want_dir {
+        return Err(SysErrNo::ENOENT);
+    }
+
+    if !removed && ext4_vol::ext4_regular_file_exists(&ext_path_norm) {
+        if want_excl && want_create {
+            return Err(SysErrNo::EEXIST);
+        }
+        let Some((ino, is_dir)) = ext4_vol::lookup_path(&ext_path_norm) else {
+            return Err(SysErrNo::ENOENT);
+        };
+        if is_dir {
+            return Err(SysErrNo::EISDIR);
+        }
+        if want_trunc && write_ok {
+            ext4_vol::truncate_regular_ext4(&ext_path_norm, 0)?;
+        }
+        let base_off = if append && write_ok {
+            ext4_vol::regular_file_size(ino)?
+        } else {
+            0
+        };
+        return Ok(fd::FileDescriptor::Ext4Regular {
+            ino,
+            offset: base_off,
+            readable: read_ok,
+            writable: write_ok,
+            append,
+        });
+    }
+
+    if want_create && write_ok {
+        let parent = parent_path(&path_norm);
+        if ext4_vol::ext4_dir_path_exists(&parent) {
+            let ino = ext4_vol::create_regular_ext4_with_mode(&path_norm, mode)?;
+            return Ok(fd::FileDescriptor::Ext4Regular {
+                ino,
+                offset: 0,
+                readable: read_ok,
+                writable: true,
+                append,
+            });
+        }
+        if MEM_FS.lock().is_dir(&parent) {
+            MEM_FS.lock().add_file(&path_norm, Vec::new());
+            return Ok(fd::FileDescriptor::MemFile {
+                name: path_norm,
+                content: Vec::new(),
+                offset: 0,
+                writable: true,
+                append,
+            });
+        }
+        return Err(SysErrNo::ENOENT);
+    }
+
+    Err(SysErrNo::ENOENT)
 }
 
 pub fn list_dir(path: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {

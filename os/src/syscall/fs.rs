@@ -239,6 +239,30 @@ fn make_kstat(ino: u64, mode: u32, size: usize) -> KStat {
     }
 }
 
+fn kstat_from_vfs(meta: crate::fs::VfsMetadata) -> KStat {
+    KStat {
+        st_dev: 0,
+        st_ino: meta.ino,
+        st_mode: meta.mode,
+        st_nlink: meta.nlink,
+        st_uid: meta.uid,
+        st_gid: meta.gid,
+        st_rdev: 0,
+        __pad: 0,
+        st_size: meta.size as isize,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: meta.blocks.max(regular_blocks(meta.size as usize)),
+        st_atime_sec: meta.atime_sec,
+        st_atime_nsec: meta.atime_nsec,
+        st_mtime_sec: meta.mtime_sec,
+        st_mtime_nsec: meta.mtime_nsec,
+        st_ctime_sec: meta.ctime_sec,
+        st_ctime_nsec: meta.ctime_nsec,
+        __unused: [0; 2],
+    }
+}
+
 fn kstat_from_ext4(meta: crate::fs::ext4_vol::Ext4Metadata) -> KStat {
     KStat {
         st_dev: 0,
@@ -290,43 +314,7 @@ fn stat_for_fd(file_desc: &FileDescriptor) -> Result<KStat, SysErrNo> {
 }
 
 fn stat_for_path(path: &str, follow_symlink: bool) -> Result<KStat, SysErrNo> {
-    let norm = crate::fs::normalize_path(path);
-    if crate::fs::is_removed(&norm) {
-        return Err(SysErrNo::ENOENT);
-    }
-
-    {
-        let mem = crate::fs::MEM_FS.lock();
-        if mem.is_dir(&norm) {
-            let entries = mem.list_dir(&norm)?;
-            return Ok(make_kstat(
-                pseudo_inode(&norm),
-                S_IFDIR | 0o755,
-                entries.len(),
-            ));
-        }
-        if let Some(file) = mem.get_file(&norm) {
-            return Ok(make_kstat(
-                pseudo_inode(&norm),
-                S_IFREG | 0o666,
-                file.size(),
-            ));
-        }
-    }
-
-    let ext_path = match crate::fs::ext4_vol::lookup_kind(&norm) {
-        Some((_ino, crate::fs::ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
-            crate::fs::ext4_vol::resolve_symlinks(&norm)?
-        }
-        Some(_) => norm.clone(),
-        None => return Err(SysErrNo::ENOENT),
-    };
-
-    if let Ok(meta) = crate::fs::ext4_vol::metadata(&ext_path) {
-        Ok(kstat_from_ext4(meta))
-    } else {
-        Err(SysErrNo::ENOENT)
-    }
+    crate::fs::metadata(path, follow_symlink).map(kstat_from_vfs)
 }
 
 fn copy_kstat_out(statbuf: *mut u8, st: &KStat) -> Result<(), SysErrNo> {
@@ -468,7 +456,7 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
         let mut inner = task.inner.lock();
 
         match super::with_kernel_page_table(|| {
-            crate::fs::fd::open_file(&host_path, &logical_path, flags, mode)
+            crate::fs::open_path(&host_path, &logical_path, flags, mode)
         }) {
             Ok(fd_desc) => {
                 let mut fds = inner.fd_table.lock();

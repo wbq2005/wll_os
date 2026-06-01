@@ -7,9 +7,10 @@ pub mod vfs;
 
 #[allow(unused_imports)]
 pub use vfs::{
-    create_dir, create_dir_with_mode, create_symlink, dir_exists, file_exists, is_removed,
-    link_path, list_dir, list_files, read_executable_file, read_file, read_interpreter, read_link,
-    remove_dir, remove_file, rename_path, truncate_path,
+    create_dir, create_dir_with_mode, create_regular_file, create_symlink, dir_exists, file_exists,
+    is_removed, link_path, list_dir, list_files, metadata, open_path, read_executable_file,
+    read_file, read_interpreter, read_link, remove_dir, remove_file, rename_path, truncate_path,
+    VfsMetadata, VfsNodeKind,
 };
 
 use alloc::format;

@@ -7,6 +7,14 @@ use super::{block_current_and_run_next, current_task, wake_task_token, TaskContr
 use crate::utils::error::SysErrNo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockReason {
+    Io,
+    ChildExit,
+    Timer,
+    Futex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     Woken,
     TimedOut,
@@ -20,12 +28,14 @@ struct WaitEntry {
 
 pub struct WaitQueue {
     waiters: Mutex<VecDeque<WaitEntry>>,
+    reason: BlockReason,
 }
 
 impl WaitQueue {
-    pub fn new() -> Self {
+    pub fn new(reason: BlockReason) -> Self {
         Self {
             waiters: Mutex::new(VecDeque::new()),
+            reason,
         }
     }
 
@@ -52,7 +62,7 @@ impl WaitQueue {
             crate::timer::add_timeout(deadline, task.clone(), token);
         }
 
-        block_current_and_run_next();
+        block_current_for(self.reason);
 
         let still_waiting = self.remove_waiter(task.pid.0, token);
         if crate::syscall::signal::current_has_unblocked_pending() {
@@ -117,13 +127,20 @@ impl WaitQueue {
 
 impl Default for WaitQueue {
     fn default() -> Self {
-        Self::new()
+        Self::new(BlockReason::Io)
     }
 }
 
 lazy_static! {
-    pub static ref IO_WAIT_QUEUE: WaitQueue = WaitQueue::new();
-    pub static ref CHILD_WAIT_QUEUE: WaitQueue = WaitQueue::new();
+    pub static ref IO_WAIT_QUEUE: WaitQueue = WaitQueue::new(BlockReason::Io);
+    pub static ref CHILD_WAIT_QUEUE: WaitQueue = WaitQueue::new(BlockReason::ChildExit);
+}
+
+pub fn block_current_for(reason: BlockReason) {
+    if let Some(task) = current_task() {
+        *task.block_reason.lock() = Some(reason);
+    }
+    block_current_and_run_next();
 }
 
 pub fn sleep_on_io(deadline_us: Option<usize>) -> Result<WaitOutcome, SysErrNo> {

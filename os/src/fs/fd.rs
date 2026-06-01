@@ -841,6 +841,7 @@ impl Default for FileDescriptorTable {
     }
 }
 
+/// 打开路径：`flags`/`mode` 语义对齐 Linux `openat` 子集。
 fn open_dir_descriptor(host_path: &str, logical_path: &str) -> Result<FileDescriptor, SysErrNo> {
     if MEM_FS.lock().is_dir(host_path) {
         let entries = fs::list_dir(host_path)?;
@@ -864,7 +865,6 @@ fn open_dir_descriptor(host_path: &str, logical_path: &str) -> Result<FileDescri
     })
 }
 
-/// 打开路径：`flags`/`mode` 语义对齐 Linux `openat` 子集。
 pub fn open_file(
     host_path: &str,
     logical_path: &str,

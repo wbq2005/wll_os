@@ -440,6 +440,7 @@ fn wake_for_signal(task: &Arc<TaskControlBlock>) {
     let mut status = task.status.lock();
     if *status == TaskStatus::Blocked {
         *status = TaskStatus::Ready;
+        *task.block_reason.lock() = None;
         drop(status);
         crate::task::manager::add_task(task.clone());
     }

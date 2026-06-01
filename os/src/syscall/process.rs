@@ -874,6 +874,7 @@ pub fn sys_clone(
         )),
         trap_frame: Mutex::new(Some(child_tf)),
         status: Mutex::new(crate::task::TaskStatus::Ready),
+        block_reason: Mutex::new(None),
         wait_token: AtomicUsize::new(0),
     });
     crate::task::manager::register_task(&child);

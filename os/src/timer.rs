@@ -4,7 +4,7 @@ use lazy_static::lazy_static;
 use polyhal::timer::current_time;
 use spin::Mutex;
 
-use crate::task::wait_queue::{WaitOutcome, WaitQueue};
+use crate::task::wait_queue::{BlockReason, WaitOutcome, WaitQueue};
 use crate::task::TaskControlBlock;
 
 /// 时钟频率
@@ -27,7 +27,7 @@ struct TimerWaiter {
 
 lazy_static! {
     static ref TIMER_WAITERS: Mutex<Vec<TimerWaiter>> = Mutex::new(Vec::new());
-    static ref SLEEP_QUEUE: WaitQueue = WaitQueue::new();
+    static ref SLEEP_QUEUE: WaitQueue = WaitQueue::new(BlockReason::Timer);
 }
 
 /// 获取当前时间戳（毫秒）
