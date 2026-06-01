@@ -24,6 +24,10 @@ pub(crate) fn map_ext4_err(e: Ext4Error) -> SysErrNo {
         Errno::ENOSPC => SysErrNo::ENOSPC,
         Errno::EROFS => SysErrNo::EROFS,
         Errno::EBADF => SysErrNo::EBADF,
+        Errno::EPERM => SysErrNo::EPERM,
+        Errno::EACCES => SysErrNo::EACCES,
+        Errno::EFBIG => SysErrNo::EFBIG,
+        Errno::EMLINK => SysErrNo::EMLINK,
         _ => SysErrNo::EIO,
     }
 }
@@ -37,9 +41,95 @@ use crate::utils::error::SysErrNo;
 lazy_static! {
     /// 挂载后的 Ext4（无盘或未探测到 virtio 时为 `None`）
     pub static ref ROOT_EXT4: Mutex<Option<Arc<Ext4>>> = Mutex::new(None);
-    static ref PATH_CACHE: Mutex<BTreeMap<String, (u32, bool)>> = Mutex::new(BTreeMap::new());
+    static ref PATH_CACHE: Mutex<BTreeMap<String, (u32, Ext4NodeKind)>> =
+        Mutex::new(BTreeMap::new());
     static ref DIR_CACHE: Mutex<BTreeMap<u32, Vec<(u32, String, bool)>>> =
         Mutex::new(BTreeMap::new());
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ext4NodeKind {
+    Regular,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Ext4Metadata {
+    pub ino: u32,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub blocks: u64,
+    pub atime_sec: isize,
+    pub atime_nsec: isize,
+    pub mtime_sec: isize,
+    pub mtime_nsec: isize,
+    pub ctime_sec: isize,
+    pub ctime_nsec: isize,
+}
+
+fn inode_kind(fs: &Ext4, ino: u32) -> Ext4NodeKind {
+    let inode = fs.get_inode_ref(ino).inode;
+    if inode.is_dir() {
+        Ext4NodeKind::Directory
+    } else if inode.is_file() {
+        Ext4NodeKind::Regular
+    } else if inode.is_link() {
+        Ext4NodeKind::Symlink
+    } else {
+        Ext4NodeKind::Other
+    }
+}
+
+fn current_ext4_time() -> u32 {
+    let (sec, _) = crate::timer::get_timeval();
+    sec.min(u32::MAX as usize) as u32
+}
+
+fn ext4_extra_nsec(extra: u32) -> isize {
+    (extra >> 2) as isize
+}
+
+fn touch_inode(fs: &Ext4, ino: u32, atime: bool, mtime: bool, ctime: bool) {
+    let now = current_ext4_time();
+    let mut iref = fs.get_inode_ref(ino);
+    if atime {
+        iref.inode.set_atime(now);
+        iref.inode.set_i_atime_extra(0);
+    }
+    if mtime {
+        iref.inode.set_mtime(now);
+        iref.inode.set_i_mtime_extra(0);
+    }
+    if ctime {
+        iref.inode.set_ctime(now);
+        iref.inode.set_i_ctime_extra(0);
+    }
+    fs.write_back_inode(&mut iref);
+}
+
+fn metadata_for_ino(fs: &Ext4, ino: u32) -> Ext4Metadata {
+    let iref = fs.get_inode_ref(ino);
+    let inode = iref.inode;
+    Ext4Metadata {
+        ino,
+        mode: inode.mode() as u32,
+        nlink: inode.links_count() as u32,
+        uid: inode.uid() as u32,
+        gid: inode.gid() as u32,
+        size: inode.size(),
+        blocks: inode.blocks_count(),
+        atime_sec: inode.atime() as isize,
+        atime_nsec: ext4_extra_nsec(inode.i_atime_extra()),
+        mtime_sec: inode.mtime() as isize,
+        mtime_nsec: ext4_extra_nsec(inode.i_mtime_extra()),
+        ctime_sec: inode.ctime() as isize,
+        ctime_nsec: ext4_extra_nsec(inode.i_ctime_extra()),
+    }
 }
 
 fn clear_metadata_cache() {
@@ -124,82 +214,204 @@ fn split_parent_name(norm: &str) -> Result<(String, String), SysErrNo> {
 }
 
 /// 删除 ext4 上的普通文件（非目录）。
-pub fn unlink_regular_file(path: &str) -> Result<(), SysErrNo> {
+pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
     let (parent_path, name) = split_parent_name(&norm)?;
-    let Some((parent_ino, _)) = resolve_existing(&fs, &parent_path) else {
+    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
         return Err(SysErrNo::ENOENT);
     };
-    let Some((child_ino, is_dir)) = resolve_existing(&fs, &norm) else {
+    if parent_kind != Ext4NodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    let Some((child_ino, child_kind)) = resolve_existing(&fs, &norm) else {
         return Err(SysErrNo::ENOENT);
     };
-    if is_dir {
+    if child_kind == Ext4NodeKind::Directory {
         return Err(SysErrNo::EISDIR);
     }
     let mut parent_ref = fs.get_inode_ref(parent_ino);
     let mut child_ref = fs.get_inode_ref(child_ino);
-    fs.unlink(&mut parent_ref, &mut child_ref, &name)
+    fs.dir_remove_entry(&mut parent_ref, &name)
         .map_err(map_ext4_err)?;
+    let old_links = child_ref.inode.links_count();
+    if old_links > 0 {
+        child_ref.inode.set_links_count(old_links - 1);
+    }
+    let now = current_ext4_time();
+    parent_ref.inode.set_mtime(now);
+    parent_ref.inode.set_ctime(now);
+    child_ref.inode.set_ctime(now);
+    if old_links <= 1 {
+        let old_size = child_ref.inode.size();
+        if old_size > 0 {
+            fs.truncate_inode(&mut child_ref, 0).map_err(map_ext4_err)?;
+        }
+        child_ref.inode.set_dtime(now);
+    }
+    fs.write_back_inode(&mut parent_ref);
+    fs.write_back_inode(&mut child_ref);
+    clear_metadata_cache();
+    Ok(())
+}
+
+pub fn unlink_regular_file(path: &str) -> Result<(), SysErrNo> {
+    unlink_non_dir(path)
+}
+
+pub fn mkdir_ext4_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let norm = normalize_path(path);
+    let (parent_path, name) = split_parent_name(&norm)?;
+    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if parent_kind != Ext4NodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    if resolve_existing(&fs, &norm).is_some() {
+        return Err(SysErrNo::EEXIST);
+    }
+    let perm = (mode as u16) & 0o777;
+    let mut child_ref = fs
+        .create(parent_ino, &name, InodeFileType::S_IFDIR.bits() | perm)
+        .map_err(map_ext4_err)?;
+    let now = current_ext4_time();
+    child_ref
+        .inode
+        .set_mode(InodeFileType::S_IFDIR.bits() | perm);
+    child_ref.inode.set_atime(now);
+    child_ref.inode.set_mtime(now);
+    child_ref.inode.set_ctime(now);
+    fs.write_back_inode(&mut child_ref);
+    touch_inode(&fs, parent_ino, false, true, true);
     clear_metadata_cache();
     Ok(())
 }
 
 pub fn mkdir_ext4(path: &str) -> Result<(), SysErrNo> {
-    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    fs.dir_mk(path).map_err(map_ext4_err)?;
-    clear_metadata_cache();
-    Ok(())
+    mkdir_ext4_with_mode(path, 0o755)
 }
 
 pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
+    if norm == "/" {
+        return Err(SysErrNo::EINVAL);
+    }
     let (parent_path, name) = split_parent_name(&norm)?;
-    let Some((parent_ino, _)) = resolve_existing(&fs, &parent_path) else {
+    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
         return Err(SysErrNo::ENOENT);
     };
-    let Some((_child_ino, is_dir)) = resolve_existing(&fs, &norm) else {
-        return Err(SysErrNo::ENOENT);
-    };
-    if !is_dir {
+    if parent_kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    fs.dir_remove(parent_ino, &name).map_err(map_ext4_err)?;
+    let Some((child_ino, child_kind)) = resolve_existing(&fs, &norm) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if child_kind != Ext4NodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    if !cached_dir_entries(&fs, child_ino).is_empty() {
+        return Err(SysErrNo::ENOTEMPTY);
+    }
+    let mut parent_ref = fs.get_inode_ref(parent_ino);
+    let mut child_ref = fs.get_inode_ref(child_ino);
+    fs.dir_remove_entry(&mut parent_ref, &name)
+        .map_err(map_ext4_err)?;
+    let now = current_ext4_time();
+    if child_ref.inode.size() > 0 {
+        fs.truncate_inode(&mut child_ref, 0).map_err(map_ext4_err)?;
+    }
+    child_ref.inode.set_links_count(0);
+    child_ref.inode.set_dtime(now);
+    child_ref.inode.set_ctime(now);
+    let parent_links = parent_ref.inode.links_count();
+    if parent_links > 0 {
+        parent_ref.inode.set_links_count(parent_links - 1);
+    }
+    parent_ref.inode.set_mtime(now);
+    parent_ref.inode.set_ctime(now);
+    fs.write_back_inode(&mut child_ref);
+    fs.write_back_inode(&mut parent_ref);
     clear_metadata_cache();
     Ok(())
 }
 
 /// 创建普通文件（已存在则由 `generic_open` 语义处理）。
-pub fn create_regular_ext4(path: &str) -> Result<u32, SysErrNo> {
+pub fn create_regular_ext4_with_mode(path: &str, mode: u32) -> Result<u32, SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
-    let mut parent = ROOT_INODE;
-    let mut nameoff = 0u32;
-    let ino = fs
-        .generic_open(
-        &norm,
-        &mut parent,
-        true,
-        InodeFileType::S_IFREG.bits(),
-        &mut nameoff,
-    )
-    .map_err(map_ext4_err)?;
+    let (parent_path, name) = split_parent_name(&norm)?;
+    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if parent_kind != Ext4NodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    if resolve_existing(&fs, &norm).is_some() {
+        return Err(SysErrNo::EEXIST);
+    }
+    let perm = (mode as u16) & 0o777;
+    let mut iref = fs
+        .create(parent_ino, &name, InodeFileType::S_IFREG.bits() | perm)
+        .map_err(map_ext4_err)?;
+    let now = current_ext4_time();
+    iref.inode.set_mode(InodeFileType::S_IFREG.bits() | perm);
+    iref.inode.set_atime(now);
+    iref.inode.set_mtime(now);
+    iref.inode.set_ctime(now);
+    fs.write_back_inode(&mut iref);
+    touch_inode(&fs, parent_ino, false, true, true);
     clear_metadata_cache();
-    Ok(ino)
+    Ok(iref.inode_num)
+}
+
+pub fn create_regular_ext4(path: &str) -> Result<u32, SysErrNo> {
+    create_regular_ext4_with_mode(path, 0o666)
+}
+
+pub fn truncate_regular_ino(ino: u32, size: u64) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let kind = inode_kind(&fs, ino);
+    if kind == Ext4NodeKind::Directory {
+        return Err(SysErrNo::EISDIR);
+    }
+    if kind != Ext4NodeKind::Regular && kind != Ext4NodeKind::Symlink {
+        return Err(SysErrNo::EINVAL);
+    }
+    let mut iref = fs.get_inode_ref(ino);
+    let old_size = iref.inode.size();
+    if size < old_size {
+        fs.truncate_inode(&mut iref, size).map_err(map_ext4_err)?;
+    } else if size > old_size {
+        let zeroes = alloc::vec![0u8; 4096];
+        let mut off = old_size as usize;
+        let target = size as usize;
+        while off < target {
+            let n = (target - off).min(zeroes.len());
+            let written = fs.write_at(ino, off, &zeroes[..n]).map_err(map_ext4_err)?;
+            if written == 0 {
+                return Err(SysErrNo::EIO);
+            }
+            off += written;
+        }
+    }
+    touch_inode(&fs, ino, false, true, true);
+    clear_metadata_cache();
+    Ok(())
 }
 
 pub fn truncate_regular_ext4(path: &str, size: u64) -> Result<(), SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    let Some((ino, is_dir)) = resolve_existing(&fs, path) else {
+    let Some((ino, kind)) = resolve_existing(&fs, path) else {
         return Err(SysErrNo::ENOENT);
     };
-    if is_dir {
+    if kind == Ext4NodeKind::Directory {
         return Err(SysErrNo::EISDIR);
     }
-    let mut iref = fs.get_inode_ref(ino);
-    fs.truncate_inode(&mut iref, size).map_err(map_ext4_err)?;
-    Ok(())
+    drop(fs);
+    truncate_regular_ino(ino, size)
 }
 
 pub fn ext4_read_at(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usize, SysErrNo> {
@@ -209,12 +421,32 @@ pub fn ext4_read_at(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usize, Sy
 
 pub fn ext4_write_at(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    fs.write_at(ino, offset, buf).map_err(map_ext4_err)
+    let written = fs.write_at(ino, offset, buf).map_err(map_ext4_err)?;
+    if written > 0 {
+        touch_inode(&fs, ino, false, true, true);
+    }
+    Ok(written)
 }
 
 pub fn lookup_path(path: &str) -> Option<(u32, bool)> {
     let fs = ROOT_EXT4.lock().clone()?;
+    resolve_existing(&fs, path).map(|(ino, kind)| (ino, kind == Ext4NodeKind::Directory))
+}
+
+pub fn lookup_kind(path: &str) -> Option<(u32, Ext4NodeKind)> {
+    let fs = ROOT_EXT4.lock().clone()?;
     resolve_existing(&fs, path)
+}
+
+pub fn metadata_by_ino(ino: u32) -> Result<Ext4Metadata, SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    Ok(metadata_for_ino(&fs, ino))
+}
+
+pub fn metadata(path: &str) -> Result<Ext4Metadata, SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let (ino, _) = resolve_existing(&fs, path).ok_or(SysErrNo::ENOENT)?;
+    Ok(metadata_for_ino(&fs, ino))
 }
 
 pub fn regular_file_size(ino: u32) -> Result<usize, SysErrNo> {
@@ -253,8 +485,254 @@ fn find_child_ino(fs: &Ext4, parent_ino: u32, name: &str) -> Option<u32> {
     None
 }
 
+fn parent_path_of(path: &str) -> String {
+    let norm = normalize_path(path);
+    let trimmed = norm.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => String::from("/"),
+        Some(pos) => String::from(&trimmed[..pos]),
+    }
+}
+
+fn resolve_link_target(link_path: &str, target: &str) -> String {
+    if target.starts_with('/') {
+        normalize_path(target)
+    } else {
+        normalize_path(&format!("{}/{}", parent_path_of(link_path), target))
+    }
+}
+
+pub fn readlink_ext4(path: &str) -> Result<String, SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let norm = normalize_path(path);
+    let Some((ino, kind)) = resolve_existing(&fs, &norm) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if kind != Ext4NodeKind::Symlink {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let inode_ref = fs.get_inode_ref(ino);
+    let size = inode_ref.inode.size() as usize;
+    let mut data = alloc::vec![0u8; size];
+    let read_ok = if size == 0 {
+        true
+    } else {
+        fs.read_at(ino, 0, &mut data)
+            .map(|n| n == size)
+            .unwrap_or(false)
+    };
+    if !read_ok && size <= 60 {
+        data.clear();
+        for word in inode_ref.inode.block() {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        data.truncate(size);
+    } else if !read_ok {
+        return Err(SysErrNo::EIO);
+    }
+    String::from_utf8(data).map_err(|_| SysErrNo::EINVAL)
+}
+
+pub fn resolve_symlinks(path: &str) -> Result<String, SysErrNo> {
+    let mut current = normalize_path(path);
+    for _ in 0..8 {
+        let Some((_ino, kind)) = lookup_kind(&current) else {
+            return Err(SysErrNo::ENOENT);
+        };
+        if kind != Ext4NodeKind::Symlink {
+            return Ok(current);
+        }
+        let target = readlink_ext4(&current)?;
+        current = resolve_link_target(&current, &target);
+    }
+    Err(SysErrNo::EINVAL)
+}
+
+fn path_is_descendant(parent: &str, child: &str) -> bool {
+    let parent = normalize_path(parent);
+    let child = normalize_path(child);
+    child
+        .strip_prefix(&parent)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some()
+}
+
+pub fn create_symlink_ext4(target: &str, link_path: &str) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let norm = normalize_path(link_path);
+    let (parent_path, name) = split_parent_name(&norm)?;
+    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if parent_kind != Ext4NodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    if resolve_existing(&fs, &norm).is_some() {
+        return Err(SysErrNo::EEXIST);
+    }
+    let mut iref = fs
+        .create(parent_ino, &name, InodeFileType::S_IFLNK.bits() | 0o777)
+        .map_err(map_ext4_err)?;
+    let now = current_ext4_time();
+    iref.inode.set_mode(InodeFileType::S_IFLNK.bits() | 0o777);
+    iref.inode.set_atime(now);
+    iref.inode.set_mtime(now);
+    iref.inode.set_ctime(now);
+    fs.write_back_inode(&mut iref);
+    let bytes = target.as_bytes();
+    if !bytes.is_empty() {
+        let written = fs
+            .write_at(iref.inode_num, 0, bytes)
+            .map_err(map_ext4_err)?;
+        if written != bytes.len() {
+            return Err(SysErrNo::EIO);
+        }
+    }
+    touch_inode(&fs, iref.inode_num, false, true, true);
+    touch_inode(&fs, parent_ino, false, true, true);
+    clear_metadata_cache();
+    Ok(())
+}
+
+pub fn link_ext4(old_path: &str, new_path: &str, follow_old: bool) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let old = if follow_old {
+        resolve_symlinks(old_path)?
+    } else {
+        normalize_path(old_path)
+    };
+    let new = normalize_path(new_path);
+    let (new_parent_path, new_name) = split_parent_name(&new)?;
+    let Some((new_parent_ino, new_parent_kind)) = resolve_existing(&fs, &new_parent_path) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if new_parent_kind != Ext4NodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    if resolve_existing(&fs, &new).is_some() {
+        return Err(SysErrNo::EEXIST);
+    }
+    let Some((old_ino, old_kind)) = resolve_existing(&fs, &old) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if old_kind == Ext4NodeKind::Directory {
+        return Err(SysErrNo::EPERM);
+    }
+
+    let mut parent_ref = fs.get_inode_ref(new_parent_ino);
+    let mut child_ref = fs.get_inode_ref(old_ino);
+    fs.link(&mut parent_ref, &mut child_ref, &new_name)
+        .map_err(map_ext4_err)?;
+    let now = current_ext4_time();
+    parent_ref.inode.set_mtime(now);
+    parent_ref.inode.set_ctime(now);
+    child_ref.inode.set_ctime(now);
+    fs.write_back_inode(&mut parent_ref);
+    fs.write_back_inode(&mut child_ref);
+    clear_metadata_cache();
+    Ok(())
+}
+
+pub fn rename_ext4(old_path: &str, new_path: &str, no_replace: bool) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let old = normalize_path(old_path);
+    let new = normalize_path(new_path);
+    if old == new {
+        return Ok(());
+    }
+    if old == "/" {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let (old_parent_path, old_name) = split_parent_name(&old)?;
+    let (new_parent_path, new_name) = split_parent_name(&new)?;
+    let Some((old_parent_ino, old_parent_kind)) = resolve_existing(&fs, &old_parent_path) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    let Some((new_parent_ino, new_parent_kind)) = resolve_existing(&fs, &new_parent_path) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if old_parent_kind != Ext4NodeKind::Directory || new_parent_kind != Ext4NodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    let Some((old_ino, old_kind)) = resolve_existing(&fs, &old) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if old_kind == Ext4NodeKind::Directory && path_is_descendant(&old, &new) {
+        return Err(SysErrNo::EINVAL);
+    }
+    let new_existing = resolve_existing(&fs, &new);
+    if no_replace && new_existing.is_some() {
+        return Err(SysErrNo::EEXIST);
+    }
+    if let Some((new_ino, new_kind)) = new_existing {
+        if new_ino == old_ino {
+            return Ok(());
+        }
+        match (old_kind, new_kind) {
+            (Ext4NodeKind::Directory, Ext4NodeKind::Directory) => {
+                if !cached_dir_entries(&fs, new_ino).is_empty() {
+                    return Err(SysErrNo::ENOTEMPTY);
+                }
+                drop(fs);
+                remove_empty_dir_ext4(&new)?;
+            }
+            (Ext4NodeKind::Directory, _) => return Err(SysErrNo::ENOTDIR),
+            (_, Ext4NodeKind::Directory) => return Err(SysErrNo::EISDIR),
+            _ => {
+                drop(fs);
+                unlink_non_dir(&new)?;
+            }
+        }
+    }
+
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let mut child_ref = fs.get_inode_ref(old_ino);
+    let now = current_ext4_time();
+    if old_parent_ino == new_parent_ino {
+        let mut parent_ref = fs.get_inode_ref(old_parent_ino);
+        fs.dir_add_entry(&mut parent_ref, &child_ref, &new_name)
+            .map_err(map_ext4_err)?;
+        fs.dir_remove_entry(&mut parent_ref, &old_name)
+            .map_err(map_ext4_err)?;
+        parent_ref.inode.set_mtime(now);
+        parent_ref.inode.set_ctime(now);
+        fs.write_back_inode(&mut parent_ref);
+    } else {
+        let mut new_parent_ref = fs.get_inode_ref(new_parent_ino);
+        fs.dir_add_entry(&mut new_parent_ref, &child_ref, &new_name)
+            .map_err(map_ext4_err)?;
+        let mut old_parent_ref = fs.get_inode_ref(old_parent_ino);
+        fs.dir_remove_entry(&mut old_parent_ref, &old_name)
+            .map_err(map_ext4_err)?;
+        if old_kind == Ext4NodeKind::Directory {
+            let old_parent_links = old_parent_ref.inode.links_count();
+            if old_parent_links > 0 {
+                old_parent_ref.inode.set_links_count(old_parent_links - 1);
+            }
+            let new_parent_links = new_parent_ref.inode.links_count();
+            new_parent_ref.inode.set_links_count(new_parent_links + 1);
+            fs.dir_remove_entry(&mut child_ref, "..")
+                .map_err(map_ext4_err)?;
+            fs.dir_add_entry(&mut child_ref, &new_parent_ref, "..")
+                .map_err(map_ext4_err)?;
+        }
+        old_parent_ref.inode.set_mtime(now);
+        old_parent_ref.inode.set_ctime(now);
+        new_parent_ref.inode.set_mtime(now);
+        new_parent_ref.inode.set_ctime(now);
+        fs.write_back_inode(&mut old_parent_ref);
+        fs.write_back_inode(&mut new_parent_ref);
+    }
+    child_ref.inode.set_ctime(now);
+    fs.write_back_inode(&mut child_ref);
+    clear_metadata_cache();
+    Ok(())
+}
+
 /// 解析已存在的绝对路径 → (inode, 是否为目录)。不存在或非法则 `None`。
-fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, bool)> {
+fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, Ext4NodeKind)> {
     let n = normalize_path(path);
     if !n.starts_with('/') {
         return None;
@@ -270,8 +748,7 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, bool)> {
     };
 
     if parts.is_empty() {
-        let r = fs.get_inode_ref(ROOT_INODE);
-        let found = (ROOT_INODE, r.inode.is_dir());
+        let found = (ROOT_INODE, inode_kind(fs, ROOT_INODE));
         PATH_CACHE.lock().insert(n, found);
         return Some(found);
     }
@@ -280,8 +757,7 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, bool)> {
     for (i, comp) in parts.iter().enumerate() {
         let ino = find_child_ino(fs, parent, comp)?;
         if i + 1 == parts.len() {
-            let r = fs.get_inode_ref(ino);
-            let found = (ino, r.inode.is_dir());
+            let found = (ino, inode_kind(fs, ino));
             PATH_CACHE.lock().insert(n, found);
             return Some(found);
         }
@@ -295,10 +771,11 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, bool)> {
 
 /// 整块读入普通文件（用于 `execve` / harness）。目录或不存在返回 `None`。
 pub fn slurp_regular_file(path: &str) -> Option<Vec<u8>> {
+    let resolved = resolve_symlinks(path).ok()?;
     let fs = ROOT_EXT4.lock().clone()?;
-    let (ino, is_dir) = resolve_existing(&fs, path)?;
+    let (ino, kind) = resolve_existing(&fs, &resolved)?;
     let inode_ref = fs.get_inode_ref(ino);
-    if is_dir || !inode_ref.inode.is_file() {
+    if kind != Ext4NodeKind::Regular || !inode_ref.inode.is_file() {
         return None;
     }
 
@@ -323,7 +800,16 @@ pub fn ext4_regular_file_exists(path: &str) -> bool {
         return false;
     };
     resolve_existing(&fs, path)
-        .map(|(ino, is_dir)| !is_dir && fs.get_inode_ref(ino).inode.is_file())
+        .map(|(_ino, kind)| kind == Ext4NodeKind::Regular)
+        .unwrap_or(false)
+}
+
+pub fn ext4_file_path_exists(path: &str) -> bool {
+    let Some(fs) = ROOT_EXT4.lock().clone() else {
+        return false;
+    };
+    resolve_existing(&fs, path)
+        .map(|(_ino, kind)| kind == Ext4NodeKind::Regular || kind == Ext4NodeKind::Symlink)
         .unwrap_or(false)
 }
 
@@ -332,15 +818,15 @@ pub fn ext4_dir_path_exists(path: &str) -> bool {
         return false;
     };
     resolve_existing(&fs, path)
-        .map(|(_, is_dir)| is_dir)
+        .map(|(_, kind)| kind == Ext4NodeKind::Directory)
         .unwrap_or(false)
 }
 
 /// 枚举目录单层子项（文件名 + 是否为目录）。
 pub fn ext4_list_dir(dir_path: &str) -> Result<Vec<(String, bool)>, SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    let (ino, is_dir) = resolve_existing(&fs, dir_path).ok_or(SysErrNo::ENOENT)?;
-    if !is_dir {
+    let (ino, kind) = resolve_existing(&fs, dir_path).ok_or(SysErrNo::ENOENT)?;
+    if kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
 

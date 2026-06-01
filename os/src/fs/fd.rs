@@ -537,6 +537,32 @@ impl FileDescriptor {
         }
     }
 
+    pub fn truncate(&mut self, new_len: usize) -> Result<(), SysErrNo> {
+        match self {
+            FileDescriptor::MemFile {
+                name,
+                content,
+                writable,
+                ..
+            } => {
+                if !*writable {
+                    return Err(SysErrNo::EBADF);
+                }
+                content.resize(new_len, 0);
+                MEM_FS.lock().add_file(name, content.clone());
+                Ok(())
+            }
+            FileDescriptor::Ext4Regular { ino, writable, .. } => {
+                if !*writable {
+                    return Err(SysErrNo::EBADF);
+                }
+                ext4_vol::truncate_regular_ino(*ino, new_len as u64)
+            }
+            FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
+            _ => Err(SysErrNo::EINVAL),
+        }
+    }
+
     pub fn read_dirents64(&mut self, buf: &mut [u8]) -> Result<usize, SysErrNo> {
         match self {
             FileDescriptor::MemDir {
@@ -843,7 +869,7 @@ pub fn open_file(
     host_path: &str,
     logical_path: &str,
     flags: u32,
-    _mode: u32,
+    mode: u32,
 ) -> Result<FileDescriptor, SysErrNo> {
     use open_flags::*;
 
@@ -869,6 +895,17 @@ pub fn open_file(
     let mem_has_file = mem.get_file(&path_norm).is_some();
     drop(mem);
 
+    let ext_path_norm = if !removed {
+        match ext4_vol::lookup_kind(&path_norm) {
+            Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => {
+                ext4_vol::resolve_symlinks(&path_norm)?
+            }
+            _ => path_norm.clone(),
+        }
+    } else {
+        path_norm.clone()
+    };
+
     if mem_has_file {
         if want_dir {
             return Err(SysErrNo::ENOTDIR);
@@ -891,15 +928,21 @@ pub fn open_file(
         });
     }
 
-    if fs::dir_exists(&path_norm) {
+    if fs::MEM_FS.lock().is_dir(&path_norm) || ext4_vol::ext4_dir_path_exists(&ext_path_norm) {
         if write_ok || want_trunc || want_create {
             return Err(SysErrNo::EISDIR);
         }
-        return open_dir_descriptor(&path_norm, &logical_norm);
+        let open_path = if fs::MEM_FS.lock().is_dir(&path_norm) {
+            path_norm.clone()
+        } else {
+            ext_path_norm.clone()
+        };
+        return open_dir_descriptor(&open_path, &logical_norm);
     }
 
     if want_dir {
-        if !fs::dir_exists(&path_norm) {
+        if !fs::MEM_FS.lock().is_dir(&path_norm) && !ext4_vol::ext4_dir_path_exists(&ext_path_norm)
+        {
             return Err(SysErrNo::ENOENT);
         }
         // MemFS 目录优先走 MemDir（预载已全部加载到内存）。
@@ -913,7 +956,7 @@ pub fn open_file(
             });
         } else {
             // ext4 目录：通过 lookup_path 获取 inode 并返回 Ext4Dir
-            let Some((ino, _)) = ext4_vol::lookup_path(&path_norm) else {
+            let Some((ino, _)) = ext4_vol::lookup_path(&ext_path_norm) else {
                 return Err(SysErrNo::ENOENT);
             };
             return Ok(FileDescriptor::Ext4Dir {
@@ -924,22 +967,22 @@ pub fn open_file(
         }
     }
 
-    if fs::dir_exists(&path_norm) {
+    if fs::MEM_FS.lock().is_dir(&path_norm) || ext4_vol::ext4_dir_path_exists(&ext_path_norm) {
         return Err(SysErrNo::EISDIR);
     }
 
-    if !removed && ext4_vol::ext4_regular_file_exists(&path_norm) {
+    if !removed && ext4_vol::ext4_regular_file_exists(&ext_path_norm) {
         if want_excl && want_create {
             return Err(SysErrNo::EEXIST);
         }
-        let Some((ino, is_dir)) = ext4_vol::lookup_path(&path_norm) else {
+        let Some((ino, is_dir)) = ext4_vol::lookup_path(&ext_path_norm) else {
             return Err(SysErrNo::ENOENT);
         };
         if is_dir {
             return Err(SysErrNo::EISDIR);
         }
         if want_trunc && write_ok {
-            ext4_vol::truncate_regular_ext4(&path_norm, 0)?;
+            ext4_vol::truncate_regular_ext4(&ext_path_norm, 0)?;
         }
         let base_off = if append && write_ok {
             ext4_vol::regular_file_size(ino)?
@@ -956,7 +999,9 @@ pub fn open_file(
     }
 
     if want_create && write_ok {
-        if let Ok(ino) = ext4_vol::create_regular_ext4(&path_norm) {
+        let parent = fs::parent_path(&path_norm);
+        if ext4_vol::ext4_dir_path_exists(&parent) {
+            let ino = ext4_vol::create_regular_ext4_with_mode(&path_norm, mode)?;
             return Ok(FileDescriptor::Ext4Regular {
                 ino,
                 offset: 0,
@@ -964,7 +1009,8 @@ pub fn open_file(
                 writable: true,
                 append,
             });
-        } else {
+        }
+        if fs::MEM_FS.lock().is_dir(&parent) {
             fs::MEM_FS.lock().add_file(&path_norm, Vec::new());
             return Ok(FileDescriptor::MemFile {
                 name: path_norm,
@@ -974,6 +1020,7 @@ pub fn open_file(
                 append,
             });
         }
+        return Err(SysErrNo::ENOENT);
     }
 
     Err(SysErrNo::ENOENT)

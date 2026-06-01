@@ -32,6 +32,7 @@ pub const SYSCALL_FCNTL: usize = 25;
 pub const SYSCALL_IOCTL: usize = 29;
 pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
+pub const SYSCALL_SYMLINKAT: usize = 36;
 pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_UMOUNT2: usize = 39;
 pub const SYSCALL_MOUNT: usize = 40;
@@ -48,6 +49,8 @@ pub const SYSCALL_WRITEV: usize = 66;
 pub const SYSCALL_PREAD64: usize = 67;
 pub const SYSCALL_LSEEK: usize = 62;
 pub const SYSCALL_SENDFILE: usize = 71;
+pub const SYSCALL_TRUNCATE: usize = 45;
+pub const SYSCALL_FTRUNCATE: usize = 46;
 pub const SYSCALL_PSELECT6: usize = 72;
 pub const SYSCALL_PPOLL: usize = 73;
 pub const SYSCALL_READLINKAT: usize = 78;
@@ -176,6 +179,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_WRITEV => fs::sys_writev(args[0], args[1] as *const u8, args[2]),
         SYSCALL_PREAD64 => fs::sys_pread64(args[0], args[1] as *mut u8, args[2], args[3]),
         SYSCALL_SENDFILE => fs::sys_sendfile(args[0], args[1], args[2], args[3]),
+        SYSCALL_TRUNCATE => fs::sys_truncate(args[0] as *const u8, args[1]),
+        SYSCALL_FTRUNCATE => fs::sys_ftruncate(args[0], args[1]),
         SYSCALL_PPOLL => fs::sys_ppoll(
             args[0] as *mut fs::PollFd,
             args[1],
@@ -206,6 +211,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_CHDIR => fs::sys_chdir(args[0] as *const u8),
         SYSCALL_MKDIRAT => fs::sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_UNLINKAT => fs::sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
+        SYSCALL_LINKAT => fs::sys_linkat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as isize,
+            args[3] as *const u8,
+            args[4],
+        ),
+        SYSCALL_SYMLINKAT => {
+            fs::sys_symlinkat(args[0] as *const u8, args[1] as isize, args[2] as *const u8)
+        }
         SYSCALL_RENAMEAT2 => fs::sys_renameat2(
             args[0] as isize,
             args[1] as *const u8,

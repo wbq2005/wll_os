@@ -25,6 +25,7 @@ const F_DUPFD_CLOEXEC: usize = 1030;
 const S_IFIFO: u32 = 0o010000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
+const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -238,10 +239,34 @@ fn make_kstat(ino: u64, mode: u32, size: usize) -> KStat {
     }
 }
 
-fn stat_for_fd(file_desc: &FileDescriptor) -> KStat {
+fn kstat_from_ext4(meta: crate::fs::ext4_vol::Ext4Metadata) -> KStat {
+    KStat {
+        st_dev: 0,
+        st_ino: meta.ino as u64,
+        st_mode: meta.mode,
+        st_nlink: meta.nlink,
+        st_uid: meta.uid,
+        st_gid: meta.gid,
+        st_rdev: 0,
+        __pad: 0,
+        st_size: meta.size as isize,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: meta.blocks.max(regular_blocks(meta.size as usize)),
+        st_atime_sec: meta.atime_sec,
+        st_atime_nsec: meta.atime_nsec,
+        st_mtime_sec: meta.mtime_sec,
+        st_mtime_nsec: meta.mtime_nsec,
+        st_ctime_sec: meta.ctime_sec,
+        st_ctime_nsec: meta.ctime_nsec,
+        __unused: [0; 2],
+    }
+}
+
+fn stat_for_fd(file_desc: &FileDescriptor) -> Result<KStat, SysErrNo> {
     match file_desc {
-        FileDescriptor::Stdin => make_kstat(0, S_IFIFO | 0o444, 0),
-        FileDescriptor::Stdout | FileDescriptor::Stderr => make_kstat(0, S_IFIFO | 0o222, 0),
+        FileDescriptor::Stdin => Ok(make_kstat(0, S_IFIFO | 0o444, 0)),
+        FileDescriptor::Stdout | FileDescriptor::Stderr => Ok(make_kstat(0, S_IFIFO | 0o222, 0)),
         FileDescriptor::MemFile {
             name,
             content,
@@ -249,35 +274,22 @@ fn stat_for_fd(file_desc: &FileDescriptor) -> KStat {
             ..
         } => {
             let mode = S_IFREG | if *writable { 0o666 } else { 0o444 };
-            make_kstat(pseudo_inode(name), mode, content.len())
+            Ok(make_kstat(pseudo_inode(name), mode, content.len()))
         }
-        FileDescriptor::MemDir { path, entries, .. } => {
-            make_kstat(pseudo_inode(path), S_IFDIR | 0o755, entries.len())
+        FileDescriptor::MemDir { path, entries, .. } => Ok(make_kstat(
+            pseudo_inode(path),
+            S_IFDIR | 0o755,
+            entries.len(),
+        )),
+        FileDescriptor::Ext4Regular { ino, .. } | FileDescriptor::Ext4Dir { ino, .. } => {
+            crate::fs::ext4_vol::metadata_by_ino(*ino).map(kstat_from_ext4)
         }
-        FileDescriptor::Ext4Regular {
-            ino,
-            readable,
-            writable,
-            ..
-        } => {
-            let perms = match (*readable, *writable) {
-                (true, true) => 0o666,
-                (false, true) => 0o222,
-                _ => 0o444,
-            };
-            make_kstat(
-                *ino as u64,
-                S_IFREG | perms,
-                crate::fs::ext4_vol::regular_file_size(*ino).unwrap_or(0),
-            )
-        }
-        FileDescriptor::Ext4Dir { ino, .. } => make_kstat(*ino as u64, S_IFDIR | 0o755, 0),
-        FileDescriptor::PipeRead { .. } => make_kstat(0, S_IFIFO | 0o444, 0),
-        FileDescriptor::PipeWrite { .. } => make_kstat(0, S_IFIFO | 0o222, 0),
+        FileDescriptor::PipeRead { .. } => Ok(make_kstat(0, S_IFIFO | 0o444, 0)),
+        FileDescriptor::PipeWrite { .. } => Ok(make_kstat(0, S_IFIFO | 0o222, 0)),
     }
 }
 
-fn stat_for_path(path: &str) -> Result<KStat, SysErrNo> {
+fn stat_for_path(path: &str, follow_symlink: bool) -> Result<KStat, SysErrNo> {
     let norm = crate::fs::normalize_path(path);
     if crate::fs::is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
@@ -302,13 +314,16 @@ fn stat_for_path(path: &str) -> Result<KStat, SysErrNo> {
         }
     }
 
-    if let Some((ino, is_dir)) = crate::fs::ext4_vol::lookup_path(&norm) {
-        if is_dir {
-            Ok(make_kstat(ino as u64, S_IFDIR | 0o755, 0))
-        } else {
-            let size = crate::fs::ext4_vol::regular_file_size(ino)?;
-            Ok(make_kstat(ino as u64, S_IFREG | 0o666, size))
+    let ext_path = match crate::fs::ext4_vol::lookup_kind(&norm) {
+        Some((_ino, crate::fs::ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
+            crate::fs::ext4_vol::resolve_symlinks(&norm)?
         }
+        Some(_) => norm.clone(),
+        None => return Err(SysErrNo::ENOENT),
+    };
+
+    if let Ok(meta) = crate::fs::ext4_vol::metadata(&ext_path) {
+        Ok(kstat_from_ext4(meta))
     } else {
         Err(SysErrNo::ENOENT)
     }
@@ -513,9 +528,9 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallRet {
     }
 }
 
-pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, _mode: u32) -> SyscallRet {
+pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-    super::with_kernel_page_table(|| crate::fs::create_dir(&host_path))?;
+    super::with_kernel_page_table(|| crate::fs::create_dir_with_mode(&host_path, mode))?;
     Ok(0)
 }
 
@@ -549,6 +564,35 @@ pub fn sys_renameat2(
     super::with_kernel_page_table(|| {
         crate::fs::rename_path(&old_host, &new_host, flags & RENAME_NOREPLACE != 0)
     })?;
+    Ok(0)
+}
+
+pub fn sys_linkat(
+    olddirfd: isize,
+    oldpath: *const u8,
+    newdirfd: isize,
+    newpath: *const u8,
+    flags: usize,
+) -> SyscallRet {
+    const AT_SYMLINK_FOLLOW: usize = 0x400;
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let (_old_logical, old_host) = resolve_host_path(olddirfd, oldpath)?;
+    let (_new_logical, new_host) = resolve_host_path(newdirfd, newpath)?;
+    super::with_kernel_page_table(|| {
+        crate::fs::link_path(&old_host, &new_host, flags & AT_SYMLINK_FOLLOW != 0)
+    })?;
+    Ok(0)
+}
+
+pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) -> SyscallRet {
+    let target = read_user_cstr(target)?;
+    if target.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+    let (_logical_path, host_path) = resolve_host_path(newdirfd, linkpath)?;
+    super::with_kernel_page_table(|| crate::fs::create_symlink(&target, &host_path))?;
     Ok(0)
 }
 
@@ -599,13 +643,11 @@ pub fn sys_readlinkat(
     }
 
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-    if super::with_kernel_page_table(|| {
-        crate::fs::file_exists(&host_path) || crate::fs::dir_exists(&host_path)
-    }) {
-        Err(SysErrNo::EINVAL)
-    } else {
-        Err(SysErrNo::ENOENT)
-    }
+    let target = super::with_kernel_page_table(|| crate::fs::read_link(&host_path))?;
+    let bytes = target.as_bytes();
+    let n = bytes.len().min(bufsiz);
+    copy_to_user(buf, &bytes[..n])?;
+    Ok(n)
 }
 
 pub fn sys_getdents64(fd: usize, dirp: *mut u8, count: usize) -> SyscallRet {
@@ -1244,6 +1286,27 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize) ->
     Ok(copied)
 }
 
+pub fn sys_truncate(pathname: *const u8, length: usize) -> SyscallRet {
+    if length > isize::MAX as usize {
+        return Err(SysErrNo::EINVAL);
+    }
+    let (_logical_path, host_path) = resolve_host_path(AT_FDCWD, pathname)?;
+    super::with_kernel_page_table(|| crate::fs::truncate_path(&host_path, length as u64))?;
+    Ok(0)
+}
+
+pub fn sys_ftruncate(fd: usize, length: usize) -> SyscallRet {
+    if length > isize::MAX as usize {
+        return Err(SysErrNo::EINVAL);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut inner = task.inner.lock();
+    let mut fds = inner.fd_table.lock();
+    let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+    super::with_kernel_page_table(|| file_desc.truncate(length))?;
+    Ok(0)
+}
+
 /// fstat 系统调用
 ///
 /// 获取文件状态
@@ -1257,7 +1320,7 @@ pub fn sys_fstat(fd: usize, statbuf: *mut u8) -> SyscallRet {
         let fds = inner.fd_table.lock();
         match fds.get(fd) {
             Some(file_desc) => {
-                let st = super::with_kernel_page_table(|| stat_for_fd(file_desc));
+                let st = super::with_kernel_page_table(|| stat_for_fd(file_desc))?;
                 copy_kstat_out(statbuf, &st)?;
                 Ok(0)
             }
@@ -1289,10 +1352,11 @@ pub fn sys_statx(
         let inner = task.inner.lock();
         let fds = inner.fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-        super::with_kernel_page_table(|| stat_for_fd(file_desc))
+        super::with_kernel_page_table(|| stat_for_fd(file_desc))?
     } else {
         let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-        super::with_kernel_page_table(|| stat_for_path(&host_path))?
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        super::with_kernel_page_table(|| stat_for_path(&host_path, follow))?
     };
 
     let statx = make_statx(&st, mask);
@@ -1318,10 +1382,11 @@ pub fn sys_newfstatat(
         let inner = task.inner.lock();
         let fds = inner.fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-        super::with_kernel_page_table(|| stat_for_fd(file_desc))
+        super::with_kernel_page_table(|| stat_for_fd(file_desc))?
     } else {
         let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-        super::with_kernel_page_table(|| stat_for_path(&host_path))?
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        super::with_kernel_page_table(|| stat_for_path(&host_path, follow))?
     };
     copy_kstat_out(statbuf, &st)?;
     Ok(0)

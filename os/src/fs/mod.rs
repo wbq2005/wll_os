@@ -7,8 +7,9 @@ pub mod vfs;
 
 #[allow(unused_imports)]
 pub use vfs::{
-    create_dir, dir_exists, file_exists, is_removed, list_dir, list_files, read_executable_file,
-    read_file, read_interpreter, remove_dir, remove_file, rename_path,
+    create_dir, create_dir_with_mode, create_symlink, dir_exists, file_exists, is_removed,
+    link_path, list_dir, list_files, read_executable_file, read_file, read_interpreter, read_link,
+    remove_dir, remove_file, rename_path, truncate_path,
 };
 
 use alloc::format;
@@ -173,11 +174,14 @@ impl MemFileSystem {
         if old == "/" || is_descendant(&old, &new) {
             return Err(SysErrNo::EINVAL);
         }
+        let new_parent = parent_path(&new);
+        if !self.is_dir(&new_parent) {
+            return Err(SysErrNo::ENOENT);
+        }
         if self.is_dir(&old) {
             if self.exists(&new) {
                 return Err(SysErrNo::EEXIST);
             }
-            self.ensure_parent_dirs(&new);
             for dir in &mut self.dirs {
                 if *dir == old {
                     *dir = new.clone();
@@ -204,7 +208,6 @@ impl MemFileSystem {
         if self.is_dir(&new) {
             return Err(SysErrNo::EISDIR);
         }
-        self.ensure_parent_dirs(&new);
         self.files
             .retain(|file| file.name != old && file.name != new);
         self.files.push(MemFile::new(&new, content));
@@ -218,7 +221,7 @@ impl MemFileSystem {
             .iter_mut()
             .find(|f| f.name == name)
             .ok_or(SysErrNo::ENOENT)?;
-        file.content.truncate(new_len);
+        file.content.resize(new_len, 0);
         Ok(())
     }
 
@@ -339,6 +342,18 @@ pub fn resolve_path_with_root(root: &str, cwd: &str, path: &str) -> String {
 
 fn file_name(path: &str) -> &str {
     path.rsplit('/').find(|part| !part.is_empty()).unwrap_or("")
+}
+
+pub fn parent_path(path: &str) -> String {
+    let norm = normalize_path(path);
+    let trimmed = norm.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return String::from("/");
+    }
+    match trimmed.rfind('/') {
+        Some(0) | None => String::from("/"),
+        Some(pos) => String::from(&trimmed[..pos]),
+    }
 }
 
 fn child_name(parent: &str, child: &str) -> Option<String> {

@@ -132,7 +132,7 @@ pub fn file_exists(name: &str) -> bool {
     if is_removed(&norm) {
         return false;
     }
-    MEM_FS.lock().exists(&norm) || ext4_vol::ext4_regular_file_exists(&norm)
+    MEM_FS.lock().get_file(&norm).is_some() || ext4_vol::ext4_file_path_exists(&norm)
 }
 
 pub fn dir_exists(name: &str) -> bool {
@@ -150,8 +150,11 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
         return m.remove_file(&norm);
     }
     drop(m);
-    if ext4_vol::ext4_regular_file_exists(&norm) {
-        ext4_vol::unlink_regular_file(&norm)?;
+    if ext4_vol::ext4_dir_path_exists(&norm) {
+        return Err(SysErrNo::EISDIR);
+    }
+    if ext4_vol::ext4_file_path_exists(&norm) {
+        ext4_vol::unlink_non_dir(&norm)?;
         return Ok(());
     }
     Err(SysErrNo::ENOENT)
@@ -164,7 +167,7 @@ pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
         return m.remove_dir(&norm);
     }
     drop(m);
-    if ext4_vol::ext4_regular_file_exists(&norm) {
+    if ext4_vol::ext4_file_path_exists(&norm) {
         return Err(SysErrNo::ENOTDIR);
     }
     if ext4_vol::ext4_dir_path_exists(&norm) {
@@ -187,9 +190,12 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
     let mut m = MEM_FS.lock();
     if m.exists(&old) {
         if !no_replace
-            && (ext4_vol::ext4_regular_file_exists(&new) || ext4_vol::ext4_dir_path_exists(&new))
+            && (ext4_vol::ext4_file_path_exists(&new) || ext4_vol::ext4_dir_path_exists(&new))
         {
             return Err(SysErrNo::EEXIST);
+        }
+        if !m.is_dir(&parent_path(&new)) {
+            return Err(SysErrNo::ENOENT);
         }
         let result = m.rename_path(&old, &new);
         if result.is_ok() {
@@ -199,62 +205,91 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
     }
     drop(m);
 
-    if ext4_vol::ext4_regular_file_exists(&old) {
-        if dir_exists(&new) {
-            return Err(SysErrNo::EISDIR);
-        }
-        let content = read_file(&old).ok_or(SysErrNo::ENOENT)?;
-        if ext4_vol::ext4_dir_path_exists(&parent_path(&new)) {
-            let ino = ext4_vol::create_regular_ext4(&new)?;
-            let mut off = 0usize;
-            while off < content.len() {
-                let n = ext4_vol::ext4_write_at(ino, off, &content[off..])?;
-                if n == 0 {
-                    return Err(SysErrNo::EIO);
-                }
-                off += n;
-            }
-            ext4_vol::unlink_regular_file(&old)?;
-            clear_whiteout(&new);
-            return Ok(());
-        }
-        ext4_vol::unlink_regular_file(&old)?;
+    if ext4_vol::lookup_kind(&old).is_some() {
+        ext4_vol::rename_ext4(&old, &new, no_replace)?;
         clear_whiteout(&new);
-        MEM_FS.lock().add_file(&new, content);
         return Ok(());
-    }
-
-    if ext4_vol::ext4_dir_path_exists(&old) {
-        if file_exists(&new) || dir_exists(&new) {
-            return Err(SysErrNo::EEXIST);
-        }
-        if !list_dir(&old)?.is_empty() {
-            return Err(SysErrNo::ENOTEMPTY);
-        }
-        if ext4_vol::ext4_dir_path_exists(&parent_path(&new)) {
-            ext4_vol::mkdir_ext4(&new)?;
-            ext4_vol::remove_empty_dir_ext4(&old)?;
-            clear_whiteout(&new);
-            return Ok(());
-        }
-        return Err(SysErrNo::EXDEV);
     }
 
     Err(SysErrNo::ENOENT)
 }
 
-pub fn create_dir(path: &str) -> Result<(), SysErrNo> {
+pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo> {
+    let old = normalize_path(old);
+    let new = normalize_path(new);
+    if is_removed(&old) {
+        return Err(SysErrNo::ENOENT);
+    }
+    if MEM_FS.lock().exists(&old) {
+        return Err(SysErrNo::EXDEV);
+    }
+    ext4_vol::link_ext4(&old, &new, follow_old)
+}
+
+pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
+    let norm = normalize_path(link_path);
+    if file_exists(&norm) || dir_exists(&norm) {
+        return Err(SysErrNo::EEXIST);
+    }
+    if ext4_vol::ext4_dir_path_exists(&parent_path(&norm)) {
+        clear_whiteout(&norm);
+        return ext4_vol::create_symlink_ext4(target, &norm);
+    }
+    if MEM_FS.lock().is_dir(&parent_path(&norm)) {
+        return Err(SysErrNo::EXDEV);
+    }
+    Err(SysErrNo::ENOENT)
+}
+
+pub fn read_link(path: &str) -> Result<String, SysErrNo> {
+    let norm = normalize_path(path);
+    if is_removed(&norm) {
+        return Err(SysErrNo::ENOENT);
+    }
+    if MEM_FS.lock().exists(&norm) {
+        return Err(SysErrNo::EINVAL);
+    }
+    ext4_vol::readlink_ext4(&norm)
+}
+
+pub fn truncate_path(path: &str, size: u64) -> Result<(), SysErrNo> {
+    let norm = normalize_path(path);
+    {
+        let mut mem = MEM_FS.lock();
+        if mem.is_dir(&norm) {
+            return Err(SysErrNo::EISDIR);
+        }
+        if mem.get_file(&norm).is_some() {
+            return mem.truncate_file(&norm, size as usize);
+        }
+    }
+    let ext_path = match ext4_vol::lookup_kind(&norm) {
+        Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => ext4_vol::resolve_symlinks(&norm)?,
+        Some(_) => norm.clone(),
+        None => return Err(SysErrNo::ENOENT),
+    };
+    ext4_vol::truncate_regular_ext4(&ext_path, size)
+}
+
+pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
     if file_exists(&norm) || dir_exists(&norm) {
         return Err(SysErrNo::EEXIST);
     }
     clear_whiteout(&norm);
     if ext4_vol::ext4_dir_path_exists(&parent_path(&norm)) {
-        ext4_vol::mkdir_ext4(&norm)?;
+        ext4_vol::mkdir_ext4_with_mode(&norm, mode)?;
         return Ok(());
     }
-    MEM_FS.lock().add_dir(&norm);
-    Ok(())
+    if MEM_FS.lock().is_dir(&parent_path(&norm)) {
+        MEM_FS.lock().add_dir(&norm);
+        return Ok(());
+    }
+    Err(SysErrNo::ENOENT)
+}
+
+pub fn create_dir(path: &str) -> Result<(), SysErrNo> {
+    create_dir_with_mode(path, 0o755)
 }
 
 pub fn list_dir(path: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
@@ -275,7 +310,7 @@ pub fn list_dir(path: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
             return Err(SysErrNo::ENOTDIR);
         }
         drop(m);
-        if ext4_vol::is_ext4_mounted() && ext4_vol::ext4_regular_file_exists(&norm) {
+        if ext4_vol::is_ext4_mounted() && ext4_vol::ext4_file_path_exists(&norm) {
             return Err(SysErrNo::ENOTDIR);
         }
         return Err(SysErrNo::ENOENT);
