@@ -48,7 +48,9 @@ run_user_task() 返回用户态
 | 29 | ioctl | IO控制 |
 | 34 | mkdirat | 创建目录 |
 | 35 | unlinkat | 删除文件 |
+| 36 | symlinkat | 创建符号链接 |
 | 37 | linkat | 创建链接 |
+| 38 | renameat | 重命名路径 |
 | 39 | umount2 | 卸载文件系统 |
 | 40 | mount | 挂载文件系统 |
 | 49 | chdir | 改变当前目录 |

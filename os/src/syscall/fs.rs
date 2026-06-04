@@ -287,8 +287,7 @@ fn check_fstatat_flags(flags: usize) -> Result<(), SysErrNo> {
 }
 
 fn check_statx_flags(flags: usize) -> Result<(), SysErrNo> {
-    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0
-    {
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0 {
         Err(SysErrNo::EINVAL)
     } else {
         Ok(())
@@ -364,19 +363,19 @@ fn copy_statfs_out(buf: *mut u8, st: &StatFs) -> Result<(), SysErrNo> {
     copy_to_user(buf, bytes)
 }
 
-fn make_statfs() -> StatFs {
+fn make_statfs(info: crate::fs::VfsStatFs) -> StatFs {
     StatFs {
-        f_type: crate::fs::filesystem_magic(),
-        f_bsize: 4096,
-        f_blocks: 262_144,
-        f_bfree: 131_072,
-        f_bavail: 131_072,
-        f_files: fd::MAX_FD_NUM,
-        f_ffree: fd::MAX_FD_NUM / 2,
+        f_type: info.f_type,
+        f_bsize: info.f_bsize,
+        f_blocks: info.f_blocks,
+        f_bfree: info.f_bfree,
+        f_bavail: info.f_bavail,
+        f_files: info.f_files,
+        f_ffree: info.f_ffree,
         f_fsid: [0, 0],
-        f_namelen: 255,
-        f_frsize: 4096,
-        f_flags: 0,
+        f_namelen: info.f_namelen,
+        f_frsize: info.f_frsize,
+        f_flags: info.f_flags,
         f_spare: [0; 4],
     }
 }
@@ -542,6 +541,15 @@ pub fn sys_unlinkat(dirfd: isize, pathname: *const u8, flags: usize) -> SyscallR
     Ok(0)
 }
 
+pub fn sys_unlink(pathname: *const u8) -> SyscallRet {
+    sys_unlinkat(AT_FDCWD, pathname, 0)
+}
+
+pub fn sys_rmdir(pathname: *const u8) -> SyscallRet {
+    const AT_REMOVEDIR: usize = 0x200;
+    sys_unlinkat(AT_FDCWD, pathname, AT_REMOVEDIR)
+}
+
 pub fn sys_renameat2(
     olddirfd: isize,
     oldpath: *const u8,
@@ -559,6 +567,19 @@ pub fn sys_renameat2(
         crate::fs::rename_path(&old_host, &new_host, flags & RENAME_NOREPLACE != 0)
     })?;
     Ok(0)
+}
+
+pub fn sys_renameat(
+    olddirfd: isize,
+    oldpath: *const u8,
+    newdirfd: isize,
+    newpath: *const u8,
+) -> SyscallRet {
+    sys_renameat2(olddirfd, oldpath, newdirfd, newpath, 0)
+}
+
+pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> SyscallRet {
+    sys_renameat2(AT_FDCWD, oldpath, AT_FDCWD, newpath, 0)
 }
 
 pub fn sys_linkat(
@@ -580,6 +601,10 @@ pub fn sys_linkat(
     Ok(0)
 }
 
+pub fn sys_link(oldpath: *const u8, newpath: *const u8) -> SyscallRet {
+    sys_linkat(AT_FDCWD, oldpath, AT_FDCWD, newpath, 0)
+}
+
 pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) -> SyscallRet {
     let target = read_user_cstr(target)?;
     if target.is_empty() {
@@ -588,6 +613,10 @@ pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) ->
     let (_logical_path, host_path) = resolve_host_path(newdirfd, linkpath)?;
     super::with_kernel_page_table(|| crate::fs::create_symlink(&target, &host_path))?;
     Ok(0)
+}
+
+pub fn sys_symlink(target: *const u8, linkpath: *const u8) -> SyscallRet {
+    sys_symlinkat(target, AT_FDCWD, linkpath)
 }
 
 pub fn sys_faccessat(dirfd: isize, pathname: *const u8, mode: usize, flags: usize) -> SyscallRet {
@@ -1021,8 +1050,8 @@ pub fn sys_statfs(pathname: *const u8, buf: *mut u8) -> SyscallRet {
         return Err(SysErrNo::EFAULT);
     }
     let (_logical_path, host_path) = resolve_host_path(AT_FDCWD, pathname)?;
-    super::with_kernel_page_table(|| crate::fs::metadata(&host_path, true))?;
-    copy_statfs_out(buf, &make_statfs())?;
+    let info = super::with_kernel_page_table(|| crate::fs::statfs_for_path(&host_path))?;
+    copy_statfs_out(buf, &make_statfs(info))?;
     Ok(0)
 }
 
@@ -1033,8 +1062,9 @@ pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
     let fds = inner.fd_table.lock();
-    let _ = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-    copy_statfs_out(buf, &make_statfs())?;
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    let info = super::with_kernel_page_table(|| crate::fs::statfs_for_fd(file_desc))?;
+    copy_statfs_out(buf, &make_statfs(info))?;
     Ok(0)
 }
 

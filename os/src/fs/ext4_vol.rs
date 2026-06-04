@@ -72,6 +72,16 @@ pub struct Ext4Metadata {
     pub ctime_nsec: isize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Ext4StatFs {
+    pub block_size: usize,
+    pub blocks: usize,
+    pub free_blocks: usize,
+    pub files: usize,
+    pub free_files: usize,
+    pub max_name_len: usize,
+}
+
 fn inode_kind(fs: &Ext4, ino: u32) -> Ext4NodeKind {
     let inode = fs.get_inode_ref(ino).inode;
     if inode.is_dir() {
@@ -139,6 +149,19 @@ fn clear_metadata_cache() {
 
 pub fn is_ext4_mounted() -> bool {
     ROOT_EXT4.lock().is_some()
+}
+
+pub fn statfs_info() -> Option<Ext4StatFs> {
+    let fs = ROOT_EXT4.lock().clone()?;
+    let sb = &fs.super_block;
+    Some(Ext4StatFs {
+        block_size: sb.block_size() as usize,
+        blocks: sb.blocks_count() as usize,
+        free_blocks: sb.free_blocks_count() as usize,
+        files: sb.total_inodes() as usize,
+        free_files: sb.free_inodes_count() as usize,
+        max_name_len: 255,
+    })
 }
 
 pub fn mount_block_device(device: Arc<dyn ext4_rs::BlockDevice>) {

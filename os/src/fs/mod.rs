@@ -8,10 +8,10 @@ pub mod vfs;
 #[allow(unused_imports)]
 pub use vfs::{
     check_access, check_fd_access, check_metadata_access, create_dir, create_dir_with_mode,
-    create_regular_file, create_symlink, dir_exists, file_exists, is_removed, link_path, list_dir,
-    list_files, metadata, metadata_for_fd, open_path, read_executable_file, read_file,
-    read_interpreter, read_link, remove_dir, remove_file, rename_path, truncate_fd, truncate_path,
-    filesystem_magic, VfsMetadata, VfsNodeKind,
+    create_regular_file, create_symlink, dir_exists, file_exists, filesystem_magic, is_removed,
+    link_path, list_dir, list_files, metadata, metadata_for_fd, open_path, read_executable_file,
+    read_file, read_interpreter, read_link, remove_dir, remove_file, rename_path, statfs_for_fd,
+    statfs_for_path, truncate_fd, truncate_path, VfsMetadata, VfsNodeKind, VfsStatFs,
 };
 
 use alloc::format;
@@ -105,6 +105,14 @@ impl MemFileSystem {
 
     pub fn list_file_names(&self) -> Vec<String> {
         self.files.iter().map(|f| f.name.clone()).collect()
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.files.len().saturating_add(self.dirs.len())
+    }
+
+    pub fn total_file_bytes(&self) -> usize {
+        self.files.iter().map(|f| f.content.len()).sum()
     }
 
     pub fn list_dir(&self, dir: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {

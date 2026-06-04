@@ -20,6 +20,20 @@ lazy_static! {
     static ref WHITEOUTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct VfsStatFs {
+    pub f_type: usize,
+    pub f_bsize: usize,
+    pub f_blocks: usize,
+    pub f_bfree: usize,
+    pub f_bavail: usize,
+    pub f_files: usize,
+    pub f_ffree: usize,
+    pub f_namelen: usize,
+    pub f_frsize: usize,
+    pub f_flags: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VfsNodeKind {
     Regular,
@@ -52,6 +66,10 @@ pub fn is_removed(name: &str) -> bool {
 
 fn clear_whiteout(name: &str) {
     WHITEOUTS.lock().remove(&normalize_path(name));
+}
+
+fn mark_whiteout(name: &str) {
+    WHITEOUTS.lock().insert(normalize_path(name));
 }
 
 fn parent_path(path: &str) -> String {
@@ -238,8 +256,7 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
             entries.len() as u64,
             1,
         )),
-        fd::FileDescriptor::Ext4Regular { ino, .. }
-        | fd::FileDescriptor::Ext4Dir { ino, .. } => {
+        fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::metadata_by_ino(*ino).map(metadata_from_ext4)
         }
         fd::FileDescriptor::PipeRead { .. } => Ok(synthetic_metadata(
@@ -276,19 +293,12 @@ pub fn check_metadata_access(meta: &VfsMetadata, access_mode: usize) -> Result<(
     Ok(())
 }
 
-pub fn check_access(
-    path: &str,
-    follow_symlink: bool,
-    access_mode: usize,
-) -> Result<(), SysErrNo> {
+pub fn check_access(path: &str, follow_symlink: bool, access_mode: usize) -> Result<(), SysErrNo> {
     let meta = metadata(path, follow_symlink)?;
     check_metadata_access(&meta, access_mode)
 }
 
-pub fn check_fd_access(
-    file: &fd::FileDescriptor,
-    access_mode: usize,
-) -> Result<(), SysErrNo> {
+pub fn check_fd_access(file: &fd::FileDescriptor, access_mode: usize) -> Result<(), SysErrNo> {
     let meta = metadata_for_fd(file)?;
     check_metadata_access(&meta, access_mode)
 }
@@ -407,46 +417,122 @@ pub fn filesystem_magic() -> usize {
     }
 }
 
+fn mem_statfs() -> VfsStatFs {
+    let mem = MEM_FS.lock();
+    let entries = mem.entry_count().max(1);
+    let used_blocks = mem.total_file_bytes().div_ceil(4096).max(1);
+    let total_blocks = used_blocks.saturating_add(4096);
+    VfsStatFs {
+        f_type: 0x0102_1994,
+        f_bsize: 4096,
+        f_blocks: total_blocks,
+        f_bfree: total_blocks.saturating_sub(used_blocks),
+        f_bavail: total_blocks.saturating_sub(used_blocks),
+        f_files: entries.saturating_add(1024),
+        f_ffree: 1024,
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0,
+    }
+}
+
+fn current_statfs() -> VfsStatFs {
+    if let Some(info) = ext4_vol::statfs_info() {
+        return VfsStatFs {
+            f_type: 0xef53,
+            f_bsize: info.block_size,
+            f_blocks: info.blocks,
+            f_bfree: info.free_blocks,
+            f_bavail: info.free_blocks,
+            f_files: info.files,
+            f_ffree: info.free_files,
+            f_namelen: info.max_name_len,
+            f_frsize: info.block_size,
+            f_flags: 0,
+        };
+    }
+    mem_statfs()
+}
+
+pub fn statfs_for_path(path: &str) -> Result<VfsStatFs, SysErrNo> {
+    metadata(path, true)?;
+    Ok(current_statfs())
+}
+
+pub fn statfs_for_fd(file: &fd::FileDescriptor) -> Result<VfsStatFs, SysErrNo> {
+    metadata_for_fd(file)?;
+    Ok(current_statfs())
+}
+
 pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
-    let mut m = MEM_FS.lock();
-    if m.exists(&norm) && !m.is_dir(&norm) {
-        return m.remove_file(&norm);
+    if is_removed(&norm) {
+        return Err(SysErrNo::ENOENT);
     }
-    drop(m);
-    if ext4_vol::ext4_dir_path_exists(&norm) {
+    if norm == "/" {
         return Err(SysErrNo::EISDIR);
     }
-    if ext4_vol::ext4_file_path_exists(&norm) {
-        ext4_vol::unlink_non_dir(&norm)?;
-        return Ok(());
+    {
+        let mut m = MEM_FS.lock();
+        if m.is_dir(&norm) {
+            return Err(SysErrNo::EISDIR);
+        }
+        if m.get_file(&norm).is_some() {
+            m.remove_file(&norm)?;
+            mark_whiteout(&norm);
+            return Ok(());
+        }
     }
-    Err(SysErrNo::ENOENT)
+
+    match ext4_vol::lookup_kind(&norm) {
+        Some((_ino, ext4_vol::Ext4NodeKind::Directory)) => Err(SysErrNo::EISDIR),
+        Some(_) => {
+            ext4_vol::unlink_non_dir(&norm)?;
+            Ok(())
+        }
+        None => Err(missing_path_errno(&norm)),
+    }
 }
 
 pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
-    let mut m = MEM_FS.lock();
-    if m.is_dir(&norm) {
-        return m.remove_dir(&norm);
+    if is_removed(&norm) {
+        return Err(SysErrNo::ENOENT);
     }
-    drop(m);
-    if ext4_vol::ext4_file_path_exists(&norm) {
-        return Err(SysErrNo::ENOTDIR);
+    if norm == "/" {
+        return Err(SysErrNo::EBUSY);
     }
-    if ext4_vol::ext4_dir_path_exists(&norm) {
-        if !list_dir(&norm)?.is_empty() {
-            return Err(SysErrNo::ENOTEMPTY);
+    {
+        let mut m = MEM_FS.lock();
+        if m.get_file(&norm).is_some() {
+            return Err(SysErrNo::ENOTDIR);
         }
-        ext4_vol::remove_empty_dir_ext4(&norm)?;
-        return Ok(());
+        if m.is_dir(&norm) {
+            m.remove_dir(&norm)?;
+            mark_whiteout(&norm);
+            return Ok(());
+        }
     }
-    Err(SysErrNo::ENOENT)
+
+    match ext4_vol::lookup_kind(&norm) {
+        Some((_ino, ext4_vol::Ext4NodeKind::Directory)) => {
+            if !list_dir(&norm)?.is_empty() {
+                return Err(SysErrNo::ENOTEMPTY);
+            }
+            ext4_vol::remove_empty_dir_ext4(&norm)?;
+            Ok(())
+        }
+        Some(_) => Err(SysErrNo::ENOTDIR),
+        None => Err(missing_path_errno(&norm)),
+    }
 }
 
 pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrNo> {
     let old = normalize_path(old);
     let new = normalize_path(new);
+    if is_removed(&old) {
+        return Err(SysErrNo::ENOENT);
+    }
     if no_replace && (file_exists(&new) || dir_exists(&new)) {
         return Err(SysErrNo::EEXIST);
     }
@@ -458,24 +544,44 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
         {
             return Err(SysErrNo::EEXIST);
         }
-        if !m.is_dir(&parent_path(&new)) {
-            return Err(SysErrNo::ENOENT);
+        let new_parent = parent_path(&new);
+        if !m.is_dir(&new_parent) {
+            drop(m);
+            if ext4_vol::ext4_dir_path_exists(&new_parent) {
+                return Err(SysErrNo::EXDEV);
+            }
+            return Err(missing_path_errno(&new));
         }
         let result = m.rename_path(&old, &new);
         if result.is_ok() {
             clear_whiteout(&new);
+            mark_whiteout(&old);
         }
         return result;
     }
     drop(m);
 
     if ext4_vol::lookup_kind(&old).is_some() {
+        let new_parent = parent_path(&new);
+        if MEM_FS.lock().exists(&new) {
+            return if no_replace {
+                Err(SysErrNo::EEXIST)
+            } else {
+                Err(SysErrNo::EXDEV)
+            };
+        }
+        if path_exists_non_dir(&new_parent) {
+            return Err(SysErrNo::ENOTDIR);
+        }
+        if MEM_FS.lock().is_dir(&new_parent) && !ext4_vol::ext4_dir_path_exists(&new_parent) {
+            return Err(SysErrNo::EXDEV);
+        }
         ext4_vol::rename_ext4(&old, &new, no_replace)?;
         clear_whiteout(&new);
         return Ok(());
     }
 
-    Err(SysErrNo::ENOENT)
+    Err(missing_path_errno(&old))
 }
 
 pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo> {
@@ -484,10 +590,28 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
     if is_removed(&old) {
         return Err(SysErrNo::ENOENT);
     }
+    if file_exists(&new) || dir_exists(&new) {
+        return Err(SysErrNo::EEXIST);
+    }
     if MEM_FS.lock().exists(&old) {
         return Err(SysErrNo::EXDEV);
     }
-    ext4_vol::link_ext4(&old, &new, follow_old)
+    if ext4_vol::lookup_kind(&old).is_none() && path_exists_non_dir(&parent_path(&old)) {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    let new_parent = parent_path(&new);
+    if MEM_FS.lock().is_dir(&new_parent) && !ext4_vol::ext4_dir_path_exists(&new_parent) {
+        return Err(SysErrNo::EXDEV);
+    }
+    if path_exists_non_dir(&new_parent) {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    if !ext4_vol::ext4_dir_path_exists(&new_parent) {
+        return Err(SysErrNo::ENOENT);
+    }
+    ext4_vol::link_ext4(&old, &new, follow_old)?;
+    clear_whiteout(&new);
+    Ok(())
 }
 
 pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
@@ -495,12 +619,16 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
     if file_exists(&norm) || dir_exists(&norm) {
         return Err(SysErrNo::EEXIST);
     }
-    if ext4_vol::ext4_dir_path_exists(&parent_path(&norm)) {
+    let parent = parent_path(&norm);
+    if ext4_vol::ext4_dir_path_exists(&parent) {
         clear_whiteout(&norm);
         return ext4_vol::create_symlink_ext4(target, &norm);
     }
-    if MEM_FS.lock().is_dir(&parent_path(&norm)) {
+    if MEM_FS.lock().is_dir(&parent) {
         return Err(SysErrNo::EXDEV);
+    }
+    if path_exists_non_dir(&parent) {
+        return Err(SysErrNo::ENOTDIR);
     }
     Err(SysErrNo::ENOENT)
 }
@@ -612,6 +740,9 @@ fn open_dir_descriptor(
 
 fn path_exists_non_dir(path: &str) -> bool {
     let norm = normalize_path(path);
+    if is_removed(&norm) {
+        return false;
+    }
     {
         let mem = MEM_FS.lock();
         if mem.get_file(&norm).is_some() {
@@ -760,6 +891,7 @@ pub fn open_path(
         let parent = parent_path(&path_norm);
         if ext4_vol::ext4_dir_path_exists(&parent) {
             let ino = ext4_vol::create_regular_ext4_with_mode(&path_norm, mode)?;
+            clear_whiteout(&path_norm);
             return Ok(fd::FileDescriptor::Ext4Regular {
                 ino,
                 offset: 0,
@@ -770,6 +902,7 @@ pub fn open_path(
         }
         if MEM_FS.lock().is_dir(&parent) {
             MEM_FS.lock().add_file(&path_norm, Vec::new());
+            clear_whiteout(&path_norm);
             return Ok(fd::FileDescriptor::MemFile {
                 name: path_norm,
                 content: Vec::new(),

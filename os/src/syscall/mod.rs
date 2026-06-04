@@ -42,6 +42,7 @@ pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
 pub const SYSCALL_SYMLINKAT: usize = 36;
 pub const SYSCALL_LINKAT: usize = 37;
+pub const SYSCALL_RENAMEAT: usize = 38;
 pub const SYSCALL_UMOUNT2: usize = 39;
 pub const SYSCALL_MOUNT: usize = 40;
 pub const SYSCALL_STATFS: usize = 43;
@@ -152,7 +153,12 @@ pub const SYSCALL_GETRANDOM: usize = 278;
 /// Maps to openat(AT_FDCWD, path, flags, mode).
 /// Linux defines SYS_open = 1024 on RISC-V (only open/openat split happened later).
 pub const SYSCALL_OPEN: usize = 1024;
+pub const SYSCALL_LINK: usize = 1025;
+pub const SYSCALL_UNLINK: usize = 1026;
+pub const SYSCALL_RMDIR: usize = 1031;
 pub const SYSCALL_ACCESS: usize = 1033;
+pub const SYSCALL_RENAME: usize = 1034;
+pub const SYSCALL_SYMLINK: usize = 1036;
 
 /// 系统调用分发
 ///
@@ -193,9 +199,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_ACCESS => fs::sys_access(args[0] as *const u8, args[1]),
         SYSCALL_CLOSE => fs::sys_close(args[0]),
         SYSCALL_PIPE2 => fs::sys_pipe2(args[0] as *mut i32, args[1]),
-        SYSCALL_FACCESSAT => {
-            fs::sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3])
-        }
+        SYSCALL_FACCESSAT => fs::sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], 0),
         SYSCALL_FACCESSAT2 => {
             fs::sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3])
         }
@@ -237,7 +241,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         ),
         SYSCALL_CHDIR => fs::sys_chdir(args[0] as *const u8),
         SYSCALL_MKDIRAT => fs::sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_UNLINK => fs::sys_unlink(args[0] as *const u8),
         SYSCALL_UNLINKAT => fs::sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
+        SYSCALL_RMDIR => fs::sys_rmdir(args[0] as *const u8),
+        SYSCALL_LINK => fs::sys_link(args[0] as *const u8, args[1] as *const u8),
         SYSCALL_LINKAT => fs::sys_linkat(
             args[0] as isize,
             args[1] as *const u8,
@@ -245,9 +252,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[3] as *const u8,
             args[4],
         ),
+        SYSCALL_SYMLINK => fs::sys_symlink(args[0] as *const u8, args[1] as *const u8),
         SYSCALL_SYMLINKAT => {
             fs::sys_symlinkat(args[0] as *const u8, args[1] as isize, args[2] as *const u8)
         }
+        SYSCALL_RENAME => fs::sys_rename(args[0] as *const u8, args[1] as *const u8),
+        SYSCALL_RENAMEAT => fs::sys_renameat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as isize,
+            args[3] as *const u8,
+        ),
         SYSCALL_RENAMEAT2 => fs::sys_renameat2(
             args[0] as isize,
             args[1] as *const u8,
