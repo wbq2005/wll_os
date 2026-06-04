@@ -91,7 +91,7 @@ pub fn wake_expired_timers() {
         }
     }
     for waiter in expired {
-        crate::task::wake_task_token(&waiter.task, waiter.token);
+        crate::task::wake_task_token_with(&waiter.task, waiter.token, WaitOutcome::TimedOut);
     }
 }
 

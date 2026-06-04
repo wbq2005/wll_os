@@ -1,6 +1,7 @@
 use super::SyscallRet;
 use crate::mm::memory_set::MemorySet;
 use crate::mm::page_table::PTEFlags;
+use crate::task::wait_queue::WaitOutcome;
 use crate::task::{current_task, TaskControlBlock, TaskStatus};
 use crate::utils::error::SysErrNo;
 use alloc::sync::Arc;
@@ -437,12 +438,8 @@ fn queue_signal(task: &Arc<TaskControlBlock>, signum: i32) {
 }
 
 fn wake_for_signal(task: &Arc<TaskControlBlock>) {
-    let mut status = task.status.lock();
-    if *status == TaskStatus::Blocked {
-        *status = TaskStatus::Ready;
-        *task.block_reason.lock() = None;
-        drop(status);
-        crate::task::manager::add_task(task.clone());
+    if has_deliverable_pending(task) {
+        crate::task::wake_blocked_task(task, WaitOutcome::Interrupted);
     }
 }
 

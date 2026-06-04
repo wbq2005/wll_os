@@ -546,7 +546,7 @@ pub fn resolve_symlinks(path: &str) -> Result<String, SysErrNo> {
         let target = readlink_ext4(&current)?;
         current = resolve_link_target(&current, &target);
     }
-    Err(SysErrNo::EINVAL)
+    Err(SysErrNo::ELOOP)
 }
 
 fn path_is_descendant(parent: &str, child: &str) -> bool {

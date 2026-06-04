@@ -1,5 +1,6 @@
 use super::SyscallRet;
 use crate::task::current_task;
+use crate::task::wait_queue::WaitOutcome;
 use crate::timer;
 use crate::utils::error::SysErrNo;
 use alloc::sync::Arc;
@@ -405,7 +406,7 @@ pub fn futex_wake_addr(uaddr: usize, n: usize) -> usize {
             };
             waiters.remove(index)
         };
-        if crate::task::wake_task_token(&waiter.task, waiter.token) {
+        if crate::task::wake_task_token_with(&waiter.task, waiter.token, WaitOutcome::Woken) {
             woke += 1;
         }
     }
@@ -468,23 +469,19 @@ pub fn sys_futex_stub(
                 timer::add_timeout(deadline, task.clone(), token);
             }
 
-            crate::task::wait_queue::block_current_for(crate::task::wait_queue::BlockReason::Futex);
+            crate::task::block_current_for_reason_until(
+                crate::task::wait_queue::BlockReason::Futex,
+                deadline,
+            );
 
             let still_waiting = remove_futex_waiter(uaddr, key, task.pid.0, token);
-            if crate::syscall::signal::current_has_unblocked_pending() {
-                return Err(SysErrNo::EINTR);
-            }
-            if still_waiting
-                && deadline
-                    .map(|deadline| timer::get_time_us() >= deadline)
-                    .unwrap_or(false)
-            {
-                Err(SysErrNo::ETIMEDOUT)
-            } else {
-                Ok(0)
+            match crate::task::wait_queue::finish_wait(&task, still_waiting, deadline) {
+                WaitOutcome::TimedOut => Err(SysErrNo::ETIMEDOUT),
+                WaitOutcome::Interrupted => Err(SysErrNo::EINTR),
+                WaitOutcome::Woken => Ok(0),
             }
         }
         FUTEX_WAKE => Ok(futex_wake_addr(uaddr, val)),
-        _ => Ok(0),
+        _ => Err(SysErrNo::ENOSYS),
     }
 }

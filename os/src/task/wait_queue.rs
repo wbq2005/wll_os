@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use super::{block_current_and_run_next, current_task, wake_task_token, TaskControlBlock};
+use super::{block_current_for_reason_until, current_task, wake_task_token_with, TaskControlBlock};
 use crate::utils::error::SysErrNo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +18,7 @@ pub enum BlockReason {
 pub enum WaitOutcome {
     Woken,
     TimedOut,
+    Interrupted,
 }
 
 #[derive(Clone)]
@@ -62,20 +63,12 @@ impl WaitQueue {
             crate::timer::add_timeout(deadline, task.clone(), token);
         }
 
-        block_current_for(self.reason);
+        block_current_for(self.reason, deadline_us);
 
         let still_waiting = self.remove_waiter(task.pid.0, token);
-        if crate::syscall::signal::current_has_unblocked_pending() {
-            return Err(SysErrNo::EINTR);
-        }
-        if still_waiting
-            && deadline_us
-                .map(|deadline| crate::timer::get_time_us() >= deadline)
-                .unwrap_or(false)
-        {
-            Ok(WaitOutcome::TimedOut)
-        } else {
-            Ok(WaitOutcome::Woken)
+        match finish_wait(&task, still_waiting, deadline_us) {
+            WaitOutcome::Interrupted => Err(SysErrNo::EINTR),
+            outcome => Ok(outcome),
         }
     }
 
@@ -90,7 +83,7 @@ impl WaitQueue {
             let Some(entry) = entry else {
                 break;
             };
-            if wake_task_token(&entry.task, entry.token) {
+            if wake_task_token_with(&entry.task, entry.token, WaitOutcome::Woken) {
                 woke += 1;
             }
         }
@@ -104,7 +97,7 @@ impl WaitQueue {
             let Some(entry) = entry else {
                 break;
             };
-            if wake_task_token(&entry.task, entry.token) {
+            if wake_task_token_with(&entry.task, entry.token, WaitOutcome::Woken) {
                 woke += 1;
             }
         }
@@ -136,11 +129,30 @@ lazy_static! {
     pub static ref CHILD_WAIT_QUEUE: WaitQueue = WaitQueue::new(BlockReason::ChildExit);
 }
 
-pub fn block_current_for(reason: BlockReason) {
-    if let Some(task) = current_task() {
-        *task.block_reason.lock() = Some(reason);
+pub fn block_current_for(reason: BlockReason, deadline_us: Option<usize>) {
+    block_current_for_reason_until(reason, deadline_us);
+}
+
+pub fn finish_wait(
+    task: &Arc<TaskControlBlock>,
+    still_waiting: bool,
+    deadline_us: Option<usize>,
+) -> WaitOutcome {
+    if let Some(outcome) = task.wait_outcome.lock().take() {
+        return outcome;
     }
-    block_current_and_run_next();
+    if crate::syscall::signal::current_has_unblocked_pending() {
+        return WaitOutcome::Interrupted;
+    }
+    if still_waiting
+        && deadline_us
+            .map(|deadline| crate::timer::get_time_us() >= deadline)
+            .unwrap_or(false)
+    {
+        WaitOutcome::TimedOut
+    } else {
+        WaitOutcome::Woken
+    }
 }
 
 pub fn sleep_on_io(deadline_us: Option<usize>) -> Result<WaitOutcome, SysErrNo> {

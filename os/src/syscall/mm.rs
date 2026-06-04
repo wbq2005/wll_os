@@ -1,6 +1,7 @@
 use super::SyscallRet;
 use crate::config::{PAGE_SIZE, USER_HEAP_START, USER_STACK_TOP};
-use crate::mm::map_area::MapAreaBacking;
+use crate::fs::fd::FileDescriptor;
+use crate::mm::map_area::{MapArea, MapAreaBacking};
 use crate::mm::page_table::PTEFlags;
 use crate::task::current_task;
 use crate::utils::error::SysErrNo;
@@ -34,6 +35,72 @@ fn align_up(value: usize) -> Result<usize, SysErrNo> {
 fn checked_range(start: usize, length: usize) -> Result<(usize, usize), SysErrNo> {
     let end = start.checked_add(length).ok_or(SysErrNo::EINVAL)?;
     Ok((start, align_up(end)?))
+}
+
+fn ranges_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+fn read_area_bytes(area: &MapArea, src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
+    let mut copied = 0usize;
+    while copied < dst.len() {
+        let addr = src.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
+        if !area.contains(VirtAddr::new(addr)) {
+            return Err(SysErrNo::EFAULT);
+        }
+        let page_idx = (align_down(addr) - area.start_va.raw()) / PAGE_SIZE;
+        let page_off = addr % PAGE_SIZE;
+        let copy_len = (dst.len() - copied).min(PAGE_SIZE - page_off);
+        let frame = area.frames.get(page_idx).ok_or(SysErrNo::EFAULT)?;
+        let src_ptr = (frame.ppn().addr() + page_off) as *const u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src_ptr, dst[copied..].as_mut_ptr(), copy_len);
+        }
+        copied += copy_len;
+    }
+    Ok(())
+}
+
+fn collect_shared_file_writes(
+    task: &crate::task::TaskControlBlock,
+    start: usize,
+    end: usize,
+) -> Result<Vec<(FileDescriptor, usize, Vec<u8>)>, SysErrNo> {
+    let ms = task.memory_set.lock();
+    let mut writes = Vec::new();
+    for area in &ms.areas {
+        if !ranges_overlap(start, end, area.start_va.raw(), area.end_va.raw()) {
+            continue;
+        }
+        let MapAreaBacking::File {
+            file,
+            offset,
+            shared,
+        } = &area.backing
+        else {
+            continue;
+        };
+        if !*shared || !area.flags.contains(PTEFlags::W) {
+            continue;
+        }
+        let copy_start = start.max(area.start_va.raw());
+        let copy_end = end.min(area.end_va.raw());
+        let mut data = alloc::vec![0u8; copy_end - copy_start];
+        read_area_bytes(area, copy_start, &mut data)?;
+        writes.push((
+            file.clone(),
+            offset.saturating_add(copy_start - area.start_va.raw()),
+            data,
+        ));
+    }
+    Ok(writes)
+}
+
+fn write_back_shared_files(writes: Vec<(FileDescriptor, usize, Vec<u8>)>) -> Result<(), SysErrNo> {
+    for (mut file, offset, data) in writes {
+        super::with_kernel_page_table(|| file.write_at(offset, &data))?;
+    }
+    Ok(())
 }
 
 fn prot_to_pte_flags(prot: i32) -> Result<PTEFlags, SysErrNo> {
@@ -249,6 +316,8 @@ pub fn sys_munmap(addr: usize, length: usize) -> SyscallRet {
     let start = align_down(addr);
     let end = align_up(addr.checked_add(length).ok_or(SysErrNo::EINVAL)?)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let writes = collect_shared_file_writes(&task, start, end)?;
+    write_back_shared_files(writes)?;
     {
         let mut ms = task.memory_set.lock();
         ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;

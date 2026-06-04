@@ -5,6 +5,8 @@ pub mod process;
 pub mod signal;
 pub(crate) mod user;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 pub use crate::utils::error::SysErrNo;
 
 /// Linux AT_FDCWD = -100, used to indicate "use current working directory" for *at syscalls.
@@ -12,6 +14,12 @@ const AT_FDCWD: isize = -100;
 
 /// 系统调用返回值类型
 pub type SyscallRet = Result<usize, SysErrNo>;
+
+static TRACE_SYSCALL_PID: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn trace_syscalls_for_pid(pid: usize) {
+    TRACE_SYSCALL_PID.store(pid, Ordering::Relaxed);
+}
 
 pub(crate) fn with_kernel_page_table<T>(f: impl FnOnce() -> T) -> T {
     crate::trap::restore_kernel_page_table();
@@ -36,6 +44,8 @@ pub const SYSCALL_SYMLINKAT: usize = 36;
 pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_UMOUNT2: usize = 39;
 pub const SYSCALL_MOUNT: usize = 40;
+pub const SYSCALL_STATFS: usize = 43;
+pub const SYSCALL_FSTATFS: usize = 44;
 pub const SYSCALL_FACCESSAT: usize = 48;
 pub const SYSCALL_CHDIR: usize = 49;
 pub const SYSCALL_OPENAT: usize = 56;
@@ -57,6 +67,7 @@ pub const SYSCALL_READLINKAT: usize = 78;
 pub const SYSCALL_NEWFSTATAT: usize = 79;
 pub const SYSCALL_FSTAT: usize = 80;
 pub const SYSCALL_FSYNC: usize = 82;
+pub const SYSCALL_FDATASYNC: usize = 83;
 pub const SYSCALL_UTIMENSAT: usize = 88;
 pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_EXIT_GROUP: usize = 94;
@@ -133,6 +144,7 @@ pub const SYSCALL_PRLIMIT64: usize = 261;
 pub const SYSCALL_RENAMEAT2: usize = 276;
 pub const SYSCALL_MEMBARRIER: usize = 283;
 pub const SYSCALL_STATX: usize = 291;
+pub const SYSCALL_FACCESSAT2: usize = 439;
 pub const SYSCALL_COPY_FILE_RANGE: usize = 326;
 pub const SYSCALL_GETRANDOM: usize = 278;
 
@@ -140,6 +152,7 @@ pub const SYSCALL_GETRANDOM: usize = 278;
 /// Maps to openat(AT_FDCWD, path, flags, mode).
 /// Linux defines SYS_open = 1024 on RISC-V (only open/openat split happened later).
 pub const SYSCALL_OPEN: usize = 1024;
+pub const SYSCALL_ACCESS: usize = 1033;
 
 /// 系统调用分发
 ///
@@ -151,6 +164,16 @@ pub const SYSCALL_OPEN: usize = 1024;
 /// 返回值: 成功返回结果，失败返回错误码
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
     log::debug!("[syscall] id: {}, args: {:?}", syscall_id, args);
+    if let Some(task) = crate::task::current_task() {
+        if TRACE_SYSCALL_PID.load(Ordering::Relaxed) == task.pid.0 {
+            crate::println!(
+                "[trace-which-syscall] pid={} id={} args={:?}",
+                task.pid.0,
+                syscall_id,
+                args
+            );
+        }
+    }
 
     match syscall_id {
         // 文件操作
@@ -167,9 +190,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[1] as u32,
             args[2] as u32,
         ),
+        SYSCALL_ACCESS => fs::sys_access(args[0] as *const u8, args[1]),
         SYSCALL_CLOSE => fs::sys_close(args[0]),
         SYSCALL_PIPE2 => fs::sys_pipe2(args[0] as *mut i32, args[1]),
         SYSCALL_FACCESSAT => {
+            fs::sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3])
+        }
+        SYSCALL_FACCESSAT2 => {
             fs::sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3])
         }
         SYSCALL_GETDENTS64 => fs::sys_getdents64(args[0], args[1] as *mut u8, args[2]),
@@ -236,6 +263,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[4],
         ),
         SYSCALL_UMOUNT2 => fs::sys_umount2(args[0] as *const u8, args[1]),
+        SYSCALL_STATFS => fs::sys_statfs(args[0] as *const u8, args[1] as *mut u8),
+        SYSCALL_FSTATFS => fs::sys_fstatfs(args[0], args[1] as *mut u8),
 
         // 进程管理
         SYSCALL_EXIT => process::sys_exit(args[0] as i32),
@@ -312,7 +341,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[3],
         ),
         SYSCALL_UTIMENSAT => Ok(0),
-        SYSCALL_FSYNC => Ok(0),
+        SYSCALL_FSYNC | SYSCALL_FDATASYNC => fs::sys_fsync(args[0]),
         SYSCALL_FUTEX => {
             other::sys_futex_stub(args[0], args[1], args[2], args[3], args[4], args[5])
         }
@@ -321,6 +350,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
 
         _ => {
             log::warn!("[syscall] Unsupported syscall: {}", syscall_id);
+            crate::println!("[trace-unsupported] id={} args={:?}", syscall_id, args);
             Err(SysErrNo::ENOSYS)
         }
     }

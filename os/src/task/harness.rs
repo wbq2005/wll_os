@@ -175,8 +175,23 @@ fn run_runtime_test_harness() -> ! {
         }
     }
 
-    *crate::trap::FOREGROUND_MODE.lock() = false;
+    crate::trap::leave_foreground_driver();
     polyhal::instruction::shutdown();
+}
+
+struct ForegroundDriverGuard;
+
+impl ForegroundDriverGuard {
+    fn enter() -> Self {
+        crate::trap::enter_foreground_driver();
+        Self
+    }
+}
+
+impl Drop for ForegroundDriverGuard {
+    fn drop(&mut self) {
+        crate::trap::leave_foreground_driver();
+    }
 }
 
 fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
@@ -188,11 +203,7 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
     };
 
     let harness = current_task();
-    if let Some(ref h) = harness {
-        let ptr = Arc::into_raw(h.clone()) as usize;
-        crate::trap::set_foreground_harness(ptr);
-    }
-    *crate::trap::FOREGROUND_MODE.lock() = true;
+    let _foreground = ForegroundDriverGuard::enter();
 
     run_user_task_foreground(task.clone());
     if let Some(ref h) = harness {
@@ -200,65 +211,62 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
         *CURRENT_TASK.lock() = Some(h.clone());
     }
 
-    let ptr = crate::trap::get_foreground_harness();
-    if ptr != 0 {
-        let _harness = unsafe { Arc::from_raw(ptr as *const TaskControlBlock) };
-    }
-    crate::trap::set_foreground_harness(0);
-    *crate::trap::FOREGROUND_MODE.lock() = false;
-
     true
 }
 
 fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
-    fn abort_task_state(task: &Arc<TaskControlBlock>, aborted: &mut Vec<usize>) -> bool {
-        if aborted.iter().any(|pid| *pid == task.pid.0) {
-            return false;
-        }
-        aborted.push(task.pid.0);
-        task.set_exit_code(-2);
-        task.set_status(TaskStatus::Zombie);
-        *task.trap_frame.lock() = None;
-        crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
-        crate::fs::fd::flush_console_buffer_for_pid(task.thread_group.tgid());
-        true
-    }
-
-    fn abort_one(task: &Arc<TaskControlBlock>, aborted: &mut Vec<usize>) {
-        let mut targets = task.thread_group.user_members();
-        if targets.is_empty() {
-            targets.push(task.clone());
-        }
-        task.thread_group.mark_process_zombie(-2);
-
-        for target in targets {
-            if abort_task_state(&target, aborted) {
-                let children = {
-                    let mut inner = target.inner.lock();
-                    core::mem::take(&mut inner.children)
-                };
-                for child in children {
-                    abort_one(&child, aborted);
-                }
-            }
+    fn remember_pid(pids: &mut Vec<usize>, pid: usize) {
+        if !pids.iter().any(|seen| *seen == pid) {
+            pids.push(pid);
         }
     }
 
-    let mut aborted = Vec::new();
-    abort_one(root, &mut aborted);
+    fn terminate_group(
+        task: &Arc<TaskControlBlock>,
+        killed_tgids: &mut Vec<usize>,
+        killed_pids: &mut Vec<usize>,
+    ) {
+        if task.is_kernel {
+            return;
+        }
+        let tgid = task.thread_group.tgid();
+        if killed_tgids.iter().any(|seen| *seen == tgid) {
+            return;
+        }
+        killed_tgids.push(tgid);
+
+        let mut members = task.thread_group.user_members();
+        if members.is_empty() {
+            members.push(task.clone());
+        }
+        for member in &members {
+            remember_pid(killed_pids, member.pid.0);
+            *member.trap_frame.lock() = None;
+        }
+        crate::task::terminate_task_group(task, -2);
+    }
+
+    let mut killed_tgids = Vec::new();
+    let mut killed_pids = Vec::new();
+    let mut tasks = manager::all_user_tasks();
+    if !tasks.iter().any(|task| task.pid.0 == root.pid.0) {
+        tasks.push(root.clone());
+    }
+
+    for task in tasks {
+        if task.status() != TaskStatus::Zombie {
+            terminate_group(&task, &mut killed_tgids, &mut killed_pids);
+        }
+    }
+
     manager::retain_tasks(|queued| {
-        if queued.is_kernel {
-            true
-        } else {
-            abort_one(queued, &mut aborted);
-            false
-        }
+        queued.is_kernel || !killed_pids.iter().any(|pid| *pid == queued.pid.0)
     });
 
     let mut current = CURRENT_TASK.lock();
     if current
         .as_ref()
-        .map(|task| aborted.iter().any(|pid| *pid == task.pid.0))
+        .map(|task| killed_pids.iter().any(|pid| *pid == task.pid.0))
         .unwrap_or(false)
     {
         *current = None;
@@ -323,22 +331,7 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
         let _reason = run_user_task(&mut ctx);
         crate::trap::restore_kernel_page_table();
 
-        let execve_done = crate::trap::take_execve_done();
-        if execve_done {
-            *active.trap_frame.lock() = Some(ctx);
-            {
-                let ms = active.memory_set.lock();
-                ms.activate();
-            }
-            let mut tf = active.trap_frame.lock().take().unwrap();
-            if crate::syscall::signal::handle_pending_for_user(&mut tf) {
-                let _ = run_user_task(&mut tf);
-            }
-            crate::trap::restore_kernel_page_table();
-            if active.status() != TaskStatus::Zombie {
-                *active.trap_frame.lock() = Some(tf);
-            }
-        } else if active.status() != TaskStatus::Zombie {
+        if active.status() != TaskStatus::Zombie {
             *active.trap_frame.lock() = Some(ctx);
         }
 
@@ -372,7 +365,12 @@ fn dirname(path: &str) -> String {
 
 fn ensure_busybox_applet_alias(root: &str, busybox_host: &str, applet: &str) -> Option<()> {
     let alias_host = crate::fs::apply_root(root, &alloc::format!("/{}", applet));
-    if crate::fs::file_exists(&alias_host) {
+    if crate::fs::metadata(&alias_host, true)
+        .map(|meta| {
+            meta.kind == crate::fs::VfsNodeKind::Regular && (meta.mode & 0o111) != 0
+        })
+        .unwrap_or(false)
+    {
         return Some(());
     }
     let busybox = crate::fs::read_executable_file(busybox_host)?;

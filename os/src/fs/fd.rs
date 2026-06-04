@@ -8,7 +8,6 @@ use alloc::vec::Vec;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::fs;
 use crate::fs::ext4_vol;
 use crate::fs::MEM_FS;
 use crate::utils::error::SysErrNo;
@@ -77,6 +76,7 @@ pub mod open_flags {
     pub const O_TRUNC: u32 = 0o00001000;
     pub const O_APPEND: u32 = 0o00002000;
     pub const O_DIRECTORY: u32 = 0o00200000;
+    pub const O_NOFOLLOW: u32 = 0o00400000;
 }
 
 /// pipe2 标志（Linux ABI）
@@ -152,23 +152,45 @@ impl FileDescriptor {
         matches!(self, FileDescriptor::PipeRead { nonblock: true, .. })
     }
 
+    pub fn set_status_flags(&mut self, flags: usize) {
+        let append = (flags & (open_flags::O_APPEND as usize)) != 0;
+        let nonblock = (flags & pipe_flags::O_NONBLOCK) != 0;
+        match self {
+            FileDescriptor::MemFile {
+                append: current, ..
+            }
+            | FileDescriptor::Ext4Regular {
+                append: current, ..
+            } => {
+                *current = append;
+            }
+            FileDescriptor::PipeRead {
+                nonblock: current, ..
+            }
+            | FileDescriptor::PipeWrite {
+                nonblock: current, ..
+            } => {
+                *current = nonblock;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn poll_hup(&self) -> bool {
+        match self {
+            FileDescriptor::PipeRead { state, .. } => state.lock().writers == 0,
+            _ => false,
+        }
+    }
+
     pub fn poll_read_ready(&self) -> bool {
         match self {
             FileDescriptor::Stdin => true,
-            FileDescriptor::MemFile {
-                content, offset, ..
-            } => *offset < content.len(),
+            FileDescriptor::MemFile { .. } => true,
             FileDescriptor::Ext4Regular {
-                ino,
-                offset,
                 readable,
                 ..
-            } => {
-                *readable
-                    && ext4_vol::regular_file_size(*ino)
-                        .map(|size| *offset < size)
-                        .unwrap_or(false)
-            }
+            } => *readable,
             FileDescriptor::PipeRead { state, .. } => {
                 let pipe = state.lock();
                 !pipe.buf.is_empty() || pipe.writers == 0
@@ -306,6 +328,39 @@ impl FileDescriptor {
                     return Err(SysErrNo::EBADF);
                 }
                 ext4_vol::ext4_read_at(*ino, offset, buf)
+            }
+            FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
+            FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
+                Err(SysErrNo::ESPIPE)
+            }
+            _ => Err(SysErrNo::EBADF),
+        }
+    }
+
+    pub fn write_at(&mut self, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {
+        match self {
+            FileDescriptor::MemFile {
+                name,
+                content,
+                writable,
+                ..
+            } => {
+                if !*writable {
+                    return Err(SysErrNo::EBADF);
+                }
+                let end = offset.checked_add(buf.len()).ok_or(SysErrNo::EFBIG)?;
+                if end > content.len() {
+                    content.resize(end, 0);
+                }
+                content[offset..end].copy_from_slice(buf);
+                MEM_FS.lock().add_file(name, content.clone());
+                Ok(buf.len())
+            }
+            FileDescriptor::Ext4Regular { ino, writable, .. } => {
+                if !*writable {
+                    return Err(SysErrNo::EBADF);
+                }
+                ext4_vol::ext4_write_at(*ino, offset, buf)
             }
             FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
             FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
@@ -842,30 +897,17 @@ impl Default for FileDescriptorTable {
 }
 
 /// 打开路径：`flags`/`mode` 语义对齐 Linux `openat` 子集。
-fn open_dir_descriptor(host_path: &str, logical_path: &str) -> Result<FileDescriptor, SysErrNo> {
-    if MEM_FS.lock().is_dir(host_path) {
-        let entries = fs::list_dir(host_path)?;
-        return Ok(FileDescriptor::MemDir {
-            path: logical_path.into(),
-            entries,
-            offset: 0,
-        });
-    }
-
-    let Some((ino, is_dir)) = ext4_vol::lookup_path(host_path) else {
-        return Err(SysErrNo::ENOENT);
-    };
-    if !is_dir {
-        return Err(SysErrNo::ENOTDIR);
-    }
-    Ok(FileDescriptor::Ext4Dir {
-        path: logical_path.into(),
-        ino,
-        offset: 0,
-    })
+pub fn open_file(
+    host_path: &str,
+    logical_path: &str,
+    flags: u32,
+    mode: u32,
+) -> Result<FileDescriptor, SysErrNo> {
+    crate::fs::open_path(host_path, logical_path, flags, mode)
 }
 
-pub fn open_file(
+#[cfg(any())]
+fn open_file_legacy_unused(
     host_path: &str,
     logical_path: &str,
     flags: u32,
@@ -886,7 +928,7 @@ pub fn open_file(
 
     let removed = fs::is_removed(&path_norm);
     if removed {
-        if !(want_create && write_ok) {
+        if !want_create {
             return Err(SysErrNo::ENOENT);
         }
     }
@@ -998,7 +1040,7 @@ pub fn open_file(
         });
     }
 
-    if want_create && write_ok {
+    if want_create {
         let parent = fs::parent_path(&path_norm);
         if ext4_vol::ext4_dir_path_exists(&parent) {
             let ino = ext4_vol::create_regular_ext4_with_mode(&path_norm, mode)?;
@@ -1006,7 +1048,7 @@ pub fn open_file(
                 ino,
                 offset: 0,
                 readable: read_ok,
-                writable: true,
+                writable: write_ok,
                 append,
             });
         }
@@ -1016,7 +1058,7 @@ pub fn open_file(
                 name: path_norm,
                 content: Vec::new(),
                 offset: 0,
-                writable: true,
+                writable: write_ok,
                 append,
             });
         }

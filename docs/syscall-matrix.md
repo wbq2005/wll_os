@@ -13,12 +13,13 @@ Status legend:
 | Area | Status | Main files | Notes |
 | --- | --- | --- | --- |
 | Process lifecycle: `clone`, `execve`, `exit`, `exit_group`, `wait4`, `yield` | `partial` | `os/src/syscall/process.rs`, `os/src/task/mod.rs` | Process-style clone and some thread flags exist. Full thread group, signal, and robust futex semantics are still incomplete. |
-| Memory: `brk`, `mmap`, `munmap`, `mprotect` | `partial` | `os/src/syscall/mm.rs`, `os/src/mm/*` | Anonymous and file-backed mappings work for common libc paths. Shared file writeback and advanced flags are not complete. |
-| Filesystem path ops: `openat`, `mkdirat`, `unlinkat`, `renameat2`, `linkat`, `symlinkat`, `readlinkat`, `truncate`, `statx`, `newfstatat` | `partial` | `os/src/fs/vfs.rs`, `os/src/syscall/fs.rs`, `os/src/fs/ext4_vol.rs` | Syscalls now enter VFS for path metadata and open. FD layer still owns read/write/seek/getdents for opened objects. |
-| FD I/O: `read`, `write`, `readv`, `writev`, `pread64`, `lseek`, `getdents64`, `sendfile`, `dup`, `dup3`, `fcntl` | `partial` | `os/src/fs/fd.rs`, `os/src/syscall/fs.rs` | Regular files, dirs, console, and pipes are covered. `fcntl(F_SETFL)` does not mutate descriptor flags yet. |
-| Pipes and polling: `pipe2`, `ppoll`, `pselect6` | `partial` | `os/src/fs/fd.rs`, `os/src/syscall/fs.rs`, `os/src/task/wait_queue.rs` | Blocking now goes through reason-tagged wait queues. Pipe capacity/backpressure is still simplified. |
+| Memory: `brk`, `mmap`, `munmap`, `mprotect` | `partial` | `os/src/syscall/mm.rs`, `os/src/mm/*` | Anonymous and file-backed mappings work for common libc paths. Writable file-backed `MAP_SHARED` writes the unmapped range back on `munmap`; dirty tracking, `msync`, and full shared-page coherence are still missing. |
+| Filesystem path ops: `openat`, `mkdirat`, `unlinkat`, `renameat2`, `linkat`, `symlinkat`, `readlinkat`, `truncate`, `statx`, `newfstatat`, `access`, `faccessat` | `partial` | `os/src/fs/vfs.rs`, `os/src/syscall/fs.rs`, `os/src/fs/ext4_vol.rs` | Path metadata/open/readlink/truncate enter VFS and share missing-path errno handling for common `ENOENT`/`ENOTDIR`/`EISDIR`/`EEXIST`/`ELOOP` cases. `statx/newfstatat` handle `AT_EMPTY_PATH` and no-follow flags. Permission bits, `O_PATH`, and full symlink traversal remain partial. |
+| FS metadata/sync: `statfs`, `fstatfs`, `fsync`, `fdatasync` | `partial` to `stub-risk` | `os/src/syscall/fs.rs`, `os/src/syscall/mod.rs` | `statfs/fstatfs` return a real ABI-shaped struct after validating path/fd. `fsync/fdatasync` validate fd and reject pipes, but persistence is still immediate/no-op for current file backends. |
+| FD I/O: `read`, `write`, `readv`, `writev`, `pread64`, `lseek`, `getdents64`, `sendfile`, `dup`, `dup3`, `fcntl` | `partial` | `os/src/fs/fd.rs`, `os/src/syscall/fs.rs` | Regular files, dirs, console, and pipes are covered. `fcntl(F_SETFL)` mutates pipe `O_NONBLOCK` and regular-file `O_APPEND`; descriptor-shared flag semantics remain partial. |
+| Pipes and polling: `pipe2`, `ppoll`, `pselect6` | `partial` | `os/src/fs/fd.rs`, `os/src/syscall/fs.rs`, `os/src/task/wait_queue.rs` | Regular file read/write readiness is immediate, including EOF. Pipe read HUP reports `POLLHUP`; blocking goes through reason-tagged wait queues. Pipe capacity/backpressure is still simplified. |
 | Signals: `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `kill`, `tkill`, `tgkill` | `partial` | `os/src/syscall/signal.rs` | Basic delivery and user trampoline exist. `sigsuspend`, `sigtimedwait`, process groups, and full default actions are incomplete. |
-| Futex: `futex WAIT/WAKE` | `partial` | `os/src/syscall/other.rs`, `os/src/task/wait_queue.rs` | Address/key matching and timeout exist. PI, requeue, robust list, and shared-process details are not implemented. |
+| Futex: `futex WAIT/WAKE` | `partial` | `os/src/syscall/other.rs`, `os/src/task/wait_queue.rs` | Address/key matching and timeout exist; unsupported futex ops return `ENOSYS` instead of fake success. PI, requeue, robust list, and shared-process details are `missing`. |
 | Time/system info: `nanosleep`, `clock_gettime`, `gettimeofday`, `times`, `uname`, `sysinfo`, `getrandom` | `partial` | `os/src/syscall/other.rs`, `os/src/timer.rs` | Enough for libc startup and basic utilities. Accuracy and clock IDs are simplified. |
 | Scheduler/rlimit/identity stubs | `stub-ok` to `stub-risk` | `os/src/syscall/other.rs`, `os/src/syscall/mod.rs` | UID/GID are fixed zero. Scheduler calls mostly return success. |
 | Networking: socket family | `missing` | `os/src/syscall/mod.rs` | Syscall numbers are declared but not dispatched. |
@@ -28,10 +29,10 @@ Status legend:
 | Test group | Current expected level | Real / partial coverage | Stub-risk / missing pressure |
 | --- | --- | --- | --- |
 | `basic` | Pass-oriented | `clone`, `wait4`, `pipe2`, `read/write`, `brk`, `mmap`, `yield`, basic stat/open are `real`/`partial`. | Foreground scheduling remains cooperative. Pipe capacity and wait timing are simplified. |
-| `busybox` | Mostly usable | Shell launch through BusyBox, ext4 read/write/create, directory ops, `poll/select`, `sendfile`, symlink/link/rename are `partial`. | `fcntl(F_SETFL)`, terminal/ioctl semantics, procfs breadth, and shell job-control calls are `stub-risk`. |
+| `busybox` | Mostly usable | Shell launch through BusyBox, ext4 read/write/create/truncate, directory ops, `poll/select`, `sendfile`, symlink/link/rename, pipe `F_SETFL(O_NONBLOCK)`, `access`, `readlinkat`, and `statfs` are `partial`. | Terminal/ioctl semantics, procfs breadth, descriptor-shared flags, full symlink/link/rename semantics, and shell job-control calls are `stub-risk`. |
 | `lua` | Not enabled by default | Needs libc startup, `open/read/write/lseek/stat`, `mmap/brk`, time calls, `getrandom`, `futex` for libc. | Floating-point signal edge cases, `mprotect`, `rt_sig*`, and allocator-heavy mmap behavior are likely pressure points. |
 | `libc-test` | Not enabled by default | Broad syscall ABI surface exists for many startup and FS cases. | High risk in signals, pthread/futex semantics, `fcntl`, `madvise`, `clock_nanosleep`, `setitimer`, `sigsuspend`, `sigtimedwait`, `getgroups`, `rlimit`. |
-| `iozone` | Not enabled by default | Sequential file create/read/write/truncate/lseek on ext4 is `partial`. | `fsync` is `stub-ok` for correctness-light tests but `stub-risk` for persistence semantics. Sparse files, mmap writeback, and large I/O paths need hardening. |
+| `iozone` | Not enabled by default | Sequential file create/read/write/truncate/lseek and simple `MAP_SHARED` munmap writeback on ext4 are `partial`. | `fsync` is `stub-ok` for correctness-light tests but `stub-risk` for persistence semantics. Sparse files, dirty tracking, `msync`, and large I/O paths need hardening. |
 | `UnixBench` | Not enabled by default | Process creation, pipe, exec, time, file I/O are `partial`. | Fork/exec throughput will expose scheduler fairness, wait queues, pipe buffering, `times/getrusage`, and shell workload gaps. |
 | `LTP` | Not enabled by default | Some smoke-level process, memory, file, and signal calls exist. | Many cases are `missing`/`stub-risk`: namespaces, mount variants, sockets, process groups, ptrace, robust futex, permissions, uid/gid, timers, advanced signals. |
 | `iperf/netperf` | Not enabled by default | Time, process, poll scaffolding exists. | Socket syscalls are `missing`: `socket`, `bind`, `listen`, `accept`, `connect`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `shutdown`. |
@@ -39,7 +40,7 @@ Status legend:
 ## High-Priority Gaps
 
 1. Harden FD/VFS contract before more suites: `os/src/fs/vfs.rs`, `os/src/fs/fd.rs`, `os/src/syscall/fs.rs`.
-   Implement mutable `F_SETFL` for `O_NONBLOCK`, consolidate legacy fd open helper, and add clearer metadata/open tests around MemFS overlay plus ext4.
+   Broaden descriptor-shared status flags beyond the current pipe `O_NONBLOCK` and regular `O_APPEND` subset, then finish full rename/link/symlink semantics and clearer metadata/open tests around MemFS overlay plus ext4.
 
 2. Make blocking semantics observable and less foreground-specific: `os/src/task/wait_queue.rs`, `os/src/task/mod.rs`, `os/src/syscall/process.rs`, `os/src/syscall/other.rs`.
    Extend `BlockReason` into debug logs and replace remaining direct blocking entry points as new waits appear.
@@ -48,7 +49,7 @@ Status legend:
    Prioritize `clone` thread semantics, `futex` shared keys, `set_robust_list`, `rt_sigsuspend`, and `rt_sigtimedwait`.
 
 4. File workload support for `iozone` and UnixBench: `os/src/fs/ext4_vol.rs`, `os/src/mm/memory_set.rs`, `os/src/syscall/mm.rs`.
-   Add mmap shared writeback, larger buffered pipe/file paths, and less stubby `fsync`/`fdatasync` behavior.
+   Add dirty tracking/`msync` for shared mappings, larger buffered pipe/file paths, and less stubby `fsync`/`fdatasync` behavior.
 
 5. Network suites last: add a socket layer under `os/src/net` or `os/src/syscall/net.rs`, then dispatch the socket syscalls declared in `os/src/syscall/mod.rs`.
    Start with loopback TCP/UDP or a minimal virtio-net-backed path, then implement `poll` readiness over sockets.

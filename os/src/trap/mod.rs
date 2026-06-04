@@ -16,24 +16,31 @@ lazy_static! {
 
     /// 标记当前是否处于 execve 调用上下文中。
     /// 置位时 handle_syscall 跳过 syscall_ok() PC 前进，让 execve 直接返回到新程序入口。
-    pub static ref EXECVE_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
-    pub static ref SIGRETURN_IN_PROGRESS: Mutex<bool> = Mutex::new(false);
+    static ref EXECVE_COMPLETED: Mutex<bool> = Mutex::new(false);
+    static ref SIGRETURN_COMPLETED: Mutex<bool> = Mutex::new(false);
 
     /// 标记前台驱动模式：当此标志为 true 时，exit/suspend/timer 不要调用 run_next_task()，
     /// 而是将当前任务置为 Zombie 后直接返回，由前台驱动负责收尾。
-    pub static ref FOREGROUND_MODE: Mutex<bool> = Mutex::new(false);
+    static ref FOREGROUND_DRIVER_ACTIVE: Mutex<bool> = Mutex::new(false);
 
-    /// 存储前台驱动的 kernel harness 任务的裸指针。
-    /// 当用户任务 exit 时，exit_current_and_run_next 需要知道将哪个 kernel 任务放回就绪队列。
-    pub static ref FOREGROUND_HARNESS_PTR: Mutex<usize> = Mutex::new(0);
 }
 
-pub fn set_foreground_harness(ptr: usize) {
-    *FOREGROUND_HARNESS_PTR.lock() = ptr;
+pub fn enter_foreground_driver() {
+    *FOREGROUND_DRIVER_ACTIVE.lock() = true;
+    crate::timer::set_next_foreground_trigger();
 }
 
-pub fn get_foreground_harness() -> usize {
-    *FOREGROUND_HARNESS_PTR.lock()
+pub fn leave_foreground_driver() {
+    *FOREGROUND_DRIVER_ACTIVE.lock() = false;
+    crate::timer::set_next_trigger();
+}
+
+pub fn foreground_driver_active() -> bool {
+    *FOREGROUND_DRIVER_ACTIVE.lock()
+}
+
+pub fn timer_should_preempt_current_task() -> bool {
+    !foreground_driver_active()
 }
 
 pub fn clone_current_trapframe() -> Option<TrapFrame> {
@@ -66,31 +73,27 @@ pub fn save_current_trapframe(tf: &TrapFrame) {
 /// 向 trap 处理层发送信号：当前 execve 已替换地址空间，
 /// handle_syscall 应跳过 syscall_ok() PC 前进，直接返回到新程序入口。
 pub fn signal_execve_done() {
-    *EXECVE_IN_PROGRESS.lock() = true;
+    *EXECVE_COMPLETED.lock() = true;
 }
 
 pub fn signal_rt_sigreturn_done() {
-    *SIGRETURN_IN_PROGRESS.lock() = true;
+    *SIGRETURN_COMPLETED.lock() = true;
 }
 
 /// Returns true if the current trap was caused by execve completing.
 /// Consumes the flag so it can only be observed once per trap.
-pub fn take_execve_done() -> bool {
-    let mut guard = EXECVE_IN_PROGRESS.lock();
+fn take_execve_done() -> bool {
+    let mut guard = EXECVE_COMPLETED.lock();
     let was = *guard;
     *guard = false;
     was
 }
 
-pub fn take_sigreturn_done() -> bool {
-    let mut guard = SIGRETURN_IN_PROGRESS.lock();
+fn take_sigreturn_done() -> bool {
+    let mut guard = SIGRETURN_COMPLETED.lock();
     let was = *guard;
     *guard = false;
     was
-}
-
-pub fn is_execve_done() -> bool {
-    *EXECVE_IN_PROGRESS.lock()
 }
 
 /// 初始化 Trap/中断处理（trap 向量，不含定时器）
@@ -153,9 +156,11 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         TrapType::Timer => {
             // 定时器中断 - 设置下一次定时器并触发调度
             crate::timer::wake_expired_timers();
-            set_next_trigger();
-            if !*FOREGROUND_MODE.lock() {
+            if timer_should_preempt_current_task() {
+                set_next_trigger();
                 suspend_current_and_run_next();
+            } else {
+                crate::timer::set_next_foreground_trigger();
             }
         }
         TrapType::IllegalInstruction(vaddr) => {
@@ -194,11 +199,11 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // loop will re-run the task immediately. Use a longer tick here so
             // CPU-heavy static libc startup is not dominated by harness traps.
             crate::timer::wake_expired_timers();
-            if *FOREGROUND_MODE.lock() {
-                crate::timer::set_next_foreground_trigger();
-            } else {
+            if timer_should_preempt_current_task() {
                 set_next_trigger();
                 suspend_current_and_run_next();
+            } else {
+                crate::timer::set_next_foreground_trigger();
             }
         }
         trap @ (TrapType::StorePageFault(vaddr)

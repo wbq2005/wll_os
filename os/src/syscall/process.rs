@@ -366,6 +366,31 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     // 在替换地址空间之前，从旧地址空间读取 argv/envp
     let argv = read_user_str_array(argv_ptr)?;
     let mut envp = read_user_str_array(envp_ptr)?;
+    if path_str.contains("busybox") || argv.iter().any(|arg| arg == "which") {
+        let env0 = envp.first().map(|s| s.as_str()).unwrap_or("<none>");
+        crate::println!(
+            "[trace-execve] path={} argc={} envc={} argv0={} argv1={} env0={}",
+            path_str,
+            argv.len(),
+            envp.len(),
+            argv.first().map(|s| s.as_str()).unwrap_or("<none>"),
+            argv.get(1).map(|s| s.as_str()).unwrap_or("<none>"),
+            env0
+        );
+        if argv.get(1).map(|s| s.as_str()) == Some("which") {
+            if let Some(task) = current_task() {
+                super::trace_syscalls_for_pid(task.pid.0);
+            }
+            crate::println!(
+                "[trace-execve-which-env] env0={} env1={} env2={} env3={} env4={}",
+                envp.first().map(|s| s.as_str()).unwrap_or("<none>"),
+                envp.get(1).map(|s| s.as_str()).unwrap_or("<none>"),
+                envp.get(2).map(|s| s.as_str()).unwrap_or("<none>"),
+                envp.get(3).map(|s| s.as_str()).unwrap_or("<none>"),
+                envp.get(4).map(|s| s.as_str()).unwrap_or("<none>")
+            );
+        }
+    }
     if envp.is_empty() {
         envp.push(String::from("PATH=/bin:/basic:/"));
         envp.push(String::from("LD_LIBRARY_PATH=/lib"));
@@ -663,7 +688,7 @@ pub fn sys_getppid() -> SyscallRet {
 
 pub fn sys_sched_yield() -> SyscallRet {
     log::debug!("[syscall] sched_yield()");
-    if *crate::trap::FOREGROUND_MODE.lock() {
+    if crate::trap::foreground_driver_active() {
         return Ok(0);
     }
     suspend_current_and_run_next();
@@ -673,11 +698,11 @@ pub fn sys_sched_yield() -> SyscallRet {
 /// wait4：支持 `pid==-1`、`pid==0`（视作任一子进程）、指定 pid，`WNOHANG`，
 /// 在未持锁状态下阻塞调度。
 ///
-/// ## FOREGROUND_MODE 特殊处理
+/// ## Foreground driver 特殊处理
 /// 在前台测试驱动模式下，父进程调用 wait4 但子进程尚未退出时，不能使用
 /// `suspend_current_and_run_next` 让出 CPU（这会导致父进程被重新放入 FIFO 队首，
 /// 永远抢在子进程之前被调度，形成活锁）。
-/// 因此在 FOREGROUND_MODE 下：
+/// 因此前台驱动模式下：
 ///   - 如果存在可回收的僵尸子进程，立即回收并返回；
 ///   - 否则返回 `-ECHILD`，让父进程返回用户态。
 ///   - 子进程获得调度机会运行并退出成为僵尸；
@@ -875,6 +900,7 @@ pub fn sys_clone(
         trap_frame: Mutex::new(Some(child_tf)),
         status: Mutex::new(crate::task::TaskStatus::Ready),
         block_reason: Mutex::new(None),
+        wait_outcome: Mutex::new(None),
         wait_token: AtomicUsize::new(0),
     });
     crate::task::manager::register_task(&child);

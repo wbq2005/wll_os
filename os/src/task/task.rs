@@ -106,6 +106,7 @@ impl TaskControlBlock {
             trap_frame: Mutex::new(Some(trap_frame)),
             status: Mutex::new(TaskStatus::Ready),
             block_reason: Mutex::new(None),
+            wait_outcome: Mutex::new(None),
             wait_token: AtomicUsize::new(0),
         });
         crate::task::manager::register_task(&task);
@@ -290,6 +291,7 @@ impl TaskControlBlock {
             trap_frame: Mutex::new(Some(trap_frame)),
             status: Mutex::new(TaskStatus::Ready),
             block_reason: Mutex::new(None),
+            wait_outcome: Mutex::new(None),
             wait_token: AtomicUsize::new(0),
         });
         crate::task::manager::register_task(&task);
@@ -344,6 +346,7 @@ impl TaskControlBlock {
             trap_frame: Mutex::new(None),
             status: Mutex::new(TaskStatus::Ready),
             block_reason: Mutex::new(None),
+            wait_outcome: Mutex::new(None),
             wait_token: AtomicUsize::new(0),
         });
         crate::task::manager::register_task(&task);
@@ -396,6 +399,7 @@ impl TaskControlBlock {
             trap_frame: Mutex::new(None),
             status: Mutex::new(TaskStatus::Ready),
             block_reason: Mutex::new(None),
+            wait_outcome: Mutex::new(None),
             wait_token: AtomicUsize::new(0),
         });
         crate::task::manager::register_task(&task);

@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use polyhal_trap::trap::run_user_task;
-use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
+use polyhal_trap::trapframe::TrapFrame;
 use spin::Mutex;
 
 use crate::console::putchar;
@@ -247,6 +247,21 @@ pub(crate) fn requeue_after_user_run(task: Arc<TaskControlBlock>) {
     }
 }
 
+pub fn block_current_for_reason(reason: wait_queue::BlockReason) {
+    block_current_for_reason_until(reason, None);
+}
+
+pub fn block_current_for_reason_until(
+    reason: wait_queue::BlockReason,
+    deadline_us: Option<usize>,
+) {
+    if let Some(task) = current_task() {
+        *task.wait_outcome.lock() = None;
+        *task.block_reason.lock() = Some(reason);
+    }
+    block_current_and_run_next(deadline_us);
+}
+
 fn switch_kernel_task_back_to_scheduler(task: &Arc<TaskControlBlock>) {
     let scheduler_ctx_ptr = SCHEDULER_CONTEXT_PTR.load(Ordering::SeqCst);
     if scheduler_ctx_ptr == 0 {
@@ -327,16 +342,16 @@ fn report_no_init_and_maybe_shutdown(reason: &str) {
 ///
 /// 这是调度器的入口函数，从内核 main 函数调用
 /// 循环从就绪队列中获取任务并执行。
-/// 在正常模式下永不返回（idle_loop WFI）；在 FOREGROUND_MODE 下可能返回。
+/// 在正常模式下永不返回（idle_loop WFI）；在 foreground driver 下可能返回。
 pub fn run_tasks() {
     log::info!("[task] Starting task scheduler...");
     loop {
         run_next_task();
         // run_next_task should not return in normal mode. If it does, panic.
-        if !*crate::trap::FOREGROUND_MODE.lock() {
-            panic!("run_tasks: run_next_task returned unexpectedly in non-FOREGROUND_MODE");
+        if !crate::trap::foreground_driver_active() {
+            panic!("run_tasks: run_next_task returned unexpectedly without foreground driver");
         }
-        // In FOREGROUND_MODE, run_next_task can return when there's no task to run.
+        // In foreground driver mode, run_next_task can return when there's no task to run.
         // This is expected; break out and let the harness continue.
         break;
     }
@@ -366,7 +381,8 @@ pub fn suspend_current_and_run_next() {
     }
 }
 
-pub fn block_current_and_run_next() {
+pub fn block_current_and_run_next(deadline_us: Option<usize>) {
+    const FOREGROUND_NO_RUNNABLE_SPINS: usize = 1024;
     let Some(task) = current_task() else {
         return;
     };
@@ -382,15 +398,24 @@ pub fn block_current_and_run_next() {
     task.set_status(TaskStatus::Blocked);
     *CURRENT_TASK.lock() = None;
 
+    let mut no_runnable_spins = 0usize;
     while task.status() == TaskStatus::Blocked {
         crate::timer::wake_expired_timers();
         if task.status() != TaskStatus::Blocked {
             break;
         }
         if run_ready_task_once() {
+            no_runnable_spins = 0;
             continue;
         }
-        if *crate::trap::FOREGROUND_MODE.lock() {
+        if crate::trap::foreground_driver_active() {
+            if deadline_us.is_none() {
+                no_runnable_spins += 1;
+                if no_runnable_spins >= FOREGROUND_NO_RUNNABLE_SPINS {
+                    wake_blocked_task(&task, wait_queue::WaitOutcome::Interrupted);
+                    break;
+                }
+            }
             core::hint::spin_loop();
         } else {
             wait_for_interrupt();
@@ -433,7 +458,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         }
         *CURRENT_TASK.lock() = None;
     }
-    if *crate::trap::FOREGROUND_MODE.lock() {
+    if crate::trap::foreground_driver_active() {
         return;
     }
     run_next_task();
@@ -457,7 +482,7 @@ pub fn exit_thread_group_and_run_next(exit_code: i32) {
         finish_process_exit(&task, exit_code);
         *CURRENT_TASK.lock() = None;
     }
-    if *crate::trap::FOREGROUND_MODE.lock() {
+    if crate::trap::foreground_driver_active() {
         return;
     }
     run_next_task();
@@ -493,6 +518,7 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     }
     task.set_exit_code(exit_code);
     *task.block_reason.lock() = None;
+    *task.wait_outcome.lock() = None;
     task.set_status(TaskStatus::Zombie);
     crate::task::manager::record_exited_task(task.pid.0, task.thread_group.tgid());
     crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
@@ -532,13 +558,13 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
 /// 运行下一个任务
 ///
 /// 从就绪队列中获取下一个任务并切换到它。
-/// 在 FOREGROUND_MODE 下，如果没有可运行任务则返回，由前台驱动继续执行。
+/// 在 foreground driver 下，如果没有可运行任务则返回，由前台驱动继续执行。
 pub(crate) fn run_next_task() {
     // UART marker: 'S' = scheduler entry
 
     if let Some(task) = manager::fetch_task() {
         if matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
-            if *crate::trap::FOREGROUND_MODE.lock() {
+            if crate::trap::foreground_driver_active() {
                 return;
             }
             run_next_task();
@@ -582,7 +608,7 @@ pub(crate) fn run_next_task() {
                 }
                 requeue_after_user_run(task.clone());
                 *CURRENT_TASK.lock() = None;
-                if *crate::trap::FOREGROUND_MODE.lock() {
+                if crate::trap::foreground_driver_active() {
                     return;
                 }
                 run_next_task();
@@ -591,39 +617,11 @@ pub(crate) fn run_next_task() {
             let reason = run_user_task(&mut ctx);
             crate::trap::restore_kernel_page_table();
             log::debug!("[task] User task returned with reason: {:?}", reason);
-            let execve_done = crate::trap::take_execve_done();
-            if execve_done {
-                task.memory_set.lock().activate();
-                let sepc = ctx[TrapFrameArgs::SEPC];
-                *task.trap_frame.lock() = Some(ctx);
-                log::info!(
-                    "[task] execve done, re-running task {} with new program at sepc={:#x}",
-                    task.pid.0,
-                    sepc
-                );
-                task.set_status(TaskStatus::Running);
-                {
-                    let mut guard = task.trap_frame.lock();
-                    let tf = guard.as_mut().unwrap();
-                    if crate::syscall::signal::handle_pending_for_user(tf) {
-                        let _reason2 = run_user_task(tf);
-                    }
-                }
-                crate::trap::restore_kernel_page_table();
-                ctx = task.trap_frame.lock().take().unwrap();
-                requeue_after_user_run(task);
-                *CURRENT_TASK.lock() = None;
-                if *crate::trap::FOREGROUND_MODE.lock() {
-                    return;
-                }
-                run_next_task();
-                return;
-            }
             // Normal case: put ctx back and requeue task
             *task.trap_frame.lock() = Some(ctx);
             requeue_after_user_run(task.clone());
             *CURRENT_TASK.lock() = None;
-            if *crate::trap::FOREGROUND_MODE.lock() {
+            if crate::trap::foreground_driver_active() {
                 return;
             }
             run_next_task();
@@ -653,9 +651,9 @@ pub(crate) fn run_next_task() {
         }
     } else {
         // 没有可运行任务
-        // 在 FOREGROUND_MODE 下：返回，让前台驱动继续（可能超时退出）
+        // 在 foreground driver 下：返回，让前台驱动继续（可能超时退出）
         // 正常模式：进入 idle 循环
-        if *crate::trap::FOREGROUND_MODE.lock() {
+        if crate::trap::foreground_driver_active() {
             return;
         }
         log::debug!("[task] No tasks available, idling");
@@ -688,10 +686,10 @@ unsafe fn return_to_user(_ctx: TrapFrame) {
 /// Idle 循环
 ///
 /// 当没有任务时执行，等待中断。
-/// 在 FOREGROUND_MODE（测试 harness）下，如果没有可运行任务则直接返回，
+/// 在 foreground driver（测试 harness）下，如果没有可运行任务则直接返回，
 /// 让调度器退出到前台驱动层，由驱动层继续执行下一个测试用例。
 fn idle_loop() {
-    if *crate::trap::FOREGROUND_MODE.lock() {
+    if crate::trap::foreground_driver_active() {
         return;
     }
 
@@ -712,7 +710,7 @@ fn idle_loop() {
         if manager::has_task() {
             run_next_task();
         }
-        // In non-FOREGROUND_MODE, this loops forever (WFI).
+        // Outside foreground driver mode, this loops forever (WFI).
         // WFI永远不会返回...
     }
 }
@@ -763,19 +761,7 @@ pub(crate) fn run_ready_task_once() -> bool {
         }
         let _reason = run_user_task(&mut ctx);
         crate::trap::restore_kernel_page_table();
-        let execve_done = crate::trap::take_execve_done();
-        if execve_done {
-            *active.trap_frame.lock() = Some(ctx);
-            active.memory_set.lock().activate();
-            let mut tf = active.trap_frame.lock().take().unwrap();
-            if crate::syscall::signal::handle_pending_for_user(&mut tf) {
-                let _ = run_user_task(&mut tf);
-            }
-            crate::trap::restore_kernel_page_table();
-            if active.status() != TaskStatus::Zombie {
-                *active.trap_frame.lock() = Some(tf);
-            }
-        } else if active.status() != TaskStatus::Zombie {
+        if active.status() != TaskStatus::Zombie {
             *active.trap_frame.lock() = Some(ctx);
         }
 
@@ -799,19 +785,35 @@ pub(crate) fn run_ready_task_once() -> bool {
     }
 }
 
-pub(crate) fn wake_task_token(task: &Arc<TaskControlBlock>, token: usize) -> bool {
-    if task.current_wait_token() != token {
-        return false;
-    }
+fn mark_blocked_task_ready(task: &Arc<TaskControlBlock>, outcome: wait_queue::WaitOutcome) -> bool {
     let mut status = task.status.lock();
     if *status != TaskStatus::Blocked {
         return false;
     }
     *status = TaskStatus::Ready;
     *task.block_reason.lock() = None;
+    *task.wait_outcome.lock() = Some(outcome);
     drop(status);
     manager::add_task(task.clone());
     true
+}
+
+pub(crate) fn wake_task_token_with(
+    task: &Arc<TaskControlBlock>,
+    token: usize,
+    outcome: wait_queue::WaitOutcome,
+) -> bool {
+    if task.current_wait_token() != token {
+        return false;
+    }
+    mark_blocked_task_ready(task, outcome)
+}
+
+pub(crate) fn wake_blocked_task(
+    task: &Arc<TaskControlBlock>,
+    outcome: wait_queue::WaitOutcome,
+) -> bool {
+    mark_blocked_task_ready(task, outcome)
 }
 
 /// 获取当前任务
@@ -862,6 +864,8 @@ pub struct TaskControlBlock {
     pub status: Mutex<TaskStatus>,
     /// Last reason this task intentionally entered Blocked state.
     pub block_reason: Mutex<Option<wait_queue::BlockReason>>,
+    /// Source that moved the task out of Blocked state for the active wait.
+    pub wait_outcome: Mutex<Option<wait_queue::WaitOutcome>>,
     /// Monotonic wait token used to reject stale timeout wakeups.
     pub wait_token: AtomicUsize,
 }

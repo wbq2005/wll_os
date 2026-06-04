@@ -36,6 +36,7 @@ pub enum SysErrNo {
     EDOM = 33,       // Math argument out of domain of func
     ERANGE = 34,     // Math result not representable
     ENOTEMPTY = 39,  // Directory not empty
+    ELOOP = 40,      // Too many symbolic links encountered
     ECANCELED = 47,  // Operation canceled (used by exit in foreground mode)
     ETIMEDOUT = 110, // Connection timed out
     ENOSYS = 38,     // Invalid system call number
