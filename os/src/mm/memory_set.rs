@@ -23,7 +23,12 @@ fn has_leaf_permission(flags: PTEFlags) -> bool {
     flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X)
 }
 
-fn ranges_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
     left_start < right_end && right_start < left_end
 }
 
@@ -328,7 +333,10 @@ impl MemorySet {
         let mut copied = 0usize;
         while copied < src.len() {
             let addr = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
-            let Some(area) = self.areas.iter().find(|area| area.contains(VirtAddr::new(addr)))
+            let Some(area) = self
+                .areas
+                .iter()
+                .find(|area| area.contains(VirtAddr::new(addr)))
             else {
                 return Err(SysErrNo::EFAULT);
             };
@@ -390,12 +398,8 @@ impl Clone for MemorySet {
         let mut new_ms = Self::from_kernel();
 
         for area in &self.areas {
-            let mut new_area = MapArea::with_backing(
-                area.start_va,
-                area.end_va,
-                area.flags,
-                area.backing.clone(),
-            );
+            let mut new_area =
+                MapArea::with_backing(area.start_va, area.end_va, area.flags, area.backing.clone());
 
             for (idx, src_frame) in area.frames.iter().enumerate() {
                 if let Some(frame) = frame_allocator::alloc_frame() {

@@ -13,6 +13,15 @@ use ext4_rs::{Errno, Ext4, Ext4Error, InodeFileType};
 
 /// ext4 标准根 inode 号（与 `ext4_rs` 内部一致，crate 根未再导出该常量）。
 const ROOT_INODE: u32 = 2;
+const MAX_FILE_OFFSET: usize = isize::MAX as usize;
+
+fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
+    let end = offset.checked_add(len).ok_or(SysErrNo::EFBIG)?;
+    if end > MAX_FILE_OFFSET {
+        return Err(SysErrNo::EFBIG);
+    }
+    Ok(end)
+}
 
 pub(crate) fn map_ext4_err(e: Ext4Error) -> SysErrNo {
     match e.error() {
@@ -395,6 +404,9 @@ pub fn create_regular_ext4(path: &str) -> Result<u32, SysErrNo> {
 }
 
 pub fn truncate_regular_ino(ino: u32, size: u64) -> Result<(), SysErrNo> {
+    if size > MAX_FILE_OFFSET as u64 {
+        return Err(SysErrNo::EFBIG);
+    }
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let kind = inode_kind(&fs, ino);
     if kind == Ext4NodeKind::Directory {
@@ -443,6 +455,7 @@ pub fn ext4_read_at(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usize, Sy
 }
 
 pub fn ext4_write_at(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {
+    checked_file_end(offset, buf.len())?;
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let written = fs.write_at(ino, offset, buf).map_err(map_ext4_err)?;
     if written > 0 {

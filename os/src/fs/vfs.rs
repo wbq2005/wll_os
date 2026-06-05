@@ -464,6 +464,14 @@ pub fn statfs_for_fd(file: &fd::FileDescriptor) -> Result<VfsStatFs, SysErrNo> {
     Ok(current_statfs())
 }
 
+pub fn sync_fd(file: &fd::FileDescriptor, data_only: bool) -> Result<(), SysErrNo> {
+    file.sync(data_only)
+}
+
+pub fn sync_all() -> Result<(), SysErrNo> {
+    Ok(())
+}
+
 pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
     if is_removed(&norm) {
@@ -836,6 +844,7 @@ pub fn open_path(
             name: path_norm,
             content,
             offset: base_off,
+            readable: read_ok,
             writable: write_ok,
             append,
         });
@@ -907,6 +916,7 @@ pub fn open_path(
                 name: path_norm,
                 content: Vec::new(),
                 offset: 0,
+                readable: read_ok,
                 writable: write_ok,
                 append,
             });

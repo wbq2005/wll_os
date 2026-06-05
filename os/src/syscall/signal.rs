@@ -513,7 +513,11 @@ fn deliver_to_process(targets: &[Arc<TaskControlBlock>], signum: i32, info: Pend
     if let Some(task) = targets
         .iter()
         .find(|task| task.status() != TaskStatus::Zombie && signal_is_unblocked(task, signum))
-        .or_else(|| targets.iter().find(|task| task.status() != TaskStatus::Zombie))
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|task| task.status() != TaskStatus::Zombie)
+        })
         .or_else(|| targets.first())
     {
         queue_signal(task, signum, info);

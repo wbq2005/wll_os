@@ -11,8 +11,8 @@ use spin::Mutex;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TimeSpec {
-    tv_sec: usize,
-    tv_nsec: usize,
+    tv_sec: isize,
+    tv_nsec: isize,
 }
 
 struct FutexWaiter {
@@ -81,13 +81,14 @@ fn copy_object_from_user<T: Copy>(src: usize) -> Result<T, SysErrNo> {
 }
 
 fn duration_us_from_timespec(ts: TimeSpec) -> Result<usize, SysErrNo> {
-    if ts.tv_nsec >= 1_000_000_000 {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
         return Err(SysErrNo::EINVAL);
     }
-    Ok(ts
-        .tv_sec
+    let tv_sec = ts.tv_sec as usize;
+    let tv_nsec = ts.tv_nsec as usize;
+    Ok(tv_sec
         .saturating_mul(1_000_000)
-        .saturating_add(ts.tv_nsec.div_ceil(1000)))
+        .saturating_add(tv_nsec.div_ceil(1000)))
 }
 
 fn deadline_from_timespec_ptr(ptr: usize) -> Result<Option<usize>, SysErrNo> {
@@ -102,6 +103,18 @@ fn read_user_i32(addr: usize) -> Result<i32, SysErrNo> {
     let mut bytes = [0u8; core::mem::size_of::<i32>()];
     super::user::copy_from_user(addr, &mut bytes)?;
     Ok(i32::from_le_bytes(bytes))
+}
+
+fn validate_futex_uaddr(uaddr: usize) -> Result<(), SysErrNo> {
+    if uaddr == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if uaddr % core::mem::align_of::<i32>() != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let mut bytes = [0u8; core::mem::size_of::<i32>()];
+    super::user::copy_from_user(uaddr, &mut bytes)?;
+    Ok(())
 }
 
 fn futex_key_for_task(task: &Arc<crate::task::TaskControlBlock>) -> usize {
@@ -159,8 +172,8 @@ pub fn sys_clock_gettime(_clock_id: usize, tp: usize) -> SyscallRet {
     copy_object_to_user(
         tp,
         &TimeSpec {
-            tv_sec: time_us / 1_000_000,
-            tv_nsec: (time_us % 1_000_000) * 1000,
+            tv_sec: (time_us / 1_000_000) as isize,
+            tv_nsec: ((time_us % 1_000_000) * 1000) as isize,
         },
     )?;
     Ok(0)
@@ -442,9 +455,7 @@ pub fn sys_futex_stub(
     let op = futex_op & FUTEX_CMD_MASK;
     match op {
         FUTEX_WAIT => {
-            if uaddr == 0 {
-                return Err(SysErrNo::EFAULT);
-            }
+            validate_futex_uaddr(uaddr)?;
             if read_user_i32(uaddr)? != val as i32 {
                 return Err(SysErrNo::EAGAIN);
             }
@@ -459,12 +470,32 @@ pub fn sys_futex_stub(
             let task = current_task().ok_or(SysErrNo::ESRCH)?;
             let key = futex_key_for_task(&task);
             let token = task.next_wait_token();
+            *task.wait_outcome.lock() = None;
+            *task.block_reason.lock() = Some(crate::task::wait_queue::BlockReason::Futex);
             FUTEX_WAITERS.lock().push(FutexWaiter {
                 uaddr,
                 key,
                 task: task.clone(),
                 token,
             });
+            match read_user_i32(uaddr) {
+                Ok(current) if current == val as i32 => {}
+                Ok(_) => {
+                    remove_futex_waiter(uaddr, key, task.pid.0, token);
+                    *task.block_reason.lock() = None;
+                    return Err(SysErrNo::EAGAIN);
+                }
+                Err(err) => {
+                    remove_futex_waiter(uaddr, key, task.pid.0, token);
+                    *task.block_reason.lock() = None;
+                    return Err(err);
+                }
+            }
+            if crate::syscall::signal::current_has_unblocked_pending() {
+                remove_futex_waiter(uaddr, key, task.pid.0, token);
+                *task.block_reason.lock() = None;
+                return Err(SysErrNo::EINTR);
+            }
             if let Some(deadline) = deadline {
                 timer::add_timeout(deadline, task.clone(), token);
             }
@@ -474,6 +505,7 @@ pub fn sys_futex_stub(
                 deadline,
             );
 
+            *task.block_reason.lock() = None;
             let still_waiting = remove_futex_waiter(uaddr, key, task.pid.0, token);
             match crate::task::wait_queue::finish_wait(&task, still_waiting, deadline) {
                 WaitOutcome::TimedOut => Err(SysErrNo::ETIMEDOUT),
@@ -481,7 +513,10 @@ pub fn sys_futex_stub(
                 WaitOutcome::Woken => Ok(0),
             }
         }
-        FUTEX_WAKE => Ok(futex_wake_addr(uaddr, val)),
+        FUTEX_WAKE => {
+            validate_futex_uaddr(uaddr)?;
+            Ok(futex_wake_addr(uaddr, val))
+        }
         _ => Err(SysErrNo::ENOSYS),
     }
 }

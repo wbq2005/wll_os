@@ -11,7 +11,8 @@ pub use vfs::{
     create_regular_file, create_symlink, dir_exists, file_exists, filesystem_magic, is_removed,
     link_path, list_dir, list_files, metadata, metadata_for_fd, open_path, read_executable_file,
     read_file, read_interpreter, read_link, remove_dir, remove_file, rename_path, statfs_for_fd,
-    statfs_for_path, truncate_fd, truncate_path, VfsMetadata, VfsNodeKind, VfsStatFs,
+    statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path, VfsMetadata, VfsNodeKind,
+    VfsStatFs,
 };
 
 use alloc::format;

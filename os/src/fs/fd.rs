@@ -25,6 +25,8 @@ pub const FD_CLOEXEC: usize = 1;
 pub type FileOffset = usize;
 
 const CONSOLE_LINE_CAP: usize = 512;
+const MAX_FILE_OFFSET: usize = isize::MAX as usize;
+const PIPE_CAPACITY: usize = 64 * 1024;
 
 lazy_static! {
     static ref CONSOLE_LINE_BUFFERS: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
@@ -101,6 +103,7 @@ pub enum FileDescriptor {
         name: String,
         content: Vec<u8>,
         offset: FileOffset,
+        readable: bool,
         writable: bool,
         append: bool,
     },
@@ -150,8 +153,61 @@ pub struct DirEntryRecord {
 }
 
 impl FileDescriptor {
+    fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
+        let end = offset.checked_add(len).ok_or(SysErrNo::EFBIG)?;
+        if end > MAX_FILE_OFFSET {
+            return Err(SysErrNo::EFBIG);
+        }
+        Ok(end)
+    }
+
+    fn checked_seek_from(base: usize, delta: isize) -> Result<usize, SysErrNo> {
+        let next = if delta >= 0 {
+            base.checked_add(delta as usize)
+        } else {
+            base.checked_sub(delta.unsigned_abs())
+        }
+        .ok_or(SysErrNo::EINVAL)?;
+        if next > MAX_FILE_OFFSET {
+            return Err(SysErrNo::EINVAL);
+        }
+        Ok(next)
+    }
+
     pub fn pipe_read_nonblocking(&self) -> bool {
         matches!(self, FileDescriptor::PipeRead { nonblock: true, .. })
+    }
+
+    pub fn is_pipe_read(&self) -> bool {
+        matches!(self, FileDescriptor::PipeRead { .. })
+    }
+
+    pub fn pipe_write_nonblocking(&self) -> bool {
+        matches!(self, FileDescriptor::PipeWrite { nonblock: true, .. })
+    }
+
+    pub fn is_pipe_write(&self) -> bool {
+        matches!(self, FileDescriptor::PipeWrite { .. })
+    }
+
+    pub fn pipe_read_would_block(&self) -> bool {
+        match self {
+            FileDescriptor::PipeRead { state, .. } => {
+                let pipe = state.lock();
+                pipe.buf.is_empty() && pipe.writers > 0
+            }
+            _ => false,
+        }
+    }
+
+    pub fn pipe_write_would_block(&self) -> bool {
+        match self {
+            FileDescriptor::PipeWrite { state, .. } => {
+                let pipe = state.lock();
+                pipe.readers > 0 && pipe.buf.len() >= PIPE_CAPACITY
+            }
+            _ => false,
+        }
     }
 
     pub fn set_status_flags(&mut self, flags: usize) {
@@ -185,14 +241,18 @@ impl FileDescriptor {
         }
     }
 
+    pub fn poll_error(&self) -> bool {
+        match self {
+            FileDescriptor::PipeWrite { state, .. } => state.lock().readers == 0,
+            _ => false,
+        }
+    }
+
     pub fn poll_read_ready(&self) -> bool {
         match self {
             FileDescriptor::Stdin => true,
-            FileDescriptor::MemFile { .. } => true,
-            FileDescriptor::Ext4Regular {
-                readable,
-                ..
-            } => *readable,
+            FileDescriptor::MemFile { readable, .. } => *readable,
+            FileDescriptor::Ext4Regular { readable, .. } => *readable,
             FileDescriptor::PipeRead { state, .. } => {
                 let pipe = state.lock();
                 !pipe.buf.is_empty() || pipe.writers == 0
@@ -206,7 +266,10 @@ impl FileDescriptor {
             FileDescriptor::Stdout | FileDescriptor::Stderr => true,
             FileDescriptor::MemFile { writable, .. } => *writable,
             FileDescriptor::Ext4Regular { writable, .. } => *writable,
-            FileDescriptor::PipeWrite { state, .. } => state.lock().readers > 0,
+            FileDescriptor::PipeWrite { state, .. } => {
+                let pipe = state.lock();
+                pipe.readers > 0 && pipe.buf.len() < PIPE_CAPACITY
+            }
             _ => false,
         }
     }
@@ -217,7 +280,7 @@ impl FileDescriptor {
             FileDescriptor::Stdin => true,
             FileDescriptor::Stdout => false,
             FileDescriptor::Stderr => false,
-            FileDescriptor::MemFile { .. } => true,
+            FileDescriptor::MemFile { readable, .. } => *readable,
             FileDescriptor::MemDir { .. } => false,
             FileDescriptor::Ext4Regular { readable, .. } => *readable,
             FileDescriptor::Ext4Dir { .. } => false,
@@ -260,8 +323,14 @@ impl FileDescriptor {
                 }
             }
             FileDescriptor::MemFile {
-                content, offset, ..
+                content,
+                offset,
+                readable,
+                ..
             } => {
+                if !*readable {
+                    return Err(SysErrNo::EBADF);
+                }
                 if *offset >= content.len() {
                     return Ok(0);
                 }
@@ -290,8 +359,14 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                let mut pipe = state.lock();
-                if !pipe.buf.is_empty() {
+                let n = {
+                    let mut pipe = state.lock();
+                    if pipe.buf.is_empty() {
+                        if pipe.writers == 0 {
+                            return Ok(0);
+                        }
+                        return Err(SysErrNo::EAGAIN);
+                    }
                     let mut n = 0usize;
                     while n < buf.len() {
                         if let Some(b) = pipe.buf.pop_front() {
@@ -301,12 +376,12 @@ impl FileDescriptor {
                             break;
                         }
                     }
-                    return Ok(n);
+                    n
+                };
+                if n > 0 {
+                    crate::task::wait_queue::wake_io_waiters();
                 }
-                if pipe.writers == 0 {
-                    return Ok(0);
-                }
-                Err(SysErrNo::EAGAIN)
+                Ok(n)
             }
             FileDescriptor::PipeWrite { .. } => Err(SysErrNo::EBADF),
             _ => Err(SysErrNo::EBADF),
@@ -317,7 +392,12 @@ impl FileDescriptor {
     /// Read from a regular file at a fixed offset without changing the fd offset.
     pub fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, SysErrNo> {
         match self {
-            FileDescriptor::MemFile { content, .. } => {
+            FileDescriptor::MemFile {
+                content, readable, ..
+            } => {
+                if !*readable {
+                    return Err(SysErrNo::EBADF);
+                }
                 if offset >= content.len() {
                     return Ok(0);
                 }
@@ -350,7 +430,7 @@ impl FileDescriptor {
                 if !*writable {
                     return Err(SysErrNo::EBADF);
                 }
-                let end = offset.checked_add(buf.len()).ok_or(SysErrNo::EFBIG)?;
+                let end = Self::checked_file_end(offset, buf.len())?;
                 if end > content.len() {
                     content.resize(end, 0);
                 }
@@ -362,6 +442,7 @@ impl FileDescriptor {
                 if !*writable {
                     return Err(SysErrNo::EBADF);
                 }
+                Self::checked_file_end(offset, buf.len())?;
                 ext4_vol::ext4_write_at(*ino, offset, buf)
             }
             FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
@@ -386,6 +467,7 @@ impl FileDescriptor {
                 offset,
                 writable,
                 append,
+                ..
             } => {
                 if !*writable {
                     return Err(SysErrNo::EBADF);
@@ -394,7 +476,7 @@ impl FileDescriptor {
                     *offset = content.len();
                 }
                 let start = *offset;
-                let end = start.saturating_add(buf.len());
+                let end = Self::checked_file_end(start, buf.len())?;
                 if end > content.len() {
                     content.resize(end, 0);
                 }
@@ -417,23 +499,31 @@ impl FileDescriptor {
                 if *append {
                     *offset = ext4_vol::regular_file_size(*ino)?;
                 }
+                Self::checked_file_end(*offset, buf.len())?;
                 let n = ext4_vol::ext4_write_at(*ino, *offset, buf)?;
                 *offset += n;
                 Ok(n)
             }
             FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
             FileDescriptor::PipeWrite { state, .. } => {
-                {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                let written = {
                     let mut pipe = state.lock();
                     if pipe.readers == 0 {
                         return Err(SysErrNo::EPIPE);
                     }
-                    for &b in buf {
-                        pipe.buf.push_back(b);
+                    let available = PIPE_CAPACITY.saturating_sub(pipe.buf.len());
+                    if available == 0 {
+                        return Err(SysErrNo::EAGAIN);
                     }
-                }
+                    let written = buf.len().min(available);
+                    pipe.buf.extend(buf[..written].iter().copied());
+                    written
+                };
                 crate::task::wait_queue::wake_io_waiters();
-                Ok(buf.len())
+                Ok(written)
             }
             FileDescriptor::PipeRead { .. } => Err(SysErrNo::EBADF),
             _ => Err(SysErrNo::EBADF),
@@ -446,22 +536,14 @@ impl FileDescriptor {
             FileDescriptor::MemFile {
                 content,
                 offset: current_offset,
-                writable,
                 ..
             } => {
-                let new_offset: isize = match whence {
-                    0 => offset,                            // SEEK_SET
-                    1 => *current_offset as isize + offset, // SEEK_CUR
-                    2 => content.len() as isize + offset,   // SEEK_END
+                let new_off = match whence {
+                    0 => Self::checked_seek_from(0, offset),
+                    1 => Self::checked_seek_from(*current_offset, offset),
+                    2 => Self::checked_seek_from(content.len(), offset),
                     _ => return Err(SysErrNo::EINVAL),
-                };
-                if new_offset < 0 {
-                    return Err(SysErrNo::EINVAL);
-                }
-                let new_off = new_offset as usize;
-                if new_off > content.len() && *writable {
-                    content.resize(new_off, 0);
-                }
+                }?;
                 *current_offset = new_off;
                 Ok(new_off)
             }
@@ -470,17 +552,14 @@ impl FileDescriptor {
                 offset: current_offset,
                 ..
             } => {
-                let sz = ext4_vol::regular_file_size(*ino)? as isize;
-                let new_offset: isize = match whence {
-                    0 => offset,
-                    1 => *current_offset as isize + offset,
-                    2 => sz + offset,
+                let sz = ext4_vol::regular_file_size(*ino)?;
+                let new_off = match whence {
+                    0 => Self::checked_seek_from(0, offset),
+                    1 => Self::checked_seek_from(*current_offset, offset),
+                    2 => Self::checked_seek_from(sz, offset),
                     _ => return Err(SysErrNo::EINVAL),
-                };
-                if new_offset < 0 {
-                    return Err(SysErrNo::EINVAL);
-                }
-                *current_offset = new_offset as usize;
+                }?;
+                *current_offset = new_off;
                 Ok(*current_offset)
             }
             FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
@@ -491,17 +570,17 @@ impl FileDescriptor {
                 offset: current_offset,
                 ..
             } => {
-                let end = entries.len() as isize;
-                let new_offset: isize = match whence {
-                    0 => offset,
-                    1 => *current_offset as isize + offset,
-                    2 => end + offset,
+                let end = entries.len();
+                let new_offset = match whence {
+                    0 => Self::checked_seek_from(0, offset),
+                    1 => Self::checked_seek_from(*current_offset, offset),
+                    2 => Self::checked_seek_from(end, offset),
                     _ => return Err(SysErrNo::EINVAL),
-                };
-                if new_offset < 0 || new_offset > end {
+                }?;
+                if new_offset > end {
                     return Err(SysErrNo::EINVAL);
                 }
-                *current_offset = new_offset as usize;
+                *current_offset = new_offset;
                 Ok(*current_offset)
             }
             FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::ESPIPE),
@@ -511,71 +590,10 @@ impl FileDescriptor {
 
     /// 设置文件偏移
     pub fn seek(&mut self, offset: FileOffset, whence: usize) -> Result<FileOffset, SysErrNo> {
-        match self {
-            FileDescriptor::MemFile {
-                content,
-                offset: current_offset,
-                writable,
-                ..
-            } => {
-                let new_offset = match whence {
-                    0 => offset,
-                    1 => (*current_offset as isize + offset as isize) as usize,
-                    2 => (content.len() as isize + offset as isize) as usize,
-                    _ => return Err(SysErrNo::EINVAL),
-                };
-                if new_offset > content.len() && !*writable {
-                    return Err(SysErrNo::EINVAL);
-                }
-                if new_offset > content.len() && *writable {
-                    content.resize(new_offset, 0);
-                }
-                *current_offset = new_offset;
-                Ok(new_offset)
-            }
-            FileDescriptor::MemDir {
-                entries,
-                offset: current_offset,
-                ..
-            } => {
-                let end = entries.len();
-                let new_offset = match whence {
-                    0 => offset,
-                    1 => *current_offset + offset,
-                    2 => end + offset,
-                    _ => return Err(SysErrNo::EINVAL),
-                };
-                if new_offset > end {
-                    return Err(SysErrNo::EINVAL);
-                }
-                *current_offset = new_offset;
-                Ok(new_offset)
-            }
-            FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::ESPIPE),
-            FileDescriptor::Ext4Regular {
-                ino,
-                offset: current_offset,
-                writable,
-                ..
-            } => {
-                let sz = ext4_vol::regular_file_size(*ino)?;
-                let new_offset = match whence {
-                    0 => offset,
-                    1 => (*current_offset as isize + offset as isize) as usize,
-                    2 => (sz as isize + offset as isize) as usize,
-                    _ => return Err(SysErrNo::EINVAL),
-                };
-                if new_offset > sz && !*writable {
-                    return Err(SysErrNo::EINVAL);
-                }
-                *current_offset = new_offset;
-                Ok(new_offset)
-            }
-            FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
-                Err(SysErrNo::ESPIPE)
-            }
-            _ => Err(SysErrNo::ESPIPE),
+        if offset > MAX_FILE_OFFSET {
+            return Err(SysErrNo::EINVAL);
         }
+        self.seek_signed(offset as isize, whence)
     }
 
     /// 获取文件大小
@@ -595,6 +613,9 @@ impl FileDescriptor {
     }
 
     pub fn truncate(&mut self, new_len: usize) -> Result<(), SysErrNo> {
+        if new_len > MAX_FILE_OFFSET {
+            return Err(SysErrNo::EFBIG);
+        }
         match self {
             FileDescriptor::MemFile {
                 name,
@@ -617,6 +638,15 @@ impl FileDescriptor {
             }
             FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
             _ => Err(SysErrNo::EINVAL),
+        }
+    }
+
+    pub fn sync(&self, _data_only: bool) -> Result<(), SysErrNo> {
+        match self {
+            FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
+                Err(SysErrNo::EINVAL)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -705,12 +735,14 @@ impl Clone for FileDescriptor {
                 name,
                 content,
                 offset,
+                readable,
                 writable,
                 append,
             } => FileDescriptor::MemFile {
                 name: name.clone(),
                 content: content.clone(),
                 offset: *offset,
+                readable: *readable,
                 writable: *writable,
                 append: *append,
             },
@@ -1013,6 +1045,7 @@ fn open_file_legacy_unused(
             name: path_norm,
             content,
             offset: base_off,
+            readable: read_ok,
             writable: write_ok,
             append,
         });
@@ -1106,6 +1139,7 @@ fn open_file_legacy_unused(
                 name: path_norm,
                 content: Vec::new(),
                 offset: 0,
+                readable: read_ok,
                 writable: write_ok,
                 append,
             });
@@ -1118,7 +1152,7 @@ fn open_file_legacy_unused(
 
 pub fn create_pipe(nonblock: bool) -> (FileDescriptor, FileDescriptor) {
     let state = Arc::new(Mutex::new(PipeState {
-        buf: VecDeque::new(),
+        buf: VecDeque::with_capacity(PIPE_CAPACITY),
         readers: 1,
         writers: 1,
     }));

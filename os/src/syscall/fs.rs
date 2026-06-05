@@ -1,7 +1,7 @@
 use super::SyscallRet;
 use crate::console::putchar;
 use crate::task::current_task;
-use crate::task::wait_queue::{sleep_on_io, WaitOutcome};
+use crate::task::wait_queue::{sleep_on_io_if, WaitOutcome};
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
 
@@ -105,8 +105,8 @@ pub(crate) struct PollFd {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TimeSpec {
-    tv_sec: usize,
-    tv_nsec: usize,
+    tv_sec: isize,
+    tv_nsec: isize,
 }
 
 #[repr(C)]
@@ -128,8 +128,13 @@ struct StatFs {
 
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
+const POLLERR: i16 = 0x0008;
 const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
+const POLLRDNORM: i16 = 0x0040;
+const POLLWRNORM: i16 = 0x0100;
+const POLL_READ_EVENTS: i16 = POLLIN | POLLRDNORM;
+const POLL_WRITE_EVENTS: i16 = POLLOUT | POLLWRNORM;
 
 fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
     super::user::read_cstr(ptr as usize)
@@ -152,13 +157,14 @@ fn copy_object_to_user<T>(dst: *mut T, obj: &T) -> Result<(), SysErrNo> {
 }
 
 fn duration_us_from_timespec(ts: TimeSpec) -> Result<usize, SysErrNo> {
-    if ts.tv_nsec >= 1_000_000_000 {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
         return Err(SysErrNo::EINVAL);
     }
-    Ok(ts
-        .tv_sec
+    let tv_sec = ts.tv_sec as usize;
+    let tv_nsec = ts.tv_nsec as usize;
+    Ok(tv_sec
         .saturating_mul(1_000_000)
-        .saturating_add(ts.tv_nsec.div_ceil(1000)))
+        .saturating_add(tv_nsec.div_ceil(1000)))
 }
 
 fn deadline_from_timespec_ptr(ptr: usize) -> Result<Option<usize>, SysErrNo> {
@@ -385,12 +391,15 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
         FileDescriptor::Stdin => fd::open_flags::O_RDONLY as usize,
         FileDescriptor::Stdout | FileDescriptor::Stderr => fd::open_flags::O_WRONLY as usize,
         FileDescriptor::MemFile {
-            writable, append, ..
+            readable,
+            writable,
+            append,
+            ..
         } => {
-            let mut flags = if *writable {
-                fd::open_flags::O_RDWR as usize
-            } else {
-                fd::open_flags::O_RDONLY as usize
+            let mut flags = match (*readable, *writable) {
+                (true, true) => fd::open_flags::O_RDWR as usize,
+                (false, true) => fd::open_flags::O_WRONLY as usize,
+                _ => fd::open_flags::O_RDONLY as usize,
             };
             if *append {
                 flags |= fd::open_flags::O_APPEND as usize;
@@ -849,6 +858,17 @@ pub fn sys_close(fd: usize) -> SyscallRet {
 pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
     log::debug!("[syscall] read(fd={}, buf={:p}, count={})", fd, buf, count);
 
+    if count == 0 {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let mut inner = task.inner.lock();
+        let mut fds = inner.fd_table.lock();
+        let mut empty: [u8; 0] = [];
+        return match fds.get_mut(fd) {
+            Some(file_desc) => super::with_kernel_page_table(|| file_desc.read(&mut empty)),
+            None => Err(SysErrNo::EBADF),
+        };
+    }
+
     // 安全检查：确保缓冲区不为 null
     if buf.is_null() {
         return Err(SysErrNo::EFAULT);
@@ -883,17 +903,34 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
         match res {
             Ok(n) => return Ok(n),
             Err(SysErrNo::EAGAIN) => {
-                let nb_pipe = {
+                let (is_pipe_read, nb_pipe, would_block) = {
                     let inner = task.inner.lock();
                     let fds = inner.fd_table.lock();
                     fds.get(fd)
-                        .map(|f| f.pipe_read_nonblocking())
-                        .unwrap_or(false)
+                        .map(|f| {
+                            (
+                                f.is_pipe_read(),
+                                f.pipe_read_nonblocking(),
+                                f.pipe_read_would_block(),
+                            )
+                        })
+                        .unwrap_or((false, false, false))
                 };
+                if !is_pipe_read {
+                    return Err(SysErrNo::EAGAIN);
+                }
                 if nb_pipe {
                     return Err(SysErrNo::EAGAIN);
                 }
-                let _ = sleep_on_io(None)?;
+                if !would_block {
+                    continue;
+                }
+                let _ = sleep_on_io_if(None, || {
+                    let inner = task.inner.lock();
+                    let fds = inner.fd_table.lock();
+                    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+                    Ok(file_desc.pipe_read_would_block())
+                })?;
             }
             Err(e) => return Err(e),
         }
@@ -911,29 +948,92 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
 pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
     log::debug!("[syscall] write(fd={}, buf={:p}, count={})", fd, buf, count);
 
-    // 安全检查：确保缓冲区不为 null
+    if count == 0 {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let mut inner = task.inner.lock();
+        let mut fds = inner.fd_table.lock();
+        return match fds.get_mut(fd) {
+            Some(file_desc) => super::with_kernel_page_table(|| file_desc.write(&[])),
+            None => Err(SysErrNo::EBADF),
+        };
+    }
     if buf.is_null() {
         return Err(SysErrNo::EFAULT);
     }
-
-    // 安全检查：确保 count 不会导致溢出
     if count > isize::MAX as usize {
         return Err(SysErrNo::EINVAL);
     }
 
-    // 获取当前任务
-    if let Some(task) = current_task() {
-        let mut kbuf = alloc::vec![0u8; count];
-        copy_from_user(buf, &mut kbuf)?;
-        let mut inner = task.inner.lock();
-        let mut fds = inner.fd_table.lock();
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut kbuf = alloc::vec![0u8; count];
+    copy_from_user(buf, &mut kbuf)?;
+    let mut written = 0usize;
 
-        match fds.get_mut(fd) {
-            Some(file_desc) => super::with_kernel_page_table(|| file_desc.write(&kbuf)),
-            None => Err(SysErrNo::EBADF),
+    loop {
+        let res = {
+            let mut inner = task.inner.lock();
+            let mut fds = inner.fd_table.lock();
+            match fds.get_mut(fd) {
+                Some(file_desc) => {
+                    super::with_kernel_page_table(|| file_desc.write(&kbuf[written..]))
+                }
+                None => Err(SysErrNo::EBADF),
+            }
+        };
+
+        match res {
+            Ok(n) => {
+                written += n;
+                if written == count || n == 0 {
+                    return Ok(written);
+                }
+            }
+            Err(SysErrNo::EAGAIN) => {
+                let (is_pipe_write, nb_pipe, would_block) = {
+                    let inner = task.inner.lock();
+                    let fds = inner.fd_table.lock();
+                    fds.get(fd)
+                        .map(|f| {
+                            (
+                                f.is_pipe_write(),
+                                f.pipe_write_nonblocking(),
+                                f.pipe_write_would_block(),
+                            )
+                        })
+                        .unwrap_or((false, false, false))
+                };
+                if !is_pipe_write {
+                    return if written != 0 {
+                        Ok(written)
+                    } else {
+                        Err(SysErrNo::EAGAIN)
+                    };
+                }
+                if nb_pipe {
+                    return if written != 0 {
+                        Ok(written)
+                    } else {
+                        Err(SysErrNo::EAGAIN)
+                    };
+                }
+                if !would_block {
+                    continue;
+                }
+                match sleep_on_io_if(None, || {
+                    let inner = task.inner.lock();
+                    let fds = inner.fd_table.lock();
+                    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+                    Ok(file_desc.pipe_write_would_block())
+                }) {
+                    Ok(_) => {}
+                    Err(SysErrNo::EINTR) if written != 0 => return Ok(written),
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) => {
+                return if written != 0 { Ok(written) } else { Err(err) };
+            }
         }
-    } else {
-        Err(SysErrNo::ESRCH)
     }
 }
 
@@ -966,6 +1066,18 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> SyscallRet {
 /// 复制文件描述符
 /// - old_fd: 旧文件描述符
 pub fn sys_pread64(fd: usize, buf: *mut u8, count: usize, offset: usize) -> SyscallRet {
+    if count == 0 {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let mut inner = task.inner.lock();
+        let mut fds = inner.fd_table.lock();
+        let mut empty: [u8; 0] = [];
+        return match fds.get_mut(fd) {
+            Some(file_desc) => {
+                super::with_kernel_page_table(|| file_desc.read_at(offset, &mut empty))
+            }
+            None => Err(SysErrNo::EBADF),
+        };
+    }
     if buf.is_null() {
         return Err(SysErrNo::EFAULT);
     }
@@ -1060,15 +1172,26 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
     }
 }
 
-pub fn sys_fsync(fd: usize) -> SyscallRet {
+fn sys_sync_fd(fd: usize, data_only: bool) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
     let fds = inner.fd_table.lock();
     let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-    match file_desc {
-        FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => Err(SysErrNo::EINVAL),
-        _ => Ok(0),
-    }
+    super::with_kernel_page_table(|| crate::fs::sync_fd(file_desc, data_only))?;
+    Ok(0)
+}
+
+pub fn sys_fsync(fd: usize) -> SyscallRet {
+    sys_sync_fd(fd, false)
+}
+
+pub fn sys_fdatasync(fd: usize) -> SyscallRet {
+    sys_sync_fd(fd, true)
+}
+
+pub fn sys_sync() -> SyscallRet {
+    super::with_kernel_page_table(crate::fs::sync_all)?;
+    Ok(0)
 }
 
 pub fn sys_statfs(pathname: *const u8, buf: *mut u8) -> SyscallRet {
@@ -1131,12 +1254,25 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {
         if iovec.iov_len == 0 {
             continue;
         }
-        total += sys_write(fd, iovec.iov_base as *const u8, iovec.iov_len)?;
+        match sys_write(fd, iovec.iov_base as *const u8, iovec.iov_len) {
+            Ok(n) => {
+                total += n;
+                if n < iovec.iov_len {
+                    break;
+                }
+            }
+            Err(_) if total != 0 => return Ok(total),
+            Err(err) => return Err(err),
+        }
     }
     Ok(total)
 }
 
 fn poll_once(fds: *mut PollFd, nfds: usize) -> Result<usize, SysErrNo> {
+    if nfds > fd::MAX_FD_NUM {
+        return Err(SysErrNo::EINVAL);
+    }
+
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
     let fd_table = inner.fd_table.lock();
@@ -1154,15 +1290,18 @@ fn poll_once(fds: *mut PollFd, nfds: usize) -> Result<usize, SysErrNo> {
 
         match fd_table.get(pfd.fd as usize) {
             Some(file_desc) => {
-                if (pfd.events & POLLIN) != 0
+                if (pfd.events & POLL_READ_EVENTS) != 0
                     && super::with_kernel_page_table(|| file_desc.poll_read_ready())
                 {
-                    pfd.revents |= POLLIN;
+                    pfd.revents |= pfd.events & POLL_READ_EVENTS;
                 }
-                if (pfd.events & POLLOUT) != 0
+                if (pfd.events & POLL_WRITE_EVENTS) != 0
                     && super::with_kernel_page_table(|| file_desc.poll_write_ready())
                 {
-                    pfd.revents |= POLLOUT;
+                    pfd.revents |= pfd.events & POLL_WRITE_EVENTS;
+                }
+                if super::with_kernel_page_table(|| file_desc.poll_error()) {
+                    pfd.revents |= POLLERR;
                 }
                 if super::with_kernel_page_table(|| file_desc.poll_hup()) {
                     pfd.revents |= POLLHUP;
@@ -1209,11 +1348,13 @@ pub fn sys_ppoll(
             if crate::timer::get_time_us() >= deadline {
                 return Ok(0);
             }
-            if sleep_on_io(Some(deadline))? == WaitOutcome::TimedOut {
+            if sleep_on_io_if(Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
+                == WaitOutcome::TimedOut
+            {
                 return Ok(0);
             }
         } else {
-            let _ = sleep_on_io(None)?;
+            let _ = sleep_on_io_if(None, || Ok(poll_once(fds, nfds)? == 0))?;
         }
     }
 }
@@ -1337,11 +1478,16 @@ pub fn sys_pselect6(
             if crate::timer::get_time_us() >= deadline {
                 return Ok(0);
             }
-            if sleep_on_io(Some(deadline))? == WaitOutcome::TimedOut {
+            if sleep_on_io_if(Some(deadline), || {
+                Ok(pselect_once(nfds, readfds, writefds, exceptfds)? == 0)
+            })? == WaitOutcome::TimedOut
+            {
                 return Ok(0);
             }
         } else {
-            let _ = sleep_on_io(None)?;
+            let _ = sleep_on_io_if(None, || {
+                Ok(pselect_once(nfds, readfds, writefds, exceptfds)? == 0)
+            })?;
         }
     }
 }

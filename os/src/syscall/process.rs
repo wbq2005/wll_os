@@ -71,10 +71,7 @@ fn child_matches_wait_target(child: &Arc<TaskControlBlock>, target: WaitTarget) 
     }
 }
 
-fn reap_zombie_child(
-    waiter: &Arc<TaskControlBlock>,
-    target: WaitTarget,
-) -> Option<(usize, i32)> {
+fn reap_zombie_child(waiter: &Arc<TaskControlBlock>, target: WaitTarget) -> Option<(usize, i32)> {
     for owner in waiter.thread_group.user_members() {
         let mut inner = owner.inner.lock();
         if let Some(index) = inner.children.iter().position(|child| {

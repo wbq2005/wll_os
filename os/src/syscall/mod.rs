@@ -67,6 +67,7 @@ pub const SYSCALL_PPOLL: usize = 73;
 pub const SYSCALL_READLINKAT: usize = 78;
 pub const SYSCALL_NEWFSTATAT: usize = 79;
 pub const SYSCALL_FSTAT: usize = 80;
+pub const SYSCALL_SYNC: usize = 81;
 pub const SYSCALL_FSYNC: usize = 82;
 pub const SYSCALL_FDATASYNC: usize = 83;
 pub const SYSCALL_UTIMENSAT: usize = 88;
@@ -356,7 +357,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[3],
         ),
         SYSCALL_UTIMENSAT => Ok(0),
-        SYSCALL_FSYNC | SYSCALL_FDATASYNC => fs::sys_fsync(args[0]),
+        SYSCALL_SYNC => fs::sys_sync(),
+        SYSCALL_FSYNC => fs::sys_fsync(args[0]),
+        SYSCALL_FDATASYNC => fs::sys_fdatasync(args[0]),
         SYSCALL_FUTEX => {
             other::sys_futex_stub(args[0], args[1], args[2], args[3], args[4], args[5])
         }

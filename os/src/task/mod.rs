@@ -251,12 +251,11 @@ pub fn block_current_for_reason(reason: wait_queue::BlockReason) {
     block_current_for_reason_until(reason, None);
 }
 
-pub fn block_current_for_reason_until(
-    reason: wait_queue::BlockReason,
-    deadline_us: Option<usize>,
-) {
+pub fn block_current_for_reason_until(reason: wait_queue::BlockReason, deadline_us: Option<usize>) {
     if let Some(task) = current_task() {
-        *task.wait_outcome.lock() = None;
+        if task.wait_outcome.lock().is_some() {
+            return;
+        }
         *task.block_reason.lock() = Some(reason);
     }
     block_current_and_run_next(deadline_us);
@@ -816,6 +815,13 @@ pub(crate) fn wake_task_token_with(
     outcome: wait_queue::WaitOutcome,
 ) -> bool {
     if task.current_wait_token() != token {
+        return false;
+    }
+    if task.status() != TaskStatus::Blocked {
+        if task.block_reason.lock().is_some() {
+            *task.wait_outcome.lock() = Some(outcome);
+            return true;
+        }
         return false;
     }
     mark_blocked_task_ready(task, outcome)

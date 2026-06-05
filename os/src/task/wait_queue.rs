@@ -45,6 +45,17 @@ impl WaitQueue {
     }
 
     pub fn sleep_until(&self, deadline_us: Option<usize>) -> Result<WaitOutcome, SysErrNo> {
+        self.sleep_until_if(deadline_us, || Ok(true))
+    }
+
+    pub fn sleep_until_if<F>(
+        &self,
+        deadline_us: Option<usize>,
+        should_sleep: F,
+    ) -> Result<WaitOutcome, SysErrNo>
+    where
+        F: FnOnce() -> Result<bool, SysErrNo>,
+    {
         let task = current_task().ok_or(SysErrNo::ESRCH)?;
 
         if let Some(deadline) = deadline_us {
@@ -54,10 +65,31 @@ impl WaitQueue {
         }
 
         let token = task.next_wait_token();
+        *task.wait_outcome.lock() = None;
+        *task.block_reason.lock() = Some(self.reason);
         self.waiters.lock().push_back(WaitEntry {
             task: task.clone(),
             token,
         });
+
+        let sleep = match should_sleep() {
+            Ok(sleep) => sleep,
+            Err(err) => {
+                self.remove_waiter(task.pid.0, token);
+                *task.block_reason.lock() = None;
+                return Err(err);
+            }
+        };
+        if !sleep {
+            self.remove_waiter(task.pid.0, token);
+            *task.block_reason.lock() = None;
+            return Ok(WaitOutcome::Woken);
+        }
+        if crate::syscall::signal::current_has_unblocked_pending() {
+            self.remove_waiter(task.pid.0, token);
+            *task.block_reason.lock() = None;
+            return Err(SysErrNo::EINTR);
+        }
 
         if let Some(deadline) = deadline_us {
             crate::timer::add_timeout(deadline, task.clone(), token);
@@ -65,6 +97,7 @@ impl WaitQueue {
 
         block_current_for(self.reason, deadline_us);
 
+        *task.block_reason.lock() = None;
         let still_waiting = self.remove_waiter(task.pid.0, token);
         match finish_wait(&task, still_waiting, deadline_us) {
             WaitOutcome::Interrupted => Err(SysErrNo::EINTR),
@@ -157,6 +190,16 @@ pub fn finish_wait(
 
 pub fn sleep_on_io(deadline_us: Option<usize>) -> Result<WaitOutcome, SysErrNo> {
     IO_WAIT_QUEUE.sleep_until(deadline_us)
+}
+
+pub fn sleep_on_io_if<F>(
+    deadline_us: Option<usize>,
+    should_sleep: F,
+) -> Result<WaitOutcome, SysErrNo>
+where
+    F: FnOnce() -> Result<bool, SysErrNo>,
+{
+    IO_WAIT_QUEUE.sleep_until_if(deadline_us, should_sleep)
 }
 
 pub fn wake_io_waiters() -> usize {

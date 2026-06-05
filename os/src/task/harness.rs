@@ -366,9 +366,7 @@ fn dirname(path: &str) -> String {
 fn ensure_busybox_applet_alias(root: &str, busybox_host: &str, applet: &str) -> Option<()> {
     let alias_host = crate::fs::apply_root(root, &alloc::format!("/{}", applet));
     if crate::fs::metadata(&alias_host, true)
-        .map(|meta| {
-            meta.kind == crate::fs::VfsNodeKind::Regular && (meta.mode & 0o111) != 0
-        })
+        .map(|meta| meta.kind == crate::fs::VfsNodeKind::Regular && (meta.mode & 0o111) != 0)
         .unwrap_or(false)
     {
         return Some(());
