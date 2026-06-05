@@ -499,6 +499,18 @@ pub(crate) fn terminate_task_group(task: &Arc<TaskControlBlock>, exit_code: i32)
     finish_process_exit(task, exit_code);
 }
 
+pub(crate) fn terminate_thread_group_peers_for_exec(task: &Arc<TaskControlBlock>) {
+    if task.is_kernel {
+        return;
+    }
+    let members = task.thread_group.user_members();
+    for member in &members {
+        if member.pid.0 != task.pid.0 && member.status() != TaskStatus::Zombie {
+            finish_task_exit(member, 0);
+        }
+    }
+}
+
 fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     let clear_child_tid = task.inner.lock().clear_child_tid;
     if clear_child_tid != 0 {

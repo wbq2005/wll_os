@@ -4,7 +4,7 @@ use crate::mm::elf_loader::ElfFile;
 use crate::task::{
     current_task, dup_fd_table, dup_fs_context, dup_mm_context, exit_current_and_run_next,
     exit_thread_group_and_run_next, new_shared_memory_set, suspend_current_and_run_next,
-    ThreadGroup,
+    TaskControlBlock, ThreadGroup,
 };
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
@@ -50,12 +50,52 @@ const CLONE_CHILD_SETTID: usize = 0x01000000;
 
 const WNOHANG: usize = 0x0000_0001;
 
+#[derive(Clone, Copy)]
+enum WaitTarget {
+    AnyChild,
+    Tgid(usize),
+}
+
 fn read_user_usize(addr: usize) -> Result<usize, SysErrNo> {
     super::user::read_usize(addr)
 }
 
 fn write_user_i32(addr: usize, value: i32) -> Result<(), SysErrNo> {
     super::user::write_i32(addr, value)
+}
+
+fn child_matches_wait_target(child: &Arc<TaskControlBlock>, target: WaitTarget) -> bool {
+    match target {
+        WaitTarget::AnyChild => true,
+        WaitTarget::Tgid(tgid) => child.thread_group.tgid() == tgid,
+    }
+}
+
+fn reap_zombie_child(
+    waiter: &Arc<TaskControlBlock>,
+    target: WaitTarget,
+) -> Option<(usize, i32)> {
+    for owner in waiter.thread_group.user_members() {
+        let mut inner = owner.inner.lock();
+        if let Some(index) = inner.children.iter().position(|child| {
+            child_matches_wait_target(child, target) && child.thread_group.is_process_zombie()
+        }) {
+            let child = inner.children.remove(index);
+            return Some((child.thread_group.tgid(), child.thread_group.exit_code()));
+        }
+    }
+    None
+}
+
+fn has_matching_child(waiter: &Arc<TaskControlBlock>, target: WaitTarget) -> bool {
+    waiter.thread_group.user_members().into_iter().any(|owner| {
+        owner
+            .inner
+            .lock()
+            .children
+            .iter()
+            .any(|child| child_matches_wait_target(child, target))
+    })
 }
 
 fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
@@ -601,12 +641,14 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     );
     crate::syscall::signal::install_signal_trampoline(&mut new_memory_set)?;
     if let Some(task) = current_task() {
+        crate::task::terminate_thread_group_peers_for_exec(&task);
         crate::syscall::signal::reset_signal_handlers_for_exec(&task);
         {
             let mut inner = task.inner.lock();
 
             // 重置堆
             inner.exec_path = exec_logical_path.clone();
+            inner.fd_table.lock().close_on_exec();
         }
         {
             let mut mm = task.mm.lock();
@@ -686,6 +728,43 @@ pub fn sys_getppid() -> SyscallRet {
     Ok(ppid)
 }
 
+fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let target = match pid {
+        -1 | 0 => WaitTarget::AnyChild,
+        n if n > 0 => WaitTarget::Tgid(n as usize),
+        _ => return Err(SysErrNo::ECHILD),
+    };
+
+    if let Some((cpid, exit_code)) = reap_zombie_child(&task, target) {
+        if !status.is_null() {
+            write_user_i32(status as usize, exit_code << 8)?;
+        }
+        return Ok(cpid);
+    }
+
+    if !has_matching_child(&task, target) {
+        return Err(SysErrNo::ECHILD);
+    }
+
+    if (options & WNOHANG) != 0 {
+        return Ok(0);
+    }
+
+    loop {
+        if let Some((cpid, exit_code)) = reap_zombie_child(&task, target) {
+            if !status.is_null() {
+                write_user_i32(status as usize, exit_code << 8)?;
+            }
+            return Ok(cpid);
+        }
+        if !has_matching_child(&task, target) {
+            return Err(SysErrNo::ECHILD);
+        }
+        let _ = crate::task::wait_queue::sleep_on_child_exit()?;
+    }
+}
+
 pub fn sys_sched_yield() -> SyscallRet {
     log::debug!("[syscall] sched_yield()");
     if crate::trap::foreground_driver_active() {
@@ -708,66 +787,10 @@ pub fn sys_sched_yield() -> SyscallRet {
 ///   - 子进程获得调度机会运行并退出成为僵尸；
 ///   - 父进程再次被调度时调用 wait4 可以成功回收。
 pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -> SyscallRet {
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let pid = if pid == 0 { -1 } else { pid };
-    // 尝试回收僵尸子进程（两种模式都走同一逻辑）
-    let try_reap = || -> Option<(usize, i32)> {
-        let mut inner = task.inner.lock();
-        if let Some(index) = inner.children.iter().position(|c| {
-            (pid == -1 || c.thread_group.tgid() == pid as usize)
-                && c.thread_group.is_process_zombie()
-        }) {
-            let child = inner.children.remove(index);
-            let cpid = child.thread_group.tgid();
-            let exit_code = child.thread_group.exit_code();
-            return Some((cpid, exit_code));
-        }
-        None
-    };
-
-    if let Some((cpid, exit_code)) = try_reap() {
-        if !status.is_null() {
-            write_user_i32(status as usize, exit_code << 8)?;
-        }
-        return Ok(cpid);
-    }
-
-    // 无僵尸子进程：WNOHANG 立即返回
-    if (options & WNOHANG) != 0 {
-        return Ok(0);
-    }
-
-    // 正常模式：使用调度器阻塞
-    loop {
-        // 检查是否有子进程
-        {
-            let inner = task.inner.lock();
-            if inner.children.is_empty() {
-                return Err(SysErrNo::ECHILD);
-            }
-            if pid > 0
-                && !inner
-                    .children
-                    .iter()
-                    .any(|c| c.thread_group.tgid() == pid as usize)
-            {
-                return Err(SysErrNo::ECHILD);
-            }
-        }
-
-        // 再检查一次僵尸
-        if let Some((cpid, exit_code)) = try_reap() {
-            if !status.is_null() {
-                write_user_i32(status as usize, exit_code << 8)?;
-            }
-            return Ok(cpid);
-        }
-
-        let _ = crate::task::wait_queue::sleep_on_child_exit()?;
-    }
+    sys_wait4_thread_group(pid, status, options)
 }
 
-/// clone：`fork()`（clone_bits==0）与带用户栈的独立进程形态；线程级共享标志暂未实现，一律 `EINVAL`。
+/// clone: supports fork-style children plus the documented shared-resource and thread flags.
 pub fn sys_clone(
     flags: usize,
     stack: usize,

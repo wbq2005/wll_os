@@ -445,6 +445,12 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
 /// - mode: 文件模式
 pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> SyscallRet {
     let (logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    let fd_flags = if (flags & fd::open_flags::O_CLOEXEC) != 0 {
+        fd::FD_CLOEXEC
+    } else {
+        0
+    };
+    let open_flags = flags & !fd::open_flags::O_CLOEXEC;
 
     log::info!(
         "[syscall] openat(dirfd={}, pathname='{}' -> '{}', flags={}, mode={})",
@@ -460,12 +466,12 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
         let mut inner = task.inner.lock();
 
         let opened = super::with_kernel_page_table(|| {
-            crate::fs::open_path(&host_path, &logical_path, flags, mode)
+            crate::fs::open_path(&host_path, &logical_path, open_flags, mode)
         });
         match opened {
             Ok(fd_desc) => {
                 let mut fds = inner.fd_table.lock();
-                match fds.alloc(fd_desc) {
+                match fds.alloc_with_flags(fd_desc, fd_flags) {
                     Some(new_fd) => {
                         log::info!(
                             "[syscall] openat: allocated fd={} for '{}', fd_table.len={}",
@@ -735,13 +741,20 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: usize) -> SyscallRet {
         return Err(SysErrNo::EINVAL);
     }
     let nonblock = (flags & pipe_flags::O_NONBLOCK) != 0;
+    let fd_flags = if (flags & pipe_flags::O_CLOEXEC) != 0 {
+        fd::FD_CLOEXEC
+    } else {
+        0
+    };
     if let Some(task) = current_task() {
         let mut inner = task.inner.lock();
         let (read_fd, write_fd) = {
             let mut fds = inner.fd_table.lock();
             let (read_end, write_end) = crate::fs::fd::create_pipe(nonblock);
-            let read_fd = fds.alloc(read_end).ok_or(SysErrNo::EMFILE)?;
-            let write_fd = match fds.alloc(write_end) {
+            let read_fd = fds
+                .alloc_with_flags(read_end, fd_flags)
+                .ok_or(SysErrNo::EMFILE)?;
+            let write_fd = match fds.alloc_with_flags(write_end, fd_flags) {
                 Some(fd) => fd,
                 None => {
                     let _ = fds.free(read_fd);
@@ -989,18 +1002,29 @@ pub fn sys_dup(old_fd: usize) -> SyscallRet {
 /// - old_fd: 旧文件描述符
 /// - new_fd: 新文件描述符
 /// - flags: 标志
-pub fn sys_dup3(old_fd: usize, new_fd: usize, _flags: usize) -> SyscallRet {
+pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: usize) -> SyscallRet {
     log::debug!(
         "[syscall] dup3(old_fd={}, new_fd={}, flags={})",
         old_fd,
         new_fd,
-        _flags
+        flags
     );
+    let allowed = fd::open_flags::O_CLOEXEC as usize;
+    if old_fd == new_fd || (flags & !allowed) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let fd_flags = if (flags & allowed) != 0 {
+        fd::FD_CLOEXEC
+    } else {
+        0
+    };
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
     let mut fds = inner.fd_table.lock();
-    fds.dup2(old_fd, new_fd)
+    let new_fd = fds.dup2(old_fd, new_fd)?;
+    fds.set_fd_flags(new_fd, fd_flags)?;
+    Ok(new_fd)
 }
 
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
@@ -1010,15 +1034,17 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let file_desc = fds.get(fd).cloned().ok_or(SysErrNo::EBADF)?;
-            fds.alloc_from(arg, file_desc).ok_or(SysErrNo::EMFILE)
+            let flags = if cmd == F_DUPFD_CLOEXEC {
+                fd::FD_CLOEXEC
+            } else {
+                0
+            };
+            fds.alloc_from_with_flags(arg, file_desc, flags)
+                .ok_or(SysErrNo::EMFILE)
         }
-        F_GETFD => {
-            let _ = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-            Ok(0)
-        }
+        F_GETFD => fds.fd_flags(fd),
         F_SETFD => {
-            let _ = arg;
-            let _ = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+            fds.set_fd_flags(fd, arg)?;
             Ok(0)
         }
         F_GETFL => {

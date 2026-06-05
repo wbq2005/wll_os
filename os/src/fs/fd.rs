@@ -19,6 +19,7 @@ pub const MAX_FD_NUM: usize = 1024;
 pub const STDIN_FD: usize = 0;
 pub const STDOUT_FD: usize = 1;
 pub const STDERR_FD: usize = 2;
+pub const FD_CLOEXEC: usize = 1;
 
 /// 文件描述符偏移量
 pub type FileOffset = usize;
@@ -77,6 +78,7 @@ pub mod open_flags {
     pub const O_APPEND: u32 = 0o00002000;
     pub const O_DIRECTORY: u32 = 0o00200000;
     pub const O_NOFOLLOW: u32 = 0o00400000;
+    pub const O_CLOEXEC: u32 = 0o2000000;
 }
 
 /// pipe2 标志（Linux ABI）
@@ -787,6 +789,7 @@ impl Drop for FileDescriptor {
 #[derive(Clone)]
 pub struct FileDescriptorTable {
     fds: Vec<Option<FileDescriptor>>,
+    fd_flags: Vec<usize>,
 }
 
 impl FileDescriptorTable {
@@ -800,13 +803,21 @@ impl FileDescriptorTable {
             fds.push(None);
         }
 
-        Self { fds }
+        Self {
+            fds,
+            fd_flags: alloc::vec![0; MAX_FD_NUM],
+        }
     }
 
     pub fn alloc(&mut self, fd: FileDescriptor) -> Option<usize> {
+        self.alloc_with_flags(fd, 0)
+    }
+
+    pub fn alloc_with_flags(&mut self, fd: FileDescriptor, flags: usize) -> Option<usize> {
         for (i, slot) in self.fds.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(fd);
+                self.fd_flags[i] = flags & FD_CLOEXEC;
                 return Some(i);
             }
         }
@@ -814,9 +825,19 @@ impl FileDescriptorTable {
     }
 
     pub fn alloc_from(&mut self, start: usize, fd: FileDescriptor) -> Option<usize> {
+        self.alloc_from_with_flags(start, fd, 0)
+    }
+
+    pub fn alloc_from_with_flags(
+        &mut self,
+        start: usize,
+        fd: FileDescriptor,
+        flags: usize,
+    ) -> Option<usize> {
         for (i, slot) in self.fds.iter_mut().enumerate().skip(start) {
             if slot.is_none() {
                 *slot = Some(fd);
+                self.fd_flags[i] = flags & FD_CLOEXEC;
                 return Some(i);
             }
         }
@@ -828,6 +849,7 @@ impl FileDescriptorTable {
             return Err(SysErrNo::EBADF);
         }
         self.fds[index] = Some(fd);
+        self.fd_flags[index] = 0;
         Ok(())
     }
 
@@ -853,7 +875,32 @@ impl FileDescriptorTable {
             return Err(SysErrNo::EBADF);
         }
         self.fds[fd] = None;
+        self.fd_flags[fd] = 0;
         Ok(())
+    }
+
+    pub fn fd_flags(&self, fd: usize) -> Result<usize, SysErrNo> {
+        if fd >= MAX_FD_NUM || self.fds[fd].is_none() {
+            return Err(SysErrNo::EBADF);
+        }
+        Ok(self.fd_flags[fd])
+    }
+
+    pub fn set_fd_flags(&mut self, fd: usize, flags: usize) -> Result<(), SysErrNo> {
+        if fd >= MAX_FD_NUM || self.fds[fd].is_none() {
+            return Err(SysErrNo::EBADF);
+        }
+        self.fd_flags[fd] = flags & FD_CLOEXEC;
+        Ok(())
+    }
+
+    pub fn close_on_exec(&mut self) {
+        for index in 0..MAX_FD_NUM {
+            if self.fds[index].is_some() && (self.fd_flags[index] & FD_CLOEXEC) != 0 {
+                self.fds[index] = None;
+                self.fd_flags[index] = 0;
+            }
+        }
     }
 
     pub fn dup(&mut self, old_fd: usize) -> Result<usize, SysErrNo> {
@@ -882,6 +929,7 @@ impl FileDescriptorTable {
         }
         let fd = self.fds[old_fd].clone().unwrap();
         self.fds[new_fd] = Some(fd);
+        self.fd_flags[new_fd] = 0;
         Ok(new_fd)
     }
 

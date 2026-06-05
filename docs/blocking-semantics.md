@@ -47,9 +47,10 @@ the syscall result into `EINTR`.
 
 Path:
 
-- `sys_wait4` first tries to reap a process-zombie child from
-  `task.inner.children`.
-- `WNOHANG` returns `0` if nothing is reapable.
+- `sys_wait4` first tries to reap a process-zombie child from the `children`
+  lists owned by any user thread in the caller's thread group.
+- `WNOHANG` returns `0` only when a matching live child still exists; no
+  matching child returns `ECHILD`.
 - The blocking loop verifies that a matching child still exists, retries reap,
   then calls `sleep_on_child_exit()`.
 - `sleep_on_child_exit()` uses the global `CHILD_WAIT_QUEUE` with
