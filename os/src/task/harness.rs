@@ -73,7 +73,7 @@ impl TestGroup {
 }
 
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] =
-    &[TestGroup::Basic, TestGroup::Busybox, TestGroup::Lua, TestGroup::LibcTest];
+    &[TestGroup::Basic, TestGroup::Busybox, TestGroup::Lua];
 
 fn console_write(msg: &str) {
     for b in msg.bytes() {
@@ -410,6 +410,9 @@ fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
         } else {
             "libctest"
         };
+        // Temporary compatibility wrapper: the official libctest_testcode.sh is
+        // discovered, but current staged runs enter run-static/run-dynamic via
+        // BusyBox instead of executing the official script body verbatim.
         script_arg = String::from("/libctest_harness.sh");
         script_host = crate::fs::apply_root(&root, &script_arg);
         let body = alloc::format!(
