@@ -22,6 +22,8 @@ const F_SETFD: usize = 2;
 const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const FIONREAD: usize = 0x541B;
+const FIONBIO: usize = 0x5421;
 
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EACCESS: usize = 0x200;
@@ -438,6 +440,14 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
         FileDescriptor::PipeWrite { nonblock, .. } => {
             let mut flags = fd::open_flags::O_WRONLY as usize;
             if *nonblock {
+                flags |= fd::pipe_flags::O_NONBLOCK;
+            }
+            flags
+        }
+        FileDescriptor::Socket { state } => {
+            let socket = state.lock();
+            let mut flags = fd::open_flags::O_RDWR as usize;
+            if socket.nonblock {
                 flags |= fd::pipe_flags::O_NONBLOCK;
             }
             flags
@@ -1217,12 +1227,43 @@ pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_ioctl(fd: usize, _request: usize, _argp: usize) -> SyscallRet {
+pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
-    let fds = inner.fd_table.lock();
-    let _ = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-    Ok(0)
+    let mut fds = inner.fd_table.lock();
+    let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+    match file_desc {
+        FileDescriptor::Socket { state } => match request {
+            FIONBIO => {
+                if argp == 0 {
+                    return Err(SysErrNo::EFAULT);
+                }
+                let value = super::user::copy_object_from_user::<i32>(argp)?;
+                state.lock().nonblock = value != 0;
+                Ok(0)
+            }
+            FIONREAD => {
+                if argp == 0 {
+                    return Err(SysErrNo::EFAULT);
+                }
+                let socket = state.lock();
+                let available = if socket.is_datagram() {
+                    socket
+                        .dgram_queue
+                        .front()
+                        .map(|packet| packet.data.len())
+                        .unwrap_or(0)
+                } else {
+                    socket.rx_buf.len()
+                };
+                let available: i32 = available.min(i32::MAX as usize) as i32;
+                super::user::copy_object_to_user(argp, &available)?;
+                Ok(0)
+            }
+            _ => Err(SysErrNo::ENOTTY),
+        },
+        _ => Ok(0),
+    }
 }
 
 pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {

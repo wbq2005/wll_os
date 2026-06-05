@@ -38,8 +38,19 @@ pub enum SysErrNo {
     ENOTEMPTY = 39,  // Directory not empty
     ELOOP = 40,      // Too many symbolic links encountered
     ECANCELED = 47,  // Operation canceled (used by exit in foreground mode)
+    ENOTSOCK = 88,   // Socket operation on non-socket
+    EDESTADDRREQ = 89, // Destination address required
+    ENOPROTOOPT = 92, // Protocol not available
+    EPROTONOSUPPORT = 93, // Protocol not supported
     EOPNOTSUPP = 95, // Operation not supported
+    EAFNOSUPPORT = 97, // Address family not supported
+    EADDRINUSE = 98, // Address already in use
+    EISCONN = 106,   // Transport endpoint is already connected
+    ENOTCONN = 107,  // Transport endpoint is not connected
     ETIMEDOUT = 110, // Connection timed out
+    ECONNREFUSED = 111, // Connection refused
+    EALREADY = 114,  // Operation already in progress
+    EINPROGRESS = 115, // Operation now in progress
     ENOSYS = 38,     // Invalid system call number
 }
 

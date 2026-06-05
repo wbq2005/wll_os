@@ -27,6 +27,8 @@ pub type FileOffset = usize;
 const CONSOLE_LINE_CAP: usize = 512;
 const MAX_FILE_OFFSET: usize = isize::MAX as usize;
 const PIPE_CAPACITY: usize = 64 * 1024;
+const SOCK_STREAM: usize = 1;
+const SOCK_DGRAM: usize = 2;
 
 lazy_static! {
     static ref CONSOLE_LINE_BUFFERS: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
@@ -137,6 +139,9 @@ pub enum FileDescriptor {
         state: Arc<Mutex<PipeState>>,
         nonblock: bool,
     },
+    Socket {
+        state: Arc<Mutex<SocketState>>,
+    },
 }
 
 #[derive(Debug)]
@@ -144,6 +149,83 @@ pub struct PipeState {
     buf: VecDeque<u8>,
     readers: usize,
     writers: usize,
+}
+
+#[derive(Debug)]
+pub struct SocketPacket {
+    pub data: Vec<u8>,
+    pub addr: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct SocketState {
+    pub domain: i32,
+    pub sock_type: usize,
+    pub protocol: i32,
+    pub nonblock: bool,
+    pub bound: bool,
+    pub listening: bool,
+    pub connected: bool,
+    pub shutdown_read: bool,
+    pub shutdown_write: bool,
+    pub local_addr: Option<Vec<u8>>,
+    pub peer_addr: Option<Vec<u8>>,
+    pub peer: Option<Arc<Mutex<SocketState>>>,
+    pub rx_buf: VecDeque<u8>,
+    pub dgram_queue: VecDeque<SocketPacket>,
+    pub pending: VecDeque<Arc<Mutex<SocketState>>>,
+    pub backlog: usize,
+    pub reuse_addr: bool,
+    pub reuse_port: bool,
+    pub keepalive: bool,
+    pub broadcast: bool,
+    pub tcp_nodelay: bool,
+    pub sndbuf: usize,
+    pub rcvbuf: usize,
+    pub send_timeout_us: Option<usize>,
+    pub recv_timeout_us: Option<usize>,
+    pub error: i32,
+}
+
+impl SocketState {
+    pub fn new(domain: i32, sock_type: usize, protocol: i32, nonblock: bool) -> Self {
+        Self {
+            domain,
+            sock_type,
+            protocol,
+            nonblock,
+            bound: false,
+            listening: false,
+            connected: false,
+            shutdown_read: false,
+            shutdown_write: false,
+            local_addr: None,
+            peer_addr: None,
+            peer: None,
+            rx_buf: VecDeque::new(),
+            dgram_queue: VecDeque::new(),
+            pending: VecDeque::new(),
+            backlog: 0,
+            reuse_addr: false,
+            reuse_port: false,
+            keepalive: false,
+            broadcast: false,
+            tcp_nodelay: false,
+            sndbuf: 64 * 1024,
+            rcvbuf: 64 * 1024,
+            send_timeout_us: None,
+            recv_timeout_us: None,
+            error: 0,
+        }
+    }
+
+    pub fn is_stream(&self) -> bool {
+        self.sock_type == SOCK_STREAM
+    }
+
+    pub fn is_datagram(&self) -> bool {
+        self.sock_type == SOCK_DGRAM
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +272,13 @@ impl FileDescriptor {
         matches!(self, FileDescriptor::PipeWrite { .. })
     }
 
+    pub fn socket_state(&self) -> Option<Arc<Mutex<SocketState>>> {
+        match self {
+            FileDescriptor::Socket { state } => Some(state.clone()),
+            _ => None,
+        }
+    }
+
     pub fn pipe_read_would_block(&self) -> bool {
         match self {
             FileDescriptor::PipeRead { state, .. } => {
@@ -230,6 +319,9 @@ impl FileDescriptor {
             } => {
                 *current = nonblock;
             }
+            FileDescriptor::Socket { state } => {
+                state.lock().nonblock = nonblock;
+            }
             _ => {}
         }
     }
@@ -237,6 +329,10 @@ impl FileDescriptor {
     pub fn poll_hup(&self) -> bool {
         match self {
             FileDescriptor::PipeRead { state, .. } => state.lock().writers == 0,
+            FileDescriptor::Socket { state } => {
+                let socket = state.lock();
+                socket.shutdown_read && socket.shutdown_write
+            }
             _ => false,
         }
     }
@@ -244,6 +340,7 @@ impl FileDescriptor {
     pub fn poll_error(&self) -> bool {
         match self {
             FileDescriptor::PipeWrite { state, .. } => state.lock().readers == 0,
+            FileDescriptor::Socket { state } => state.lock().error != 0,
             _ => false,
         }
     }
@@ -257,6 +354,13 @@ impl FileDescriptor {
                 let pipe = state.lock();
                 !pipe.buf.is_empty() || pipe.writers == 0
             }
+            FileDescriptor::Socket { state } => {
+                let socket = state.lock();
+                socket.shutdown_read
+                    || !socket.rx_buf.is_empty()
+                    || !socket.dgram_queue.is_empty()
+                    || !socket.pending.is_empty()
+            }
             _ => false,
         }
     }
@@ -269,6 +373,12 @@ impl FileDescriptor {
             FileDescriptor::PipeWrite { state, .. } => {
                 let pipe = state.lock();
                 pipe.readers > 0 && pipe.buf.len() < PIPE_CAPACITY
+            }
+            FileDescriptor::Socket { state } => {
+                let socket = state.lock();
+                (socket.connected || socket.is_datagram())
+                    && !socket.shutdown_write
+                    && socket.error == 0
             }
             _ => false,
         }
@@ -286,6 +396,7 @@ impl FileDescriptor {
             FileDescriptor::Ext4Dir { .. } => false,
             FileDescriptor::PipeRead { .. } => true,
             FileDescriptor::PipeWrite { .. } => false,
+            FileDescriptor::Socket { .. } => true,
         }
     }
 
@@ -301,6 +412,7 @@ impl FileDescriptor {
             FileDescriptor::Ext4Dir { .. } => false,
             FileDescriptor::PipeRead { .. } => false,
             FileDescriptor::PipeWrite { .. } => true,
+            FileDescriptor::Socket { .. } => true,
         }
     }
 
@@ -384,6 +496,44 @@ impl FileDescriptor {
                 Ok(n)
             }
             FileDescriptor::PipeWrite { .. } => Err(SysErrNo::EBADF),
+            FileDescriptor::Socket { state } => {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                let mut socket = state.lock();
+                if socket.shutdown_read {
+                    return Ok(0);
+                }
+                if socket.is_stream() && !socket.connected {
+                    return Err(SysErrNo::ENOTCONN);
+                }
+                let n = if socket.is_datagram() {
+                    let Some(packet) = socket.dgram_queue.pop_front() else {
+                        return Err(SysErrNo::EAGAIN);
+                    };
+                    let n = buf.len().min(packet.data.len());
+                    buf[..n].copy_from_slice(&packet.data[..n]);
+                    n
+                } else {
+                    if socket.rx_buf.is_empty() {
+                        return Err(SysErrNo::EAGAIN);
+                    }
+                    let mut n = 0usize;
+                    while n < buf.len() {
+                        if let Some(b) = socket.rx_buf.pop_front() {
+                            buf[n] = b;
+                            n += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    n
+                };
+                if n > 0 {
+                    crate::task::wait_queue::wake_io_waiters();
+                }
+                Ok(n)
+            }
             _ => Err(SysErrNo::EBADF),
         }
     }
@@ -415,6 +565,7 @@ impl FileDescriptor {
             FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
                 Err(SysErrNo::ESPIPE)
             }
+            FileDescriptor::Socket { .. } => Err(SysErrNo::ESPIPE),
             _ => Err(SysErrNo::EBADF),
         }
     }
@@ -449,6 +600,7 @@ impl FileDescriptor {
             FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
                 Err(SysErrNo::ESPIPE)
             }
+            FileDescriptor::Socket { .. } => Err(SysErrNo::ESPIPE),
             _ => Err(SysErrNo::EBADF),
         }
     }
@@ -526,6 +678,28 @@ impl FileDescriptor {
                 Ok(written)
             }
             FileDescriptor::PipeRead { .. } => Err(SysErrNo::EBADF),
+            FileDescriptor::Socket { state } => {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                let socket = state.lock();
+                if socket.shutdown_write {
+                    return Err(SysErrNo::EPIPE);
+                }
+                if socket.is_stream() && !socket.connected {
+                    return Err(SysErrNo::ENOTCONN);
+                }
+                let peer = socket.peer.clone().ok_or(SysErrNo::ENOTCONN)?;
+                drop(socket);
+                let mut peer_socket = peer.lock();
+                if peer_socket.shutdown_read {
+                    return Err(SysErrNo::EPIPE);
+                }
+                peer_socket.rx_buf.extend(buf.iter().copied());
+                drop(peer_socket);
+                crate::task::wait_queue::wake_io_waiters();
+                Ok(buf.len())
+            }
             _ => Err(SysErrNo::EBADF),
         }
     }
@@ -787,6 +961,9 @@ impl Clone for FileDescriptor {
                     nonblock: *nonblock,
                 }
             }
+            FileDescriptor::Socket { state } => FileDescriptor::Socket {
+                state: state.clone(),
+            },
         }
     }
 }
@@ -807,6 +984,9 @@ impl Drop for FileDescriptor {
                 if pipe.writers > 0 {
                     pipe.writers -= 1;
                 }
+                wake_io = true;
+            }
+            FileDescriptor::Socket { .. } => {
                 wake_io = true;
             }
             _ => {}

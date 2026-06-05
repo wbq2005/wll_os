@@ -1,5 +1,6 @@
 pub mod fs;
 pub mod mm;
+pub mod net;
 pub mod other;
 pub mod process;
 pub mod signal;
@@ -226,6 +227,26 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_DUP3 => fs::sys_dup3(args[0], args[1], args[2]),
         SYSCALL_FCNTL => fs::sys_fcntl(args[0], args[1], args[2]),
         SYSCALL_IOCTL => fs::sys_ioctl(args[0], args[1], args[2]),
+        SYSCALL_SOCKET => net::sys_socket(args[0], args[1], args[2]),
+        SYSCALL_SOCKETPAIR => net::sys_socketpair(args[0], args[1], args[2], args[3]),
+        SYSCALL_BIND => net::sys_bind(args[0], args[1], args[2]),
+        SYSCALL_LISTEN => net::sys_listen(args[0], args[1]),
+        SYSCALL_ACCEPT => net::sys_accept(args[0], args[1], args[2]),
+        SYSCALL_ACCEPT4 => net::sys_accept4(args[0], args[1], args[2], args[3]),
+        SYSCALL_CONNECT => net::sys_connect(args[0], args[1], args[2]),
+        SYSCALL_GETSOCKNAME => net::sys_getsockname(args[0], args[1], args[2]),
+        SYSCALL_GETPEERNAME => net::sys_getpeername(args[0], args[1], args[2]),
+        SYSCALL_SENDTO => net::sys_sendto(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_RECVFROM => {
+            net::sys_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
+        SYSCALL_SETSOCKOPT => {
+            net::sys_setsockopt(args[0], args[1], args[2], args[3], args[4])
+        }
+        SYSCALL_GETSOCKOPT => {
+            net::sys_getsockopt(args[0], args[1], args[2], args[3], args[4])
+        }
+        SYSCALL_SHUTDOWN => net::sys_shutdown(args[0], args[1]),
         SYSCALL_NEWFSTATAT => fs::sys_newfstatat(
             args[0] as isize,
             args[1] as *const u8,
