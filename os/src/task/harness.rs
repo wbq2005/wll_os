@@ -364,6 +364,13 @@ fn dirname(path: &str) -> String {
     }
 }
 
+fn is_libc_test_script(path: &str) -> bool {
+    testcode_stem(path)
+        .and_then(TestGroup::from_stem)
+        .map(|group| group == TestGroup::LibcTest)
+        .unwrap_or(false)
+}
+
 fn ensure_busybox_applet_alias(root: &str, busybox_host: &str, applet: &str) -> Option<()> {
     let alias_logical = if applet.starts_with('/') {
         applet.to_string()
@@ -395,7 +402,7 @@ fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
     ensure_busybox_applet_alias(&root, &busybox_host, "sh")?;
     ensure_busybox_applet_alias(&root, &busybox_host, "/bin/sh")?;
 
-    if logical_script == "/libctest_testcode.sh" {
+    if is_libc_test_script(&logical_script) {
         let group = if root == "/glibc" {
             "libctest-glibc"
         } else if root == "/musl" {
