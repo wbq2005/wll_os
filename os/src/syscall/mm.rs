@@ -19,7 +19,25 @@ const MAP_SHARED_VALIDATE: usize = 0x03;
 const MAP_TYPE: usize = 0x0f;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
+const MAP_DENYWRITE: usize = 0x0800;
+const MAP_EXECUTABLE: usize = 0x1000;
+const MAP_LOCKED: usize = 0x2000;
+const MAP_NORESERVE: usize = 0x4000;
+const MAP_POPULATE: usize = 0x8000;
+const MAP_NONBLOCK: usize = 0x10000;
+const MAP_STACK: usize = 0x20000;
+const MAP_HUGETLB: usize = 0x40000;
+const MAP_SYNC: usize = 0x80000;
 const MAP_FIXED_NOREPLACE: usize = 0x100000;
+const MAP_COMPAT_IGNORED: usize = MAP_DENYWRITE
+    | MAP_EXECUTABLE
+    | MAP_LOCKED
+    | MAP_NORESERVE
+    | MAP_POPULATE
+    | MAP_NONBLOCK
+    | MAP_STACK;
+const MAP_SUPPORTED: usize =
+    MAP_TYPE | MAP_FIXED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_COMPAT_IGNORED;
 
 fn align_down(value: usize) -> usize {
     value / PAGE_SIZE * PAGE_SIZE
@@ -37,7 +55,12 @@ fn checked_range(start: usize, length: usize) -> Result<(usize, usize), SysErrNo
     Ok((start, align_up(end)?))
 }
 
-fn ranges_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
     left_start < right_end && right_start < left_end
 }
 
@@ -126,31 +149,69 @@ fn prot_to_pte_flags(prot: i32) -> Result<PTEFlags, SysErrNo> {
 /// brk system call.
 pub fn sys_brk(new_brk: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let mut mm = task.mm.lock();
+    let (current_break, mapped_break) = {
+        let mm = task.mm.lock();
+        (mm.program_break, mm.mapped_break)
+    };
 
     if new_brk == 0 {
-        return Ok(mm.program_break);
+        return Ok(current_break);
     }
     if new_brk < USER_HEAP_START {
+        return Ok(current_break);
+    }
+
+    let new_mapped_end = match align_up(new_brk) {
+        Ok(end) => end,
+        Err(_) => return Ok(current_break),
+    };
+    if new_mapped_end > USER_STACK_TOP {
+        return Ok(current_break);
+    }
+
+    if new_mapped_end != mapped_break {
+        let mut ms = task.memory_set.lock();
+        if new_mapped_end > mapped_break {
+            if ms.range_overlaps(mapped_break, new_mapped_end) {
+                return Ok(current_break);
+            }
+            if ms
+                .insert_framed_area(
+                    VirtAddr::new(mapped_break),
+                    VirtAddr::new(new_mapped_end),
+                    PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
+                )
+                .is_err()
+            {
+                return Ok(current_break);
+            }
+        } else if ms
+            .unmap_range(VirtAddr::new(new_mapped_end), VirtAddr::new(mapped_break))
+            .is_err()
+        {
+            return Ok(current_break);
+        }
+        ms.activate();
+    }
+
+    let mut mm = task.mm.lock();
+    mm.program_break = new_brk;
+    mm.mapped_break = new_mapped_end;
+    Ok(new_brk)
+}
+
+fn validate_mmap_flags(flags: usize) -> Result<(), SysErrNo> {
+    let unsupported = flags & !MAP_SUPPORTED;
+    if unsupported == 0 {
+        return Ok(());
+    }
+    if (flags & MAP_TYPE) == MAP_SHARED_VALIDATE {
+        return Err(SysErrNo::EOPNOTSUPP);
+    }
+    if (unsupported & (MAP_HUGETLB | MAP_SYNC)) != 0 {
         return Err(SysErrNo::EINVAL);
     }
-
-    let new_mapped_end = align_up(new_brk)?;
-    if new_mapped_end > mm.mapped_break {
-        let mapped_break = mm.mapped_break;
-        task.memory_set.lock().insert_framed_area(
-            VirtAddr::new(mapped_break),
-            VirtAddr::new(new_mapped_end),
-            PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
-        )?;
-        mm.mapped_break = new_mapped_end;
-    }
-    drop(mm);
-
-    task.memory_set.lock().activate();
-
-    task.mm.lock().program_break = new_brk;
-    Ok(new_brk)
+    Err(SysErrNo::EINVAL)
 }
 
 fn mmap_type(flags: usize) -> Result<bool, SysErrNo> {
@@ -186,8 +247,11 @@ pub fn sys_mmap(
     }
 
     let flags = flags_arg as usize;
+    validate_mmap_flags(flags)?;
     let shared = mmap_type(flags)?;
-    let fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
+    let map_fixed = (flags & MAP_FIXED) != 0;
+    let no_replace = (flags & MAP_FIXED_NOREPLACE) != 0;
+    let fixed_addr = map_fixed || no_replace;
     let anonymous = (flags & MAP_ANONYMOUS) != 0;
     let pte_flags = prot_to_pte_flags(prot)?;
     let map_len = align_up(length)?;
@@ -198,14 +262,14 @@ pub fn sys_mmap(
     if !anonymous && fd < 0 {
         return Err(SysErrNo::EBADF);
     }
-    if fixed && addr % PAGE_SIZE != 0 {
+    if fixed_addr && addr % PAGE_SIZE != 0 {
         return Err(SysErrNo::EINVAL);
     }
 
     let next_hint = task.mm.lock().next_mmap;
     let start = {
         let ms = task.memory_set.lock();
-        if fixed {
+        if fixed_addr {
             addr
         } else if addr != 0 {
             let hint = align_up(addr)?;
@@ -222,6 +286,9 @@ pub fn sys_mmap(
         }
     };
     let end = start.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
+    if start < PAGE_SIZE {
+        return Err(SysErrNo::EPERM);
+    }
     if end > USER_STACK_TOP {
         return Err(SysErrNo::ENOMEM);
     }
@@ -253,14 +320,19 @@ pub fn sys_mmap(
         )
     };
 
+    if map_fixed && !no_replace {
+        let writes = collect_shared_file_writes(&task, start, end)?;
+        write_back_shared_files(writes)?;
+    }
+
     {
         let mut ms = task.memory_set.lock();
-        if (flags & MAP_FIXED_NOREPLACE) != 0 && ms.range_overlaps(start, end) {
+        if no_replace && ms.range_overlaps(start, end) {
             return Err(SysErrNo::EEXIST);
         }
-        if fixed {
+        if map_fixed && !no_replace {
             ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
-        } else if ms.range_overlaps(start, end) {
+        } else if !fixed_addr && ms.range_overlaps(start, end) {
             return Err(SysErrNo::ENOMEM);
         }
 
