@@ -73,8 +73,12 @@ impl TestGroup {
 }
 
 #[cfg(not(feature = "libctest"))]
-const DEFAULT_ENABLED_GROUPS: &[TestGroup] =
-    &[TestGroup::Basic, TestGroup::Busybox, TestGroup::Lua, TestGroup::LibcTest];
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
+    TestGroup::Basic,
+    TestGroup::Busybox,
+    TestGroup::Lua,
+    TestGroup::LibcTest,
+];
 
 #[cfg(feature = "libctest")]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::LibcTest];
@@ -170,21 +174,109 @@ pub fn try_start_runtime_test_harness() -> bool {
 }
 
 fn run_runtime_test_harness() -> ! {
-    let scripts = collect_script_paths();
+    #[cfg(feature = "libctest")]
+    {
+        run_libctest_collection_harness();
+        crate::trap::leave_foreground_driver();
+        polyhal::instruction::shutdown();
+    }
 
-    for script in &scripts {
-        console_write("[harness] SCRIPT ");
-        console_write(script);
-        console_write("\n");
-        if !run_script_via_busybox(script) {
-            console_write("[harness] failed to launch script: ");
+    #[cfg(not(feature = "libctest"))]
+    {
+        let scripts = collect_script_paths();
+
+        for script in &scripts {
+            console_write("[harness] SCRIPT ");
             console_write(script);
+            console_write("\n");
+            if !run_script_via_busybox(script) {
+                console_write("[harness] failed to launch script: ");
+                console_write(script);
+                console_write("\n");
+            }
+        }
+
+        crate::trap::leave_foreground_driver();
+        polyhal::instruction::shutdown();
+    }
+}
+
+#[cfg(feature = "libctest")]
+fn run_libctest_collection_harness() {
+    const STATIC_SMOKE: &[&str] = &["argv"];
+    const DYNAMIC_SMOKE: &[&str] = &["argv"];
+    const SEGMENTS: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "/glibc",
+            "libctest-glibc-static",
+            "entry-static.exe",
+            STATIC_SMOKE,
+        ),
+        (
+            "/glibc",
+            "libctest-glibc-dynamic",
+            "entry-dynamic.exe",
+            DYNAMIC_SMOKE,
+        ),
+        (
+            "/musl",
+            "libctest-musl-static",
+            "entry-static.exe",
+            STATIC_SMOKE,
+        ),
+        (
+            "/musl",
+            "libctest-musl-dynamic",
+            "entry-dynamic.exe",
+            DYNAMIC_SMOKE,
+        ),
+    ];
+
+    for (root, name, entry, cases) in SEGMENTS {
+        console_write("[harness] LIBCTEST SEGMENT ");
+        console_write(name);
+        console_write("\n");
+        if !run_libctest_segment(root, name, entry, cases) {
+            console_write("[harness] failed to launch libc-test segment: ");
+            console_write(name);
             console_write("\n");
         }
     }
+}
 
-    crate::trap::leave_foreground_driver();
-    polyhal::instruction::shutdown();
+#[cfg(feature = "libctest")]
+fn run_libctest_segment(root: &str, name: &str, entry: &str, cases: &[&str]) -> bool {
+    let busybox_path = String::from("/busybox");
+    let busybox_host = crate::fs::apply_root(root, &busybox_path);
+    let mut command = format!("echo '#### OS COMP TEST GROUP START {} ####'", name);
+    for case in cases {
+        command.push_str("; ./runtest.exe -w ");
+        command.push_str(entry);
+        command.push(' ');
+        command.push_str(case);
+    }
+    command.push_str("; echo '#### OS COMP TEST GROUP END ");
+    command.push_str(name);
+    command.push_str(" ####'");
+
+    crate::fs::read_executable_file(&busybox_host).is_some()
+        && run_user_program_spec_foreground(&UserProgramSpec {
+            path: busybox_path.clone(),
+            argv: alloc::vec![
+                busybox_path.clone(),
+                String::from("sh"),
+                String::from("-c"),
+                command,
+            ],
+            envp: alloc::vec![
+                String::from("PATH=.:/:/bin:/usr/bin"),
+                String::from("LD_LIBRARY_PATH=/lib"),
+                alloc::format!("SHELL={}", busybox_path),
+            ],
+            cwd: String::from("/"),
+            root: String::from(root),
+            marker_name: None,
+        })
 }
 
 struct ForegroundDriverGuard;
@@ -282,6 +374,9 @@ fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
 }
 
 fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
+    #[cfg(feature = "libctest")]
+    const TIMEOUT_TICKS: usize = 100;
+    #[cfg(not(feature = "libctest"))]
     const TIMEOUT_TICKS: usize = 1_000;
     let mut waited = 0usize;
 
@@ -306,6 +401,7 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
             continue;
         };
         if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+            waited += 1;
             continue;
         }
 
