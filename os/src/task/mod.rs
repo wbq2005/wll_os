@@ -511,11 +511,10 @@ pub(crate) fn terminate_thread_group_peers_for_exec(task: &Arc<TaskControlBlock>
 }
 
 fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
+    crate::syscall::other::process_robust_list_on_exit(task);
     let clear_child_tid = {
-        let mut inner = task.inner.lock();
+        let inner = task.inner.lock();
         let clear_child_tid = inner.clear_child_tid;
-        inner.robust_list_head = 0;
-        inner.robust_list_len = 0;
         clear_child_tid
     };
     if clear_child_tid != 0 {
@@ -531,7 +530,7 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
                 err
             );
         }
-        crate::syscall::other::futex_wake_addr(clear_child_tid, usize::MAX);
+        crate::syscall::other::futex_wake_addr_for_task(task, clear_child_tid, usize::MAX);
     }
     task.set_exit_code(exit_code);
     *task.block_reason.lock() = None;

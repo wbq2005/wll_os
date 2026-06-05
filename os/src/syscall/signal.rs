@@ -28,6 +28,8 @@ const SIGTTIN: i32 = 21;
 const SIGTTOU: i32 = 22;
 const SIGURG: i32 = 23;
 const SIGWINCH: i32 = 28;
+const SIGCANCEL: i32 = 32;
+const SIGSETXID: i32 = 33;
 
 const SIG_BLOCK: i32 = 0;
 const SIG_UNBLOCK: i32 = 1;
@@ -125,6 +127,7 @@ pub struct SignalState {
     pub blocked: usize,
     pub pending: usize,
     pub pending_info: [PendingSignalInfo; MAX_SIGNAL_USIZE + 1],
+    pub suspend_old_mask: Option<usize>,
 }
 
 impl SignalState {
@@ -133,6 +136,7 @@ impl SignalState {
             blocked: 0,
             pending: 0,
             pending_info: [PendingSignalInfo::empty(); MAX_SIGNAL_USIZE + 1],
+            suspend_old_mask: None,
         }
     }
 
@@ -141,6 +145,7 @@ impl SignalState {
             blocked: sanitize_mask(blocked),
             pending: 0,
             pending_info: [PendingSignalInfo::empty(); MAX_SIGNAL_USIZE + 1],
+            suspend_old_mask: None,
         }
     }
 }
@@ -254,7 +259,10 @@ fn signal_bit(signum: i32) -> usize {
 }
 
 fn unblockable_mask() -> usize {
-    signal_bit(SIGKILL) | signal_bit(SIGSTOP)
+    // glibc/NPTL uses private real-time signals for cancellation and setxid.
+    // Linux keeps them out of the user-visible mask so pthread cancellation can
+    // interrupt cancellation points even if user code blocks all ordinary signals.
+    signal_bit(SIGKILL) | signal_bit(SIGSTOP) | signal_bit(SIGCANCEL) | signal_bit(SIGSETXID)
 }
 
 fn sanitize_mask(mask: usize) -> usize {
@@ -424,6 +432,40 @@ pub fn sys_sigtimedwait(set: usize, info: usize, timeout: usize, sigset_size: us
     }
 }
 
+pub fn sys_sigsuspend(mask: usize, sigset_size: usize) -> SyscallRet {
+    if mask == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if sigset_size != KERNEL_SIGSET_SIZE {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let suspend_mask = read_sigset(mask)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    {
+        let mut state = task.signal_state.lock();
+        state.suspend_old_mask = Some(state.blocked);
+        state.blocked = suspend_mask;
+    }
+
+    loop {
+        if has_deliverable_pending(&task) {
+            return Err(SysErrNo::EINTR);
+        }
+        match SIGNAL_WAIT_QUEUE.sleep_until_if(None, || Ok(!has_deliverable_pending(&task))) {
+            Ok(_) => continue,
+            Err(SysErrNo::EINTR) => return Err(SysErrNo::EINTR),
+            Err(err) => {
+                let mut state = task.signal_state.lock();
+                if let Some(old_mask) = state.suspend_old_mask.take() {
+                    state.blocked = old_mask;
+                }
+                return Err(err);
+            }
+        }
+    }
+}
+
 pub fn sys_kill(pid: i32, sig: i32) -> SyscallRet {
     if sig != 0 && !valid_signal(sig) {
         return Err(SysErrNo::EINVAL);
@@ -550,7 +592,7 @@ pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {
 
         let (old_mask, info) = {
             let mut state = task.signal_state.lock();
-            let old_mask = state.blocked;
+            let old_mask = state.suspend_old_mask.take().unwrap_or(state.blocked);
             let info = state.pending_info[signum as usize];
             let mut blocked = old_mask | action.mask;
             if (action.flags & SA_NODEFER) == 0 {

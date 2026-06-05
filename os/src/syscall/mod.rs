@@ -351,6 +351,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_TGKILL => signal::sys_tgkill(args[0] as i32, args[1] as i32, args[2] as i32),
         SYSCALL_SIGACTION => signal::sys_sigaction(args[0] as i32, args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::sys_sigprocmask(args[0] as i32, args[1], args[2], args[3]),
+        SYSCALL_SIGSUSPEND => signal::sys_sigsuspend(args[0], args[1]),
         SYSCALL_SIGTIMEDWAIT => signal::sys_sigtimedwait(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGRETURN => signal::sys_sigreturn(),
 

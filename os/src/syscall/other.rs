@@ -15,6 +15,12 @@ struct TimeSpec {
     tv_nsec: isize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RobustExitState {
+    head: usize,
+    len: usize,
+}
+
 struct FutexWaiter {
     uaddr: usize,
     key: usize,
@@ -131,6 +137,14 @@ fn validate_futex_uaddr(uaddr: usize) -> Result<(), SysErrNo> {
 
 fn futex_key_for_task(task: &Arc<crate::task::TaskControlBlock>) -> usize {
     Arc::as_ptr(&task.memory_set) as usize
+}
+
+fn futex_key_for_op(task: &Arc<crate::task::TaskControlBlock>, private: bool) -> usize {
+    if private {
+        futex_key_for_task(task)
+    } else {
+        0
+    }
 }
 
 pub fn sys_nanosleep(req: usize, rem: usize) -> SyscallRet {
@@ -306,6 +320,23 @@ pub fn sys_set_robust_list(head: usize, len: usize) -> SyscallRet {
     Ok(0)
 }
 
+pub(crate) fn take_robust_exit_state(
+    task: &Arc<crate::task::TaskControlBlock>,
+) -> Option<RobustExitState> {
+    let mut inner = task.inner.lock();
+    let state = if inner.robust_list_head != 0 {
+        Some(RobustExitState {
+            head: inner.robust_list_head,
+            len: inner.robust_list_len,
+        })
+    } else {
+        None
+    };
+    inner.robust_list_head = 0;
+    inner.robust_list_len = 0;
+    state
+}
+
 pub fn sys_getrandom(buf: usize, buflen: usize, _flags: usize) -> SyscallRet {
     if buf == 0 {
         return Err(SysErrNo::EFAULT);
@@ -419,18 +450,39 @@ pub fn sys_sched_stub() -> SyscallRet {
     Ok(0)
 }
 
-pub fn futex_wake_addr(uaddr: usize, n: usize) -> usize {
-    futex_wake_addr_bitset(uaddr, n, usize::MAX)
+pub(crate) fn futex_wake_addr_for_task(
+    task: &Arc<crate::task::TaskControlBlock>,
+    uaddr: usize,
+    n: usize,
+) -> usize {
+    futex_wake_addr_key(uaddr, futex_key_for_task(task), n, usize::MAX)
 }
 
-fn futex_wake_addr_bitset(uaddr: usize, n: usize, bitset: usize) -> usize {
+fn futex_wake_addr_private_and_shared(
+    task: &Arc<crate::task::TaskControlBlock>,
+    uaddr: usize,
+    n: usize,
+) -> usize {
+    let private_woke = futex_wake_addr_key(uaddr, futex_key_for_task(task), n, usize::MAX);
+    let remaining = n.saturating_sub(private_woke);
+    private_woke + futex_wake_addr_key(uaddr, 0, remaining, usize::MAX)
+}
+
+fn futex_wake_addr_bitset(uaddr: usize, private: bool, n: usize, bitset: usize) -> usize {
     if uaddr == 0 || n == 0 {
         return 0;
     }
     let Some(task) = current_task() else {
         return 0;
     };
-    let key = futex_key_for_task(&task);
+    let key = futex_key_for_op(&task, private);
+    futex_wake_addr_key(uaddr, key, n, bitset)
+}
+
+fn futex_wake_addr_key(uaddr: usize, key: usize, n: usize, bitset: usize) -> usize {
+    if uaddr == 0 || n == 0 {
+        return 0;
+    }
     let mut woke = 0usize;
     while woke < n {
         let waiter = {
@@ -457,6 +509,7 @@ fn futex_wait_addr(
     val: usize,
     deadline: Option<usize>,
     bitset: usize,
+    private: bool,
 ) -> SyscallRet {
     if bitset == 0 {
         return Err(SysErrNo::EINVAL);
@@ -473,7 +526,7 @@ fn futex_wait_addr(
     }
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let key = futex_key_for_task(&task);
+    let key = futex_key_for_op(&task, private);
     let token = task.next_wait_token();
     *task.wait_outcome.lock() = None;
     *task.block_reason.lock() = Some(crate::task::wait_queue::BlockReason::Futex);
@@ -532,6 +585,81 @@ fn remove_futex_waiter(uaddr: usize, key: usize, pid: usize, token: usize) -> bo
     }
 }
 
+pub(crate) fn process_robust_list_on_exit(task: &Arc<crate::task::TaskControlBlock>) {
+    const ROBUST_LIST_HEAD_SIZE: usize = 24;
+    const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
+    const FUTEX_OWNER_DIED: i32 = 0x4000_0000;
+    const FUTEX_WAITERS: i32 = 0x8000_0000u32 as i32;
+    const MAX_ROBUST_ENTRIES: usize = 2048;
+
+    let Some(state) = take_robust_exit_state(task) else {
+        return;
+    };
+    if state.len != ROBUST_LIST_HEAD_SIZE {
+        return;
+    }
+
+    let memory_set = task.memory_set.lock();
+    let read_usize_at = |addr: usize| -> Result<usize, SysErrNo> {
+        let mut bytes = [0u8; core::mem::size_of::<usize>()];
+        super::user::copy_from_user_in_memory_set(&memory_set, addr, &mut bytes)?;
+        Ok(usize::from_ne_bytes(bytes))
+    };
+    let read_i32_at = |addr: usize| -> Result<i32, SysErrNo> {
+        let mut bytes = [0u8; core::mem::size_of::<i32>()];
+        super::user::copy_from_user_in_memory_set(&memory_set, addr, &mut bytes)?;
+        Ok(i32::from_ne_bytes(bytes))
+    };
+    let write_i32_at = |addr: usize, value: i32| -> Result<(), SysErrNo> {
+        super::user::copy_to_user_in_memory_set(&memory_set, addr, &value.to_ne_bytes())
+    };
+
+    let futex_offset = match read_usize_at(state.head + core::mem::size_of::<usize>()) {
+        Ok(raw) => raw as isize,
+        Err(_) => return,
+    };
+    let pending = read_usize_at(state.head + 2 * core::mem::size_of::<usize>()).unwrap_or(0);
+    let mut next = match read_usize_at(state.head) {
+        Ok(next) => next,
+        Err(_) => return,
+    };
+    let tid = task.pid.0 as i32;
+
+    let mark_entry = |entry: usize| {
+        if entry == 0 || entry == state.head {
+            return;
+        }
+        let Some(futex_addr) = (entry as isize)
+            .checked_add(futex_offset)
+            .and_then(|addr| usize::try_from(addr).ok())
+        else {
+            return;
+        };
+        let Ok(value) = read_i32_at(futex_addr) else {
+            return;
+        };
+        if (value & FUTEX_TID_MASK) != tid {
+            return;
+        }
+        let new_value = (value & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        if write_i32_at(futex_addr, new_value).is_ok() {
+            futex_wake_addr_private_and_shared(task, futex_addr, 1);
+        }
+    };
+
+    mark_entry(pending);
+    for _ in 0..MAX_ROBUST_ENTRIES {
+        if next == 0 || next == state.head {
+            break;
+        }
+        mark_entry(next);
+        match read_usize_at(next) {
+            Ok(new_next) => next = new_next,
+            Err(_) => break,
+        }
+    }
+}
+
 pub fn sys_futex_stub(
     uaddr: usize,
     futex_op: usize,
@@ -545,26 +673,28 @@ pub fn sys_futex_stub(
     const FUTEX_WAIT_BITSET: usize = 9;
     const FUTEX_WAKE_BITSET: usize = 10;
     const FUTEX_CMD_MASK: usize = 0x7f;
+    const FUTEX_PRIVATE_FLAG: usize = 0x80;
     let op = futex_op & FUTEX_CMD_MASK;
+    let private = (futex_op & FUTEX_PRIVATE_FLAG) != 0;
     match op {
         FUTEX_WAIT => {
             let deadline = deadline_from_timespec_ptr(timeout)?;
-            futex_wait_addr(uaddr, val, deadline, usize::MAX)
+            futex_wait_addr(uaddr, val, deadline, usize::MAX, private)
         }
         FUTEX_WAKE => {
             validate_futex_uaddr(uaddr)?;
-            Ok(futex_wake_addr(uaddr, val))
+            Ok(futex_wake_addr_bitset(uaddr, private, val, usize::MAX))
         }
         FUTEX_WAIT_BITSET => {
             let deadline = deadline_from_absolute_timespec_ptr(timeout)?;
-            futex_wait_addr(uaddr, val, deadline, _val3)
+            futex_wait_addr(uaddr, val, deadline, _val3, private)
         }
         FUTEX_WAKE_BITSET => {
             validate_futex_uaddr(uaddr)?;
             if _val3 == 0 {
                 return Err(SysErrNo::EINVAL);
             }
-            Ok(futex_wake_addr_bitset(uaddr, val, _val3))
+            Ok(futex_wake_addr_bitset(uaddr, private, val, _val3))
         }
         _ => Err(SysErrNo::ENOSYS),
     }

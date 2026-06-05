@@ -74,7 +74,7 @@ impl TestGroup {
 
 #[cfg(not(feature = "libctest"))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] =
-    &[TestGroup::Basic, TestGroup::Busybox, TestGroup::Lua];
+    &[TestGroup::Basic, TestGroup::Busybox, TestGroup::Lua, TestGroup::LibcTest];
 
 #[cfg(feature = "libctest")]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::LibcTest];

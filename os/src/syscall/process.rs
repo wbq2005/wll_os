@@ -758,7 +758,22 @@ fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> Sysca
         if !has_matching_child(&task, target) {
             return Err(SysErrNo::ECHILD);
         }
-        let _ = crate::task::wait_queue::sleep_on_child_exit()?;
+        match crate::task::wait_queue::sleep_on_child_exit() {
+            Ok(_) => {}
+            Err(SysErrNo::EINTR) => {
+                if let Some((cpid, exit_code)) = reap_zombie_child(&task, target) {
+                    if !status.is_null() {
+                        write_user_i32(status as usize, exit_code << 8)?;
+                    }
+                    return Ok(cpid);
+                }
+                if has_matching_child(&task, target) {
+                    continue;
+                }
+                return Err(SysErrNo::ECHILD);
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
 

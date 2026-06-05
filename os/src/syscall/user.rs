@@ -48,12 +48,14 @@ pub fn copy_to_user_in_memory_set(
     Ok(())
 }
 
-pub fn copy_from_user(src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
+pub fn copy_from_user_in_memory_set(
+    memory_set: &MemorySet,
+    src: usize,
+    dst: &mut [u8],
+) -> Result<(), SysErrNo> {
     if src == 0 && !dst.is_empty() {
         return Err(SysErrNo::EFAULT);
     }
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
     for (i, byte) in dst.iter_mut().enumerate() {
         let pa = memory_set
             .translate(VirtAddr::new(src + i))
@@ -61,6 +63,15 @@ pub fn copy_from_user(src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
         *byte = unsafe { *(pa.raw() as *const u8) };
     }
     Ok(())
+}
+
+pub fn copy_from_user(src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
+    if src == 0 && !dst.is_empty() {
+        return Err(SysErrNo::EFAULT);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let memory_set = task.memory_set.lock();
+    copy_from_user_in_memory_set(&memory_set, src, dst)
 }
 
 pub fn copy_object_to_user<T>(dst: usize, obj: &T) -> Result<(), SysErrNo> {
