@@ -31,10 +31,31 @@ const SIG_BLOCK: i32 = 0;
 const SIG_UNBLOCK: i32 = 1;
 const SIG_SETMASK: i32 = 2;
 
+const SA_NOCLDSTOP: usize = 0x0000_0001;
+const SA_NOCLDWAIT: usize = 0x0000_0002;
+const SA_SIGINFO: usize = 0x0000_0004;
+const SA_UNSUPPORTED: usize = 0x0000_0400;
+const SA_EXPOSE_TAGBITS: usize = 0x0000_0800;
+const SA_RESTORER: usize = 0x0400_0000;
+const SA_ONSTACK: usize = 0x0800_0000;
+const SA_RESTART: usize = 0x1000_0000;
+const SA_INTERRUPT: usize = 0x2000_0000;
 const SA_NODEFER: usize = 0x4000_0000;
 const SA_RESETHAND: usize = 0x8000_0000;
+const KNOWN_SIGACTION_FLAGS: usize = SA_NOCLDSTOP
+    | SA_NOCLDWAIT
+    | SA_SIGINFO
+    | SA_EXPOSE_TAGBITS
+    | SA_RESTORER
+    | SA_ONSTACK
+    | SA_RESTART
+    | SA_INTERRUPT
+    | SA_NODEFER
+    | SA_RESETHAND;
 
 const SIGNAL_FRAME_MAGIC: usize = 0x574c_4c5f_5349_4746; // "WLL_SIGF"
+const SI_USER: i32 = 0;
+const SI_TKILL: i32 = -6;
 
 #[cfg(target_arch = "riscv64")]
 const SIGNAL_TRAMPOLINE_CODE: &[u8] = &[
@@ -54,12 +75,14 @@ const SIGNAL_TRAMPOLINE_CODE: &[u8] = &[
 pub struct KernelSigAction {
     pub handler: usize,
     pub flags: usize,
+    pub restorer: usize,
     pub mask: usize,
 }
 
 const DEFAULT_SIGACTION: KernelSigAction = KernelSigAction {
     handler: SIG_DFL,
     flags: 0,
+    restorer: 0,
     mask: 0,
 };
 
@@ -88,6 +111,7 @@ impl SignalActions {
 pub struct SignalState {
     pub blocked: usize,
     pub pending: usize,
+    pub pending_info: [PendingSignalInfo; MAX_SIGNAL_USIZE + 1],
 }
 
 impl SignalState {
@@ -95,6 +119,7 @@ impl SignalState {
         Self {
             blocked: 0,
             pending: 0,
+            pending_info: [PendingSignalInfo::empty(); MAX_SIGNAL_USIZE + 1],
         }
     }
 
@@ -102,6 +127,7 @@ impl SignalState {
         Self {
             blocked: sanitize_mask(blocked),
             pending: 0,
+            pending_info: [PendingSignalInfo::empty(); MAX_SIGNAL_USIZE + 1],
         }
     }
 }
@@ -121,7 +147,59 @@ pub fn dup_signal_actions(src: &SharedSignalActions) -> SharedSignalActions {
 struct UserSigAction {
     handler: usize,
     flags: usize,
+    restorer: usize,
     mask: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserSigInfo {
+    signo: i32,
+    errno: i32,
+    code: i32,
+    _align: i32,
+    pid: i32,
+    uid: u32,
+    _reserved: [u8; 104],
+}
+
+#[derive(Clone, Copy)]
+pub struct PendingSignalInfo {
+    code: i32,
+    sender_pid: i32,
+    sender_uid: u32,
+}
+
+impl PendingSignalInfo {
+    const fn empty() -> Self {
+        Self {
+            code: SI_USER,
+            sender_pid: 0,
+            sender_uid: 0,
+        }
+    }
+
+    fn from_current(code: i32) -> Self {
+        Self {
+            code,
+            sender_pid: current_task()
+                .map(|task| task.thread_group.tgid() as i32)
+                .unwrap_or(0),
+            sender_uid: 0,
+        }
+    }
+
+    fn user_siginfo(self, signum: i32) -> UserSigInfo {
+        UserSigInfo {
+            signo: signum,
+            errno: 0,
+            code: self.code,
+            _align: 0,
+            pid: self.sender_pid,
+            uid: self.sender_uid,
+            _reserved: [0; 104],
+        }
+    }
 }
 
 #[repr(C)]
@@ -131,6 +209,7 @@ struct SignalFrame {
     frame_size: usize,
     signo: usize,
     old_mask: usize,
+    siginfo: UserSigInfo,
     context: ArchSignalContext,
 }
 
@@ -169,6 +248,10 @@ fn sanitize_mask(mask: usize) -> usize {
     mask & !unblockable_mask()
 }
 
+fn sanitize_flags(flags: usize) -> usize {
+    flags & KNOWN_SIGACTION_FLAGS & !SA_UNSUPPORTED
+}
+
 fn cannot_catch_or_ignore(signum: i32) -> bool {
     signum == SIGKILL || signum == SIGSTOP
 }
@@ -188,6 +271,7 @@ fn user_action(action: KernelSigAction) -> UserSigAction {
     UserSigAction {
         handler: action.handler,
         flags: action.flags,
+        restorer: action.restorer,
         mask: action.mask,
     }
 }
@@ -195,7 +279,8 @@ fn user_action(action: KernelSigAction) -> UserSigAction {
 fn kernel_action(action: UserSigAction) -> KernelSigAction {
     KernelSigAction {
         handler: action.handler,
-        flags: action.flags,
+        flags: sanitize_flags(action.flags),
+        restorer: action.restorer,
         mask: sanitize_mask(action.mask),
     }
 }
@@ -300,7 +385,7 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallRet {
         return Ok(0);
     }
 
-    deliver_to_process(&targets, sig);
+    deliver_to_process(&targets, sig, PendingSignalInfo::from_current(SI_USER));
     Ok(0)
 }
 
@@ -316,7 +401,7 @@ pub fn sys_tkill(tid: i32, sig: i32) -> SyscallRet {
         return Err(SysErrNo::ESRCH);
     }
     if sig != 0 {
-        queue_signal(&task, sig);
+        queue_signal(&task, sig, PendingSignalInfo::from_current(SI_TKILL));
     }
     Ok(0)
 }
@@ -333,7 +418,7 @@ pub fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> SyscallRet {
         return Err(SysErrNo::ESRCH);
     }
     if sig != 0 {
-        queue_signal(&task, sig);
+        queue_signal(&task, sig, PendingSignalInfo::from_current(SI_TKILL));
     }
     Ok(0)
 }
@@ -388,33 +473,35 @@ pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {
         let action = task.signal_actions.lock().get(signum);
 
         if action.handler == SIG_IGN || (action.handler == SIG_DFL && default_ignored(signum)) {
-            task.signal_state.lock().pending &= !signal_bit(signum);
+            clear_pending_signal(&task, signum);
             continue;
         }
 
         if action.handler == SIG_DFL {
-            task.signal_state.lock().pending &= !signal_bit(signum);
+            clear_pending_signal(&task, signum);
             crate::task::terminate_task_group(&task, default_exit_code(signum));
             return false;
         }
 
-        let old_mask = {
+        let (old_mask, info) = {
             let mut state = task.signal_state.lock();
             let old_mask = state.blocked;
+            let info = state.pending_info[signum as usize];
             let mut blocked = old_mask | action.mask;
             if (action.flags & SA_NODEFER) == 0 {
                 blocked |= signal_bit(signum);
             }
             state.pending &= !signal_bit(signum);
+            state.pending_info[signum as usize] = PendingSignalInfo::empty();
             state.blocked = sanitize_mask(blocked);
-            old_mask
+            (old_mask, info)
         };
 
         if (action.flags & SA_RESETHAND) != 0 && !cannot_catch_or_ignore(signum) {
             task.signal_actions.lock().set(signum, DEFAULT_SIGACTION);
         }
 
-        if setup_signal_frame(ctx, signum, action.handler, old_mask).is_err() {
+        if setup_signal_frame(ctx, signum, action, old_mask, info).is_err() {
             crate::task::terminate_task_group(&task, default_exit_code(SIGSEGV));
             return false;
         }
@@ -422,18 +509,22 @@ pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {
     }
 }
 
-fn deliver_to_process(targets: &[Arc<TaskControlBlock>], signum: i32) {
+fn deliver_to_process(targets: &[Arc<TaskControlBlock>], signum: i32, info: PendingSignalInfo) {
     if let Some(task) = targets
         .iter()
-        .find(|task| task.status() != TaskStatus::Zombie)
+        .find(|task| task.status() != TaskStatus::Zombie && signal_is_unblocked(task, signum))
+        .or_else(|| targets.iter().find(|task| task.status() != TaskStatus::Zombie))
         .or_else(|| targets.first())
     {
-        queue_signal(task, signum);
+        queue_signal(task, signum, info);
     }
 }
 
-fn queue_signal(task: &Arc<TaskControlBlock>, signum: i32) {
-    task.signal_state.lock().pending |= signal_bit(signum);
+fn queue_signal(task: &Arc<TaskControlBlock>, signum: i32, info: PendingSignalInfo) {
+    let mut state = task.signal_state.lock();
+    state.pending |= signal_bit(signum);
+    state.pending_info[signum as usize] = info;
+    drop(state);
     wake_for_signal(task);
 }
 
@@ -451,6 +542,17 @@ fn next_unblocked_pending(task: &Arc<TaskControlBlock>) -> Option<i32> {
     } else {
         Some(pending.trailing_zeros() as i32 + 1)
     }
+}
+
+fn signal_is_unblocked(task: &Arc<TaskControlBlock>, signum: i32) -> bool {
+    let state = task.signal_state.lock();
+    (state.blocked & signal_bit(signum)) == 0
+}
+
+fn clear_pending_signal(task: &Arc<TaskControlBlock>, signum: i32) {
+    let mut state = task.signal_state.lock();
+    state.pending &= !signal_bit(signum);
+    state.pending_info[signum as usize] = PendingSignalInfo::empty();
 }
 
 fn has_deliverable_pending(task: &Arc<TaskControlBlock>) -> bool {
@@ -473,8 +575,9 @@ fn has_deliverable_pending(task: &Arc<TaskControlBlock>) -> bool {
 fn setup_signal_frame(
     ctx: &mut TrapFrame,
     signum: i32,
-    handler: usize,
+    action: KernelSigAction,
     old_mask: usize,
+    info: PendingSignalInfo,
 ) -> Result<(), SysErrNo> {
     let frame_size = core::mem::size_of::<SignalFrame>();
     let frame_addr = ctx[TrapFrameArgs::SP]
@@ -486,16 +589,25 @@ fn setup_signal_frame(
         frame_size,
         signo: signum as usize,
         old_mask,
+        siginfo: info.user_siginfo(signum),
         context: arch_context_from_trapframe(ctx),
     };
     super::user::copy_object_to_user(frame_addr, &frame)?;
 
     ctx[TrapFrameArgs::SP] = frame_addr;
-    ctx[TrapFrameArgs::SEPC] = handler;
-    ctx[TrapFrameArgs::RA] = signal_trampoline_addr();
+    ctx[TrapFrameArgs::SEPC] = action.handler;
+    ctx[TrapFrameArgs::RA] = if (action.flags & SA_RESTORER) != 0 && action.restorer != 0 {
+        action.restorer
+    } else {
+        signal_trampoline_addr()
+    };
     ctx[TrapFrameArgs::ARG0] = signum as usize;
-    ctx[TrapFrameArgs::ARG1] = 0;
-    ctx[TrapFrameArgs::ARG2] = frame_addr;
+    ctx[TrapFrameArgs::ARG1] = if (action.flags & SA_SIGINFO) != 0 {
+        frame_addr + core::mem::offset_of!(SignalFrame, siginfo)
+    } else {
+        0
+    };
+    ctx[TrapFrameArgs::ARG2] = frame_addr + core::mem::offset_of!(SignalFrame, context);
     Ok(())
 }
 
