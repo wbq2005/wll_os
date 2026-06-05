@@ -40,6 +40,7 @@ riscv = []
 loongarch = ["dep:loongArch64"]
 no-init-idle = []
 dev-preload = []
+libctest = []
 
 [[bin]]
 name = "wll_OS"

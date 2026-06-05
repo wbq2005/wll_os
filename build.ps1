@@ -3,7 +3,9 @@ param(
     [ValidateSet("riscv64", "loongarch64", "both")]
     [string]$Arch = "both",
 
-    [switch]$Check
+    [switch]$Check,
+
+    [switch]$LibcTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +38,9 @@ function Build-Arch {
         $cargoArgs = @($MODE, "-p", "wll_OS", "--release", "--target", $TARGET)
         if ($EXTRA -ne "") {
             $cargoArgs += $EXTRA.Split(" ") | Where-Object { $_ -ne "" }
+        }
+        if ($LibcTest) {
+            $cargoArgs += @("--features", "libctest")
         }
         $cargoArgs += @("-Z", "build-std=core,alloc")
 

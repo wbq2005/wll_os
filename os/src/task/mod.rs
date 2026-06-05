@@ -511,7 +511,13 @@ pub(crate) fn terminate_thread_group_peers_for_exec(task: &Arc<TaskControlBlock>
 }
 
 fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
-    let clear_child_tid = task.inner.lock().clear_child_tid;
+    let clear_child_tid = {
+        let mut inner = task.inner.lock();
+        let clear_child_tid = inner.clear_child_tid;
+        inner.robust_list_head = 0;
+        inner.robust_list_len = 0;
+        clear_child_tid
+    };
     if clear_child_tid != 0 {
         let bytes = 0i32.to_ne_bytes();
         let memory_set = task.memory_set.lock();
@@ -905,6 +911,8 @@ pub struct TaskControlBlockInner {
     pub mapped_break: usize,
     pub next_mmap: usize,
     pub clear_child_tid: usize,
+    pub robust_list_head: usize,
+    pub robust_list_len: usize,
 }
 
 /// 任务状态

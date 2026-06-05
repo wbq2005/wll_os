@@ -72,8 +72,12 @@ impl TestGroup {
     }
 }
 
+#[cfg(not(feature = "libctest"))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] =
     &[TestGroup::Basic, TestGroup::Busybox, TestGroup::Lua];
+
+#[cfg(feature = "libctest")]
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::LibcTest];
 
 fn console_write(msg: &str) {
     for b in msg.bytes() {
@@ -169,6 +173,9 @@ fn run_runtime_test_harness() -> ! {
     let scripts = collect_script_paths();
 
     for script in &scripts {
+        console_write("[harness] SCRIPT ");
+        console_write(script);
+        console_write("\n");
         if !run_script_via_busybox(script) {
             console_write("[harness] failed to launch script: ");
             console_write(script);
@@ -364,13 +371,6 @@ fn dirname(path: &str) -> String {
     }
 }
 
-fn is_libc_test_script(path: &str) -> bool {
-    testcode_stem(path)
-        .and_then(TestGroup::from_stem)
-        .map(|group| group == TestGroup::LibcTest)
-        .unwrap_or(false)
-}
-
 fn ensure_busybox_applet_alias(root: &str, busybox_host: &str, applet: &str) -> Option<()> {
     let alias_logical = if applet.starts_with('/') {
         applet.to_string()
@@ -393,8 +393,7 @@ fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
     let (root, logical_script) = logical_path_for_script(script_path)?;
     let busybox_path = String::from("/busybox");
     let busybox_host = crate::fs::apply_root(&root, &busybox_path);
-    let mut script_host = crate::fs::apply_root(&root, &logical_script);
-    let mut script_arg = logical_script.clone();
+    let script_host = crate::fs::apply_root(&root, &logical_script);
 
     crate::fs::read_executable_file(&busybox_host)?;
     crate::fs::read_file(&script_host)?;
@@ -402,38 +401,12 @@ fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
     ensure_busybox_applet_alias(&root, &busybox_host, "sh")?;
     ensure_busybox_applet_alias(&root, &busybox_host, "/bin/sh")?;
 
-    if is_libc_test_script(&logical_script) {
-        let group = if root == "/glibc" {
-            "libctest-glibc"
-        } else if root == "/musl" {
-            "libctest-musl"
-        } else {
-            "libctest"
-        };
-        // Temporary compatibility wrapper: the official libctest_testcode.sh is
-        // discovered, but current staged runs enter run-static/run-dynamic via
-        // BusyBox instead of executing the official script body verbatim.
-        script_arg = String::from("/libctest_harness.sh");
-        script_host = crate::fs::apply_root(&root, &script_arg);
-        let body = alloc::format!(
-            "./busybox echo \"#### OS COMP TEST GROUP START {} ####\"\n\
-             ./busybox sh ./run-static.sh\n\
-             ./busybox sh ./run-dynamic.sh\n\
-             ./busybox echo \"#### OS COMP TEST GROUP END {} ####\"\n",
-            group,
-            group
-        );
-        crate::fs::MEM_FS
-            .lock()
-            .add_file(&script_host, body.into_bytes());
-    }
-
     Some(UserProgramSpec {
         path: busybox_path.clone(),
         argv: alloc::vec![
             busybox_path.clone(),
             String::from("sh"),
-            script_arg,
+            logical_script.clone(),
         ],
         envp: alloc::vec![
             String::from("PATH=.:/:/bin:/usr/bin"),

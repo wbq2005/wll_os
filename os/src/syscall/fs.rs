@@ -691,16 +691,13 @@ fn readlink_target_at(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
     // glibc asks /proc/self/exe during startup to name the executable used for
     // diagnostics and pointer-guard setup. Model this as a procfs symlink
     // backed by task metadata rather than a BusyBox-specific string.
-    if path == "/proc/self/exe" || path == "/proc/thread-self/exe" {
-        let task = current_task().ok_or(SysErrNo::ESRCH)?;
-        let exec_path = task.inner.lock().exec_path.clone();
-        if exec_path.is_empty() {
-            return Err(SysErrNo::ENOENT);
-        }
-        return Ok(exec_path);
+    let logical = resolve_path_str(dirfd, path)?;
+    if let Some(target) = super::process::proc_self_exe_target(&logical)? {
+        return Ok(target);
     }
 
-    let (_logical_path, host_path) = resolve_host_path_str(dirfd, path)?;
+    let root = current_root()?;
+    let host_path = crate::fs::apply_root(&root, &logical);
     super::with_kernel_page_table(|| crate::fs::read_link(&host_path))
 }
 

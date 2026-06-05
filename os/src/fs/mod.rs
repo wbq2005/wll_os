@@ -275,6 +275,8 @@ fn init_pseudo_files() {
     let meminfo = b"MemTotal:       131072 kB\nMemFree:         65536 kB\nMemAvailable:    65536 kB\nBuffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\nSwapFree:            0 kB\n";
     let mut fs = MEM_FS.lock();
     for root in ["", "/musl", "/glibc"] {
+        fs.add_dir(&alloc::format!("{}/tmp", root));
+        fs.add_dir(&alloc::format!("{}/var/tmp", root));
         fs.add_file(&alloc::format!("{}/proc/mounts", root), mounts.to_vec());
         fs.add_file(&alloc::format!("{}/etc/mtab", root), mounts.to_vec());
         fs.add_file(&alloc::format!("{}/proc/meminfo", root), meminfo.to_vec());

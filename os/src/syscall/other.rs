@@ -294,7 +294,15 @@ pub fn sys_set_tid_address(tidptr: usize) -> SyscallRet {
     Ok(task.pid.0)
 }
 
-pub fn sys_set_robust_list(_head: usize, _len: usize) -> SyscallRet {
+pub fn sys_set_robust_list(head: usize, len: usize) -> SyscallRet {
+    const ROBUST_LIST_HEAD_SIZE: usize = 24;
+    if len != ROBUST_LIST_HEAD_SIZE {
+        return Err(SysErrNo::EINVAL);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut inner = task.inner.lock();
+    inner.robust_list_head = head;
+    inner.robust_list_len = len;
     Ok(0)
 }
 

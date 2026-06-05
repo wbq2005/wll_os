@@ -212,6 +212,18 @@ fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
     super::user::read_cstr_null_empty(ptr as usize)
 }
 
+pub(crate) fn proc_self_exe_target(path: &str) -> Result<Option<String>, SysErrNo> {
+    if path != "/proc/self/exe" && path != "/proc/thread-self/exe" {
+        return Ok(None);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let exec_path = task.inner.lock().exec_path.clone();
+    if exec_path.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+    Ok(Some(exec_path))
+}
+
 /// 在用户栈上构造 argc/argv/envp/auxv 布局，返回新的栈顶。
 /// 布局（从高到低）：
 ///   - 字符串数据（argv[i] 的 c-string 内容, envp[i] 的内容）
@@ -423,7 +435,9 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     } else {
         (String::from("/"), String::from("/"))
     };
-    let logical_path = crate::fs::resolve_path(&cwd, &path_str);
+    let requested_logical_path = crate::fs::resolve_path(&cwd, &path_str);
+    let logical_path =
+        proc_self_exe_target(&requested_logical_path)?.unwrap_or(requested_logical_path);
     let host_path = crate::fs::apply_root(&root, &logical_path);
 
     let mut elf_data = match super::with_kernel_page_table(|| read_executable_file(&host_path)) {
@@ -629,6 +643,8 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
 
             // 重置堆
             inner.exec_path = exec_logical_path.clone();
+            inner.robust_list_head = 0;
+            inner.robust_list_len = 0;
             inner.fd_table.lock().close_on_exec();
         }
         {
@@ -892,6 +908,8 @@ pub fn sys_clone(
             } else {
                 0
             },
+            robust_list_head: 0,
+            robust_list_len: 0,
         }),
         task_ctx: crate::task::KernelCtx::new(crate::task::context::TaskContext::zero_init()),
         memory_set,
