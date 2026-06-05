@@ -59,7 +59,7 @@ Status legend:
 | --- | --- | --- | --- |
 | `basic` | Pass-oriented | `clone`, `wait4`, `pipe2`, `read/write`, `brk`, `mmap`, `yield`, basic stat/open are `real`/`partial`; pipe blocking/nonblocking and readiness now use real pipe buffer state; `wait4(WNOHANG)` and child zombie reaping use task/thread-group state instead of harness markers. | Foreground scheduling remains cooperative. Pipe atomic-write guarantees and descriptor-shared status flags are still partial. |
 | `busybox` | Mostly usable | Shell launch through BusyBox, ext4 read/write/create/truncate, directory ops, `poll/select`, `sendfile`, symlink/link/rename, pipe `F_SETFL(O_NONBLOCK)`, bounded pipe backpressure, `FD_CLOEXEC`, `access`, `readlinkat`, and ext4-backed `statfs` are `partial`. | Terminal/ioctl semantics, procfs breadth, full descriptor-shared flags, cross-backend symlink/link/rename behavior, and shell job-control calls are `stub-risk`. |
-| `lua` | Not enabled by default | Needs libc startup, `open/read/write/lseek/stat`, `mmap/brk`, time calls, `getrandom`, `futex` for libc. | Floating-point signal edge cases, `mprotect`, `rt_sig*`, and allocator-heavy mmap behavior are likely pressure points. |
+| `lua` | Pass-oriented | Enabled in the default runtime harness after `basic` and `busybox`. Verified on real RISC-V and LoongArch QEMU logs for both glibc and musl. Relies on BusyBox shell script execution, `/bin/busybox` shebang fallback to the libc-rooted `/busybox`, libc startup, `open/read/write/lseek/stat`, `mmap/brk`, time calls, `getrandom`, and `futex`. | This proves the packaged 9 Lua scripts, not the full later-suite surface. Floating-point signal edge cases, `mprotect`, `rt_sig*`, and allocator-heavy mmap behavior remain likely pressure points for broader workloads. |
 | `libc-test` | Not enabled by default | Broad syscall ABI surface exists for many startup and FS cases; process basics now include TGID/TID distinction, `FD_CLOEXEC`, and process-zombie `wait4`. | High risk in signals, pthread/futex semantics, advanced `fcntl`, `madvise`, `clock_nanosleep`, `setitimer`, `sigsuspend`, `sigtimedwait`, `getgroups`, `rlimit`. |
 | `iozone` | Not enabled by default | Sequential file create/read/write/read-back, `O_APPEND`, truncate/ftruncate size changes, lseek-past-EOF without size growth, `sync`, and stat size/blocks are `partial` but now backed by fd/VFS/ext4 state rather than test-path special cases. Simple `MAP_SHARED` munmap writeback on ext4 is `partial`. | `fsync/fdatasync` are compatibility no-ops over write-through backends and remain `stub-risk` for persistence semantics. `pwrite64`, `pwritev`, `preadv`, dirty tracking, `msync`, descriptor-shared offsets, sparse-hole accounting, and sustained large I/O performance remain `missing`/`stub-risk`. |
 | `UnixBench` | Not enabled by default | Process creation, pipe, exec, time, file I/O are `partial`. | Fork/exec throughput will expose scheduler fairness, wait queues, pipe buffering, `times/getrusage`, and shell workload gaps. |
@@ -85,8 +85,8 @@ Status legend:
 
 ## Suggested Enable Order
 
-1. Keep `basic` and `busybox` as the default harness groups.
-2. Enable `lua` next; it exercises libc and file paths without demanding a huge syscall surface.
+1. Keep `basic`, `busybox`, and `lua` as the default harness groups.
+2. Keep all three groups under dual-architecture regression before enabling another suite.
 3. Enable `iozone` after ext4 write/truncate/fsync and mmap behavior are stable.
 4. Enable `UnixBench` after scheduler, pipe, wait, and timing behavior are less synthetic.
 5. Enable `libc-test` in small categories, starting with file/process/memory, then pthread/signal.

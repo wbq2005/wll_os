@@ -72,7 +72,8 @@ impl TestGroup {
     }
 }
 
-const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Basic, TestGroup::Busybox];
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] =
+    &[TestGroup::Basic, TestGroup::Busybox, TestGroup::Lua];
 
 fn console_write(msg: &str) {
     for b in msg.bytes() {

@@ -151,12 +151,21 @@ fn script_interpreter_spec(
         crate::fs::file_exists(&crate::fs::apply_root(root, "/busybox"))
     });
 
-    if !interp_exists && interp_logical == "/bin/sh" && busybox_exists {
+    if !interp_exists
+        && (interp_logical == "/bin/sh" || interp_logical == "/bin/busybox")
+        && busybox_exists
+    {
         interp_logical = String::from("/busybox");
         argv.push(interp_logical.clone());
-        argv.push(String::from("sh"));
-        if let Some(arg) = interp.arg {
-            argv.push(arg);
+        if interp.path.ends_with("/busybox") {
+            if let Some(arg) = interp.arg {
+                argv.push(arg);
+            }
+        } else {
+            argv.push(String::from("sh"));
+            if let Some(arg) = interp.arg {
+                argv.push(arg);
+            }
         }
     } else {
         argv.push(interp_logical.clone());
