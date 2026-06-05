@@ -1,10 +1,12 @@
 use super::SyscallRet;
 use crate::mm::memory_set::MemorySet;
 use crate::mm::page_table::PTEFlags;
-use crate::task::wait_queue::WaitOutcome;
+use crate::task::wait_queue::{BlockReason, WaitOutcome, WaitQueue};
 use crate::task::{current_task, TaskControlBlock, TaskStatus};
+use crate::timer;
 use crate::utils::error::SysErrNo;
 use alloc::sync::Arc;
+use lazy_static::lazy_static;
 use polyhal::VirtAddr;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 use spin::Mutex;
@@ -56,6 +58,17 @@ const KNOWN_SIGACTION_FLAGS: usize = SA_NOCLDSTOP
 const SIGNAL_FRAME_MAGIC: usize = 0x574c_4c5f_5349_4746; // "WLL_SIGF"
 const SI_USER: i32 = 0;
 const SI_TKILL: i32 = -6;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TimeSpec {
+    tv_sec: isize,
+    tv_nsec: isize,
+}
+
+lazy_static! {
+    static ref SIGNAL_WAIT_QUEUE: WaitQueue = WaitQueue::new(BlockReason::Signal);
+}
 
 #[cfg(target_arch = "riscv64")]
 const SIGNAL_TRAMPOLINE_CODE: &[u8] = &[
@@ -267,6 +280,21 @@ fn default_exit_code(signum: i32) -> i32 {
     128 + signum
 }
 
+fn read_sigset(addr: usize) -> Result<usize, SysErrNo> {
+    let mut bytes = [0u8; KERNEL_SIGSET_SIZE];
+    super::user::copy_from_user(addr, &mut bytes)?;
+    Ok(sanitize_mask(usize::from_ne_bytes(bytes)))
+}
+
+fn duration_us_from_timespec(ts: TimeSpec) -> Result<usize, SysErrNo> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(SysErrNo::EINVAL);
+    }
+    Ok((ts.tv_sec as usize)
+        .saturating_mul(1_000_000)
+        .saturating_add((ts.tv_nsec as usize).div_ceil(1000)))
+}
+
 fn user_action(action: KernelSigAction) -> UserSigAction {
     UserSigAction {
         handler: action.handler,
@@ -357,6 +385,43 @@ pub fn sys_sigprocmask(how: i32, set: usize, oldset: usize, sigset_size: usize) 
         };
     }
     Ok(0)
+}
+
+pub fn sys_sigtimedwait(set: usize, info: usize, timeout: usize, sigset_size: usize) -> SyscallRet {
+    if set == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if sigset_size != KERNEL_SIGSET_SIZE {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let wait_mask = read_sigset(set)?;
+    let deadline_us = if timeout != 0 {
+        let timeout = super::user::copy_object_from_user::<TimeSpec>(timeout)?;
+        Some(timer::deadline_after_us(duration_us_from_timespec(timeout)?))
+    } else {
+        None
+    };
+
+    loop {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        if let Some((signum, pending_info)) = take_pending_from_mask(&task, wait_mask) {
+            if info != 0 {
+                super::user::copy_object_to_user(info, &pending_info.user_siginfo(signum))?;
+            }
+            return Ok(signum as usize);
+        }
+
+        match SIGNAL_WAIT_QUEUE.sleep_until_if(deadline_us, || {
+            let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            Ok(!has_pending_in_mask(&task, wait_mask))
+        }) {
+            Ok(WaitOutcome::TimedOut) => return Err(SysErrNo::EAGAIN),
+            Ok(_) => continue,
+            Err(SysErrNo::EINTR) => return Err(SysErrNo::EINTR),
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 pub fn sys_kill(pid: i32, sig: i32) -> SyscallRet {
@@ -529,6 +594,7 @@ fn queue_signal(task: &Arc<TaskControlBlock>, signum: i32, info: PendingSignalIn
     state.pending |= signal_bit(signum);
     state.pending_info[signum as usize] = info;
     drop(state);
+    SIGNAL_WAIT_QUEUE.wake_all();
     wake_for_signal(task);
 }
 
@@ -557,6 +623,27 @@ fn clear_pending_signal(task: &Arc<TaskControlBlock>, signum: i32) {
     let mut state = task.signal_state.lock();
     state.pending &= !signal_bit(signum);
     state.pending_info[signum as usize] = PendingSignalInfo::empty();
+}
+
+fn has_pending_in_mask(task: &Arc<TaskControlBlock>, mask: usize) -> bool {
+    let state = task.signal_state.lock();
+    (state.pending & mask) != 0
+}
+
+fn take_pending_from_mask(
+    task: &Arc<TaskControlBlock>,
+    mask: usize,
+) -> Option<(i32, PendingSignalInfo)> {
+    let mut state = task.signal_state.lock();
+    let pending = state.pending & mask;
+    if pending == 0 {
+        return None;
+    }
+    let signum = pending.trailing_zeros() as i32 + 1;
+    let info = state.pending_info[signum as usize];
+    state.pending &= !signal_bit(signum);
+    state.pending_info[signum as usize] = PendingSignalInfo::empty();
+    Some((signum, info))
 }
 
 fn has_deliverable_pending(task: &Arc<TaskControlBlock>) -> bool {

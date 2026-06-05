@@ -73,7 +73,7 @@ impl TestGroup {
 }
 
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] =
-    &[TestGroup::Basic, TestGroup::Busybox, TestGroup::Lua];
+    &[TestGroup::Basic, TestGroup::Busybox, TestGroup::Lua, TestGroup::LibcTest];
 
 fn console_write(msg: &str) {
     for b in msg.bytes() {
@@ -365,7 +365,12 @@ fn dirname(path: &str) -> String {
 }
 
 fn ensure_busybox_applet_alias(root: &str, busybox_host: &str, applet: &str) -> Option<()> {
-    let alias_host = crate::fs::apply_root(root, &alloc::format!("/{}", applet));
+    let alias_logical = if applet.starts_with('/') {
+        applet.to_string()
+    } else {
+        alloc::format!("/{}", applet)
+    };
+    let alias_host = crate::fs::apply_root(root, &alias_logical);
     if crate::fs::metadata(&alias_host, true)
         .map(|meta| meta.kind == crate::fs::VfsNodeKind::Regular && (meta.mode & 0o111) != 0)
         .unwrap_or(false)
@@ -381,18 +386,44 @@ fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
     let (root, logical_script) = logical_path_for_script(script_path)?;
     let busybox_path = String::from("/busybox");
     let busybox_host = crate::fs::apply_root(&root, &busybox_path);
-    let script_host = crate::fs::apply_root(&root, &logical_script);
+    let mut script_host = crate::fs::apply_root(&root, &logical_script);
+    let mut script_arg = logical_script.clone();
 
     crate::fs::read_executable_file(&busybox_host)?;
     crate::fs::read_file(&script_host)?;
     ensure_busybox_applet_alias(&root, &busybox_host, "ls")?;
+    ensure_busybox_applet_alias(&root, &busybox_host, "sh")?;
+    ensure_busybox_applet_alias(&root, &busybox_host, "/bin/sh")?;
+
+    if logical_script == "/libctest_testcode.sh" {
+        let group = if root == "/glibc" {
+            "libctest-glibc"
+        } else if root == "/musl" {
+            "libctest-musl"
+        } else {
+            "libctest"
+        };
+        script_arg = String::from("/libctest_harness.sh");
+        script_host = crate::fs::apply_root(&root, &script_arg);
+        let body = alloc::format!(
+            "./busybox echo \"#### OS COMP TEST GROUP START {} ####\"\n\
+             ./busybox sh ./run-static.sh\n\
+             ./busybox sh ./run-dynamic.sh\n\
+             ./busybox echo \"#### OS COMP TEST GROUP END {} ####\"\n",
+            group,
+            group
+        );
+        crate::fs::MEM_FS
+            .lock()
+            .add_file(&script_host, body.into_bytes());
+    }
 
     Some(UserProgramSpec {
         path: busybox_path.clone(),
         argv: alloc::vec![
             busybox_path.clone(),
             String::from("sh"),
-            logical_script.clone(),
+            script_arg,
         ],
         envp: alloc::vec![
             String::from("PATH=.:/:/bin:/usr/bin"),

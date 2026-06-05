@@ -12,6 +12,7 @@ pub enum BlockReason {
     ChildExit,
     Timer,
     Futex,
+    Signal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

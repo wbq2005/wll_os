@@ -412,31 +412,6 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     // 在替换地址空间之前，从旧地址空间读取 argv/envp
     let argv = read_user_str_array(argv_ptr)?;
     let mut envp = read_user_str_array(envp_ptr)?;
-    if path_str.contains("busybox") || argv.iter().any(|arg| arg == "which") {
-        let env0 = envp.first().map(|s| s.as_str()).unwrap_or("<none>");
-        crate::println!(
-            "[trace-execve] path={} argc={} envc={} argv0={} argv1={} env0={}",
-            path_str,
-            argv.len(),
-            envp.len(),
-            argv.first().map(|s| s.as_str()).unwrap_or("<none>"),
-            argv.get(1).map(|s| s.as_str()).unwrap_or("<none>"),
-            env0
-        );
-        if argv.get(1).map(|s| s.as_str()) == Some("which") {
-            if let Some(task) = current_task() {
-                super::trace_syscalls_for_pid(task.pid.0);
-            }
-            crate::println!(
-                "[trace-execve-which-env] env0={} env1={} env2={} env3={} env4={}",
-                envp.first().map(|s| s.as_str()).unwrap_or("<none>"),
-                envp.get(1).map(|s| s.as_str()).unwrap_or("<none>"),
-                envp.get(2).map(|s| s.as_str()).unwrap_or("<none>"),
-                envp.get(3).map(|s| s.as_str()).unwrap_or("<none>"),
-                envp.get(4).map(|s| s.as_str()).unwrap_or("<none>")
-            );
-        }
-    }
     if envp.is_empty() {
         envp.push(String::from("PATH=/bin:/basic:/"));
         envp.push(String::from("LD_LIBRARY_PATH=/lib"));

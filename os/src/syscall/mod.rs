@@ -6,8 +6,6 @@ pub mod process;
 pub mod signal;
 pub(crate) mod user;
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 pub use crate::utils::error::SysErrNo;
 
 /// Linux AT_FDCWD = -100, used to indicate "use current working directory" for *at syscalls.
@@ -15,12 +13,6 @@ const AT_FDCWD: isize = -100;
 
 /// 系统调用返回值类型
 pub type SyscallRet = Result<usize, SysErrNo>;
-
-static TRACE_SYSCALL_PID: AtomicUsize = AtomicUsize::new(0);
-
-pub(crate) fn trace_syscalls_for_pid(pid: usize) {
-    TRACE_SYSCALL_PID.store(pid, Ordering::Relaxed);
-}
 
 pub(crate) fn with_kernel_page_table<T>(f: impl FnOnce() -> T) -> T {
     crate::trap::restore_kernel_page_table();
@@ -172,16 +164,6 @@ pub const SYSCALL_SYMLINK: usize = 1036;
 /// 返回值: 成功返回结果，失败返回错误码
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
     log::debug!("[syscall] id: {}, args: {:?}", syscall_id, args);
-    if let Some(task) = crate::task::current_task() {
-        if TRACE_SYSCALL_PID.load(Ordering::Relaxed) == task.pid.0 {
-            crate::println!(
-                "[trace-which-syscall] pid={} id={} args={:?}",
-                task.pid.0,
-                syscall_id,
-                args
-            );
-        }
-    }
 
     match syscall_id {
         // 文件操作
@@ -369,6 +351,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_TGKILL => signal::sys_tgkill(args[0] as i32, args[1] as i32, args[2] as i32),
         SYSCALL_SIGACTION => signal::sys_sigaction(args[0] as i32, args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::sys_sigprocmask(args[0] as i32, args[1], args[2], args[3]),
+        SYSCALL_SIGTIMEDWAIT => signal::sys_sigtimedwait(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGRETURN => signal::sys_sigreturn(),
 
         SYSCALL_READLINKAT => fs::sys_readlinkat(
@@ -389,7 +372,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
 
         _ => {
             log::warn!("[syscall] Unsupported syscall: {}", syscall_id);
-            crate::println!("[trace-unsupported] id={} args={:?}", syscall_id, args);
             Err(SysErrNo::ENOSYS)
         }
     }
