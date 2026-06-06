@@ -203,32 +203,337 @@ fn run_runtime_test_harness() -> ! {
 
 #[cfg(feature = "libctest")]
 fn run_libctest_collection_harness() {
-    const STATIC_SMOKE: &[&str] = &["argv"];
-    const DYNAMIC_SMOKE: &[&str] = &["argv"];
+    const STATIC_CASES: &[&str] = &[
+        "argv",
+        "basename",
+        "clock_gettime",
+        "dirname",
+        "env",
+        "fdopen",
+        "iconv_open",
+        "inet_pton",
+        "memstream",
+        "pthread_cancel",
+        "pthread_cond",
+        "pthread_tsd",
+        "qsort",
+        "random",
+        "search_hsearch",
+        "search_insque",
+        "search_lsearch",
+        "search_tsearch",
+        "setjmp",
+        "snprintf",
+        "socket",
+        "sscanf_long",
+        "stat",
+        "string",
+        "string_memcpy",
+        "string_memmem",
+        "string_memset",
+        "string_strchr",
+        "string_strcspn",
+        "string_strstr",
+        "strptime",
+        "strtod",
+        "strtod_simple",
+        "strtof",
+        "strtold",
+        "fflush_exit",
+        "fgets_eof",
+        "fpclassify_invalid_ld80",
+        "ftello_unflushed_append",
+        "getpwnam_r_crash",
+        "getpwnam_r_errno",
+        "iconv_roundtrips",
+        "inet_ntop_v4mapped",
+        "inet_pton_empty_last_field",
+        "iswspace_null",
+        "lrand48_signextend",
+        "lseek_large",
+        "malloc_0",
+        "mbsrtowcs_overflow",
+        "memmem_oob_read",
+        "memmem_oob",
+        "mkdtemp_failure",
+        "mkstemp_failure",
+        "printf_1e9_oob",
+        "printf_fmt_g_round",
+        "printf_fmt_g_zeros",
+        "printf_fmt_n",
+        "pthread_robust_detach",
+        "pthread_cancel_sem_wait",
+        "pthread_condattr_setclock",
+        "pthread_exit_cancel",
+        "pthread_once_deadlock",
+        "pthread_rwlock_ebusy",
+        "putenv_doublefree",
+        "regex_backref_0",
+        "regex_bracket_icase",
+        "regex_negated_range",
+        "regexec_nosub",
+        "rewind_clear_error",
+        "rlimit_open_files",
+        "scanf_bytes_consumed",
+        "scanf_match_literal_eof",
+        "scanf_nullbyte_char",
+        "sigprocmask_internal",
+        "sscanf_eof",
+        "statvfs",
+        "strverscmp",
+        "syscall_sign_extend",
+        "uselocale_0",
+        "wcsncpy_read_overflow",
+        "wcsstr_false_negative",
+    ];
+    const DYNAMIC_CASES: &[&str] = &[
+        "argv",
+        "basename",
+        "clock_gettime",
+        "dirname",
+        "dlopen",
+        "env",
+        "fdopen",
+        "iconv_open",
+        "inet_pton",
+        "memstream",
+        "pthread_cond",
+        "pthread_tsd",
+        "qsort",
+        "random",
+        "search_hsearch",
+        "search_insque",
+        "search_lsearch",
+        "search_tsearch",
+        "sem_init",
+        "setjmp",
+        "snprintf",
+        "socket",
+        "sscanf_long",
+        "stat",
+        "string",
+        "string_memcpy",
+        "string_memmem",
+        "string_memset",
+        "string_strchr",
+        "string_strcspn",
+        "string_strstr",
+        "strptime",
+        "strtod",
+        "strtod_simple",
+        "strtof",
+        "strtold",
+        "fflush_exit",
+        "fgets_eof",
+        "fpclassify_invalid_ld80",
+        "ftello_unflushed_append",
+        "getpwnam_r_crash",
+        "getpwnam_r_errno",
+        "iconv_roundtrips",
+        "inet_ntop_v4mapped",
+        "inet_pton_empty_last_field",
+        "iswspace_null",
+        "lrand48_signextend",
+        "lseek_large",
+        "malloc_0",
+        "mbsrtowcs_overflow",
+        "memmem_oob_read",
+        "memmem_oob",
+        "mkdtemp_failure",
+        "mkstemp_failure",
+        "printf_1e9_oob",
+        "printf_fmt_g_round",
+        "printf_fmt_g_zeros",
+        "printf_fmt_n",
+        "pthread_robust_detach",
+        "pthread_condattr_setclock",
+        "pthread_exit_cancel",
+        "pthread_once_deadlock",
+        "pthread_rwlock_ebusy",
+        "putenv_doublefree",
+        "regex_backref_0",
+        "regex_bracket_icase",
+        "regex_negated_range",
+        "regexec_nosub",
+        "rewind_clear_error",
+        "rlimit_open_files",
+        "scanf_bytes_consumed",
+        "scanf_match_literal_eof",
+        "scanf_nullbyte_char",
+        "sigprocmask_internal",
+        "sscanf_eof",
+        "statvfs",
+        "strverscmp",
+        "syscall_sign_extend",
+        "uselocale_0",
+        "wcsncpy_read_overflow",
+        "wcsstr_false_negative",
+    ];
+    const STATIC_RISK_CASES: &[&str] = &[
+        "clocale_mbfuncs",
+        "crypt",
+        "fnmatch",
+        "fscanf",
+        "fwscanf",
+        "mbc",
+        "pthread_cancel_points",
+        "sscanf",
+        "strftime",
+        "strtol",
+        "swprintf",
+        "fgetwc_buffering",
+        "pthread_cond_smasher",
+        "regex_ere_backref",
+        "regex_escaped_high_byte",
+        "setvbuf_unget",
+        "dn_expand_empty",
+        "dn_expand_ptr_0",
+    ];
+    const DYNAMIC_RISK_CASES: &[&str] = &[
+        "clocale_mbfuncs",
+        "crypt",
+        "fnmatch",
+        "fscanf",
+        "fwscanf",
+        "mbc",
+        "pthread_cancel_points",
+        "pthread_cancel",
+        "sscanf",
+        "strftime",
+        "strtol",
+        "swprintf",
+        "fgetwc_buffering",
+        "pthread_cond_smasher",
+        "regex_ere_backref",
+        "regex_escaped_high_byte",
+        "setvbuf_unget",
+        "dn_expand_empty",
+        "dn_expand_ptr_0",
+    ];
     const SEGMENTS: &[(&str, &str, &str, &[&str])] = &[
         (
             "/glibc",
             "libctest-glibc-static",
             "entry-static.exe",
-            STATIC_SMOKE,
+            STATIC_CASES,
         ),
         (
             "/glibc",
             "libctest-glibc-dynamic",
             "entry-dynamic.exe",
-            DYNAMIC_SMOKE,
+            DYNAMIC_CASES,
         ),
         (
             "/musl",
             "libctest-musl-static",
             "entry-static.exe",
-            STATIC_SMOKE,
+            STATIC_CASES,
         ),
         (
             "/musl",
             "libctest-musl-dynamic",
             "entry-dynamic.exe",
-            DYNAMIC_SMOKE,
+            DYNAMIC_CASES,
+        ),
+        (
+            "/musl",
+            "libctest-musl-static-daemon",
+            "entry-static.exe",
+            &["daemon_failure"],
+        ),
+        (
+            "/musl",
+            "libctest-musl-dynamic-daemon",
+            "entry-dynamic.exe",
+            &["daemon_failure"],
+        ),
+        (
+            "/glibc",
+            "libctest-glibc-static-late",
+            "entry-static.exe",
+            &["utime", "wcsstr", "wcstol", "pleval"],
+        ),
+        (
+            "/glibc",
+            "libctest-glibc-dynamic-late",
+            "entry-dynamic.exe",
+            &["utime", "wcsstr", "wcstol"],
+        ),
+        (
+            "/musl",
+            "libctest-musl-static-late",
+            "entry-static.exe",
+            &["utime", "wcsstr", "wcstol", "pleval"],
+        ),
+        (
+            "/musl",
+            "libctest-musl-dynamic-late",
+            "entry-dynamic.exe",
+            &["utime", "wcsstr", "wcstol"],
+        ),
+        (
+            "/glibc",
+            "libctest-glibc-static-tail",
+            "entry-static.exe",
+            &["time", "tgmath", "tls_align", "udiv", "ungetc"],
+        ),
+        (
+            "/glibc",
+            "libctest-glibc-dynamic-tail",
+            "entry-dynamic.exe",
+            &[
+                "time",
+                "tgmath",
+                "tls_init",
+                "tls_local_exec",
+                "tls_get_new_dtv",
+                "udiv",
+                "ungetc",
+            ],
+        ),
+        (
+            "/musl",
+            "libctest-musl-static-tail",
+            "entry-static.exe",
+            &["time", "tgmath", "tls_align", "udiv", "ungetc"],
+        ),
+        (
+            "/musl",
+            "libctest-musl-dynamic-tail",
+            "entry-dynamic.exe",
+            &[
+                "time",
+                "tgmath",
+                "tls_init",
+                "tls_local_exec",
+                "tls_get_new_dtv",
+                "udiv",
+                "ungetc",
+            ],
+        ),
+        (
+            "/glibc",
+            "libctest-glibc-static-risk",
+            "entry-static.exe",
+            STATIC_RISK_CASES,
+        ),
+        (
+            "/glibc",
+            "libctest-glibc-dynamic-risk",
+            "entry-dynamic.exe",
+            DYNAMIC_RISK_CASES,
+        ),
+        (
+            "/musl",
+            "libctest-musl-static-risk",
+            "entry-static.exe",
+            STATIC_RISK_CASES,
+        ),
+        (
+            "/musl",
+            "libctest-musl-dynamic-risk",
+            "entry-dynamic.exe",
+            DYNAMIC_RISK_CASES,
         ),
     ];
 
@@ -246,32 +551,49 @@ fn run_libctest_collection_harness() {
 
 #[cfg(feature = "libctest")]
 fn run_libctest_segment(root: &str, name: &str, entry: &str, cases: &[&str]) -> bool {
-    let busybox_path = String::from("/busybox");
-    let busybox_host = crate::fs::apply_root(root, &busybox_path);
-    let mut command = format!("echo '#### OS COMP TEST GROUP START {} ####'", name);
-    for case in cases {
-        command.push_str("; ./runtest.exe -w ");
-        command.push_str(entry);
-        command.push(' ');
-        command.push_str(case);
-    }
-    command.push_str("; echo '#### OS COMP TEST GROUP END ");
-    command.push_str(name);
-    command.push_str(" ####'");
+    let mut launched = false;
 
-    crate::fs::read_executable_file(&busybox_host).is_some()
+    console_write("#### OS COMP TEST GROUP START ");
+    console_write(name);
+    console_write(" ####\n");
+
+    for case in cases {
+        if run_libctest_case(root, entry, case) {
+            launched = true;
+        } else {
+            console_write("[harness] failed to launch libc-test case: ");
+            console_write(name);
+            console_write(" ");
+            console_write(case);
+            console_write("\n");
+        }
+    }
+
+    console_write("#### OS COMP TEST GROUP END ");
+    console_write(name);
+    console_write(" ####\n");
+
+    launched
+}
+
+#[cfg(feature = "libctest")]
+fn run_libctest_case(root: &str, entry: &str, case: &str) -> bool {
+    let runtest_path = String::from("/runtest.exe");
+    let runtest_host = crate::fs::apply_root(root, &runtest_path);
+
+    crate::fs::read_executable_file(&runtest_host).is_some()
         && run_user_program_spec_foreground(&UserProgramSpec {
-            path: busybox_path.clone(),
+            path: runtest_path.clone(),
             argv: alloc::vec![
-                busybox_path.clone(),
-                String::from("sh"),
-                String::from("-c"),
-                command,
+                runtest_path.clone(),
+                String::from("-w"),
+                String::from(entry),
+                String::from(case),
             ],
             envp: alloc::vec![
                 String::from("PATH=.:/:/bin:/usr/bin"),
                 String::from("LD_LIBRARY_PATH=/lib"),
-                alloc::format!("SHELL={}", busybox_path),
+                String::from("SHELL=/busybox"),
             ],
             cwd: String::from("/"),
             root: String::from(root),
@@ -375,10 +697,10 @@ fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
 
 fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
     #[cfg(feature = "libctest")]
-    const TIMEOUT_TICKS: usize = 100;
+    const RUN_TIMEOUT_US: usize = 15_000_000;
     #[cfg(not(feature = "libctest"))]
-    const TIMEOUT_TICKS: usize = 1_000;
-    let mut waited = 0usize;
+    const RUN_TIMEOUT_US: usize = 120_000_000;
+    let deadline_us = crate::timer::deadline_after_us(RUN_TIMEOUT_US);
 
     task.set_status(TaskStatus::Ready);
     manager::add_task(task.clone());
@@ -388,7 +710,7 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
         if task.status() == TaskStatus::Zombie && !manager::has_task() {
             break;
         }
-        if waited >= TIMEOUT_TICKS {
+        if crate::timer::get_time_us() >= deadline_us {
             console_write("[harness] TIMEOUT pid=");
             console_write(&format!("{}", task.pid.0));
             console_write("\n");
@@ -397,11 +719,9 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
         }
 
         let Some(active) = manager::fetch_task() else {
-            waited += 1;
             continue;
         };
         if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
-            waited += 1;
             continue;
         }
 
@@ -428,10 +748,10 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
                 *active.trap_frame.lock() = Some(ctx);
             }
             requeue_after_user_run(active);
-            waited += 1;
             continue;
         }
 
+        crate::trap::prepare_user_trapframe(&mut ctx);
         let _reason = run_user_task(&mut ctx);
         crate::trap::restore_kernel_page_table();
 
@@ -440,7 +760,6 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
         }
 
         requeue_after_user_run(active);
-        waited += 1;
     }
 
     *CURRENT_TASK.lock() = None;

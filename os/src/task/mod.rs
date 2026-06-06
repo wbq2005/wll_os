@@ -630,6 +630,7 @@ pub(crate) fn run_next_task() {
                 run_next_task();
                 return;
             }
+            crate::trap::prepare_user_trapframe(&mut ctx);
             let reason = run_user_task(&mut ctx);
             crate::trap::restore_kernel_page_table();
             log::debug!("[task] User task returned with reason: {:?}", reason);
@@ -775,6 +776,7 @@ pub(crate) fn run_ready_task_once() -> bool {
             *CURRENT_TASK.lock() = None;
             return true;
         }
+        crate::trap::prepare_user_trapframe(&mut ctx);
         let _reason = run_user_task(&mut ctx);
         crate::trap::restore_kernel_page_table();
         if active.status() != TaskStatus::Zombie {
@@ -909,6 +911,8 @@ pub struct TaskControlBlockInner {
     pub program_break: usize,
     pub mapped_break: usize,
     pub next_mmap: usize,
+    pub rlimit_nofile: usize,
+    pub rlimit_nofile_max: usize,
     pub clear_child_tid: usize,
     pub robust_list_head: usize,
     pub robust_list_len: usize,

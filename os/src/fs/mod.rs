@@ -281,6 +281,7 @@ fn init_pseudo_files() {
         fs.add_file(&alloc::format!("{}/etc/mtab", root), mounts.to_vec());
         fs.add_file(&alloc::format!("{}/proc/meminfo", root), meminfo.to_vec());
         fs.add_file(&alloc::format!("{}/dev/null", root), Vec::new());
+        fs.add_file(&alloc::format!("{}/dev/zero", root), Vec::new());
         fs.add_file(&alloc::format!("{}/dev/misc/rtc", root), Vec::new());
     }
 }

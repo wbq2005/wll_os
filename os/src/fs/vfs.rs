@@ -14,8 +14,13 @@ use super::{normalize_path, MEM_FS};
 
 const S_IFDIR: u32 = 0o040000;
 const S_IFIFO: u32 = 0o010000;
+const S_IFCHR: u32 = 0o020000;
 const S_IFREG: u32 = 0o100000;
 const S_IFSOCK: u32 = 0o140000;
+const DEV_NULL_MAJOR: u32 = 1;
+const DEV_NULL_MINOR: u32 = 3;
+const DEV_ZERO_MAJOR: u32 = 1;
+const DEV_ZERO_MINOR: u32 = 5;
 
 lazy_static! {
     static ref WHITEOUTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -51,6 +56,8 @@ pub struct VfsMetadata {
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
+    pub rdev_major: u32,
+    pub rdev_minor: u32,
     pub size: u64,
     pub blocks: u64,
     pub atime_sec: isize,
@@ -127,6 +134,8 @@ fn metadata_from_ext4(meta: ext4_vol::Ext4Metadata) -> VfsMetadata {
         nlink: meta.nlink,
         uid: meta.uid,
         gid: meta.gid,
+        rdev_major: 0,
+        rdev_minor: 0,
         size: meta.size,
         blocks: meta.blocks.max(regular_blocks(meta.size)),
         atime_sec: meta.atime_sec,
@@ -153,6 +162,8 @@ fn synthetic_metadata(
         nlink,
         uid: 0,
         gid: 0,
+        rdev_major: 0,
+        rdev_minor: 0,
         size,
         blocks: regular_blocks(size),
         atime_sec: sec,
@@ -164,7 +175,28 @@ fn synthetic_metadata(
     }
 }
 
+fn is_dev_null_path(path: &str) -> bool {
+    matches!(path, "/dev/null" | "/glibc/dev/null" | "/musl/dev/null")
+}
+
+fn is_dev_zero_path(path: &str) -> bool {
+    matches!(path, "/dev/zero" | "/glibc/dev/zero" | "/musl/dev/zero")
+}
+
+fn metadata_for_char_device(path: &str, major: u32, minor: u32) -> VfsMetadata {
+    let mut meta = synthetic_metadata(path, VfsNodeKind::Other, S_IFCHR | 0o666, 0, 1);
+    meta.rdev_major = major;
+    meta.rdev_minor = minor;
+    meta
+}
+
 fn metadata_for_mem_file(name: &str, content: &[u8]) -> VfsMetadata {
+    if is_dev_null_path(name) {
+        return metadata_for_char_device(name, DEV_NULL_MAJOR, DEV_NULL_MINOR);
+    }
+    if is_dev_zero_path(name) {
+        return metadata_for_char_device(name, DEV_ZERO_MAJOR, DEV_ZERO_MINOR);
+    }
     let perm = if is_elf_image(content) { 0o777 } else { 0o666 };
     synthetic_metadata(
         name,
@@ -193,6 +225,8 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
                 nlink: 1,
                 uid: 0,
                 gid: 0,
+                rdev_major: 0,
+                rdev_minor: 0,
                 size: entries.len() as u64,
                 blocks: regular_blocks(entries.len() as u64),
                 atime_sec: sec,
@@ -248,7 +282,11 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
             1,
         )),
         fd::FileDescriptor::MemFile { name, content, .. } => {
-            Ok(metadata_for_mem_file(name, content))
+            let latest = MEM_FS.lock().get_file(name).map(|file| file.content.clone());
+            Ok(metadata_for_mem_file(
+                name,
+                latest.as_deref().unwrap_or(content),
+            ))
         }
         fd::FileDescriptor::MemDir { path, entries, .. } => Ok(synthetic_metadata(
             path,

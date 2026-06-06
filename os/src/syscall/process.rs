@@ -206,6 +206,7 @@ fn reset_exec_trapframe(tf: &mut TrapFrame, entry: usize, sp: usize, argc: usize
 
     tf[TrapFrameArgs::SEPC] = entry;
     set_user_entry_registers(tf, sp, argc);
+    crate::trap::prepare_user_trapframe(tf);
 }
 
 fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
@@ -853,6 +854,7 @@ pub fn sys_clone(
     if (clone_bits & CLONE_SETTLS) != 0 {
         child_tf[TrapFrameArgs::TLS] = tls;
     }
+    crate::trap::prepare_user_trapframe(&mut child_tf);
 
     let share_vm = (clone_bits & CLONE_VM) != 0;
     let is_thread = (clone_bits & CLONE_THREAD) != 0;
@@ -866,7 +868,7 @@ pub fn sys_clone(
     } else {
         dup_mm_context(&parent.mm)
     };
-    let (fd_table, exec_path, thread_parent) = {
+    let (fd_table, exec_path, thread_parent, rlimit_nofile, rlimit_nofile_max) = {
         let inner = parent.inner.lock();
         let fd_table = if (clone_bits & CLONE_FILES) != 0 {
             inner.fd_table.clone()
@@ -874,7 +876,13 @@ pub fn sys_clone(
             let fd_guard = inner.fd_table.lock();
             dup_fd_table(&*fd_guard)
         };
-        (fd_table, inner.exec_path.clone(), inner.parent.clone())
+        (
+            fd_table,
+            inner.exec_path.clone(),
+            inner.parent.clone(),
+            inner.rlimit_nofile,
+            inner.rlimit_nofile_max,
+        )
     };
     let fs = if (clone_bits & CLONE_FS) != 0 {
         parent.fs.clone()
@@ -918,6 +926,8 @@ pub fn sys_clone(
             program_break: mm_snapshot.program_break,
             mapped_break: mm_snapshot.mapped_break,
             next_mmap: mm_snapshot.next_mmap,
+            rlimit_nofile,
+            rlimit_nofile_max,
             clear_child_tid: if (clone_bits & CLONE_CHILD_CLEARTID) != 0 {
                 child_tid
             } else {

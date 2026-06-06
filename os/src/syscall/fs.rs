@@ -235,6 +235,10 @@ fn regular_blocks(size: usize) -> u64 {
     size.div_ceil(512) as u64
 }
 
+fn encode_dev(major: u32, minor: u32) -> u64 {
+    ((minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12)) as u64
+}
+
 fn kstat_from_vfs(meta: crate::fs::VfsMetadata) -> KStat {
     KStat {
         st_dev: 0,
@@ -243,7 +247,7 @@ fn kstat_from_vfs(meta: crate::fs::VfsMetadata) -> KStat {
         st_nlink: meta.nlink,
         st_uid: meta.uid,
         st_gid: meta.gid,
-        st_rdev: 0,
+        st_rdev: encode_dev(meta.rdev_major, meta.rdev_minor),
         __pad: 0,
         st_size: meta.size as isize,
         st_blksize: 4096,
@@ -340,8 +344,8 @@ fn make_statx(st: &KStat, mask: usize) -> Statx {
         stx_btime: make_statx_timestamp(st.st_ctime_sec, st.st_ctime_nsec),
         stx_ctime: make_statx_timestamp(st.st_ctime_sec, st.st_ctime_nsec),
         stx_mtime: make_statx_timestamp(st.st_mtime_sec, st.st_mtime_nsec),
-        stx_rdev_major: 0,
-        stx_rdev_minor: 0,
+        stx_rdev_major: ((st.st_rdev >> 8) & 0xfff) as u32,
+        stx_rdev_minor: ((st.st_rdev & 0xff) | ((st.st_rdev >> 12) & !0xff)) as u32,
         stx_dev_major: 0,
         stx_dev_minor: 0,
         stx_mnt_id: 0,
@@ -482,7 +486,8 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
 
     // 获取当前任务的文件描述符表
     if let Some(task) = current_task() {
-        let mut inner = task.inner.lock();
+        let inner = task.inner.lock();
+        let nofile_limit = inner.rlimit_nofile;
 
         let opened = super::with_kernel_page_table(|| {
             crate::fs::open_path(&host_path, &logical_path, open_flags, mode)
@@ -490,7 +495,7 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
         match opened {
             Ok(fd_desc) => {
                 let mut fds = inner.fd_table.lock();
-                match fds.alloc_with_flags(fd_desc, fd_flags) {
+                match fds.alloc_with_flags_below(fd_desc, fd_flags, nofile_limit) {
                     Some(new_fd) => {
                         log::info!(
                             "[syscall] openat: allocated fd={} for '{}', fd_table.len={}",
@@ -730,7 +735,7 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, count: usize) -> SyscallRet {
         return Err(SysErrNo::EFAULT);
     }
     if let Some(task) = current_task() {
-        let mut inner = task.inner.lock();
+        let inner = task.inner.lock();
         let mut fds = inner.fd_table.lock();
         match fds.get_mut(fd) {
             Some(file_desc) => {
@@ -763,14 +768,15 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: usize) -> SyscallRet {
         0
     };
     if let Some(task) = current_task() {
-        let mut inner = task.inner.lock();
+        let inner = task.inner.lock();
+        let nofile_limit = inner.rlimit_nofile;
         let (read_fd, write_fd) = {
             let mut fds = inner.fd_table.lock();
             let (read_end, write_end) = crate::fs::fd::create_pipe(nonblock);
             let read_fd = fds
-                .alloc_with_flags(read_end, fd_flags)
+                .alloc_with_flags_below(read_end, fd_flags, nofile_limit)
                 .ok_or(SysErrNo::EMFILE)?;
-            let write_fd = match fds.alloc_with_flags(write_end, fd_flags) {
+            let write_fd = match fds.alloc_with_flags_below(write_end, fd_flags, nofile_limit) {
                 Some(fd) => fd,
                 None => {
                     let _ = fds.free(read_fd);
@@ -1111,8 +1117,9 @@ pub fn sys_dup(old_fd: usize) -> SyscallRet {
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
+    let nofile_limit = inner.rlimit_nofile;
     let mut fds = inner.fd_table.lock();
-    fds.dup(old_fd)
+    fds.dup_below(old_fd, nofile_limit)
 }
 
 /// dup3 系统调用 (dup2 的现代版本)
@@ -1140,8 +1147,9 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: usize) -> SyscallRet {
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
+    let nofile_limit = inner.rlimit_nofile;
     let mut fds = inner.fd_table.lock();
-    let new_fd = fds.dup2(old_fd, new_fd)?;
+    let new_fd = fds.dup2_below(old_fd, new_fd, nofile_limit)?;
     fds.set_fd_flags(new_fd, fd_flags)?;
     Ok(new_fd)
 }
@@ -1149,16 +1157,20 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: usize) -> SyscallRet {
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
+    let nofile_limit = inner.rlimit_nofile;
     let mut fds = inner.fd_table.lock();
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
+            if arg >= nofile_limit.min(fd::MAX_FD_NUM) {
+                return Err(SysErrNo::EINVAL);
+            }
             let file_desc = fds.get(fd).cloned().ok_or(SysErrNo::EBADF)?;
             let flags = if cmd == F_DUPFD_CLOEXEC {
                 fd::FD_CLOEXEC
             } else {
                 0
             };
-            fds.alloc_from_with_flags(arg, file_desc, flags)
+            fds.alloc_from_with_flags_below(arg, file_desc, flags, nofile_limit)
                 .ok_or(SysErrNo::EMFILE)
         }
         F_GETFD => fds.fd_flags(fd),

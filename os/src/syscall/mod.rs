@@ -321,6 +321,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_GETGID => other::sys_getgid(),
         SYSCALL_GETEGID => other::sys_getegid(),
         SYSCALL_GETTID => other::sys_gettid(),
+        SYSCALL_GETRLIMIT => other::sys_getrlimit(args[0], args[1]),
+        SYSCALL_SETRLIMIT => other::sys_setrlimit(args[0], args[1]),
         SYSCALL_PRLIMIT64 => other::sys_prlimit64(args[0], args[1], args[2], args[3]),
         SYSCALL_SET_TID_ADDRESS => other::sys_set_tid_address(args[0]),
         SYSCALL_SET_ROBUST_LIST => other::sys_set_robust_list(args[0], args[1]),

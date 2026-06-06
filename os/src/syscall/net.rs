@@ -284,6 +284,7 @@ pub fn sys_socket(domain: usize, raw_type: usize, protocol: usize) -> SyscallRet
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
+    let nofile_limit = inner.rlimit_nofile;
     let mut fds = inner.fd_table.lock();
     let fd_flags = if (flags & SOCK_CLOEXEC) != 0 {
         fd::FD_CLOEXEC
@@ -295,7 +296,8 @@ pub fn sys_socket(domain: usize, raw_type: usize, protocol: usize) -> SyscallRet
             domain, sock_type, protocol, nonblock,
         ))),
     };
-    fds.alloc_with_flags(socket, fd_flags).ok_or(SysErrNo::EMFILE)
+    fds.alloc_with_flags_below(socket, fd_flags, nofile_limit)
+        .ok_or(SysErrNo::EMFILE)
 }
 
 pub fn sys_socketpair(
@@ -378,9 +380,12 @@ pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: usize) -> Sysc
         drop(socket);
         let task = current_task().ok_or(SysErrNo::ESRCH)?;
         let inner = task.inner.lock();
+        let nofile_limit = inner.rlimit_nofile;
         let mut fds = inner.fd_table.lock();
         let desc = FileDescriptor::Socket { state: accepted };
-        return fds.alloc_with_flags(desc, fd_flags).ok_or(SysErrNo::EMFILE);
+        return fds
+            .alloc_with_flags_below(desc, fd_flags, nofile_limit)
+            .ok_or(SysErrNo::EMFILE);
     }
     if socket.nonblock || (flags & SOCK_NONBLOCK) != 0 {
         return Err(SysErrNo::EAGAIN);

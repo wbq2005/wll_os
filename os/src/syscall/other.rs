@@ -40,6 +40,8 @@ struct RLimit {
     rlim_max: usize,
 }
 
+const RLIMIT_NOFILE: usize = 7;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TimeVal {
@@ -281,21 +283,78 @@ pub fn sys_getegid() -> SyscallRet {
     Ok(0)
 }
 
+fn resource_limit_snapshot(resource: usize) -> Result<RLimit, SysErrNo> {
+    if resource == RLIMIT_NOFILE {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        Ok(RLimit {
+            rlim_cur: inner.rlimit_nofile,
+            rlim_max: inner.rlimit_nofile_max,
+        })
+    } else {
+        Ok(RLimit {
+            rlim_cur: usize::MAX,
+            rlim_max: usize::MAX,
+        })
+    }
+}
+
+fn apply_resource_limit(resource: usize, limit_ptr: usize) -> Result<(), SysErrNo> {
+    if limit_ptr == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let limit = copy_object_from_user::<RLimit>(limit_ptr)?;
+    if limit.rlim_cur > limit.rlim_max {
+        return Err(SysErrNo::EINVAL);
+    }
+    if resource != RLIMIT_NOFILE {
+        return Ok(());
+    }
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut inner = task.inner.lock();
+    let hard = limit.rlim_max.min(crate::fs::fd::MAX_FD_NUM);
+    let soft = limit.rlim_cur.min(hard);
+    inner.rlimit_nofile = soft;
+    inner.rlimit_nofile_max = hard;
+    Ok(())
+}
+
+pub fn sys_getrlimit(resource: usize, old_limit: usize) -> SyscallRet {
+    if old_limit == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    copy_object_to_user(old_limit, &resource_limit_snapshot(resource)?)?;
+    Ok(0)
+}
+
+pub fn sys_setrlimit(resource: usize, new_limit: usize) -> SyscallRet {
+    apply_resource_limit(resource, new_limit)?;
+    Ok(0)
+}
+
 pub fn sys_prlimit64(
-    _pid: usize,
-    _resource: usize,
+    pid: usize,
+    resource: usize,
     new_limit: usize,
     old_limit: usize,
 ) -> SyscallRet {
-    let _ = new_limit;
-    if old_limit != 0 {
-        copy_object_to_user(
-            old_limit,
-            &RLimit {
-                rlim_cur: usize::MAX,
-                rlim_max: usize::MAX,
-            },
-        )?;
+    if pid != 0 {
+        let current = current_task().ok_or(SysErrNo::ESRCH)?;
+        if pid != current.pid.0 && pid != current.thread_group.tgid() {
+            return Err(SysErrNo::ESRCH);
+        }
+    }
+    let old = if old_limit != 0 {
+        Some(resource_limit_snapshot(resource)?)
+    } else {
+        None
+    };
+    if new_limit != 0 {
+        apply_resource_limit(resource, new_limit)?;
+    }
+    if let Some(old) = old {
+        copy_object_to_user(old_limit, &old)?;
     }
     Ok(0)
 }

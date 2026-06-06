@@ -15,14 +15,13 @@ use crate::utils::error::SysErrNo;
 
 #[cfg(target_arch = "riscv64")]
 fn init_user_trapframe(tf: &mut polyhal_trap::trapframe::TrapFrame) {
-    let bits = unsafe { core::mem::transmute::<_, usize>(tf.sstatus) };
-    let bits = (bits & !(1 << 8)) | (1 << 5);
-    tf.sstatus = unsafe { core::mem::transmute(bits) };
-    debug_assert_eq!(bits & (1 << 8), 0);
+    crate::trap::prepare_user_trapframe(tf);
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-fn init_user_trapframe(_tf: &mut polyhal_trap::trapframe::TrapFrame) {}
+fn init_user_trapframe(tf: &mut polyhal_trap::trapframe::TrapFrame) {
+    crate::trap::prepare_user_trapframe(tf);
+}
 
 fn resolve_program_path(root: &str, path: &str) -> String {
     crate::fs::resolve_path_with_root(root, "/", path)
@@ -91,6 +90,8 @@ impl TaskControlBlock {
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
+                rlimit_nofile: crate::fs::fd::MAX_FD_NUM,
+                rlimit_nofile_max: crate::fs::fd::MAX_FD_NUM,
                 clear_child_tid: 0,
                 robust_list_head: 0,
                 robust_list_len: 0,
@@ -278,6 +279,8 @@ impl TaskControlBlock {
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
+                rlimit_nofile: crate::fs::fd::MAX_FD_NUM,
+                rlimit_nofile_max: crate::fs::fd::MAX_FD_NUM,
                 clear_child_tid: 0,
                 robust_list_head: 0,
                 robust_list_len: 0,
@@ -335,6 +338,8 @@ impl TaskControlBlock {
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
+                rlimit_nofile: crate::fs::fd::MAX_FD_NUM,
+                rlimit_nofile_max: crate::fs::fd::MAX_FD_NUM,
                 clear_child_tid: 0,
                 robust_list_head: 0,
                 robust_list_len: 0,
@@ -390,6 +395,8 @@ impl TaskControlBlock {
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
+                rlimit_nofile: crate::fs::fd::MAX_FD_NUM,
+                rlimit_nofile_max: crate::fs::fd::MAX_FD_NUM,
                 clear_child_tid: 0,
                 robust_list_head: 0,
                 robust_list_len: 0,

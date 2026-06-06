@@ -30,6 +30,23 @@ const PIPE_CAPACITY: usize = 64 * 1024;
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
 
+fn is_dev_null_path(path: &str) -> bool {
+    matches!(path, "/dev/null" | "/glibc/dev/null" | "/musl/dev/null")
+}
+
+fn is_dev_zero_path(path: &str) -> bool {
+    matches!(path, "/dev/zero" | "/glibc/dev/zero" | "/musl/dev/zero")
+}
+
+fn refresh_mem_content(name: &str, content: &mut Vec<u8>) {
+    if is_dev_null_path(name) || is_dev_zero_path(name) {
+        return;
+    }
+    if let Some(file) = MEM_FS.lock().get_file(name) {
+        *content = file.content.clone();
+    }
+}
+
 lazy_static! {
     static ref CONSOLE_LINE_BUFFERS: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
 }
@@ -435,6 +452,7 @@ impl FileDescriptor {
                 }
             }
             FileDescriptor::MemFile {
+                name,
                 content,
                 offset,
                 readable,
@@ -443,6 +461,15 @@ impl FileDescriptor {
                 if !*readable {
                     return Err(SysErrNo::EBADF);
                 }
+                if is_dev_null_path(name) {
+                    return Ok(0);
+                }
+                if is_dev_zero_path(name) {
+                    buf.fill(0);
+                    *offset = (*offset).saturating_add(buf.len());
+                    return Ok(buf.len());
+                }
+                refresh_mem_content(name, content);
                 if *offset >= content.len() {
                     return Ok(0);
                 }
@@ -543,11 +570,22 @@ impl FileDescriptor {
     pub fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, SysErrNo> {
         match self {
             FileDescriptor::MemFile {
-                content, readable, ..
+                name,
+                content,
+                readable,
+                ..
             } => {
                 if !*readable {
                     return Err(SysErrNo::EBADF);
                 }
+                if is_dev_null_path(name) {
+                    return Ok(0);
+                }
+                if is_dev_zero_path(name) {
+                    buf.fill(0);
+                    return Ok(buf.len());
+                }
+                refresh_mem_content(name, content);
                 if offset >= content.len() {
                     return Ok(0);
                 }
@@ -581,6 +619,10 @@ impl FileDescriptor {
                 if !*writable {
                     return Err(SysErrNo::EBADF);
                 }
+                if is_dev_null_path(name) || is_dev_zero_path(name) {
+                    return Ok(buf.len());
+                }
+                refresh_mem_content(name, content);
                 let end = Self::checked_file_end(offset, buf.len())?;
                 if end > content.len() {
                     content.resize(end, 0);
@@ -624,6 +666,10 @@ impl FileDescriptor {
                 if !*writable {
                     return Err(SysErrNo::EBADF);
                 }
+                if is_dev_null_path(name) || is_dev_zero_path(name) {
+                    return Ok(buf.len());
+                }
+                refresh_mem_content(name, content);
                 if *append {
                     *offset = content.len();
                 }
@@ -773,7 +819,17 @@ impl FileDescriptor {
     /// 获取文件大小
     pub fn size(&self) -> usize {
         match self {
-            FileDescriptor::MemFile { content, .. } => content.len(),
+            FileDescriptor::MemFile { name, content, .. } => {
+                if is_dev_null_path(name) || is_dev_zero_path(name) {
+                    0
+                } else {
+                    MEM_FS
+                        .lock()
+                        .get_file(name)
+                        .map(|file| file.content.len())
+                        .unwrap_or(content.len())
+                }
+            }
             FileDescriptor::MemDir { entries, .. } => entries.len(),
             FileDescriptor::Ext4Regular { ino, .. } => {
                 ext4_vol::regular_file_size(*ino).unwrap_or(0)
@@ -800,6 +856,10 @@ impl FileDescriptor {
                 if !*writable {
                     return Err(SysErrNo::EBADF);
                 }
+                if is_dev_null_path(name) || is_dev_zero_path(name) {
+                    return Ok(());
+                }
+                refresh_mem_content(name, content);
                 content.resize(new_len, 0);
                 MEM_FS.lock().add_file(name, content.clone());
                 Ok(())
@@ -1026,7 +1086,17 @@ impl FileDescriptorTable {
     }
 
     pub fn alloc_with_flags(&mut self, fd: FileDescriptor, flags: usize) -> Option<usize> {
-        for (i, slot) in self.fds.iter_mut().enumerate() {
+        self.alloc_with_flags_below(fd, flags, MAX_FD_NUM)
+    }
+
+    pub fn alloc_with_flags_below(
+        &mut self,
+        fd: FileDescriptor,
+        flags: usize,
+        limit: usize,
+    ) -> Option<usize> {
+        let limit = limit.min(MAX_FD_NUM);
+        for (i, slot) in self.fds.iter_mut().enumerate().take(limit) {
             if slot.is_none() {
                 *slot = Some(fd);
                 self.fd_flags[i] = flags & FD_CLOEXEC;
@@ -1046,7 +1116,18 @@ impl FileDescriptorTable {
         fd: FileDescriptor,
         flags: usize,
     ) -> Option<usize> {
-        for (i, slot) in self.fds.iter_mut().enumerate().skip(start) {
+        self.alloc_from_with_flags_below(start, fd, flags, MAX_FD_NUM)
+    }
+
+    pub fn alloc_from_with_flags_below(
+        &mut self,
+        start: usize,
+        fd: FileDescriptor,
+        flags: usize,
+        limit: usize,
+    ) -> Option<usize> {
+        let limit = limit.min(MAX_FD_NUM);
+        for (i, slot) in self.fds.iter_mut().enumerate().take(limit).skip(start) {
             if slot.is_none() {
                 *slot = Some(fd);
                 self.fd_flags[i] = flags & FD_CLOEXEC;
@@ -1116,21 +1197,34 @@ impl FileDescriptorTable {
     }
 
     pub fn dup(&mut self, old_fd: usize) -> Result<usize, SysErrNo> {
+        self.dup_below(old_fd, MAX_FD_NUM)
+    }
+
+    pub fn dup_below(&mut self, old_fd: usize, limit: usize) -> Result<usize, SysErrNo> {
         if old_fd >= MAX_FD_NUM || self.fds[old_fd].is_none() {
             return Err(SysErrNo::EBADF);
         }
         let fd = self.fds[old_fd].clone().unwrap();
-        match self.alloc(fd) {
+        match self.alloc_with_flags_below(fd, 0, limit) {
             Some(new_fd) => Ok(new_fd),
             None => Err(SysErrNo::EMFILE),
         }
     }
 
     pub fn dup2(&mut self, old_fd: usize, new_fd: usize) -> Result<usize, SysErrNo> {
+        self.dup2_below(old_fd, new_fd, MAX_FD_NUM)
+    }
+
+    pub fn dup2_below(
+        &mut self,
+        old_fd: usize,
+        new_fd: usize,
+        limit: usize,
+    ) -> Result<usize, SysErrNo> {
         if old_fd >= MAX_FD_NUM || self.fds[old_fd].is_none() {
             return Err(SysErrNo::EBADF);
         }
-        if new_fd >= MAX_FD_NUM {
+        if new_fd >= limit.min(MAX_FD_NUM) {
             return Err(SysErrNo::EBADF);
         }
         if old_fd == new_fd {

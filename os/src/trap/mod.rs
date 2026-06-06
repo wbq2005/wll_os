@@ -43,6 +43,19 @@ pub fn timer_should_preempt_current_task() -> bool {
     !foreground_driver_active()
 }
 
+pub fn prepare_user_trapframe(tf: &mut TrapFrame) {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let bits = unsafe { core::mem::transmute::<_, usize>(tf.sstatus) };
+        let bits = (bits & !(1 << 8)) | (1 << 5);
+        tf.sstatus = unsafe { core::mem::transmute(bits) };
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        tf.prmd = (tf.prmd & !0b111) | 0b111;
+    }
+}
+
 pub fn clone_current_trapframe() -> Option<TrapFrame> {
     let ptr = *CURRENT_SYSCALL_CTX_PTR.lock();
     if ptr == 0 {
