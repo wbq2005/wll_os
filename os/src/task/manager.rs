@@ -54,6 +54,21 @@ pub fn remove_task(pid: usize) -> Option<Arc<TaskControlBlock>> {
     queue.remove(index)
 }
 
+pub fn remove_task_instances(task: &Arc<TaskControlBlock>) -> usize {
+    let mut removed = 0usize;
+    let mut queue = READY_QUEUE.lock();
+    let mut kept = VecDeque::new();
+    while let Some(queued) = queue.pop_front() {
+        if Arc::ptr_eq(&queued, task) || queued.pid.0 == task.pid.0 {
+            removed += 1;
+        } else {
+            kept.push_back(queued);
+        }
+    }
+    *queue = kept;
+    removed
+}
+
 pub fn retain_tasks(mut keep: impl FnMut(&Arc<TaskControlBlock>) -> bool) {
     let mut queue = READY_QUEUE.lock();
     let mut kept = VecDeque::new();

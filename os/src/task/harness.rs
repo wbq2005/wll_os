@@ -637,16 +637,9 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
 }
 
 fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
-    fn remember_pid(pids: &mut Vec<usize>, pid: usize) {
-        if !pids.iter().any(|seen| *seen == pid) {
-            pids.push(pid);
-        }
-    }
-
     fn terminate_group(
         task: &Arc<TaskControlBlock>,
         killed_tgids: &mut Vec<usize>,
-        killed_pids: &mut Vec<usize>,
     ) {
         if task.is_kernel {
             return;
@@ -662,14 +655,12 @@ fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
             members.push(task.clone());
         }
         for member in &members {
-            remember_pid(killed_pids, member.pid.0);
             *member.trap_frame.lock() = None;
         }
         crate::task::terminate_task_group(task, -2);
     }
 
     let mut killed_tgids = Vec::new();
-    let mut killed_pids = Vec::new();
     let mut tasks = manager::all_user_tasks();
     if !tasks.iter().any(|task| task.pid.0 == root.pid.0) {
         tasks.push(root.clone());
@@ -677,21 +668,8 @@ fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
 
     for task in tasks {
         if task.status() != TaskStatus::Zombie {
-            terminate_group(&task, &mut killed_tgids, &mut killed_pids);
+            terminate_group(&task, &mut killed_tgids);
         }
-    }
-
-    manager::retain_tasks(|queued| {
-        queued.is_kernel || !killed_pids.iter().any(|pid| *pid == queued.pid.0)
-    });
-
-    let mut current = CURRENT_TASK.lock();
-    if current
-        .as_ref()
-        .map(|task| killed_pids.iter().any(|pid| *pid == task.pid.0))
-        .unwrap_or(false)
-    {
-        *current = None;
     }
 }
 

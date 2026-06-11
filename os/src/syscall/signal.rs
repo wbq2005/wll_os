@@ -60,6 +60,7 @@ const KNOWN_SIGACTION_FLAGS: usize = SA_NOCLDSTOP
 const SIGNAL_FRAME_MAGIC: usize = 0x574c_4c5f_5349_4746; // "WLL_SIGF"
 const SI_USER: i32 = 0;
 const SI_TKILL: i32 = -6;
+const CLD_EXITED: i32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -563,6 +564,30 @@ pub fn current_has_unblocked_pending() -> bool {
         .as_ref()
         .map(has_deliverable_pending)
         .unwrap_or(false)
+}
+
+pub(crate) fn remove_signal_waiters_for_task(task: &Arc<TaskControlBlock>) -> usize {
+    SIGNAL_WAIT_QUEUE.remove_task_waiters(task)
+}
+
+pub(crate) fn notify_child_exit(child: &Arc<TaskControlBlock>) {
+    let parent = child.inner.lock().parent.clone();
+    let Some(parent) = parent else {
+        return;
+    };
+    if parent.is_kernel || parent.status() == TaskStatus::Zombie {
+        return;
+    }
+
+    queue_signal(
+        &parent,
+        SIGCHLD,
+        PendingSignalInfo {
+            code: CLD_EXITED,
+            sender_pid: child.thread_group.tgid() as i32,
+            sender_uid: 0,
+        },
+    );
 }
 
 pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {

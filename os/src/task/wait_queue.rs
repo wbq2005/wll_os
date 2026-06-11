@@ -100,6 +100,9 @@ impl WaitQueue {
 
         *task.block_reason.lock() = None;
         let still_waiting = self.remove_waiter(task.pid.0, token);
+        if deadline_us.is_some() {
+            crate::timer::remove_timeout(task.pid.0, token);
+        }
         match finish_wait(&task, still_waiting, deadline_us) {
             WaitOutcome::Interrupted => Err(SysErrNo::EINTR),
             outcome => Ok(outcome),
@@ -136,6 +139,21 @@ impl WaitQueue {
             }
         }
         woke
+    }
+
+    pub fn remove_task_waiters(&self, task: &Arc<TaskControlBlock>) -> usize {
+        let mut removed = 0usize;
+        let mut waiters = self.waiters.lock();
+        let mut index = 0usize;
+        while index < waiters.len() {
+            if Arc::ptr_eq(&waiters[index].task, task) || waiters[index].task.pid.0 == task.pid.0 {
+                waiters.remove(index);
+                removed += 1;
+            } else {
+                index += 1;
+            }
+        }
+        removed
     }
 
     fn remove_waiter(&self, pid: usize, token: usize) -> bool {
@@ -213,4 +231,8 @@ pub fn sleep_on_child_exit() -> Result<WaitOutcome, SysErrNo> {
 
 pub fn wake_child_waiters() -> usize {
     CHILD_WAIT_QUEUE.wake_all()
+}
+
+pub(crate) fn remove_core_waiters_for_task(task: &Arc<TaskControlBlock>) -> usize {
+    IO_WAIT_QUEUE.remove_task_waiters(task) + CHILD_WAIT_QUEUE.remove_task_waiters(task)
 }

@@ -4,7 +4,7 @@ use crate::mm::elf_loader::ElfFile;
 use crate::task::{
     current_task, dup_fd_table, dup_fs_context, dup_mm_context, exit_current_and_run_next,
     exit_thread_group_and_run_next, new_shared_memory_set, suspend_current_and_run_next,
-    TaskControlBlock, ThreadGroup,
+    yield_current_once, TaskControlBlock, ThreadGroup,
 };
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
@@ -781,6 +781,7 @@ fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> Sysca
 pub fn sys_sched_yield() -> SyscallRet {
     log::debug!("[syscall] sched_yield()");
     if crate::trap::foreground_driver_active() {
+        yield_current_once();
         return Ok(0);
     }
     suspend_current_and_run_next();

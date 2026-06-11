@@ -622,6 +622,9 @@ fn futex_wait_addr(
 
     *task.block_reason.lock() = None;
     let still_waiting = remove_futex_waiter(uaddr, key, task.pid.0, token);
+    if deadline.is_some() {
+        timer::remove_timeout(task.pid.0, token);
+    }
     match crate::task::wait_queue::finish_wait(&task, still_waiting, deadline) {
         WaitOutcome::TimedOut => Err(SysErrNo::ETIMEDOUT),
         WaitOutcome::Interrupted => Err(SysErrNo::EINTR),
@@ -642,6 +645,21 @@ fn remove_futex_waiter(uaddr: usize, key: usize, pid: usize, token: usize) -> bo
     } else {
         false
     }
+}
+
+pub(crate) fn remove_futex_waiters_for_task(task: &Arc<crate::task::TaskControlBlock>) -> usize {
+    let mut removed = 0usize;
+    let mut waiters = FUTEX_WAITERS.lock();
+    let mut index = 0usize;
+    while index < waiters.len() {
+        if Arc::ptr_eq(&waiters[index].task, task) || waiters[index].task.pid.0 == task.pid.0 {
+            waiters.remove(index);
+            removed += 1;
+        } else {
+            index += 1;
+        }
+    }
+    removed
 }
 
 pub(crate) fn process_robust_list_on_exit(task: &Arc<crate::task::TaskControlBlock>) {

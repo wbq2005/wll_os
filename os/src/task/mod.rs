@@ -380,6 +380,23 @@ pub fn suspend_current_and_run_next() {
     }
 }
 
+pub fn yield_current_once() -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    if is_kernel_task(&task) {
+        return false;
+    }
+
+    crate::timer::wake_expired_timers();
+    if crate::trap::foreground_driver_active() {
+        task.set_status(TaskStatus::Ready);
+        return manager::has_task();
+    }
+    suspend_current_and_run_next();
+    true
+}
+
 pub fn block_current_and_run_next(deadline_us: Option<usize>) {
     const FOREGROUND_NO_RUNNABLE_SPINS: usize = 1024;
     let Some(task) = current_task() else {
@@ -532,7 +549,9 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
         }
         crate::syscall::other::futex_wake_addr_for_task(task, clear_child_tid, usize::MAX);
     }
+    purge_wait_state_for_task(task);
     task.set_exit_code(exit_code);
+    *task.trap_frame.lock() = None;
     *task.block_reason.lock() = None;
     *task.wait_outcome.lock() = None;
     task.set_status(TaskStatus::Zombie);
@@ -541,10 +560,27 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     crate::fs::fd::flush_console_buffer_for_pid(task.thread_group.tgid());
 }
 
+fn purge_wait_state_for_task(task: &Arc<TaskControlBlock>) {
+    let removed = manager::remove_task_instances(task)
+        + wait_queue::remove_core_waiters_for_task(task)
+        + crate::timer::remove_task_timer_waiters(task)
+        + crate::syscall::other::remove_futex_waiters_for_task(task)
+        + crate::syscall::signal::remove_signal_waiters_for_task(task);
+    if removed != 0 {
+        log::debug!(
+            "[task] purged {} queued wait entries for pid={}",
+            removed,
+            task.pid.0
+        );
+    }
+}
+
 fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     if !task.thread_group.mark_process_zombie(exit_code) {
         return;
     }
+
+    crate::syscall::signal::notify_child_exit(task);
 
     let mut orphans = Vec::new();
     for member in task.thread_group.user_members() {

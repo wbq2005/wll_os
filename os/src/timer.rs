@@ -76,6 +76,38 @@ pub fn add_timeout(deadline_us: usize, task: Arc<TaskControlBlock>, token: usize
     set_next_trigger();
 }
 
+pub fn remove_timeout(pid: usize, token: usize) -> bool {
+    let mut waiters = TIMER_WAITERS.lock();
+    if let Some(index) = waiters
+        .iter()
+        .position(|waiter| waiter.task.pid.0 == pid && waiter.token == token)
+    {
+        waiters.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn remove_task_timeouts(task: &Arc<TaskControlBlock>) -> usize {
+    let mut removed = 0usize;
+    let mut waiters = TIMER_WAITERS.lock();
+    let mut index = 0usize;
+    while index < waiters.len() {
+        if Arc::ptr_eq(&waiters[index].task, task) || waiters[index].task.pid.0 == task.pid.0 {
+            waiters.remove(index);
+            removed += 1;
+        } else {
+            index += 1;
+        }
+    }
+    removed
+}
+
+pub(crate) fn remove_task_timer_waiters(task: &Arc<TaskControlBlock>) -> usize {
+    SLEEP_QUEUE.remove_task_waiters(task) + remove_task_timeouts(task)
+}
+
 pub fn wake_expired_timers() {
     let now = get_time_us();
     let mut expired = Vec::new();
