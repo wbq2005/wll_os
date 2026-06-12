@@ -179,7 +179,7 @@ pub fn try_start_runtime_test_harness() -> bool {
 fn run_runtime_test_harness() -> ! {
     #[cfg(feature = "libctest")]
     {
-        run_libctest_collection_harness();
+        run_libctest_collection_harness(true);
         crate::trap::leave_foreground_driver();
         polyhal::instruction::shutdown();
     }
@@ -187,8 +187,16 @@ fn run_runtime_test_harness() -> ! {
     #[cfg(not(feature = "libctest"))]
     {
         let scripts = collect_script_paths();
+        let mut ran_libctest = false;
 
         for script in &scripts {
+            if testcode_stem(script).and_then(TestGroup::from_stem) == Some(TestGroup::LibcTest) {
+                if !ran_libctest {
+                    run_libctest_collection_harness(false);
+                    ran_libctest = true;
+                }
+                continue;
+            }
             console_write("[harness] SCRIPT ");
             console_write(script);
             console_write("\n");
@@ -204,8 +212,7 @@ fn run_runtime_test_harness() -> ! {
     }
 }
 
-#[cfg(feature = "libctest")]
-fn run_libctest_collection_harness() {
+fn run_libctest_collection_harness(include_glibc: bool) {
     const STATIC_CASES: &[&str] = &[
         "argv",
         "basename",
@@ -553,6 +560,9 @@ fn run_libctest_collection_harness() {
     ];
 
     for (root, name, entry, cases) in SEGMENTS {
+        if !include_glibc && *root != "/musl" {
+            continue;
+        }
         if !libctest_segment_enabled(name) {
             continue;
         }
@@ -566,6 +576,9 @@ fn run_libctest_collection_harness() {
         }
     }
     for (root, name, runner, cases) in EXTRA_SEGMENTS {
+        if !include_glibc && *root != "/musl" {
+            continue;
+        }
         if !libctest_segment_enabled(name) {
             continue;
         }
@@ -580,7 +593,6 @@ fn run_libctest_collection_harness() {
     }
 }
 
-#[cfg(feature = "libctest")]
 fn libctest_segment_enabled(name: &str) -> bool {
     match option_env!("LIBCTEST_FILTER") {
         Some(filter) => {
@@ -601,7 +613,6 @@ fn libctest_segment_enabled(name: &str) -> bool {
     }
 }
 
-#[cfg(feature = "libctest")]
 fn run_libctest_segment(root: &str, name: &str, entry: &str, cases: &[&str]) -> bool {
     let mut launched = false;
 
@@ -628,7 +639,6 @@ fn run_libctest_segment(root: &str, name: &str, entry: &str, cases: &[&str]) -> 
     launched
 }
 
-#[cfg(feature = "libctest")]
 fn run_libctest_case(root: &str, entry: &str, case: &str) -> bool {
     let runtest_path = String::from("/runtest.exe");
     let runtest_host = crate::fs::apply_root(root, &runtest_path);
@@ -653,7 +663,6 @@ fn run_libctest_case(root: &str, entry: &str, case: &str) -> bool {
         })
 }
 
-#[cfg(feature = "libctest")]
 fn run_libctest_extra_segment(root: &str, name: &str, runner: &str, cases: &[&str]) -> bool {
     let mut launched = false;
 
@@ -680,7 +689,6 @@ fn run_libctest_extra_segment(root: &str, name: &str, runner: &str, cases: &[&st
     launched
 }
 
-#[cfg(feature = "libctest")]
 fn run_libctest_extra_case(root: &str, runner: &str, case: &str) -> bool {
     let runner_path = String::from(runner);
     let runner_host = crate::fs::apply_root(root, &runner_path);

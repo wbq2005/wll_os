@@ -43,22 +43,14 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LIBCTEST");
     println!("cargo:rerun-if-env-changed=LIBCTEST_FILTER");
     let dev_preload = env::var_os("CARGO_FEATURE_DEV_PRELOAD").is_some();
-    let libctest = env::var_os("CARGO_FEATURE_LIBCTEST").is_some();
-    if !dev_preload && !libctest {
-        fs::write(&generated, "fn preload_generated_programs() {}\n")
-            .expect("write empty preload source");
-        return;
-    }
 
     let mut code = String::from("fn preload_generated_programs() {\n");
 
     if dev_preload {
         emit_dev_preload(&mut code, manifest_dir, target);
     }
-    if libctest {
-        emit_libctest_runtime_libs(&mut code, target);
-        emit_libctest_extra(&mut code, manifest_dir, target, &out_dir);
-    }
+    emit_libctest_runtime_libs(&mut code, target);
+    emit_libctest_extra(&mut code, manifest_dir, target, &out_dir);
 
     code.push_str("}\n");
     fs::write(&generated, code).expect("write generated preload source");
