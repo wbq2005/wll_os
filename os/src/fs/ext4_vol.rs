@@ -113,6 +113,10 @@ fn ext4_extra_nsec(extra: u32) -> isize {
     (extra >> 2) as isize
 }
 
+fn ext4_nsec_extra(nsec: isize) -> u32 {
+    (nsec.max(0) as u32).min(999_999_999) << 2
+}
+
 fn touch_inode(fs: &Ext4, ino: u32, atime: bool, mtime: bool, ctime: bool) {
     let now = current_ext4_time();
     let mut iref = fs.get_inode_ref(ino);
@@ -483,6 +487,42 @@ pub fn metadata(path: &str) -> Result<Ext4Metadata, SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let (ino, _) = resolve_existing(&fs, path).ok_or(SysErrNo::ENOENT)?;
     Ok(metadata_for_ino(&fs, ino))
+}
+
+pub fn set_times_ino(
+    ino: u32,
+    atime: Option<(isize, isize)>,
+    mtime: Option<(isize, isize)>,
+) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let mut iref = fs.get_inode_ref(ino);
+    if let Some((sec, nsec)) = atime {
+        iref.inode
+            .set_atime((sec.max(0) as usize).min(u32::MAX as usize) as u32);
+        iref.inode.set_i_atime_extra(ext4_nsec_extra(nsec));
+    }
+    if let Some((sec, nsec)) = mtime {
+        iref.inode
+            .set_mtime((sec.max(0) as usize).min(u32::MAX as usize) as u32);
+        iref.inode.set_i_mtime_extra(ext4_nsec_extra(nsec));
+    }
+    let now = current_ext4_time();
+    iref.inode.set_ctime(now);
+    iref.inode.set_i_ctime_extra(0);
+    fs.write_back_inode(&mut iref);
+    clear_metadata_cache();
+    Ok(())
+}
+
+pub fn set_times_path(
+    path: &str,
+    atime: Option<(isize, isize)>,
+    mtime: Option<(isize, isize)>,
+) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let (ino, _) = resolve_existing(&fs, path).ok_or(SysErrNo::ENOENT)?;
+    drop(fs);
+    set_times_ino(ino, atime, mtime)
 }
 
 pub fn regular_file_size(ino: u32) -> Result<usize, SysErrNo> {

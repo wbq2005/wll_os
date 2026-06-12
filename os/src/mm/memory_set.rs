@@ -45,16 +45,36 @@ fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
     }
 }
 
-fn unmap_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
-    for idx in 0..area.page_count() {
+fn unmap_area_pages(page_table: &PageTableWrapper, area: &MapArea, flags: PTEFlags) {
+    if !has_leaf_permission(flags) || !area.has_frames() {
+        return;
+    }
+
+    for idx in 0..area.frames.len() {
         let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
         page_table.unmap_page(vaddr);
     }
 }
 
-fn remap_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
-    unmap_area_pages(page_table, area);
+fn remap_area_pages(page_table: &PageTableWrapper, area: &MapArea, old_flags: PTEFlags) {
+    unmap_area_pages(page_table, area, old_flags);
     map_area_pages(page_table, area);
+}
+
+fn populate_area_frames(area: &mut MapArea) -> Result<(), SysErrNo> {
+    if area.has_frames() {
+        return Ok(());
+    }
+
+    let mut frames = Vec::new();
+    for _ in 0..area.page_count() {
+        let Some(frame) = frame_allocator::alloc_frame() else {
+            return Err(SysErrNo::ENOMEM);
+        };
+        frames.push(frame);
+    }
+    area.frames = frames;
+    Ok(())
 }
 
 /// Per-process address space.
@@ -107,6 +127,11 @@ impl MemorySet {
             permission,
             backing,
         );
+        if !has_leaf_permission(permission) {
+            self.areas.push(area);
+            self.coalesce_areas();
+            return Ok(());
+        }
 
         let start_vpn = start / PAGE_SIZE;
         let end_vpn = end / PAGE_SIZE;
@@ -291,7 +316,7 @@ impl MemorySet {
         let mut kept = Vec::new();
         for area in mem::take(&mut self.areas) {
             if area.overlaps(start, end) {
-                unmap_area_pages(&self.page_table, &area);
+                unmap_area_pages(&self.page_table, &area, area.flags);
             } else {
                 kept.push(area);
             }
@@ -321,8 +346,12 @@ impl MemorySet {
 
         for area in &mut self.areas {
             if area.start_va.raw() >= start && area.end_va.raw() <= end {
+                let old_flags = area.flags;
+                if has_leaf_permission(flags) {
+                    populate_area_frames(area)?;
+                }
                 area.flags = flags;
-                remap_area_pages(&self.page_table, area);
+                remap_area_pages(&self.page_table, area, old_flags);
             }
         }
         self.coalesce_areas();

@@ -9,6 +9,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::fs::ext4_vol;
+use crate::fs::FileTimes;
 use crate::fs::MEM_FS;
 use crate::utils::error::SysErrNo;
 
@@ -38,12 +39,13 @@ fn is_dev_zero_path(path: &str) -> bool {
     matches!(path, "/dev/zero" | "/glibc/dev/zero" | "/musl/dev/zero")
 }
 
-fn refresh_mem_content(name: &str, content: &mut Vec<u8>) {
+fn refresh_mem_file(name: &str, content: &mut Vec<u8>, times: &mut FileTimes) {
     if is_dev_null_path(name) || is_dev_zero_path(name) {
         return;
     }
     if let Some(file) = MEM_FS.lock().get_file(name) {
         *content = file.content.clone();
+        *times = file.times;
     }
 }
 
@@ -121,6 +123,7 @@ pub enum FileDescriptor {
     MemFile {
         name: String,
         content: Vec<u8>,
+        times: FileTimes,
         offset: FileOffset,
         readable: bool,
         writable: bool,
@@ -454,6 +457,7 @@ impl FileDescriptor {
             FileDescriptor::MemFile {
                 name,
                 content,
+                times,
                 offset,
                 readable,
                 ..
@@ -469,7 +473,7 @@ impl FileDescriptor {
                     *offset = (*offset).saturating_add(buf.len());
                     return Ok(buf.len());
                 }
-                refresh_mem_content(name, content);
+                refresh_mem_file(name, content, times);
                 if *offset >= content.len() {
                     return Ok(0);
                 }
@@ -572,6 +576,7 @@ impl FileDescriptor {
             FileDescriptor::MemFile {
                 name,
                 content,
+                times,
                 readable,
                 ..
             } => {
@@ -585,7 +590,7 @@ impl FileDescriptor {
                     buf.fill(0);
                     return Ok(buf.len());
                 }
-                refresh_mem_content(name, content);
+                refresh_mem_file(name, content, times);
                 if offset >= content.len() {
                     return Ok(0);
                 }
@@ -613,6 +618,7 @@ impl FileDescriptor {
             FileDescriptor::MemFile {
                 name,
                 content,
+                times,
                 writable,
                 ..
             } => {
@@ -622,13 +628,16 @@ impl FileDescriptor {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(buf.len());
                 }
-                refresh_mem_content(name, content);
+                refresh_mem_file(name, content, times);
                 let end = Self::checked_file_end(offset, buf.len())?;
                 if end > content.len() {
                     content.resize(end, 0);
                 }
                 content[offset..end].copy_from_slice(buf);
-                MEM_FS.lock().add_file(name, content.clone());
+                times.touch_modified();
+                MEM_FS
+                    .lock()
+                    .write_file_content(name, content.clone(), *times);
                 Ok(buf.len())
             }
             FileDescriptor::Ext4Regular { ino, writable, .. } => {
@@ -658,6 +667,7 @@ impl FileDescriptor {
             FileDescriptor::MemFile {
                 name,
                 content,
+                times,
                 offset,
                 writable,
                 append,
@@ -669,7 +679,7 @@ impl FileDescriptor {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(buf.len());
                 }
-                refresh_mem_content(name, content);
+                refresh_mem_file(name, content, times);
                 if *append {
                     *offset = content.len();
                 }
@@ -680,7 +690,10 @@ impl FileDescriptor {
                 }
                 content[start..end].copy_from_slice(buf);
                 *offset = end;
-                MEM_FS.lock().add_file(name, content.clone());
+                times.touch_modified();
+                MEM_FS
+                    .lock()
+                    .write_file_content(name, content.clone(), *times);
 
                 Ok(buf.len())
             }
@@ -850,6 +863,7 @@ impl FileDescriptor {
             FileDescriptor::MemFile {
                 name,
                 content,
+                times,
                 writable,
                 ..
             } => {
@@ -859,9 +873,12 @@ impl FileDescriptor {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(());
                 }
-                refresh_mem_content(name, content);
+                refresh_mem_file(name, content, times);
                 content.resize(new_len, 0);
-                MEM_FS.lock().add_file(name, content.clone());
+                times.touch_modified();
+                MEM_FS
+                    .lock()
+                    .write_file_content(name, content.clone(), *times);
                 Ok(())
             }
             FileDescriptor::Ext4Regular { ino, writable, .. } => {
@@ -968,6 +985,7 @@ impl Clone for FileDescriptor {
             FileDescriptor::MemFile {
                 name,
                 content,
+                times,
                 offset,
                 readable,
                 writable,
@@ -975,6 +993,7 @@ impl Clone for FileDescriptor {
             } => FileDescriptor::MemFile {
                 name: name.clone(),
                 content: content.clone(),
+                times: *times,
                 offset: *offset,
                 readable: *readable,
                 writable: *writable,
@@ -1309,15 +1328,23 @@ fn open_file_legacy_unused(
         if want_excl && want_create {
             return Err(SysErrNo::EEXIST);
         }
-        let mut content = fs::read_file(&path_norm).unwrap_or_default();
+        let source = fs::MEM_FS
+            .lock()
+            .get_file(&path_norm)
+            .map(|file| (file.content.clone(), file.times));
+        let (mut content, mut times) = source.unwrap_or_else(|| (Vec::new(), FileTimes::now()));
         if want_trunc && write_ok {
             content.clear();
             fs::MEM_FS.lock().truncate_file(&path_norm, 0)?;
+            if let Some(file) = fs::MEM_FS.lock().get_file(&path_norm) {
+                times = file.times;
+            }
         }
         let base_off = if append && write_ok { content.len() } else { 0 };
         return Ok(FileDescriptor::MemFile {
             name: path_norm,
             content,
+            times,
             offset: base_off,
             readable: read_ok,
             writable: write_ok,
@@ -1409,9 +1436,15 @@ fn open_file_legacy_unused(
         }
         if fs::MEM_FS.lock().is_dir(&parent) {
             fs::MEM_FS.lock().add_file(&path_norm, Vec::new());
+            let times = fs::MEM_FS
+                .lock()
+                .get_file(&path_norm)
+                .map(|file| file.times)
+                .unwrap_or_else(FileTimes::now);
             return Ok(FileDescriptor::MemFile {
                 name: path_norm,
                 content: Vec::new(),
+                times,
                 offset: 0,
                 readable: read_ok,
                 writable: write_ok,

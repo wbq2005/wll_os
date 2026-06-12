@@ -229,26 +229,77 @@ struct SignalFrame {
     signo: usize,
     old_mask: usize,
     siginfo: UserSigInfo,
-    context: ArchSignalContext,
+    ucontext: UserUContext,
+    arch_extra: ArchSignalExtra,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserSigAltStack {
+    ss_sp: usize,
+    ss_flags: i32,
+    _pad: i32,
+    ss_size: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserSigSet {
+    bits: [usize; 16],
+}
+
+impl UserSigSet {
+    fn from_kernel(mask: usize) -> Self {
+        let mut bits = [0usize; 16];
+        bits[0] = mask;
+        Self { bits }
+    }
+
+    fn to_kernel_mask(self) -> usize {
+        self.bits[0]
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserUContext {
+    uc_flags: usize,
+    uc_link: usize,
+    uc_stack: UserSigAltStack,
+    uc_sigmask: UserSigSet,
+    uc_mcontext: UserMContext,
+}
+
+#[cfg(target_arch = "riscv64")]
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct UserMContext {
+    gregs: [usize; 32],
+    fpregs: [u64; 66],
 }
 
 #[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct ArchSignalContext {
-    x: [usize; 32],
+struct ArchSignalExtra {
     sstatus: usize,
-    sepc: usize,
     fsx: [usize; 2],
 }
 
 #[cfg(target_arch = "loongarch64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct ArchSignalContext {
+struct UserMContext {
     regs: [usize; 32],
     prmd: usize,
     era: usize,
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ArchSignalExtra {
+    _reserved: usize,
 }
 
 fn valid_signal(signum: i32) -> bool {
@@ -260,10 +311,7 @@ fn signal_bit(signum: i32) -> usize {
 }
 
 fn unblockable_mask() -> usize {
-    // glibc/NPTL uses private real-time signals for cancellation and setxid.
-    // Linux keeps them out of the user-visible mask so pthread cancellation can
-    // interrupt cancellation points even if user code blocks all ordinary signals.
-    signal_bit(SIGKILL) | signal_bit(SIGSTOP) | signal_bit(SIGCANCEL) | signal_bit(SIGSETXID)
+    signal_bit(SIGKILL) | signal_bit(SIGSTOP)
 }
 
 fn sanitize_mask(mask: usize) -> usize {
@@ -286,7 +334,7 @@ fn default_ignored(signum: i32) -> bool {
 }
 
 fn default_exit_code(signum: i32) -> i32 {
-    128 + signum
+    crate::task::signal_exit_code(signum)
 }
 
 fn read_sigset(addr: usize) -> Result<usize, SysErrNo> {
@@ -407,7 +455,9 @@ pub fn sys_sigtimedwait(set: usize, info: usize, timeout: usize, sigset_size: us
     let wait_mask = read_sigset(set)?;
     let deadline_us = if timeout != 0 {
         let timeout = super::user::copy_object_from_user::<TimeSpec>(timeout)?;
-        Some(timer::deadline_after_us(duration_us_from_timespec(timeout)?))
+        Some(timer::deadline_after_us(duration_us_from_timespec(
+            timeout,
+        )?))
     } else {
         None
     };
@@ -541,8 +591,10 @@ pub fn sys_sigreturn() -> SyscallRet {
     }
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    task.signal_state.lock().blocked = sanitize_mask(frame.old_mask);
-    if !crate::trap::update_current_trapframe(|tf| restore_trapframe(&frame.context, tf)) {
+    task.signal_state.lock().blocked = sanitize_mask(frame.ucontext.uc_sigmask.to_kernel_mask());
+    if !crate::trap::update_current_trapframe(|tf| {
+        restore_trapframe(&frame.ucontext.uc_mcontext, &frame.arch_extra, tf)
+    }) {
         return Err(SysErrNo::EINVAL);
     }
     crate::trap::signal_rt_sigreturn_done();
@@ -748,7 +800,8 @@ fn setup_signal_frame(
         signo: signum as usize,
         old_mask,
         siginfo: info.user_siginfo(signum),
-        context: arch_context_from_trapframe(ctx),
+        ucontext: user_ucontext_from_trapframe(ctx, old_mask),
+        arch_extra: arch_extra_from_trapframe(ctx),
     };
     super::user::copy_object_to_user(frame_addr, &frame)?;
 
@@ -765,31 +818,55 @@ fn setup_signal_frame(
     } else {
         0
     };
-    ctx[TrapFrameArgs::ARG2] = frame_addr + core::mem::offset_of!(SignalFrame, context);
+    ctx[TrapFrameArgs::ARG2] = frame_addr + core::mem::offset_of!(SignalFrame, ucontext);
     Ok(())
 }
 
+fn user_ucontext_from_trapframe(tf: &TrapFrame, old_mask: usize) -> UserUContext {
+    UserUContext {
+        uc_flags: 0,
+        uc_link: 0,
+        uc_stack: UserSigAltStack {
+            ss_sp: 0,
+            ss_flags: 0,
+            _pad: 0,
+            ss_size: 0,
+        },
+        uc_sigmask: UserSigSet::from_kernel(old_mask),
+        uc_mcontext: user_mcontext_from_trapframe(tf),
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
-fn arch_context_from_trapframe(tf: &TrapFrame) -> ArchSignalContext {
-    ArchSignalContext {
-        x: tf.x,
+fn user_mcontext_from_trapframe(tf: &TrapFrame) -> UserMContext {
+    let mut gregs = tf.x;
+    gregs[0] = tf.sepc;
+    UserMContext {
+        gregs,
+        fpregs: [0; 66],
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn arch_extra_from_trapframe(tf: &TrapFrame) -> ArchSignalExtra {
+    ArchSignalExtra {
         sstatus: unsafe { core::mem::transmute::<_, usize>(tf.sstatus) },
-        sepc: tf.sepc,
         fsx: tf.fsx,
     }
 }
 
 #[cfg(target_arch = "riscv64")]
-fn restore_trapframe(saved: &ArchSignalContext, tf: &mut TrapFrame) {
-    tf.x = saved.x;
-    tf.sstatus = unsafe { core::mem::transmute(saved.sstatus) };
-    tf.sepc = saved.sepc;
-    tf.fsx = saved.fsx;
+fn restore_trapframe(saved: &UserMContext, extra: &ArchSignalExtra, tf: &mut TrapFrame) {
+    tf.x = saved.gregs;
+    tf.x[0] = 0;
+    tf.sstatus = unsafe { core::mem::transmute(extra.sstatus) };
+    tf.sepc = saved.gregs[0];
+    tf.fsx = extra.fsx;
 }
 
 #[cfg(target_arch = "loongarch64")]
-fn arch_context_from_trapframe(tf: &TrapFrame) -> ArchSignalContext {
-    ArchSignalContext {
+fn user_mcontext_from_trapframe(tf: &TrapFrame) -> UserMContext {
+    UserMContext {
         regs: tf.regs,
         prmd: tf.prmd,
         era: tf.era,
@@ -797,7 +874,12 @@ fn arch_context_from_trapframe(tf: &TrapFrame) -> ArchSignalContext {
 }
 
 #[cfg(target_arch = "loongarch64")]
-fn restore_trapframe(saved: &ArchSignalContext, tf: &mut TrapFrame) {
+fn arch_extra_from_trapframe(_tf: &TrapFrame) -> ArchSignalExtra {
+    ArchSignalExtra { _reserved: 0 }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn restore_trapframe(saved: &UserMContext, _extra: &ArchSignalExtra, tf: &mut TrapFrame) {
     tf.regs = saved.regs;
     tf.prmd = saved.prmd;
     tf.era = saved.era;

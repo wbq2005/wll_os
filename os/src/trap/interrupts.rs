@@ -41,8 +41,8 @@ pub fn enable_interrupt() {
 
     #[cfg(all(target_arch = "loongarch64", feature = "loongarch"))]
     {
-        use loongArch64::register::prmd;
-        prmd::set_pie(true);
+        use loongArch64::register::crmd;
+        crmd::set_ie(true);
     }
 }
 
@@ -56,8 +56,8 @@ pub fn disable_interrupt() {
 
     #[cfg(all(target_arch = "loongarch64", feature = "loongarch"))]
     {
-        use loongArch64::register::prmd;
-        prmd::set_pie(false);
+        use loongArch64::register::crmd;
+        crmd::set_ie(false);
     }
 }
 
@@ -71,8 +71,8 @@ pub fn is_interrupt_enabled() -> bool {
 
     #[cfg(all(target_arch = "loongarch64", feature = "loongarch"))]
     {
-        use loongArch64::register::prmd;
-        prmd::read().pie()
+        use loongArch64::register::crmd;
+        crmd::read().ie()
     }
 
     #[cfg(not(any(

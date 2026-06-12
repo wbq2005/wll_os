@@ -28,6 +28,7 @@ static mut SCHEDULER_CONTEXT: TaskContext = TaskContext {
     s: [0; 12],
 };
 static SCHEDULER_CONTEXT_PTR: AtomicUsize = AtomicUsize::new(0);
+const SIGNAL_EXIT_CODE_BASE: i32 = -0x1000;
 
 /// Flag set when the scheduler is context-switching FROM a user task that called exit()
 /// (via ECANCELED in the trap handler). When this flag is set, kernel_task_return()
@@ -44,6 +45,8 @@ lazy_static! {
 
     /// 孤儿进程收养者：`/init` 或预载入 harness（无 init 时），供父退出时移交子进程
     pub static ref ORPHAN_REAPER: Mutex<Option<Arc<TaskControlBlock>>> = Mutex::new(None);
+    static ref FOREGROUND_ACTIVE_TASKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static ref FOREGROUND_REQUEUE_FRONT: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 }
 
 /// Unified specification for launching user programs with full control over
@@ -228,6 +231,113 @@ pub fn orphan_reaper() -> Option<Arc<TaskControlBlock>> {
     ORPHAN_REAPER.lock().clone()
 }
 
+pub(crate) fn enter_foreground_user_task(pid: usize) {
+    if crate::trap::foreground_driver_active() {
+        FOREGROUND_ACTIVE_TASKS.lock().push(pid);
+    }
+}
+
+pub(crate) fn leave_foreground_user_task(pid: usize) {
+    if crate::trap::foreground_driver_active() {
+        let mut active = FOREGROUND_ACTIVE_TASKS.lock();
+        if let Some(index) = active.iter().rposition(|active_pid| *active_pid == pid) {
+            active.remove(index);
+        }
+    }
+}
+
+fn is_foreground_user_task_active(pid: usize) -> bool {
+    crate::trap::foreground_driver_active() && FOREGROUND_ACTIVE_TASKS.lock().contains(&pid)
+}
+
+pub(crate) fn request_foreground_requeue_front(pid: usize) {
+    if !crate::trap::foreground_driver_active() {
+        return;
+    }
+    let mut pids = FOREGROUND_REQUEUE_FRONT.lock();
+    if !pids.contains(&pid) {
+        pids.push(pid);
+    }
+}
+
+fn take_foreground_requeue_front(pid: usize) -> bool {
+    if !crate::trap::foreground_driver_active() {
+        return false;
+    }
+    let mut pids = FOREGROUND_REQUEUE_FRONT.lock();
+    if let Some(index) = pids.iter().position(|queued_pid| *queued_pid == pid) {
+        pids.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
+fn fetch_dispatchable_task() -> Option<Arc<TaskControlBlock>> {
+    let mut skipped_active = Vec::new();
+    loop {
+        let Some(task) = manager::fetch_task() else {
+            for task in skipped_active {
+                manager::add_task(task);
+            }
+            return None;
+        };
+        if is_foreground_user_task_active(task.pid.0) {
+            skipped_active.push(task);
+            continue;
+        }
+        for task in skipped_active {
+            manager::add_task(task);
+        }
+        return Some(task);
+    }
+}
+
+pub(crate) fn signal_exit_code(signum: i32) -> i32 {
+    SIGNAL_EXIT_CODE_BASE - signum
+}
+
+pub(crate) fn wait_status_from_exit_code(exit_code: i32) -> i32 {
+    if exit_code < SIGNAL_EXIT_CODE_BASE {
+        let signum = SIGNAL_EXIT_CODE_BASE - exit_code;
+        if (1..=64).contains(&signum) {
+            return signum;
+        }
+    }
+    (exit_code & 0xff) << 8
+}
+
+pub(crate) fn detach_child_from_parent(task: &Arc<TaskControlBlock>) -> bool {
+    let parent = task.inner.lock().parent.clone();
+    let Some(parent) = parent else {
+        return false;
+    };
+
+    let mut parent_inner = parent.inner.lock();
+    if let Some(index) = parent_inner.children.iter().position(|child| {
+        Arc::ptr_eq(child, task)
+            || child.pid.0 == task.pid.0
+            || child.thread_group.tgid() == task.thread_group.tgid()
+    }) {
+        parent_inner.children.remove(index);
+        drop(parent_inner);
+        task.inner.lock().parent = None;
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn purge_exited_user_task_for_foreground(task: &Arc<TaskControlBlock>) {
+    if task.is_kernel {
+        return;
+    }
+    purge_wait_state_for_task(task);
+    if task.status() == TaskStatus::Zombie {
+        detach_child_from_parent(task);
+    }
+}
+
 fn is_kernel_task(task: &Arc<TaskControlBlock>) -> bool {
     task.is_kernel
 }
@@ -242,7 +352,11 @@ pub(crate) fn requeue_after_user_run(task: Arc<TaskControlBlock>) {
         TaskStatus::Running | TaskStatus::Ready => {
             *task.block_reason.lock() = None;
             task.set_status(TaskStatus::Ready);
-            manager::add_task(task);
+            if take_foreground_requeue_front(task.pid.0) {
+                manager::add_task_front(task);
+            } else {
+                manager::add_task(task);
+            }
         }
     }
 }
@@ -415,21 +529,34 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
     *CURRENT_TASK.lock() = None;
 
     let mut no_runnable_spins = 0usize;
+    let mut parked_syscall = false;
     while task.status() == TaskStatus::Blocked {
+        if crate::trap::foreground_driver_active() {
+            if run_ready_task_once() {
+                no_runnable_spins = 0;
+                continue;
+            }
+        }
         crate::timer::wake_expired_timers();
         if task.status() != TaskStatus::Blocked {
             break;
         }
-        if run_ready_task_once() {
+        if !crate::trap::foreground_driver_active() && run_ready_task_once() {
             no_runnable_spins = 0;
             continue;
         }
         if crate::trap::foreground_driver_active() {
-            if deadline_us.is_none() {
-                no_runnable_spins += 1;
-                if no_runnable_spins >= FOREGROUND_NO_RUNNABLE_SPINS {
-                    wake_blocked_task(&task, wait_queue::WaitOutcome::Interrupted);
+            no_runnable_spins += 1;
+            if no_runnable_spins >= FOREGROUND_NO_RUNNABLE_SPINS {
+                if matches!(*task.block_reason.lock(), Some(wait_queue::BlockReason::Futex)) {
+                    crate::trap::signal_syscall_parked();
+                    parked_syscall = true;
                     break;
+                } else {
+                    if deadline_us.is_none() {
+                        wake_blocked_task(&task, wait_queue::WaitOutcome::Interrupted);
+                        break;
+                    }
                 }
             }
             core::hint::spin_loop();
@@ -438,7 +565,10 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
         }
     }
 
-    let _ = manager::remove_task(task.pid.0);
+    manager::remove_task_instances(&task);
+    if parked_syscall {
+        return;
+    }
     if task.status() == TaskStatus::Ready {
         *task.block_reason.lock() = None;
         task.set_status(TaskStatus::Running);
@@ -614,7 +744,7 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
 pub(crate) fn run_next_task() {
     // UART marker: 'S' = scheduler entry
 
-    if let Some(task) = manager::fetch_task() {
+    if let Some(task) = fetch_dispatchable_task() {
         if matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
             if crate::trap::foreground_driver_active() {
                 return;
@@ -667,7 +797,9 @@ pub(crate) fn run_next_task() {
                 return;
             }
             crate::trap::prepare_user_trapframe(&mut ctx);
+            enter_foreground_user_task(task.pid.0);
             let reason = run_user_task(&mut ctx);
+            leave_foreground_user_task(task.pid.0);
             crate::trap::restore_kernel_page_table();
             log::debug!("[task] User task returned with reason: {:?}", reason);
             // Normal case: put ctx back and requeue task
@@ -782,7 +914,7 @@ fn wait_for_interrupt() {
 }
 
 pub(crate) fn run_ready_task_once() -> bool {
-    let Some(active) = manager::fetch_task() else {
+    let Some(active) = fetch_dispatchable_task() else {
         return false;
     };
     if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
@@ -813,7 +945,9 @@ pub(crate) fn run_ready_task_once() -> bool {
             return true;
         }
         crate::trap::prepare_user_trapframe(&mut ctx);
+        enter_foreground_user_task(active.pid.0);
         let _reason = run_user_task(&mut ctx);
+        leave_foreground_user_task(active.pid.0);
         crate::trap::restore_kernel_page_table();
         if active.status() != TaskStatus::Zombie {
             *active.trap_frame.lock() = Some(ctx);

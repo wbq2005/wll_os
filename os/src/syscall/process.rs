@@ -26,6 +26,7 @@ const ALLOWED_CLONE_FLAGS: usize = CLONE_VM
     | CLONE_SETTLS
     | CLONE_PARENT_SETTID
     | CLONE_CHILD_CLEARTID
+    | CLONE_DETACHED
     | CLONE_CHILD_SETTID;
 
 const CLONE_VM: usize = 0x00000100;
@@ -45,6 +46,8 @@ const CLONE_SETTLS: usize = 0x00080000;
 const CLONE_PARENT_SETTID: usize = 0x00100000;
 
 const CLONE_CHILD_CLEARTID: usize = 0x00200000;
+
+const CLONE_DETACHED: usize = 0x00400000;
 
 const CLONE_CHILD_SETTID: usize = 0x01000000;
 
@@ -736,7 +739,10 @@ fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> Sysca
 
     if let Some((cpid, exit_code)) = reap_zombie_child(&task, target) {
         if !status.is_null() {
-            write_user_i32(status as usize, exit_code << 8)?;
+            write_user_i32(
+                status as usize,
+                crate::task::wait_status_from_exit_code(exit_code),
+            )?;
         }
         return Ok(cpid);
     }
@@ -752,7 +758,10 @@ fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> Sysca
     loop {
         if let Some((cpid, exit_code)) = reap_zombie_child(&task, target) {
             if !status.is_null() {
-                write_user_i32(status as usize, exit_code << 8)?;
+                write_user_i32(
+                    status as usize,
+                    crate::task::wait_status_from_exit_code(exit_code),
+                )?;
             }
             return Ok(cpid);
         }
@@ -764,7 +773,10 @@ fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> Sysca
             Err(SysErrNo::EINTR) => {
                 if let Some((cpid, exit_code)) = reap_zombie_child(&task, target) {
                     if !status.is_null() {
-                        write_user_i32(status as usize, exit_code << 8)?;
+                        write_user_i32(
+                            status as usize,
+                            crate::task::wait_status_from_exit_code(exit_code),
+                        )?;
                     }
                     return Ok(cpid);
                 }
@@ -809,12 +821,16 @@ pub fn sys_clone(
     flags: usize,
     stack: usize,
     parent_tid: usize,
-    tls: usize,
-    child_tid: usize,
+    arg3: usize,
+    arg4: usize,
 ) -> SyscallRet {
     let parent = current_task().ok_or(SysErrNo::ESRCH)?;
     let parent_tid_num = parent.pid.0;
     let parent_pid = parent.thread_group.tgid();
+    #[cfg(target_arch = "loongarch64")]
+    let (tls, child_tid) = (arg4, arg3);
+    #[cfg(not(target_arch = "loongarch64"))]
+    let (tls, child_tid) = (arg3, arg4);
 
     let clone_bits = flags & !CSIGNAL;
     if clone_bits != 0 && (clone_bits & !ALLOWED_CLONE_FLAGS) != 0 {
@@ -845,7 +861,6 @@ pub fn sys_clone(
         area_count,
         page_count
     );
-
     let mut child_tf = crate::trap::clone_current_trapframe().ok_or(SysErrNo::EINVAL)?;
     child_tf[TrapFrameArgs::RET] = 0;
     child_tf.syscall_ok();
@@ -953,8 +968,8 @@ pub fn sys_clone(
     });
     crate::task::manager::register_task(&child);
     thread_group.add_member(&child);
-    // RISC-V clone uses Linux's order:
-    // clone(flags, stack, parent_tidptr, tls, child_tidptr).
+    // RISC-V uses clone(flags, stack, parent_tidptr, tls, child_tidptr);
+    // LoongArch musl uses clone(flags, stack, parent_tidptr, child_tidptr, tls).
     if (clone_bits & CLONE_PARENT_SETTID) != 0 && parent_tid != 0 {
         write_user_i32(parent_tid, child_pid as i32)?;
     }
@@ -968,6 +983,7 @@ pub fn sys_clone(
         parent.inner.lock().children.push(child.clone());
     }
     crate::task::manager::add_task(child);
+    crate::task::request_foreground_requeue_front(parent.pid.0);
 
     log::info!(
         "[syscall] clone(flags={:#x}, stack={:#x}) parent_pid={} parent_tid={} child_tid={}",

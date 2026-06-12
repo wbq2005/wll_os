@@ -41,6 +41,7 @@ loongarch = ["dep:loongArch64"]
 no-init-idle = []
 dev-preload = []
 libctest = []
+iozone = []
 
 [[bin]]
 name = "wll_OS"

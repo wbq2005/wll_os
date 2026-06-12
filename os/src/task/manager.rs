@@ -26,7 +26,25 @@ pub fn record_exited_task(pid: usize, tgid: usize) {
 
 /// 添加任务到就绪队列
 pub fn add_task(task: Arc<TaskControlBlock>) {
-    READY_QUEUE.lock().push_back(task);
+    let mut queue = READY_QUEUE.lock();
+    if queue
+        .iter()
+        .any(|queued| Arc::ptr_eq(queued, &task) || queued.pid.0 == task.pid.0)
+    {
+        return;
+    }
+    queue.push_back(task);
+}
+
+pub fn add_task_front(task: Arc<TaskControlBlock>) {
+    let mut queue = READY_QUEUE.lock();
+    if queue
+        .iter()
+        .any(|queued| Arc::ptr_eq(queued, &task) || queued.pid.0 == task.pid.0)
+    {
+        return;
+    }
+    queue.push_front(task);
 }
 
 /// 从就绪队列取出一个任务

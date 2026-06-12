@@ -10,9 +10,9 @@ pub use vfs::{
     check_access, check_fd_access, check_metadata_access, create_dir, create_dir_with_mode,
     create_regular_file, create_symlink, dir_exists, file_exists, filesystem_magic, is_removed,
     link_path, list_dir, list_files, metadata, metadata_for_fd, open_path, read_executable_file,
-    read_file, read_interpreter, read_link, remove_dir, remove_file, rename_path, statfs_for_fd,
-    statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path, VfsMetadata, VfsNodeKind,
-    VfsStatFs,
+    read_file, read_interpreter, read_link, remove_dir, remove_file, rename_path, set_times_fd,
+    set_times_path, statfs_for_fd, statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path,
+    VfsMetadata, VfsNodeKind, VfsStatFs,
 };
 
 use alloc::format;
@@ -27,10 +27,63 @@ use crate::utils::error::SysErrNo;
 /// 文件内容
 pub type FileContent = Vec<u8>;
 
+#[derive(Clone, Copy, Debug)]
+pub struct FileTimes {
+    pub atime_sec: isize,
+    pub atime_nsec: isize,
+    pub mtime_sec: isize,
+    pub mtime_nsec: isize,
+    pub ctime_sec: isize,
+    pub ctime_nsec: isize,
+}
+
+impl FileTimes {
+    pub fn now() -> Self {
+        let (sec, usec) = crate::timer::get_timeval();
+        let sec = sec as isize;
+        let nsec = (usec * 1000) as isize;
+        Self {
+            atime_sec: sec,
+            atime_nsec: nsec,
+            mtime_sec: sec,
+            mtime_nsec: nsec,
+            ctime_sec: sec,
+            ctime_nsec: nsec,
+        }
+    }
+
+    pub fn touch_modified(&mut self) {
+        let now = Self::now();
+        self.mtime_sec = now.mtime_sec;
+        self.mtime_nsec = now.mtime_nsec;
+        self.ctime_sec = now.ctime_sec;
+        self.ctime_nsec = now.ctime_nsec;
+    }
+
+    pub fn set_access_modify(
+        &mut self,
+        atime: Option<(isize, isize)>,
+        mtime: Option<(isize, isize)>,
+    ) {
+        if let Some((sec, nsec)) = atime {
+            self.atime_sec = sec;
+            self.atime_nsec = nsec;
+        }
+        if let Some((sec, nsec)) = mtime {
+            self.mtime_sec = sec;
+            self.mtime_nsec = nsec;
+        }
+        let now = Self::now();
+        self.ctime_sec = now.ctime_sec;
+        self.ctime_nsec = now.ctime_nsec;
+    }
+}
+
 /// 内存中的文件
 pub struct MemFile {
     pub name: String,
     pub content: FileContent,
+    pub times: FileTimes,
 }
 
 impl MemFile {
@@ -38,6 +91,15 @@ impl MemFile {
         Self {
             name: String::from(name),
             content,
+            times: FileTimes::now(),
+        }
+    }
+
+    pub fn with_times(name: &str, content: Vec<u8>, times: FileTimes) -> Self {
+        Self {
+            name: String::from(name),
+            content,
+            times,
         }
     }
 
@@ -70,6 +132,17 @@ impl MemFileSystem {
         let len = content.len();
         self.files.push(MemFile::new(&name, content));
         log::info!("[fs] Added file '{}' ({} bytes)", name, len);
+    }
+
+    pub fn write_file_content(&mut self, name: &str, content: Vec<u8>, times: FileTimes) -> bool {
+        let name = normalize_path(name);
+        if let Some(file) = self.files.iter_mut().find(|f| f.name == name) {
+            file.content = content;
+            file.times = times;
+            true
+        } else {
+            false
+        }
     }
 
     /// 添加目录
@@ -216,12 +289,18 @@ impl MemFileSystem {
             .find(|file| file.name == old)
             .map(|file| file.content.clone())
             .ok_or(SysErrNo::ENOENT)?;
+        let times = self
+            .files
+            .iter()
+            .find(|file| file.name == old)
+            .map(|file| file.times)
+            .ok_or(SysErrNo::ENOENT)?;
         if self.is_dir(&new) {
             return Err(SysErrNo::EISDIR);
         }
         self.files
             .retain(|file| file.name != old && file.name != new);
-        self.files.push(MemFile::new(&new, content));
+        self.files.push(MemFile::with_times(&new, content, times));
         Ok(())
     }
 
@@ -233,6 +312,27 @@ impl MemFileSystem {
             .find(|f| f.name == name)
             .ok_or(SysErrNo::ENOENT)?;
         file.content.resize(new_len, 0);
+        let now = FileTimes::now();
+        file.times.mtime_sec = now.mtime_sec;
+        file.times.mtime_nsec = now.mtime_nsec;
+        file.times.ctime_sec = now.ctime_sec;
+        file.times.ctime_nsec = now.ctime_nsec;
+        Ok(())
+    }
+
+    pub fn set_file_times(
+        &mut self,
+        name: &str,
+        atime: Option<(isize, isize)>,
+        mtime: Option<(isize, isize)>,
+    ) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        let file = self
+            .files
+            .iter_mut()
+            .find(|f| f.name == name)
+            .ok_or(SysErrNo::ENOENT)?;
+        file.times.set_access_modify(atime, mtime);
         Ok(())
     }
 
@@ -277,6 +377,7 @@ fn init_pseudo_files() {
     for root in ["", "/musl", "/glibc"] {
         fs.add_dir(&alloc::format!("{}/tmp", root));
         fs.add_dir(&alloc::format!("{}/var/tmp", root));
+        fs.add_dir(&alloc::format!("{}/dev/shm", root));
         fs.add_file(&alloc::format!("{}/proc/mounts", root), mounts.to_vec());
         fs.add_file(&alloc::format!("{}/etc/mtab", root), mounts.to_vec());
         fs.add_file(&alloc::format!("{}/proc/meminfo", root), meminfo.to_vec());

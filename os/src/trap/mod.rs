@@ -10,6 +10,9 @@ use crate::task::TaskStatus;
 use crate::task::{exit_current_and_run_next, suspend_current_and_run_next};
 use crate::timer::set_next_trigger;
 
+const SIGILL: i32 = 4;
+const SIGSEGV: i32 = 11;
+
 lazy_static! {
     /// 存 `TrapFrame` 裸指针（单核）；用 `usize` 避免 `*mut TrapFrame: !Send` 与 `lazy_static` 冲突。
     pub static ref CURRENT_SYSCALL_CTX_PTR: Mutex<usize> = Mutex::new(0);
@@ -22,6 +25,7 @@ lazy_static! {
     /// 标记前台驱动模式：当此标志为 true 时，exit/suspend/timer 不要调用 run_next_task()，
     /// 而是将当前任务置为 Zombie 后直接返回，由前台驱动负责收尾。
     static ref FOREGROUND_DRIVER_ACTIVE: Mutex<bool> = Mutex::new(false);
+    static ref SYSCALL_PARKED: Mutex<bool> = Mutex::new(false);
 
 }
 
@@ -37,6 +41,25 @@ pub fn leave_foreground_driver() {
 
 pub fn foreground_driver_active() -> bool {
     *FOREGROUND_DRIVER_ACTIVE.lock()
+}
+
+pub fn signal_syscall_parked() {
+    *SYSCALL_PARKED.lock() = true;
+}
+
+pub fn syscall_parked() -> bool {
+    *SYSCALL_PARKED.lock()
+}
+
+fn take_syscall_parked() -> bool {
+    let mut guard = SYSCALL_PARKED.lock();
+    let was = *guard;
+    *guard = false;
+    was
+}
+
+fn exit_user_thread_group_for_signal(signum: i32) {
+    crate::task::exit_thread_group_and_run_next(crate::task::signal_exit_code(signum));
 }
 
 pub fn timer_should_preempt_current_task() -> bool {
@@ -247,21 +270,21 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                     vaddr
                 );
             }
-            exit_current_and_run_next(-2);
+            exit_user_thread_group_for_signal(SIGSEGV);
         }
         TrapType::IllegalInstruction(vaddr) => {
             log::error!(
                 "[trap] User illegal instruction at {:#x}, killing process",
                 vaddr
             );
-            exit_current_and_run_next(-2);
+            exit_user_thread_group_for_signal(SIGILL);
         }
         _ => {
             log::warn!(
                 "[trap] Unhandled user trap {:?}, killing process",
                 trap_type
             );
-            exit_current_and_run_next(-2);
+            exit_user_thread_group_for_signal(SIGSEGV);
         }
     }
 }
@@ -285,6 +308,9 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     let result = syscall(syscall_id, args);
 
     *CURRENT_SYSCALL_CTX_PTR.lock() = 0;
+    if take_syscall_parked() {
+        return;
+    }
 
     // 设置返回值到 a0/x[10]
     // 检查是否是 execve 刚完成——如果是，跳过 syscall_ok() 的 PC 前进，
@@ -313,7 +339,6 @@ fn handle_syscall(ctx: &mut TrapFrame) {
             ctx[TrapFrameArgs::RET] = errno.as_ret();
         }
     }
-
     // 普通系统调用：PC 需要前进（跳过 ecall 指令）
     ctx.syscall_ok();
 }

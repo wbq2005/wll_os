@@ -51,6 +51,9 @@ pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_READV: usize = 65;
 pub const SYSCALL_WRITEV: usize = 66;
 pub const SYSCALL_PREAD64: usize = 67;
+pub const SYSCALL_PWRITE64: usize = 68;
+pub const SYSCALL_PREADV: usize = 69;
+pub const SYSCALL_PWRITEV: usize = 70;
 pub const SYSCALL_LSEEK: usize = 62;
 pub const SYSCALL_SENDFILE: usize = 71;
 pub const SYSCALL_TRUNCATE: usize = 45;
@@ -69,6 +72,7 @@ pub const SYSCALL_EXIT_GROUP: usize = 94;
 pub const SYSCALL_SET_TID_ADDRESS: usize = 96;
 pub const SYSCALL_FUTEX: usize = 98;
 pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
+pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 pub const SYSCALL_NANOSLEEP: usize = 101;
 pub const SYSCALL_SETITIMER: usize = 103;
 pub const SYSCALL_CLOCK_SETTIME: usize = 112;
@@ -132,6 +136,7 @@ pub const SYSCALL_CLONE: usize = 220;
 pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 pub const SYSCALL_MPROTECT: usize = 226;
+pub const SYSCALL_MSYNC: usize = 227;
 pub const SYSCALL_MADVISE: usize = 233;
 pub const SYSCALL_ACCEPT4: usize = 242;
 pub const SYSCALL_WAIT4: usize = 260;
@@ -193,6 +198,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_READV => fs::sys_readv(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITEV => fs::sys_writev(args[0], args[1] as *const u8, args[2]),
         SYSCALL_PREAD64 => fs::sys_pread64(args[0], args[1] as *mut u8, args[2], args[3]),
+        SYSCALL_PWRITE64 => fs::sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3]),
+        SYSCALL_PREADV => fs::sys_preadv(args[0], args[1] as *const u8, args[2], args[3]),
+        SYSCALL_PWRITEV => fs::sys_pwritev(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_SENDFILE => fs::sys_sendfile(args[0], args[1], args[2], args[3]),
         SYSCALL_TRUNCATE => fs::sys_truncate(args[0] as *const u8, args[1]),
         SYSCALL_FTRUNCATE => fs::sys_ftruncate(args[0], args[1]),
@@ -219,15 +227,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_GETSOCKNAME => net::sys_getsockname(args[0], args[1], args[2]),
         SYSCALL_GETPEERNAME => net::sys_getpeername(args[0], args[1], args[2]),
         SYSCALL_SENDTO => net::sys_sendto(args[0], args[1], args[2], args[3], args[4], args[5]),
-        SYSCALL_RECVFROM => {
-            net::sys_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5])
-        }
-        SYSCALL_SETSOCKOPT => {
-            net::sys_setsockopt(args[0], args[1], args[2], args[3], args[4])
-        }
-        SYSCALL_GETSOCKOPT => {
-            net::sys_getsockopt(args[0], args[1], args[2], args[3], args[4])
-        }
+        SYSCALL_RECVFROM => net::sys_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_SETSOCKOPT => net::sys_setsockopt(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_GETSOCKOPT => net::sys_getsockopt(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_SHUTDOWN => net::sys_shutdown(args[0], args[1]),
         SYSCALL_NEWFSTATAT => fs::sys_newfstatat(
             args[0] as isize,
@@ -308,6 +310,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[5],
         ),
         SYSCALL_MUNMAP => mm::sys_munmap(args[0], args[1]),
+        SYSCALL_MSYNC => mm::sys_msync(args[0], args[1], args[2]),
 
         // 时间和系统信息
         SYSCALL_NANOSLEEP => other::sys_nanosleep(args[0], args[1]),
@@ -326,6 +329,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_PRLIMIT64 => other::sys_prlimit64(args[0], args[1], args[2], args[3]),
         SYSCALL_SET_TID_ADDRESS => other::sys_set_tid_address(args[0]),
         SYSCALL_SET_ROBUST_LIST => other::sys_set_robust_list(args[0], args[1]),
+        SYSCALL_GET_ROBUST_LIST => other::sys_get_robust_list(args[0], args[1], args[2]),
         SYSCALL_GETRANDOM => other::sys_getrandom(args[0], args[1], args[2]),
         SYSCALL_SYSINFO => other::sys_sysinfo(args[0]),
         SYSCALL_SYSLOG => other::sys_syslog(args[0], args[1], args[2]),
@@ -363,7 +367,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[2] as *mut u8,
             args[3],
         ),
-        SYSCALL_UTIMENSAT => Ok(0),
+        SYSCALL_UTIMENSAT => fs::sys_utimensat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *const fs::TimeSpec,
+            args[3],
+        ),
         SYSCALL_SYNC => fs::sys_sync(),
         SYSCALL_FSYNC => fs::sys_fsync(args[0]),
         SYSCALL_FDATASYNC => fs::sys_fdatasync(args[0]),

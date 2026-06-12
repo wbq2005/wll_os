@@ -207,6 +207,28 @@ fn metadata_for_mem_file(name: &str, content: &[u8]) -> VfsMetadata {
     )
 }
 
+fn metadata_from_mem_file(file: &super::MemFile) -> VfsMetadata {
+    let mut meta = metadata_for_mem_file(&file.name, &file.content);
+    meta.atime_sec = file.times.atime_sec;
+    meta.atime_nsec = file.times.atime_nsec;
+    meta.mtime_sec = file.times.mtime_sec;
+    meta.mtime_nsec = file.times.mtime_nsec;
+    meta.ctime_sec = file.times.ctime_sec;
+    meta.ctime_nsec = file.times.ctime_nsec;
+    meta
+}
+
+fn metadata_from_mem_fd(name: &str, content: &[u8], times: super::FileTimes) -> VfsMetadata {
+    let mut meta = metadata_for_mem_file(name, content);
+    meta.atime_sec = times.atime_sec;
+    meta.atime_nsec = times.atime_nsec;
+    meta.mtime_sec = times.mtime_sec;
+    meta.mtime_nsec = times.mtime_nsec;
+    meta.ctime_sec = times.ctime_sec;
+    meta.ctime_nsec = times.ctime_nsec;
+    meta
+}
+
 pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrNo> {
     let norm = normalize_path(path);
     if is_removed(&norm) {
@@ -238,7 +260,7 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
             });
         }
         if let Some(file) = mem.get_file(&norm) {
-            return Ok(metadata_for_mem_file(&norm, &file.content));
+            return Ok(metadata_from_mem_file(file));
         }
     }
 
@@ -281,12 +303,18 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
             0,
             1,
         )),
-        fd::FileDescriptor::MemFile { name, content, .. } => {
-            let latest = MEM_FS.lock().get_file(name).map(|file| file.content.clone());
-            Ok(metadata_for_mem_file(
-                name,
-                latest.as_deref().unwrap_or(content),
-            ))
+        fd::FileDescriptor::MemFile {
+            name,
+            content,
+            times,
+            ..
+        } => {
+            let mem = MEM_FS.lock();
+            if let Some(file) = mem.get_file(name) {
+                Ok(metadata_from_mem_file(file))
+            } else {
+                Ok(metadata_from_mem_fd(name, content, *times))
+            }
         }
         fd::FileDescriptor::MemDir { path, entries, .. } => Ok(synthetic_metadata(
             path,
@@ -728,6 +756,51 @@ pub fn truncate_fd(file: &mut fd::FileDescriptor, size: u64) -> Result<(), SysEr
     file.truncate(size as usize)
 }
 
+pub fn set_times_path(
+    path: &str,
+    follow_symlink: bool,
+    atime: Option<(isize, isize)>,
+    mtime: Option<(isize, isize)>,
+) -> Result<(), SysErrNo> {
+    let norm = normalize_path(path);
+    {
+        let mut mem = MEM_FS.lock();
+        if mem.is_dir(&norm) {
+            return Ok(());
+        }
+        if mem.get_file(&norm).is_some() {
+            return mem.set_file_times(&norm, atime, mtime);
+        }
+    }
+    let ext_path = match ext4_vol::lookup_kind(&norm) {
+        Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
+            ext4_vol::resolve_symlinks(&norm)?
+        }
+        Some(_) => norm.clone(),
+        None => return Err(missing_path_errno(&norm)),
+    };
+    ext4_vol::set_times_path(&ext_path, atime, mtime)
+}
+
+pub fn set_times_fd(
+    file: &mut fd::FileDescriptor,
+    atime: Option<(isize, isize)>,
+    mtime: Option<(isize, isize)>,
+) -> Result<(), SysErrNo> {
+    match file {
+        fd::FileDescriptor::MemFile { name, times, .. } => {
+            let _ = MEM_FS.lock().set_file_times(name, atime, mtime);
+            times.set_access_modify(atime, mtime);
+            Ok(())
+        }
+        fd::FileDescriptor::MemDir { .. } => Ok(()),
+        fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
+            ext4_vol::set_times_ino(*ino, atime, mtime)
+        }
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
 pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
     if file_exists(&norm) || dir_exists(&norm) {
@@ -880,15 +953,24 @@ pub fn open_path(
         if want_excl && want_create {
             return Err(SysErrNo::EEXIST);
         }
-        let mut content = read_file(&path_norm).unwrap_or_default();
+        let source = MEM_FS
+            .lock()
+            .get_file(&path_norm)
+            .map(|file| (file.content.clone(), file.times));
+        let (mut content, mut times) =
+            source.unwrap_or_else(|| (Vec::new(), super::FileTimes::now()));
         if want_trunc && write_ok {
             content.clear();
             MEM_FS.lock().truncate_file(&path_norm, 0)?;
+            if let Some(file) = MEM_FS.lock().get_file(&path_norm) {
+                times = file.times;
+            }
         }
         let base_off = if append && write_ok { content.len() } else { 0 };
         return Ok(fd::FileDescriptor::MemFile {
             name: path_norm,
             content,
+            times,
             offset: base_off,
             readable: read_ok,
             writable: write_ok,
@@ -958,9 +1040,15 @@ pub fn open_path(
         if MEM_FS.lock().is_dir(&parent) {
             MEM_FS.lock().add_file(&path_norm, Vec::new());
             clear_whiteout(&path_norm);
+            let times = MEM_FS
+                .lock()
+                .get_file(&path_norm)
+                .map(|file| file.times)
+                .unwrap_or_else(super::FileTimes::now);
             return Ok(fd::FileDescriptor::MemFile {
                 name: path_norm,
                 content: Vec::new(),
+                times,
                 offset: 0,
                 readable: read_ok,
                 writable: write_ok,

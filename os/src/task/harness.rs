@@ -5,8 +5,8 @@ use alloc::vec::Vec;
 use polyhal_trap::trap::run_user_task;
 
 use super::{
-    current_task, manager, requeue_after_user_run, set_orphan_reaper, TaskControlBlock, TaskStatus,
-    UserProgramSpec, CURRENT_TASK,
+    current_task, manager, purge_exited_user_task_for_foreground, requeue_after_user_run,
+    set_orphan_reaper, TaskControlBlock, TaskStatus, UserProgramSpec, CURRENT_TASK,
 };
 use crate::console::putchar;
 
@@ -72,7 +72,7 @@ impl TestGroup {
     }
 }
 
-#[cfg(not(feature = "libctest"))]
+#[cfg(all(not(feature = "libctest"), not(feature = "iozone")))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Basic,
     TestGroup::Busybox,
@@ -82,6 +82,9 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
 
 #[cfg(feature = "libctest")]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::LibcTest];
+
+#[cfg(all(not(feature = "libctest"), feature = "iozone"))]
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Iozone];
 
 fn console_write(msg: &str) {
     for b in msg.bytes() {
@@ -371,7 +374,6 @@ fn run_libctest_collection_harness() {
     ];
     const STATIC_RISK_CASES: &[&str] = &[
         "clocale_mbfuncs",
-        "crypt",
         "fnmatch",
         "fscanf",
         "fwscanf",
@@ -382,16 +384,15 @@ fn run_libctest_collection_harness() {
         "strtol",
         "swprintf",
         "fgetwc_buffering",
-        "pthread_cond_smasher",
         "regex_ere_backref",
         "regex_escaped_high_byte",
         "setvbuf_unget",
         "dn_expand_empty",
         "dn_expand_ptr_0",
+        "pthread_cond_smasher",
     ];
     const DYNAMIC_RISK_CASES: &[&str] = &[
         "clocale_mbfuncs",
-        "crypt",
         "fnmatch",
         "fscanf",
         "fwscanf",
@@ -403,12 +404,12 @@ fn run_libctest_collection_harness() {
         "strtol",
         "swprintf",
         "fgetwc_buffering",
-        "pthread_cond_smasher",
         "regex_ere_backref",
         "regex_escaped_high_byte",
         "setvbuf_unget",
         "dn_expand_empty",
         "dn_expand_ptr_0",
+        "pthread_cond_smasher",
     ];
     const SEGMENTS: &[(&str, &str, &str, &[&str])] = &[
         (
@@ -451,7 +452,7 @@ fn run_libctest_collection_harness() {
             "/glibc",
             "libctest-glibc-static-late",
             "entry-static.exe",
-            &["utime", "wcsstr", "wcstol", "pleval"],
+            &["utime", "wcsstr", "wcstol"],
         ),
         (
             "/glibc",
@@ -463,7 +464,7 @@ fn run_libctest_collection_harness() {
             "/musl",
             "libctest-musl-static-late",
             "entry-static.exe",
-            &["utime", "wcsstr", "wcstol", "pleval"],
+            &["utime", "wcsstr", "wcstol"],
         ),
         (
             "/musl",
@@ -536,8 +537,25 @@ fn run_libctest_collection_harness() {
             DYNAMIC_RISK_CASES,
         ),
     ];
+    const EXTRA_SEGMENTS: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "/musl",
+            "libctest-musl-static-extra",
+            "/libctest-extra-static.exe",
+            &["crypt", "pleval"],
+        ),
+        (
+            "/musl",
+            "libctest-musl-dynamic-extra",
+            "/libctest-extra-dynamic.exe",
+            &["crypt"],
+        ),
+    ];
 
     for (root, name, entry, cases) in SEGMENTS {
+        if !libctest_segment_enabled(name) {
+            continue;
+        }
         console_write("[harness] LIBCTEST SEGMENT ");
         console_write(name);
         console_write("\n");
@@ -546,6 +564,40 @@ fn run_libctest_collection_harness() {
             console_write(name);
             console_write("\n");
         }
+    }
+    for (root, name, runner, cases) in EXTRA_SEGMENTS {
+        if !libctest_segment_enabled(name) {
+            continue;
+        }
+        console_write("[harness] LIBCTEST EXTRA SEGMENT ");
+        console_write(name);
+        console_write("\n");
+        if !run_libctest_extra_segment(root, name, runner, cases) {
+            console_write("[harness] failed to launch libc-test extra segment: ");
+            console_write(name);
+            console_write("\n");
+        }
+    }
+}
+
+#[cfg(feature = "libctest")]
+fn libctest_segment_enabled(name: &str) -> bool {
+    match option_env!("LIBCTEST_FILTER") {
+        Some(filter) => {
+            let mut any = false;
+            for part in filter.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                any = true;
+                if name.contains(part) {
+                    return true;
+                }
+            }
+            !any
+        }
+        None => true,
     }
 }
 
@@ -601,6 +653,53 @@ fn run_libctest_case(root: &str, entry: &str, case: &str) -> bool {
         })
 }
 
+#[cfg(feature = "libctest")]
+fn run_libctest_extra_segment(root: &str, name: &str, runner: &str, cases: &[&str]) -> bool {
+    let mut launched = false;
+
+    console_write("#### OS COMP TEST GROUP START ");
+    console_write(name);
+    console_write(" ####\n");
+
+    for case in cases {
+        if run_libctest_extra_case(root, runner, case) {
+            launched = true;
+        } else {
+            console_write("[harness] failed to launch libc-test extra case: ");
+            console_write(name);
+            console_write(" ");
+            console_write(case);
+            console_write("\n");
+        }
+    }
+
+    console_write("#### OS COMP TEST GROUP END ");
+    console_write(name);
+    console_write(" ####\n");
+
+    launched
+}
+
+#[cfg(feature = "libctest")]
+fn run_libctest_extra_case(root: &str, runner: &str, case: &str) -> bool {
+    let runner_path = String::from(runner);
+    let runner_host = crate::fs::apply_root(root, &runner_path);
+
+    crate::fs::read_executable_file(&runner_host).is_some()
+        && run_user_program_spec_foreground(&UserProgramSpec {
+            path: runner_path.clone(),
+            argv: alloc::vec![runner_path.clone(), String::from(case)],
+            envp: alloc::vec![
+                String::from("PATH=.:/:/bin:/usr/bin"),
+                String::from("LD_LIBRARY_PATH=/lib"),
+                String::from("SHELL=/busybox"),
+            ],
+            cwd: String::from("/"),
+            root: String::from(root),
+            marker_name: None,
+        })
+}
+
 struct ForegroundDriverGuard;
 
 impl ForegroundDriverGuard {
@@ -628,6 +727,7 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
     let _foreground = ForegroundDriverGuard::enter();
 
     run_user_task_foreground(task.clone());
+    cleanup_foreground_task_tree(&task);
     if let Some(ref h) = harness {
         h.set_status(TaskStatus::Running);
         *CURRENT_TASK.lock() = Some(h.clone());
@@ -636,11 +736,28 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
     true
 }
 
+fn cleanup_foreground_task_tree(root: &Arc<TaskControlBlock>) {
+    let mut tasks = manager::all_user_tasks();
+    if !tasks.iter().any(|task| task.pid.0 == root.pid.0) {
+        tasks.push(root.clone());
+    }
+
+    let mut killed_tgids = Vec::new();
+    for task in &tasks {
+        let tgid = task.thread_group.tgid();
+        if task.status() != TaskStatus::Zombie && !killed_tgids.iter().any(|seen| *seen == tgid) {
+            killed_tgids.push(tgid);
+            crate::task::terminate_task_group(task, -2);
+        }
+    }
+
+    for task in tasks {
+        purge_exited_user_task_for_foreground(&task);
+    }
+}
+
 fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
-    fn terminate_group(
-        task: &Arc<TaskControlBlock>,
-        killed_tgids: &mut Vec<usize>,
-    ) {
+    fn terminate_group(task: &Arc<TaskControlBlock>, killed_tgids: &mut Vec<usize>) {
         if task.is_kernel {
             return;
         }
@@ -730,7 +847,9 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
         }
 
         crate::trap::prepare_user_trapframe(&mut ctx);
+        crate::task::enter_foreground_user_task(active.pid.0);
         let _reason = run_user_task(&mut ctx);
+        crate::task::leave_foreground_user_task(active.pid.0);
         crate::trap::restore_kernel_page_table();
 
         if active.status() != TaskStatus::Zombie {

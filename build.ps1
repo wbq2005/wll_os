@@ -5,7 +5,9 @@ param(
 
     [switch]$Check,
 
-    [switch]$LibcTest
+    [switch]$LibcTest,
+
+    [switch]$Iozone
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,6 +43,9 @@ function Build-Arch {
         }
         if ($LibcTest) {
             $cargoArgs += @("--features", "libctest")
+        }
+        if ($Iozone) {
+            $cargoArgs += @("--features", "iozone")
         }
         $cargoArgs += @("-Z", "build-std=core,alloc")
 

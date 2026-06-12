@@ -116,13 +116,19 @@ fn deadline_from_absolute_timespec_ptr(ptr: usize) -> Result<Option<usize>, SysE
     if ptr == 0 {
         return Ok(None);
     }
-    Ok(Some(timespec_to_us(copy_object_from_user::<TimeSpec>(ptr)?)?))
+    Ok(Some(timespec_to_us(copy_object_from_user::<TimeSpec>(
+        ptr,
+    )?)?))
 }
 
 fn read_user_i32(addr: usize) -> Result<i32, SysErrNo> {
     let mut bytes = [0u8; core::mem::size_of::<i32>()];
     super::user::copy_from_user(addr, &mut bytes)?;
     Ok(i32::from_le_bytes(bytes))
+}
+
+fn write_user_i32(addr: usize, value: i32) -> Result<(), SysErrNo> {
+    super::user::copy_to_user(addr, &value.to_le_bytes())
 }
 
 fn validate_futex_uaddr(uaddr: usize) -> Result<(), SysErrNo> {
@@ -155,7 +161,10 @@ pub fn sys_nanosleep(req: usize, rem: usize) -> SyscallRet {
     }
 
     let req = copy_object_from_user::<TimeSpec>(req)?;
-    let sleep_us = duration_us_from_timespec(req)?;
+    let mut sleep_us = duration_us_from_timespec(req)?;
+    if sleep_us != 0 && crate::trap::foreground_driver_active() {
+        sleep_us = sleep_us.max(crate::timer::TIME_SLICE_MS as usize * 1000);
+    }
     if sleep_us != 0 {
         let _ = timer::sleep_until_us(timer::deadline_after_us(sleep_us))?;
     }
@@ -379,6 +388,24 @@ pub fn sys_set_robust_list(head: usize, len: usize) -> SyscallRet {
     Ok(0)
 }
 
+pub fn sys_get_robust_list(pid: usize, head_ptr: usize, len_ptr: usize) -> SyscallRet {
+    if head_ptr == 0 || len_ptr == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let task = if pid == 0 {
+        current_task().ok_or(SysErrNo::ESRCH)?
+    } else {
+        crate::task::manager::find_task(pid).ok_or(SysErrNo::ESRCH)?
+    };
+    let (head, len) = {
+        let inner = task.inner.lock();
+        (inner.robust_list_head, inner.robust_list_len)
+    };
+    copy_to_user(head_ptr, &head.to_ne_bytes())?;
+    copy_to_user(len_ptr, &len.to_ne_bytes())?;
+    Ok(0)
+}
+
 pub(crate) fn take_robust_exit_state(
     task: &Arc<crate::task::TaskControlBlock>,
 ) -> Option<RobustExitState> {
@@ -514,7 +541,7 @@ pub(crate) fn futex_wake_addr_for_task(
     uaddr: usize,
     n: usize,
 ) -> usize {
-    futex_wake_addr_key(uaddr, futex_key_for_task(task), n, usize::MAX)
+    futex_wake_addr_private_and_shared(task, uaddr, n)
 }
 
 fn futex_wake_addr_private_and_shared(
@@ -546,12 +573,9 @@ fn futex_wake_addr_key(uaddr: usize, key: usize, n: usize, bitset: usize) -> usi
     while woke < n {
         let waiter = {
             let mut waiters = FUTEX_WAITERS.lock();
-            let Some(index) = waiters
-                .iter()
-                .position(|waiter| {
-                    waiter.uaddr == uaddr && waiter.key == key && (waiter.bitset & bitset) != 0
-                })
-            else {
+            let Some(index) = waiters.iter().position(|waiter| {
+                waiter.uaddr == uaddr && waiter.key == key && (waiter.bitset & bitset) != 0
+            }) else {
                 break;
             };
             waiters.remove(index)
@@ -563,6 +587,132 @@ fn futex_wake_addr_key(uaddr: usize, key: usize, n: usize, bitset: usize) -> usi
     woke
 }
 
+fn futex_requeue_addr(
+    uaddr: usize,
+    uaddr2: usize,
+    private: bool,
+    nr_wake: usize,
+    nr_requeue: usize,
+    cmp: Option<i32>,
+) -> SyscallRet {
+    validate_futex_uaddr(uaddr)?;
+    if nr_requeue != 0 {
+        validate_futex_uaddr(uaddr2)?;
+    }
+    if let Some(expected) = cmp {
+        if read_user_i32(uaddr)? != expected {
+            return Err(SysErrNo::EAGAIN);
+        }
+    }
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let key = futex_key_for_op(&task, private);
+    let mut to_wake = Vec::new();
+    let mut requeued = 0usize;
+
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        let mut index = 0usize;
+        while index < waiters.len() && to_wake.len() < nr_wake {
+            if waiters[index].uaddr == uaddr && waiters[index].key == key {
+                to_wake.push(waiters.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+
+        let mut index = 0usize;
+        while index < waiters.len() && requeued < nr_requeue {
+            if waiters[index].uaddr == uaddr && waiters[index].key == key {
+                waiters[index].uaddr = uaddr2;
+                waiters[index].key = key;
+                requeued += 1;
+            }
+            index += 1;
+        }
+    }
+
+    let mut woke = 0usize;
+    for waiter in to_wake {
+        if crate::task::wake_task_token_with(&waiter.task, waiter.token, WaitOutcome::Woken) {
+            woke += 1;
+        }
+    }
+
+    Ok(woke + requeued)
+}
+
+fn sign_extend_12(value: usize) -> i32 {
+    let value = (value & 0x0fff) as i32;
+    if (value & 0x0800) != 0 {
+        value | !0x0fff
+    } else {
+        value
+    }
+}
+
+fn futex_wake_op_arg(encoded: usize) -> Option<(i32, i32, i32, i32)> {
+    let mut op = ((encoded >> 28) & 0x0f) as i32;
+    let cmp = ((encoded >> 24) & 0x0f) as i32;
+    let raw_oparg = (encoded >> 12) & 0x0fff;
+    let cmparg = sign_extend_12(encoded);
+
+    let shift_oparg = (op & 0x08) != 0;
+    op &= !0x08;
+    let oparg = if shift_oparg {
+        if raw_oparg >= 32 {
+            return None;
+        }
+        1i32.wrapping_shl(raw_oparg as u32)
+    } else {
+        sign_extend_12(raw_oparg)
+    };
+
+    Some((op, oparg, cmp, cmparg))
+}
+
+fn futex_wake_op(
+    uaddr: usize,
+    uaddr2: usize,
+    private: bool,
+    nr_wake: usize,
+    nr_wake2: usize,
+    encoded_op: usize,
+) -> SyscallRet {
+    validate_futex_uaddr(uaddr)?;
+    validate_futex_uaddr(uaddr2)?;
+
+    let Some((op, oparg, cmp, cmparg)) = futex_wake_op_arg(encoded_op) else {
+        return Err(SysErrNo::EINVAL);
+    };
+    let old = read_user_i32(uaddr2)?;
+    let new = match op {
+        0 => oparg,
+        1 => old.wrapping_add(oparg),
+        2 => old | oparg,
+        3 => old & !oparg,
+        4 => old ^ oparg,
+        _ => return Err(SysErrNo::EINVAL),
+    };
+    write_user_i32(uaddr2, new)?;
+
+    let cmp_matches = match cmp {
+        0 => old == cmparg,
+        1 => old != cmparg,
+        2 => old < cmparg,
+        3 => old <= cmparg,
+        4 => old > cmparg,
+        5 => old >= cmparg,
+        _ => return Err(SysErrNo::EINVAL),
+    };
+
+    let mut woke = futex_wake_addr_bitset(uaddr, private, nr_wake, usize::MAX);
+    if cmp_matches {
+        woke += futex_wake_addr_bitset(uaddr2, private, nr_wake2, usize::MAX);
+    }
+    Ok(woke)
+}
+
 fn futex_wait_addr(
     uaddr: usize,
     val: usize,
@@ -570,6 +720,10 @@ fn futex_wait_addr(
     bitset: usize,
     private: bool,
 ) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    if let Some(ret) = finish_resumed_futex_wait(&task, uaddr, deadline, private) {
+        return ret;
+    }
     if bitset == 0 {
         return Err(SysErrNo::EINVAL);
     }
@@ -584,7 +738,6 @@ fn futex_wait_addr(
         return Err(SysErrNo::ETIMEDOUT);
     }
 
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let key = futex_key_for_op(&task, private);
     let token = task.next_wait_token();
     *task.wait_outcome.lock() = None;
@@ -601,45 +754,74 @@ fn futex_wait_addr(
         Ok(_) => {
             remove_futex_waiter(uaddr, key, task.pid.0, token);
             *task.block_reason.lock() = None;
+            *task.wait_outcome.lock() = None;
             return Err(SysErrNo::EAGAIN);
         }
         Err(err) => {
             remove_futex_waiter(uaddr, key, task.pid.0, token);
             *task.block_reason.lock() = None;
+            *task.wait_outcome.lock() = None;
             return Err(err);
         }
     }
     if crate::syscall::signal::current_has_unblocked_pending() {
         remove_futex_waiter(uaddr, key, task.pid.0, token);
         *task.block_reason.lock() = None;
+        *task.wait_outcome.lock() = None;
         return Err(SysErrNo::EINTR);
     }
     if let Some(deadline) = deadline {
         timer::add_timeout(deadline, task.clone(), token);
     }
 
-    crate::task::block_current_for_reason_until(crate::task::wait_queue::BlockReason::Futex, deadline);
+    crate::task::block_current_for_reason_until(
+        crate::task::wait_queue::BlockReason::Futex,
+        deadline,
+    );
+    if crate::trap::syscall_parked() {
+        return Ok(0);
+    }
 
     *task.block_reason.lock() = None;
     let still_waiting = remove_futex_waiter(uaddr, key, task.pid.0, token);
     if deadline.is_some() {
         timer::remove_timeout(task.pid.0, token);
     }
-    match crate::task::wait_queue::finish_wait(&task, still_waiting, deadline) {
+    let outcome = crate::task::wait_queue::finish_wait(&task, still_waiting, deadline);
+    match outcome {
         WaitOutcome::TimedOut => Err(SysErrNo::ETIMEDOUT),
         WaitOutcome::Interrupted => Err(SysErrNo::EINTR),
         WaitOutcome::Woken => Ok(0),
     }
 }
 
-fn remove_futex_waiter(uaddr: usize, key: usize, pid: usize, token: usize) -> bool {
+fn finish_resumed_futex_wait(
+    task: &Arc<crate::task::TaskControlBlock>,
+    uaddr: usize,
+    deadline: Option<usize>,
+    private: bool,
+) -> Option<SyscallRet> {
+    let outcome = task.wait_outcome.lock().take()?;
+    let key = futex_key_for_op(task, private);
+    let token = task.current_wait_token();
+    *task.block_reason.lock() = None;
+    remove_futex_waiter(uaddr, key, task.pid.0, token);
+    if deadline.is_some() {
+        timer::remove_timeout(task.pid.0, token);
+    }
+    Some(match outcome {
+        WaitOutcome::TimedOut => Err(SysErrNo::ETIMEDOUT),
+        WaitOutcome::Interrupted => Err(SysErrNo::EINTR),
+        WaitOutcome::Woken => Ok(0),
+    })
+}
+
+fn remove_futex_waiter(_uaddr: usize, _key: usize, pid: usize, token: usize) -> bool {
     let mut waiters = FUTEX_WAITERS.lock();
-    if let Some(index) = waiters.iter().position(|waiter| {
-        waiter.uaddr == uaddr
-            && waiter.key == key
-            && waiter.task.pid.0 == pid
-            && waiter.token == token
-    }) {
+    if let Some(index) = waiters
+        .iter()
+        .position(|waiter| waiter.task.pid.0 == pid && waiter.token == token)
+    {
         waiters.remove(index);
         true
     } else {
@@ -747,6 +929,9 @@ pub fn sys_futex_stub(
 ) -> SyscallRet {
     const FUTEX_WAIT: usize = 0;
     const FUTEX_WAKE: usize = 1;
+    const FUTEX_REQUEUE: usize = 3;
+    const FUTEX_CMP_REQUEUE: usize = 4;
+    const FUTEX_WAKE_OP: usize = 5;
     const FUTEX_WAIT_BITSET: usize = 9;
     const FUTEX_WAKE_BITSET: usize = 10;
     const FUTEX_CMD_MASK: usize = 0x7f;
@@ -762,6 +947,11 @@ pub fn sys_futex_stub(
             validate_futex_uaddr(uaddr)?;
             Ok(futex_wake_addr_bitset(uaddr, private, val, usize::MAX))
         }
+        FUTEX_REQUEUE => futex_requeue_addr(uaddr, _uaddr2, private, val, timeout, None),
+        FUTEX_CMP_REQUEUE => {
+            futex_requeue_addr(uaddr, _uaddr2, private, val, timeout, Some(_val3 as i32))
+        }
+        FUTEX_WAKE_OP => futex_wake_op(uaddr, _uaddr2, private, val, timeout, _val3),
         FUTEX_WAIT_BITSET => {
             let deadline = deadline_from_absolute_timespec_ptr(timeout)?;
             futex_wait_addr(uaddr, val, deadline, _val3, private)

@@ -27,6 +27,9 @@ const FIONBIO: usize = 0x5421;
 
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EACCESS: usize = 0x200;
+const UTIME_NOW: isize = 0x3fffffff;
+const UTIME_OMIT: isize = 0x3ffffffe;
+const IOV_MAX: usize = 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -106,7 +109,7 @@ pub(crate) struct PollFd {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct TimeSpec {
+pub(crate) struct TimeSpec {
     tv_sec: isize,
     tv_nsec: isize,
 }
@@ -176,6 +179,36 @@ fn deadline_from_timespec_ptr(ptr: usize) -> Result<Option<usize>, SysErrNo> {
     let duration_us =
         duration_us_from_timespec(super::user::copy_object_from_user::<TimeSpec>(ptr)?)?;
     Ok(Some(crate::timer::deadline_after_us(duration_us)))
+}
+
+fn current_time_pair() -> (isize, isize) {
+    let (sec, usec) = crate::timer::get_timeval();
+    (sec as isize, (usec * 1000) as isize)
+}
+
+fn parse_utimens_times(
+    times: *const TimeSpec,
+) -> Result<(Option<(isize, isize)>, Option<(isize, isize)>), SysErrNo> {
+    if times.is_null() {
+        let now = current_time_pair();
+        return Ok((Some(now), Some(now)));
+    }
+
+    let atime = copy_object_from_user(times)?;
+    let mtime = copy_object_from_user(unsafe { times.add(1) })?;
+
+    fn convert(ts: TimeSpec) -> Result<Option<(isize, isize)>, SysErrNo> {
+        match ts.tv_nsec {
+            UTIME_OMIT => Ok(None),
+            UTIME_NOW => Ok(Some(current_time_pair())),
+            nsec if (0..1_000_000_000).contains(&nsec) && ts.tv_sec >= 0 => {
+                Ok(Some((ts.tv_sec, nsec)))
+            }
+            _ => Err(SysErrNo::EINVAL),
+        }
+    }
+
+    Ok((convert(atime)?, convert(mtime)?))
 }
 
 fn resolve_path_str(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
@@ -1112,6 +1145,35 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, count: usize, offset: usize) -> Sysc
     }
 }
 
+pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: usize) -> SyscallRet {
+    if count == 0 {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let mut fds = inner.fd_table.lock();
+        return match fds.get_mut(fd) {
+            Some(file_desc) => super::with_kernel_page_table(|| file_desc.write_at(offset, &[])),
+            None => Err(SysErrNo::EBADF),
+        };
+    }
+    if buf.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+    if count > isize::MAX as usize {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let mut kbuf = alloc::vec![0u8; count];
+    copy_from_user(buf, &mut kbuf)?;
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let mut fds = inner.fd_table.lock();
+    match fds.get_mut(fd) {
+        Some(file_desc) => super::with_kernel_page_table(|| file_desc.write_at(offset, &kbuf)),
+        None => Err(SysErrNo::EBADF),
+    }
+}
+
 pub fn sys_dup(old_fd: usize) -> SyscallRet {
     log::debug!("[syscall] dup(old_fd={})", old_fd);
 
@@ -1276,12 +1338,25 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SyscallRet {
 }
 
 pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(SysErrNo::EINVAL);
+    }
     if iov.is_null() {
         return Err(SysErrNo::EFAULT);
     }
     let mut total = 0usize;
     for i in 0..iovcnt {
         let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(i) })?;
+        if total
+            .checked_add(iovec.iov_len)
+            .filter(|sum| *sum <= isize::MAX as usize)
+            .is_none()
+        {
+            return Err(SysErrNo::EINVAL);
+        }
         if iovec.iov_len == 0 {
             continue;
         }
@@ -1295,16 +1370,107 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {
 }
 
 pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(SysErrNo::EINVAL);
+    }
     if iov.is_null() {
         return Err(SysErrNo::EFAULT);
     }
     let mut total = 0usize;
     for i in 0..iovcnt {
         let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(i) })?;
+        if total
+            .checked_add(iovec.iov_len)
+            .filter(|sum| *sum <= isize::MAX as usize)
+            .is_none()
+        {
+            return Err(SysErrNo::EINVAL);
+        }
         if iovec.iov_len == 0 {
             continue;
         }
         match sys_write(fd, iovec.iov_base as *const u8, iovec.iov_len) {
+            Ok(n) => {
+                total += n;
+                if n < iovec.iov_len {
+                    break;
+                }
+            }
+            Err(_) if total != 0 => return Ok(total),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(total)
+}
+
+pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> SyscallRet {
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(SysErrNo::EINVAL);
+    }
+    if iov.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+
+    let mut total = 0usize;
+    for i in 0..iovcnt {
+        let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(i) })?;
+        if total
+            .checked_add(iovec.iov_len)
+            .filter(|sum| *sum <= isize::MAX as usize)
+            .is_none()
+        {
+            return Err(SysErrNo::EINVAL);
+        }
+        if iovec.iov_len == 0 {
+            continue;
+        }
+        let fixed_offset = offset.checked_add(total).ok_or(SysErrNo::EFBIG)?;
+        let n = sys_pread64(fd, iovec.iov_base, iovec.iov_len, fixed_offset)?;
+        total += n;
+        if n < iovec.iov_len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> SyscallRet {
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(SysErrNo::EINVAL);
+    }
+    if iov.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+
+    let mut total = 0usize;
+    for i in 0..iovcnt {
+        let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(i) })?;
+        if total
+            .checked_add(iovec.iov_len)
+            .filter(|sum| *sum <= isize::MAX as usize)
+            .is_none()
+        {
+            return Err(SysErrNo::EINVAL);
+        }
+        if iovec.iov_len == 0 {
+            continue;
+        }
+        let fixed_offset = offset.checked_add(total).ok_or(SysErrNo::EFBIG)?;
+        match sys_pwrite64(
+            fd,
+            iovec.iov_base as *const u8,
+            iovec.iov_len,
+            fixed_offset,
+        ) {
             Ok(n) => {
                 total += n;
                 if n < iovec.iov_len {
@@ -1695,6 +1861,47 @@ pub fn sys_newfstatat(
 /// write 系统调用的安全版本
 ///
 /// 用于从内核态调用，buf 是内核空间指针
+pub fn sys_utimensat(
+    dirfd: isize,
+    pathname: *const u8,
+    times: *const TimeSpec,
+    flags: usize,
+) -> SyscallRet {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let (atime, mtime) = parse_utimens_times(times)?;
+
+    if pathname.is_null() {
+        let fd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let mut fds = inner.fd_table.lock();
+        let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+        return super::with_kernel_page_table(|| crate::fs::set_times_fd(file_desc, atime, mtime))
+            .map(|_| 0);
+    }
+
+    let path = read_user_cstr(pathname)?;
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(SysErrNo::ENOENT);
+        }
+        let fd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let mut fds = inner.fd_table.lock();
+        let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+        return super::with_kernel_page_table(|| crate::fs::set_times_fd(file_desc, atime, mtime))
+            .map(|_| 0);
+    }
+
+    let (_logical_path, host_path) = resolve_host_path_str(dirfd, &path)?;
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    super::with_kernel_page_table(|| crate::fs::set_times_path(&host_path, follow, atime, mtime))
+        .map(|_| 0)
+}
+
 pub fn sys_write_kernel(fd: usize, buf: &[u8]) -> SyscallRet {
     match fd {
         FD_STDOUT | FD_STDERR => {

@@ -5,6 +5,7 @@ INIT ?= test
 LOG ?= OFF
 DEV_PRELOAD ?= 0
 LIBCTEST ?= 0
+IOZONE ?= 0
 RUSTUP_TOOLCHAIN ?= $(shell sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null | head -n 1)
 ifeq ($(strip $(RUSTUP_TOOLCHAIN)),)
     # Keep judge builds on the repository-pinned compiler. Falling back to the
@@ -34,6 +35,11 @@ ifeq ($(LIBCTEST),1)
     LIBCTEST_EXTRA := --features libctest
 else
     LIBCTEST_EXTRA :=
+endif
+ifeq ($(IOZONE),1)
+    IOZONE_EXTRA := --features iozone
+else
+    IOZONE_EXTRA :=
 endif
 NO_PRELOAD_PATTERN := _testcode\.sh|busybox_cmd\.txt|testcase busybox
 
@@ -123,13 +129,13 @@ build:
 	@echo "Building kernel for $(ARCH)..."
 	$(MAKE) prepare-cargo-config
 	@if [ "$(DEV_PRELOAD)" = "1" ]; then $(MAKE) check-sdcard ARCH=$(ARCH); fi
-	cd os && cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA)
+	cd os && cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA)
 
 # 快速检查（不做链接，更快，适合开发阶段验证代码）
 check:
 	@echo "Checking kernel for $(ARCH)..."
 	$(MAKE) prepare-cargo-config
-	cd os && cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA)
+	cd os && cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA)
 
 check-kernel-no-preload:
 	@if [ ! -f kernel-rv ]; then \

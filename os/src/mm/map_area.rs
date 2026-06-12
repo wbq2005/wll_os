@@ -109,16 +109,26 @@ impl MapArea {
         self.size() / PAGE_SIZE
     }
 
+    pub fn has_frames(&self) -> bool {
+        !self.frames.is_empty()
+    }
+
+    fn has_full_frames(&self) -> bool {
+        self.frames.len() == self.page_count()
+    }
+
     pub fn overlaps(&self, start: usize, end: usize) -> bool {
         self.start_va.raw() < end && start < self.end_va.raw()
     }
 
     pub fn can_merge_with(&self, next: &Self) -> bool {
+        let compatible_frames =
+            (self.frames.is_empty() && next.frames.is_empty())
+                || (self.has_full_frames() && next.has_full_frames());
         self.end_va.raw() == next.start_va.raw()
             && self.flags.bits() == next.flags.bits()
             && self.backing.can_merge_with(self.size(), &next.backing)
-            && self.frames.len() == self.page_count()
-            && next.frames.len() == next.page_count()
+            && compatible_frames
     }
 
     pub fn merge_with(&mut self, mut next: Self) {
@@ -136,11 +146,14 @@ impl MapArea {
         }
 
         let right_idx = (split - self.start_va.raw()) / PAGE_SIZE;
-        if right_idx > self.frames.len() {
-            return None;
-        }
-
-        let right_frames = self.frames.split_off(right_idx);
+        let right_frames = if self.frames.is_empty() {
+            Vec::new()
+        } else {
+            if right_idx > self.frames.len() {
+                return None;
+            }
+            self.frames.split_off(right_idx)
+        };
         let old_end = self.end_va;
         let right_backing = self.backing.split_right(split - self.start_va.raw());
         self.end_va = split_va;

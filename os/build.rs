@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use ext4_view::Ext4;
 
@@ -39,18 +40,36 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
     let generated = out_dir.join("preloaded_apps.rs");
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DEV_PRELOAD");
-    if env::var_os("CARGO_FEATURE_DEV_PRELOAD").is_none() {
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LIBCTEST");
+    println!("cargo:rerun-if-env-changed=LIBCTEST_FILTER");
+    let dev_preload = env::var_os("CARGO_FEATURE_DEV_PRELOAD").is_some();
+    let libctest = env::var_os("CARGO_FEATURE_LIBCTEST").is_some();
+    if !dev_preload && !libctest {
         fs::write(&generated, "fn preload_generated_programs() {}\n")
             .expect("write empty preload source");
         return;
     }
 
+    let mut code = String::from("fn preload_generated_programs() {\n");
+
+    if dev_preload {
+        emit_dev_preload(&mut code, manifest_dir, target);
+    }
+    if libctest {
+        emit_libctest_runtime_libs(&mut code, target);
+        emit_libctest_extra(&mut code, manifest_dir, target, &out_dir);
+    }
+
+    code.push_str("}\n");
+    fs::write(&generated, code).expect("write generated preload source");
+}
+
+fn emit_dev_preload(code: &mut String, manifest_dir: &PathBuf, target: &str) {
     let image_name = if target.contains("riscv64") {
         "sdcard-rv.img"
     } else if target.contains("loongarch") {
         "sdcard-la.img"
     } else {
-        let _ = fs::write(&generated, "fn preload_generated_programs() {}\n");
         return;
     };
 
@@ -59,8 +78,6 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
         .unwrap_or(manifest_dir)
         .join(image_name);
     println!("cargo:rerun-if-changed={}", image_path.display());
-
-    let mut code = String::from("fn preload_generated_programs() {\n");
 
     if image_path.is_file() {
         match fs::read(&image_path)
@@ -191,9 +208,227 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
             image_path.display()
         );
     }
+}
 
-    code.push_str("}\n");
-    fs::write(&generated, code).expect("write generated preload source");
+struct LibcTestExtraSpec {
+    libc: &'static str,
+    install_path: &'static str,
+    entry_name: &'static str,
+    static_link: bool,
+    musl_pleval: bool,
+}
+
+fn emit_libctest_runtime_libs(code: &mut String, target: &str) {
+    let specs = libctest_runtime_lib_specs(target);
+    for (install_path, candidates) in specs {
+        let Some(path) = candidates.iter().map(PathBuf::from).find(|path| path.is_file()) else {
+            println!(
+                "cargo:warning=skip libc-test runtime lib {}: no candidate found",
+                install_path
+            );
+            continue;
+        };
+        println!("cargo:rerun-if-changed={}", path.display());
+        code.push_str(&format!(
+            "    crate::fs::add_user_program({:?}, include_bytes!({:?}));\n",
+            install_path,
+            path.to_string_lossy()
+        ));
+    }
+}
+
+fn libctest_runtime_lib_specs(target: &str) -> Vec<(&'static str, Vec<&'static str>)> {
+    if target.contains("loongarch") {
+        vec![(
+            "/glibc/lib/libgcc_s.so.1",
+            vec![
+                "/opt/gcc-13.2.0-loongarch64-linux-gnu/loongarch64-linux-gnu/lib64/libgcc_s.so.1",
+                "/opt/toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18/sysroot/usr/lib64/libgcc_s.so.1",
+            ],
+        )]
+    } else if target.contains("riscv64") {
+        vec![(
+            "/glibc/lib/libgcc_s.so.1",
+            vec![
+                "/usr/riscv64-linux-gnu/lib/libgcc_s.so.1",
+                "/usr/lib/gcc-cross/riscv64-linux-gnu/13/libgcc_s.so",
+            ],
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn emit_libctest_extra(code: &mut String, manifest_dir: &PathBuf, target: &str, out_dir: &PathBuf) {
+    let source = manifest_dir.join("user").join("libctest_extra.c");
+    println!("cargo:rerun-if-changed={}", source.display());
+    if !source.is_file() {
+        println!(
+            "cargo:warning=skip libc-test extra runners: source missing at {}",
+            source.display()
+        );
+        return;
+    }
+
+    let specs = [
+        LibcTestExtraSpec {
+            libc: "musl",
+            install_path: "/musl/libctest-extra-static.exe",
+            entry_name: "entry-static.exe",
+            static_link: true,
+            musl_pleval: true,
+        },
+        LibcTestExtraSpec {
+            libc: "musl",
+            install_path: "/musl/libctest-extra-dynamic.exe",
+            entry_name: "entry-dynamic.exe",
+            static_link: false,
+            musl_pleval: false,
+        },
+    ];
+
+    for spec in specs {
+        let Some(cc) = find_libctest_extra_cc(target, spec.libc) else {
+            println!(
+                "cargo:warning=skip {}: no {} compiler for target {}",
+                spec.install_path, spec.libc, target
+            );
+            continue;
+        };
+        match compile_libctest_extra(&cc, &source, out_dir, target, &spec) {
+            Ok(binary) => {
+                code.push_str(&format!(
+                    "    crate::fs::add_user_program({:?}, include_bytes!({:?}));\n",
+                    spec.install_path,
+                    binary.to_string_lossy()
+                ));
+            }
+            Err(err) => {
+                println!("cargo:warning=skip {}: {}", spec.install_path, err);
+            }
+        }
+    }
+}
+
+fn compile_libctest_extra(
+    cc: &str,
+    source: &PathBuf,
+    out_dir: &PathBuf,
+    target: &str,
+    spec: &LibcTestExtraSpec,
+) -> Result<PathBuf, String> {
+    let arch = if target.contains("riscv64") {
+        "riscv64"
+    } else if target.contains("loongarch") {
+        "loongarch64"
+    } else {
+        return Err(format!("unsupported target {target}"));
+    };
+    let link_kind = if spec.static_link { "static" } else { "dynamic" };
+    let out = out_dir
+        .join("libctest-extra")
+        .join(arch)
+        .join(spec.libc)
+        .join(format!("libctest-extra-{link_kind}.exe"));
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create {}: {err}", parent.display()))?;
+    }
+
+    let mut args = vec![
+        "-Os".to_string(),
+        "-s".to_string(),
+        "-std=c99".to_string(),
+        "-D_POSIX_C_SOURCE=200809L".to_string(),
+        "-DHAVE_CRYPT=1".to_string(),
+        format!("-DENTRY_NAME=\"{}\"", spec.entry_name),
+    ];
+    if spec.static_link {
+        args.push("-static".to_string());
+    }
+    if spec.musl_pleval {
+        args.push("-DHAVE_MUSL_PLEVAL=1".to_string());
+    }
+    args.push(source.to_string_lossy().into_owned());
+    args.push("-o".to_string());
+    args.push(out.to_string_lossy().into_owned());
+    if spec.static_link {
+        args.push("-lcrypt".to_string());
+    } else {
+        args.push("-Wl,-Bstatic".to_string());
+        args.push("-lcrypt".to_string());
+        args.push("-Wl,-Bdynamic".to_string());
+    }
+
+    let output = Command::new(cc)
+        .args(&args)
+        .output()
+        .map_err(|err| format!("launch {cc}: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "{cc} failed with status {} stdout={} stderr={}",
+            output.status, stdout, stderr
+        ));
+    }
+
+    Ok(out)
+}
+
+fn find_libctest_extra_cc(target: &str, libc: &str) -> Option<String> {
+    let arch_key = if target.contains("riscv64") {
+        "RISCV64"
+    } else if target.contains("loongarch") {
+        "LOONGARCH64"
+    } else {
+        return None;
+    };
+    let env_key = format!(
+        "LIBCTEST_EXTRA_{}_{}_CC",
+        arch_key,
+        libc.to_ascii_uppercase()
+    );
+    if let Ok(cc) = env::var(&env_key) {
+        return Some(cc);
+    }
+
+    for candidate in libctest_extra_cc_candidates(target, libc) {
+        if command_is_available(candidate) {
+            return Some((*candidate).to_string());
+        }
+    }
+    None
+}
+
+fn libctest_extra_cc_candidates(target: &str, libc: &str) -> &'static [&'static str] {
+    match (target.contains("riscv64"), target.contains("loongarch"), libc) {
+        (true, _, "glibc") => &["riscv64-linux-gnu-gcc", "/usr/bin/riscv64-linux-gnu-gcc"],
+        (true, _, "musl") => &[
+            "/opt/riscv64-linux-musl-cross/bin/riscv64-linux-musl-gcc",
+            "riscv64-linux-musl-gcc",
+        ],
+        (_, true, "glibc") => &[
+            "/opt/gcc-13.2.0-loongarch64-linux-gnu/bin/loongarch64-linux-gnu-gcc",
+            "/opt/toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18/bin/loongarch64-linux-gnu-gcc",
+            "loongarch64-linux-gnu-gcc",
+        ],
+        (_, true, "musl") => &[
+            "/opt/loongarch64-linux-musl-cross/bin/loongarch64-linux-musl-gcc",
+            "loongarch64-linux-musl-gcc",
+        ],
+        _ => &[],
+    }
+}
+
+fn command_is_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn candidate_paths(target: &str) -> &'static [(&'static str, &'static str)] {

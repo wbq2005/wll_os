@@ -29,6 +29,10 @@ const MAP_STACK: usize = 0x20000;
 const MAP_HUGETLB: usize = 0x40000;
 const MAP_SYNC: usize = 0x80000;
 const MAP_FIXED_NOREPLACE: usize = 0x100000;
+const MS_ASYNC: usize = 0x1;
+const MS_INVALIDATE: usize = 0x2;
+const MS_SYNC: usize = 0x4;
+const MS_SUPPORTED: usize = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
 const MAP_COMPAT_IGNORED: usize = MAP_DENYWRITE
     | MAP_EXECUTABLE
     | MAP_LOCKED
@@ -144,6 +148,10 @@ fn prot_to_pte_flags(prot: i32) -> Result<PTEFlags, SysErrNo> {
         flags |= PTEFlags::X;
     }
     Ok(flags)
+}
+
+fn pte_has_leaf_permission(flags: PTEFlags) -> bool {
+    flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X)
 }
 
 /// brk system call.
@@ -293,6 +301,7 @@ pub fn sys_mmap(
         return Err(SysErrNo::ENOMEM);
     }
 
+    let map_has_leaf = pte_has_leaf_permission(pte_flags);
     let (backing, file_data) = if anonymous {
         (MapAreaBacking::Anonymous, None)
     } else {
@@ -306,17 +315,22 @@ pub fn sys_mmap(
             return Err(SysErrNo::EACCES);
         }
 
-        let mut data = Vec::new();
-        data.resize(length, 0);
-        let n = super::with_kernel_page_table(|| file_desc.read_at(offset, &mut data))?;
-        data.truncate(n);
+        let data = if map_has_leaf {
+            let mut data = Vec::new();
+            data.resize(length, 0);
+            let n = super::with_kernel_page_table(|| file_desc.read_at(offset, &mut data))?;
+            data.truncate(n);
+            Some(data)
+        } else {
+            None
+        };
         (
             MapAreaBacking::File {
                 file: file_desc.clone(),
                 offset,
                 shared,
             },
-            Some(data),
+            data,
         )
     };
 
@@ -395,5 +409,36 @@ pub fn sys_munmap(addr: usize, length: usize) -> SyscallRet {
         ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
         ms.activate();
     }
+    Ok(0)
+}
+
+pub fn sys_msync(addr: usize, length: usize, flags: usize) -> SyscallRet {
+    log::debug!(
+        "[syscall] msync(addr={:#x}, len={:#x}, flags={:#x})",
+        addr,
+        length,
+        flags
+    );
+    if addr % PAGE_SIZE != 0 || (flags & !MS_SUPPORTED) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if (flags & MS_ASYNC) != 0 && (flags & MS_SYNC) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if length == 0 {
+        return Ok(0);
+    }
+
+    let start = align_down(addr);
+    let end = align_up(addr.checked_add(length).ok_or(SysErrNo::EINVAL)?)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    {
+        let ms = task.memory_set.lock();
+        if !ms.range_covered(start, end) {
+            return Err(SysErrNo::ENOMEM);
+        }
+    }
+    let writes = collect_shared_file_writes(&task, start, end)?;
+    write_back_shared_files(writes)?;
     Ok(0)
 }
