@@ -84,7 +84,13 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::LibcTest];
 
 #[cfg(all(not(feature = "libctest"), feature = "iozone"))]
-const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Iozone];
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
+    TestGroup::Basic,
+    TestGroup::Busybox,
+    TestGroup::Lua,
+    TestGroup::LibcTest,
+    TestGroup::Iozone,
+];
 
 fn console_write(msg: &str) {
     for b in msg.bytes() {
