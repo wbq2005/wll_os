@@ -5,7 +5,7 @@ INIT ?= test
 LOG ?= OFF
 DEV_PRELOAD ?= 0
 LIBCTEST ?= 0
-IOZONE ?= 0
+IOZONE ?= 1
 RUSTUP_TOOLCHAIN ?= $(shell sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null | head -n 1)
 ifeq ($(strip $(RUSTUP_TOOLCHAIN)),)
     # Keep judge builds on the repository-pinned compiler. Falling back to the
