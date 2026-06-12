@@ -37,7 +37,7 @@ function Build-Arch {
     try {
         # Build using cargo directly (toolchain from rust-toolchain.toml)
         # Note: -p must come AFTER check/build command, -Z must come at the end
-        $cargoArgs = @($MODE, "-p", "wll_OS", "--release", "--target", $TARGET)
+        $cargoArgs = @($MODE, "-p", "wll_OS", "--locked", "--offline", "--release", "--target", $TARGET)
         if ($EXTRA -ne "") {
             $cargoArgs += $EXTRA.Split(" ") | Where-Object { $_ -ne "" }
         }
@@ -47,8 +47,6 @@ function Build-Arch {
         if ($Iozone) {
             $cargoArgs += @("--features", "iozone")
         }
-        $cargoArgs += @("-Z", "build-std=core,alloc")
-
         Write-Host "[$TargetArch] cargo @($cargoArgs)" -ForegroundColor Gray
         & cargo $cargoArgs
 

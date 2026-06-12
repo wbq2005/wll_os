@@ -559,37 +559,19 @@ fn run_libctest_collection_harness(include_glibc: bool) {
         ),
     ];
 
-    for (root, name, entry, cases) in SEGMENTS {
+    const GROUPS: &[(&str, &str)] = &[
+        ("/glibc", "libctest-glibc"),
+        ("/musl", "libctest-musl"),
+    ];
+
+    for (root, group_name) in GROUPS {
         if !include_glibc && *root != "/musl" {
             continue;
         }
-        if !libctest_segment_enabled(name) {
+        if !libctest_group_enabled(root, SEGMENTS, EXTRA_SEGMENTS) {
             continue;
         }
-        console_write("[harness] LIBCTEST SEGMENT ");
-        console_write(name);
-        console_write("\n");
-        if !run_libctest_segment(root, name, entry, cases) {
-            console_write("[harness] failed to launch libc-test segment: ");
-            console_write(name);
-            console_write("\n");
-        }
-    }
-    for (root, name, runner, cases) in EXTRA_SEGMENTS {
-        if !include_glibc && *root != "/musl" {
-            continue;
-        }
-        if !libctest_segment_enabled(name) {
-            continue;
-        }
-        console_write("[harness] LIBCTEST EXTRA SEGMENT ");
-        console_write(name);
-        console_write("\n");
-        if !run_libctest_extra_segment(root, name, runner, cases) {
-            console_write("[harness] failed to launch libc-test extra segment: ");
-            console_write(name);
-            console_write("\n");
-        }
+        run_libctest_judge_group(root, group_name, SEGMENTS, EXTRA_SEGMENTS);
     }
 }
 
@@ -613,12 +595,68 @@ fn libctest_segment_enabled(name: &str) -> bool {
     }
 }
 
+fn libctest_group_enabled(
+    root: &str,
+    segments: &[(&str, &str, &str, &[&str])],
+    extra_segments: &[(&str, &str, &str, &[&str])],
+) -> bool {
+    segments
+        .iter()
+        .any(|(segment_root, name, _, _)| *segment_root == root && libctest_segment_enabled(name))
+        || extra_segments
+            .iter()
+            .any(|(segment_root, name, _, _)| {
+                *segment_root == root && libctest_segment_enabled(name)
+            })
+}
+
+fn run_libctest_judge_group(
+    root: &str,
+    group_name: &str,
+    segments: &[(&str, &str, &str, &[&str])],
+    extra_segments: &[(&str, &str, &str, &[&str])],
+) {
+    console_write("[harness] LIBCTEST GROUP ");
+    console_write(group_name);
+    console_write("\n");
+    console_write("#### OS COMP TEST GROUP START ");
+    console_write(group_name);
+    console_write(" ####\n");
+
+    for (segment_root, name, entry, cases) in segments {
+        if *segment_root != root || !libctest_segment_enabled(name) {
+            continue;
+        }
+        console_write("[harness] LIBCTEST SEGMENT ");
+        console_write(name);
+        console_write("\n");
+        if !run_libctest_segment(root, name, entry, cases) {
+            console_write("[harness] failed to launch libc-test segment: ");
+            console_write(name);
+            console_write("\n");
+        }
+    }
+    for (segment_root, name, runner, cases) in extra_segments {
+        if *segment_root != root || !libctest_segment_enabled(name) {
+            continue;
+        }
+        console_write("[harness] LIBCTEST EXTRA SEGMENT ");
+        console_write(name);
+        console_write("\n");
+        if !run_libctest_extra_segment(root, name, runner, cases) {
+            console_write("[harness] failed to launch libc-test extra segment: ");
+            console_write(name);
+            console_write("\n");
+        }
+    }
+
+    console_write("#### OS COMP TEST GROUP END ");
+    console_write(group_name);
+    console_write(" ####\n");
+}
+
 fn run_libctest_segment(root: &str, name: &str, entry: &str, cases: &[&str]) -> bool {
     let mut launched = false;
-
-    console_write("#### OS COMP TEST GROUP START ");
-    console_write(name);
-    console_write(" ####\n");
 
     for case in cases {
         if run_libctest_case(root, entry, case) {
@@ -631,10 +669,6 @@ fn run_libctest_segment(root: &str, name: &str, entry: &str, cases: &[&str]) -> 
             console_write("\n");
         }
     }
-
-    console_write("#### OS COMP TEST GROUP END ");
-    console_write(name);
-    console_write(" ####\n");
 
     launched
 }
@@ -666,10 +700,6 @@ fn run_libctest_case(root: &str, entry: &str, case: &str) -> bool {
 fn run_libctest_extra_segment(root: &str, name: &str, runner: &str, cases: &[&str]) -> bool {
     let mut launched = false;
 
-    console_write("#### OS COMP TEST GROUP START ");
-    console_write(name);
-    console_write(" ####\n");
-
     for case in cases {
         if run_libctest_extra_case(root, runner, case) {
             launched = true;
@@ -681,10 +711,6 @@ fn run_libctest_extra_segment(root: &str, name: &str, runner: &str, cases: &[&st
             console_write("\n");
         }
     }
-
-    console_write("#### OS COMP TEST GROUP END ");
-    console_write(name);
-    console_write(" ####\n");
 
     launched
 }
