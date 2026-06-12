@@ -12,6 +12,10 @@ pub enum MapAreaBacking {
         offset: usize,
         shared: bool,
     },
+    SharedMemory {
+        shmid: usize,
+        offset: usize,
+    },
 }
 
 impl MapAreaBacking {
@@ -26,6 +30,10 @@ impl MapAreaBacking {
                 file: file.clone(),
                 offset: offset.saturating_add(delta),
                 shared: *shared,
+            },
+            Self::SharedMemory { shmid, offset } => Self::SharedMemory {
+                shmid: *shmid,
+                offset: offset.saturating_add(delta),
             },
         }
     }
@@ -63,6 +71,16 @@ impl MapAreaBacking {
                     && Self::same_file(left_file, right_file)
                     && left_offset.saturating_add(left_len) == *right_offset
             }
+            (
+                Self::SharedMemory {
+                    shmid: left_shmid,
+                    offset: left_offset,
+                },
+                Self::SharedMemory {
+                    shmid: right_shmid,
+                    offset: right_offset,
+                },
+            ) => left_shmid == right_shmid && left_offset.saturating_add(left_len) == *right_offset,
             _ => false,
         }
     }

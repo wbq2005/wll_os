@@ -197,6 +197,45 @@ impl MemorySet {
         frames
     }
 
+    pub fn insert_shared_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: PTEFlags,
+        backing: MapAreaBacking,
+        frames: &[FrameTracker],
+    ) -> Result<(), SysErrNo> {
+        let start = align_down(start_va.raw());
+        let end = align_up(end_va.raw()).ok_or(SysErrNo::EINVAL)?;
+        if start >= end || frames.len() != (end - start) / PAGE_SIZE {
+            return Err(SysErrNo::EINVAL);
+        }
+        if self.range_overlaps(start, end) {
+            return Err(SysErrNo::ENOMEM);
+        }
+
+        let mut area = MapArea::with_backing(
+            VirtAddr::new(start),
+            VirtAddr::new(end),
+            permission,
+            backing,
+        );
+        area.frames = frames.to_vec();
+        if has_leaf_permission(permission) {
+            let mf: MappingFlags = permission.into();
+            for (idx, frame) in area.frames.iter().enumerate() {
+                let vaddr = VirtAddr::new(start + idx * PAGE_SIZE);
+                let paddr = PhysAddr::new(frame.ppn().addr());
+                self.page_table
+                    .map_page(vaddr, paddr, mf, MappingSize::Page4KB);
+            }
+        }
+
+        self.areas.push(area);
+        self.coalesce_areas();
+        Ok(())
+    }
+
     /// Build a user address space seeded with the kernel/device mappings needed
     /// while the kernel runs on a user task's page table.
     pub fn from_kernel() -> Self {
@@ -429,6 +468,13 @@ impl Clone for MemorySet {
         for area in &self.areas {
             let mut new_area =
                 MapArea::with_backing(area.start_va, area.end_va, area.flags, area.backing.clone());
+
+            if matches!(area.backing, MapAreaBacking::SharedMemory { .. }) {
+                new_area.frames = area.frames.clone();
+                map_area_pages(&new_ms.page_table, &new_area);
+                new_ms.areas.push(new_area);
+                continue;
+            }
 
             for (idx, src_frame) in area.frames.iter().enumerate() {
                 if let Some(frame) = frame_allocator::alloc_frame() {

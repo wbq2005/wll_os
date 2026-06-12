@@ -543,6 +543,7 @@ pub fn sync_fd(file: &fd::FileDescriptor, data_only: bool) -> Result<(), SysErrN
 }
 
 pub fn sync_all() -> Result<(), SysErrNo> {
+    ext4_vol::flush_all_cached()?;
     Ok(())
 }
 

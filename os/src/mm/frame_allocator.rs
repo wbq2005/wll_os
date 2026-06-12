@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use buddy_system_allocator::FrameAllocator;
 use lazy_static::lazy_static;
@@ -41,23 +42,30 @@ impl TryFrom<polyhal::PhysAddr> for PhysPageNum {
 }
 
 /// 页帧追踪器 - RAII自动释放
+struct FrameTrackerInner {
+    ppn: PhysPageNum,
+}
+
+impl Drop for FrameTrackerInner {
+    fn drop(&mut self) {
+        dealloc_frame(self.ppn);
+    }
+}
+
+#[derive(Clone)]
 pub struct FrameTracker {
-    pub ppn: PhysPageNum,
+    inner: Arc<FrameTrackerInner>,
 }
 
 impl FrameTracker {
     pub fn new(ppn: PhysPageNum) -> Self {
-        Self { ppn }
+        Self {
+            inner: Arc::new(FrameTrackerInner { ppn }),
+        }
     }
 
     pub fn ppn(&self) -> PhysPageNum {
-        self.ppn
-    }
-}
-
-impl Drop for FrameTracker {
-    fn drop(&mut self) {
-        dealloc_frame(self.ppn);
+        self.inner.ppn
     }
 }
 

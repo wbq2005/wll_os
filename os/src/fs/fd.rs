@@ -894,6 +894,7 @@ impl FileDescriptor {
 
     pub fn sync(&self, _data_only: bool) -> Result<(), SysErrNo> {
         match self {
+            FileDescriptor::Ext4Regular { ino, .. } => ext4_vol::flush_cached_ino(*ino),
             FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
                 Err(SysErrNo::EINVAL)
             }

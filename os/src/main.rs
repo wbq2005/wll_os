@@ -38,7 +38,7 @@ impl PageAlloc for KernelPageAlloc {
     fn alloc(&self) -> PhysAddr {
         mm::frame_allocator::alloc_frame()
             .map(|frame| {
-                let paddr = PhysAddr::new(frame.ppn.addr());
+                let paddr = PhysAddr::new(frame.ppn().addr());
                 paddr.clear_len(crate::config::PAGE_SIZE);
                 core::mem::forget(frame);
                 paddr

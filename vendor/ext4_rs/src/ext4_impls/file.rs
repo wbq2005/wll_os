@@ -392,13 +392,6 @@ impl Ext4 {
             total_blocks += 1;
 
             let mut block = Block::load(&self.block_device, pblock_idx as usize * BLOCK_SIZE);
-            
-            // Read existing data if needed
-            if unaligned > 0 || len < BLOCK_SIZE {
-                let existing_data = self.block_device.read_offset(pblock_idx as usize * BLOCK_SIZE);
-                block.data.copy_from_slice(&existing_data);
-            }
-            
             block.write_offset(unaligned, &write_buf[..len], len);
             block.sync_blk_to_disk(&self.block_device);
             drop(block);
@@ -427,13 +420,6 @@ impl Ext4 {
             let block_offset = pblock_idx as usize * BLOCK_SIZE;
             let mut block = Block::load(&self.block_device, block_offset);
             let write_size = min(BLOCK_SIZE, write_buf_len - written);
-            
-            // For partial block writes, read existing data first
-            if write_size < BLOCK_SIZE {
-                let existing_data = self.block_device.read_offset(block_offset);
-                block.data.copy_from_slice(&existing_data);
-            }
-            
             block.write_offset(0, &write_buf[written..written + write_size], write_size);
             block.sync_blk_to_disk(&self.block_device);
             drop(block);

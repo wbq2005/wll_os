@@ -1,12 +1,17 @@
 use super::SyscallRet;
 use crate::config::{PAGE_SIZE, USER_HEAP_START, USER_STACK_TOP};
 use crate::fs::fd::FileDescriptor;
+use crate::mm::frame_allocator::{self, FrameTracker};
 use crate::mm::map_area::{MapArea, MapAreaBacking};
 use crate::mm::page_table::PTEFlags;
 use crate::task::current_task;
 use crate::utils::error::SysErrNo;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use lazy_static::lazy_static;
 use polyhal::VirtAddr;
+use spin::Mutex;
 
 const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
@@ -33,6 +38,17 @@ const MS_ASYNC: usize = 0x1;
 const MS_INVALIDATE: usize = 0x2;
 const MS_SYNC: usize = 0x4;
 const MS_SUPPORTED: usize = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+const IPC_PRIVATE: isize = 0;
+const IPC_CREAT: i32 = 0o1000;
+const IPC_EXCL: i32 = 0o2000;
+const IPC_RMID: i32 = 0;
+const IPC_SET: i32 = 1;
+const IPC_STAT: i32 = 2;
+const SHM_RDONLY: i32 = 0o10000;
+const SHM_RND: i32 = 0o20000;
+const SHM_REMAP: i32 = 0o40000;
+const SHM_EXEC: i32 = 0o100000;
+const SHM_SUPPORTED_FLAGS: i32 = SHM_RDONLY | SHM_RND | SHM_REMAP | SHM_EXEC;
 const MAP_COMPAT_IGNORED: usize = MAP_DENYWRITE
     | MAP_EXECUTABLE
     | MAP_LOCKED
@@ -43,6 +59,28 @@ const MAP_COMPAT_IGNORED: usize = MAP_DENYWRITE
 const MAP_SUPPORTED: usize =
     MAP_TYPE | MAP_FIXED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_COMPAT_IGNORED;
 
+#[derive(Clone)]
+struct SharedMemorySegment {
+    key: isize,
+    size: usize,
+    perm: u16,
+    cpid: usize,
+    lpid: usize,
+    atime: isize,
+    dtime: isize,
+    ctime: isize,
+    frames: Vec<FrameTracker>,
+    attach_count: usize,
+    marked_for_remove: bool,
+}
+
+lazy_static! {
+    static ref SHM_SEGMENTS: Mutex<BTreeMap<usize, SharedMemorySegment>> =
+        Mutex::new(BTreeMap::new());
+}
+
+static NEXT_SHMID: AtomicUsize = AtomicUsize::new(1);
+
 fn align_down(value: usize) -> usize {
     value / PAGE_SIZE * PAGE_SIZE
 }
@@ -52,6 +90,11 @@ fn align_up(value: usize) -> Result<usize, SysErrNo> {
         .checked_add(PAGE_SIZE - 1)
         .map(|value| value / PAGE_SIZE * PAGE_SIZE)
         .ok_or(SysErrNo::EINVAL)
+}
+
+fn current_time_sec() -> isize {
+    let (sec, _) = crate::timer::get_timeval();
+    sec as isize
 }
 
 fn checked_range(start: usize, length: usize) -> Result<(usize, usize), SysErrNo> {
@@ -128,6 +171,85 @@ fn write_back_shared_files(writes: Vec<(FileDescriptor, usize, Vec<u8>)>) -> Res
         super::with_kernel_page_table(|| file.write_at(offset, &data))?;
     }
     Ok(())
+}
+
+fn shm_find_by_key(segments: &BTreeMap<usize, SharedMemorySegment>, key: isize) -> Option<usize> {
+    segments
+        .iter()
+        .find(|(_, segment)| segment.key == key && !segment.marked_for_remove)
+        .map(|(shmid, _)| *shmid)
+}
+
+fn shm_alloc_frames(size: usize) -> Result<Vec<FrameTracker>, SysErrNo> {
+    let len = align_up(size)?;
+    let pages = len / PAGE_SIZE;
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        frames.push(frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?);
+    }
+    Ok(frames)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserIpcPerm {
+    key: i32,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    mode: u32,
+    seq: i32,
+    pad1: isize,
+    pad2: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserShmidDs {
+    shm_perm: UserIpcPerm,
+    shm_segsz: usize,
+    shm_atime: isize,
+    shm_dtime: isize,
+    shm_ctime: isize,
+    shm_cpid: i32,
+    shm_lpid: i32,
+    shm_nattch: usize,
+    pad1: usize,
+    pad2: usize,
+}
+
+fn user_shmid_ds(shmid: usize, segment: &SharedMemorySegment) -> UserShmidDs {
+    let mode = (segment.perm & 0o777) as u32;
+    UserShmidDs {
+        shm_perm: UserIpcPerm {
+            key: segment.key as i32,
+            uid: 0,
+            gid: 0,
+            cuid: 0,
+            cgid: 0,
+            mode,
+            seq: shmid as i32,
+            pad1: 0,
+            pad2: 0,
+        },
+        shm_segsz: segment.size,
+        shm_atime: segment.atime,
+        shm_dtime: segment.dtime,
+        shm_ctime: segment.ctime,
+        shm_cpid: segment.cpid as i32,
+        shm_lpid: segment.lpid as i32,
+        shm_nattch: segment.attach_count,
+        pad1: 0,
+        pad2: 0,
+    }
+}
+
+fn copy_shmid_ds_to_user(addr: usize, shmid: usize, segment: &SharedMemorySegment) -> Result<(), SysErrNo> {
+    if addr == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    super::user::copy_object_to_user(addr, &user_shmid_ds(shmid, segment))
 }
 
 fn prot_to_pte_flags(prot: i32) -> Result<PTEFlags, SysErrNo> {
@@ -441,4 +563,226 @@ pub fn sys_msync(addr: usize, length: usize, flags: usize) -> SyscallRet {
     let writes = collect_shared_file_writes(&task, start, end)?;
     write_back_shared_files(writes)?;
     Ok(0)
+}
+
+pub fn sys_shmget(key: isize, size: usize, shmflg: i32) -> SyscallRet {
+    log::info!(
+        "[syscall] shmget(key={:#x}, size={:#x}, flags={:#x})",
+        key,
+        size,
+        shmflg
+    );
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let create = (shmflg & IPC_CREAT) != 0;
+    let excl = (shmflg & IPC_EXCL) != 0;
+    let perm = (shmflg & 0o777) as u16;
+
+    let mut segments = SHM_SEGMENTS.lock();
+    if key != IPC_PRIVATE {
+        if let Some(existing) = shm_find_by_key(&segments, key) {
+            if create && excl {
+                return Err(SysErrNo::EEXIST);
+            }
+            if size != 0 && size > segments.get(&existing).map(|segment| segment.size).unwrap_or(0) {
+                return Err(SysErrNo::EINVAL);
+            }
+            return Ok(existing);
+        }
+        if !create {
+            return Err(SysErrNo::ENOENT);
+        }
+    }
+
+    if size == 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let frames = shm_alloc_frames(size)?;
+    let shmid = NEXT_SHMID.fetch_add(1, Ordering::SeqCst);
+    let now = current_time_sec();
+    segments.insert(
+        shmid,
+        SharedMemorySegment {
+            key,
+            size,
+            perm,
+            cpid: task.thread_group.tgid(),
+            lpid: 0,
+            atime: 0,
+            dtime: 0,
+            ctime: now,
+            frames,
+            attach_count: 0,
+            marked_for_remove: false,
+        },
+    );
+    Ok(shmid)
+}
+
+pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SyscallRet {
+    log::info!(
+        "[syscall] shmat(shmid={}, addr={:#x}, flags={:#x})",
+        shmid,
+        shmaddr,
+        shmflg
+    );
+    if (shmflg & !SHM_SUPPORTED_FLAGS) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let read_only = (shmflg & SHM_RDONLY) != 0;
+    let remap = (shmflg & SHM_REMAP) != 0;
+
+    let (frames, map_len) = {
+        let mut segments = SHM_SEGMENTS.lock();
+        let segment = segments.get_mut(&shmid).ok_or(SysErrNo::EINVAL)?;
+        if segment.marked_for_remove {
+            return Err(SysErrNo::EINVAL);
+        }
+        segment.attach_count = segment.attach_count.saturating_add(1);
+        segment.lpid = task.thread_group.tgid();
+        segment.atime = current_time_sec();
+        (segment.frames.clone(), segment.frames.len() * PAGE_SIZE)
+    };
+
+    let attach_result = (|| -> Result<usize, SysErrNo> {
+        let start = if shmaddr == 0 {
+            let next_hint = task.mm.lock().next_mmap;
+            let ms = task.memory_set.lock();
+            ms.find_free_area(next_hint, map_len, USER_STACK_TOP)
+                .ok_or(SysErrNo::ENOMEM)?
+        } else if (shmflg & SHM_RND) != 0 {
+            align_down(shmaddr)
+        } else {
+            if shmaddr % PAGE_SIZE != 0 {
+                return Err(SysErrNo::EINVAL);
+            }
+            shmaddr
+        };
+        if start < PAGE_SIZE {
+            return Err(SysErrNo::EINVAL);
+        }
+        let end = start.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
+        if end > USER_STACK_TOP {
+            return Err(SysErrNo::ENOMEM);
+        }
+
+        let mut pte_flags = PTEFlags::U | PTEFlags::V | PTEFlags::R;
+        if !read_only {
+            pte_flags |= PTEFlags::W;
+        }
+        if (shmflg & SHM_EXEC) != 0 {
+            pte_flags |= PTEFlags::X;
+        }
+
+        if remap {
+            if shmaddr == 0 {
+                return Err(SysErrNo::EINVAL);
+            }
+            let writes = collect_shared_file_writes(&task, start, end)?;
+            write_back_shared_files(writes)?;
+        }
+
+        {
+            let mut ms = task.memory_set.lock();
+            if remap {
+                ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
+            } else if ms.range_overlaps(start, end) {
+                return Err(SysErrNo::ENOMEM);
+            }
+            ms.insert_shared_framed_area(
+                VirtAddr::new(start),
+                VirtAddr::new(end),
+                pte_flags,
+                MapAreaBacking::SharedMemory { shmid, offset: 0 },
+                &frames,
+            )?;
+            ms.activate();
+        }
+        {
+            let mut mm = task.mm.lock();
+            if mm.next_mmap < end {
+                mm.next_mmap = end;
+            }
+        }
+        Ok(start)
+    })();
+
+    if attach_result.is_err() {
+        let mut segments = SHM_SEGMENTS.lock();
+        if let Some(segment) = segments.get_mut(&shmid) {
+            segment.attach_count = segment.attach_count.saturating_sub(1);
+        }
+    }
+    attach_result
+}
+
+pub fn sys_shmdt(shmaddr: usize) -> SyscallRet {
+    log::info!("[syscall] shmdt(addr={:#x})", shmaddr);
+    if shmaddr == 0 || shmaddr % PAGE_SIZE != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let (shmid, end) = {
+        let ms = task.memory_set.lock();
+        let area = ms
+            .areas
+            .iter()
+            .find(|area| area.start_va.raw() == shmaddr)
+            .ok_or(SysErrNo::EINVAL)?;
+        let MapAreaBacking::SharedMemory { shmid, .. } = area.backing else {
+            return Err(SysErrNo::EINVAL);
+        };
+        (shmid, area.end_va.raw())
+    };
+    {
+        let mut ms = task.memory_set.lock();
+        ms.unmap_range(VirtAddr::new(shmaddr), VirtAddr::new(end))?;
+        ms.activate();
+    }
+    {
+        let mut segments = SHM_SEGMENTS.lock();
+        let remove = if let Some(segment) = segments.get_mut(&shmid) {
+            segment.attach_count = segment.attach_count.saturating_sub(1);
+            segment.lpid = task.thread_group.tgid();
+            segment.dtime = current_time_sec();
+            segment.marked_for_remove && segment.attach_count == 0
+        } else {
+            false
+        };
+        if remove {
+            segments.remove(&shmid);
+        }
+    }
+    Ok(0)
+}
+
+pub fn sys_shmctl(shmid: usize, cmd: i32, buf: usize) -> SyscallRet {
+    log::info!(
+        "[syscall] shmctl(shmid={}, cmd={}, buf={:#x})",
+        shmid,
+        cmd,
+        buf
+    );
+    let mut segments = SHM_SEGMENTS.lock();
+    match cmd {
+        IPC_STAT => {
+            let segment = segments.get(&shmid).ok_or(SysErrNo::EINVAL)?;
+            copy_shmid_ds_to_user(buf, shmid, segment)?;
+            Ok(0)
+        }
+        IPC_SET => Err(SysErrNo::ENOSYS),
+        IPC_RMID => {
+            let remove_now = {
+                let segment = segments.get_mut(&shmid).ok_or(SysErrNo::EINVAL)?;
+                segment.marked_for_remove = true;
+                segment.ctime = current_time_sec();
+                segment.attach_count == 0
+            };
+            if remove_now {
+                segments.remove(&shmid);
+            }
+            Ok(0)
+        }
+        _ => Err(SysErrNo::EINVAL),
+    }
 }

@@ -117,6 +117,10 @@ pub const SYSCALL_GETGID: usize = 176;
 pub const SYSCALL_GETEGID: usize = 177;
 pub const SYSCALL_GETTID: usize = 178;
 pub const SYSCALL_SYSINFO: usize = 179;
+pub const SYSCALL_SHMGET: usize = 194;
+pub const SYSCALL_SHMCTL: usize = 195;
+pub const SYSCALL_SHMAT: usize = 196;
+pub const SYSCALL_SHMDT: usize = 197;
 pub const SYSCALL_SOCKET: usize = 198;
 pub const SYSCALL_SOCKETPAIR: usize = 199;
 pub const SYSCALL_BIND: usize = 200;
@@ -311,6 +315,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         ),
         SYSCALL_MUNMAP => mm::sys_munmap(args[0], args[1]),
         SYSCALL_MSYNC => mm::sys_msync(args[0], args[1], args[2]),
+        SYSCALL_SHMGET => mm::sys_shmget(args[0] as isize, args[1], args[2] as i32),
+        SYSCALL_SHMCTL => mm::sys_shmctl(args[0], args[1] as i32, args[2]),
+        SYSCALL_SHMAT => mm::sys_shmat(args[0], args[1], args[2] as i32),
+        SYSCALL_SHMDT => mm::sys_shmdt(args[0]),
 
         // 时间和系统信息
         SYSCALL_NANOSLEEP => other::sys_nanosleep(args[0], args[1]),
