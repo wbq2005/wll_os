@@ -1,6 +1,20 @@
 #!/usr/bin/env sh
 set -eu
 
+restore_offline_crate_source() {
+    crate="$1"
+    src="offline_crate_sources/$crate"
+    dst="vendor/$crate"
+
+    if [ -d "$src" ] && { [ ! -f "$dst/Cargo.toml" ] || [ ! -f "$dst/src/lib.rs" ]; }; then
+        mkdir -p "$dst"
+        cp -R "$src"/. "$dst"/
+    fi
+}
+
+restore_offline_crate_source 'buddy_system_allocator'
+restore_offline_crate_source 'sbi-spec'
+
 mkdir -p 'vendor/aarch64-cpu'
 cp 'vendor_hidden/aarch64-cpu/__dot__cargo_vcs_info.json' 'vendor/aarch64-cpu/.cargo_vcs_info.json'
 mkdir -p 'vendor/aarch64-cpu'
