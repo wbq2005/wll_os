@@ -365,6 +365,13 @@ impl MemorySet {
         Ok(())
     }
 
+    pub fn release_user_areas(&mut self) {
+        for area in &self.areas {
+            unmap_area_pages(&self.page_table, area, area.flags);
+        }
+        self.areas.clear();
+    }
+
     pub fn protect_range(
         &mut self,
         start_va: VirtAddr,

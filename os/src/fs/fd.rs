@@ -1222,6 +1222,13 @@ impl FileDescriptorTable {
         }
     }
 
+    pub fn close_all(&mut self) {
+        for index in 0..MAX_FD_NUM {
+            self.fds[index] = None;
+            self.fd_flags[index] = 0;
+        }
+    }
+
     pub fn dup(&mut self, old_fd: usize) -> Result<usize, SysErrNo> {
         self.dup_below(old_fd, MAX_FD_NUM)
     }

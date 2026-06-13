@@ -9,6 +9,7 @@ use super::{
     set_orphan_reaper, TaskControlBlock, TaskStatus, UserProgramSpec, CURRENT_TASK,
 };
 use crate::console::putchar;
+use crate::utils::error::SysErrNo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestGroup {
@@ -96,6 +97,35 @@ fn console_write(msg: &str) {
     for b in msg.bytes() {
         putchar(b);
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScriptLaunchError {
+    InvalidPath,
+    MissingBusybox,
+    MissingScript,
+    MissingApplet(&'static str),
+    CreateTask(SysErrNo),
+}
+
+fn log_script_launch_error(script: &str, err: ScriptLaunchError) {
+    console_write("[harness] failed to launch script: ");
+    console_write(script);
+    console_write(" (");
+    match err {
+        ScriptLaunchError::InvalidPath => console_write("invalid path"),
+        ScriptLaunchError::MissingBusybox => console_write("missing busybox"),
+        ScriptLaunchError::MissingScript => console_write("missing script"),
+        ScriptLaunchError::MissingApplet(applet) => {
+            console_write("missing applet ");
+            console_write(applet);
+        }
+        ScriptLaunchError::CreateTask(errno) => {
+            console_write("create task ");
+            console_write(&format!("{:?}", errno));
+        }
+    }
+    console_write(")\n");
 }
 
 fn basename(path: &str) -> &str {
@@ -206,10 +236,8 @@ fn run_runtime_test_harness() -> ! {
             console_write("[harness] SCRIPT ");
             console_write(script);
             console_write("\n");
-            if !run_script_via_busybox(script) {
-                console_write("[harness] failed to launch script: ");
-                console_write(script);
-                console_write("\n");
+            if let Err(err) = run_script_via_busybox(script) {
+                log_script_launch_error(script, err);
             }
         }
 
@@ -696,6 +724,7 @@ fn run_libctest_case(root: &str, entry: &str, case: &str) -> bool {
             root: String::from(root),
             marker_name: None,
         })
+        .is_ok()
 }
 
 fn run_libctest_extra_segment(root: &str, name: &str, runner: &str, cases: &[&str]) -> bool {
@@ -733,6 +762,7 @@ fn run_libctest_extra_case(root: &str, runner: &str, case: &str) -> bool {
             root: String::from(root),
             marker_name: None,
         })
+        .is_ok()
 }
 
 struct ForegroundDriverGuard;
@@ -750,12 +780,10 @@ impl Drop for ForegroundDriverGuard {
     }
 }
 
-fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
+fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> Result<(), SysErrNo> {
     let task = match TaskControlBlock::new_user_with_args_env_cwd(spec) {
         Ok(task) => task,
-        Err(_err) => {
-            return false;
-        }
+        Err(err) => return Err(err),
     };
 
     let harness = current_task();
@@ -768,7 +796,7 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
         *CURRENT_TASK.lock() = Some(h.clone());
     }
 
-    true
+    Ok(())
 }
 
 fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
@@ -950,19 +978,23 @@ fn ensure_busybox_applet_alias(root: &str, busybox_host: &str, applet: &str) -> 
     Some(())
 }
 
-fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
-    let (root, logical_script) = logical_path_for_script(script_path)?;
+fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunchError> {
+    let (root, logical_script) =
+        logical_path_for_script(script_path).ok_or(ScriptLaunchError::InvalidPath)?;
     let busybox_path = String::from("/busybox");
     let busybox_host = crate::fs::apply_root(&root, &busybox_path);
     let script_host = crate::fs::apply_root(&root, &logical_script);
 
-    crate::fs::read_executable_file(&busybox_host)?;
-    crate::fs::read_file(&script_host)?;
-    ensure_busybox_applet_alias(&root, &busybox_host, "ls")?;
-    ensure_busybox_applet_alias(&root, &busybox_host, "sh")?;
-    ensure_busybox_applet_alias(&root, &busybox_host, "/bin/sh")?;
+    crate::fs::read_executable_file(&busybox_host).ok_or(ScriptLaunchError::MissingBusybox)?;
+    crate::fs::read_file(&script_host).ok_or(ScriptLaunchError::MissingScript)?;
+    ensure_busybox_applet_alias(&root, &busybox_host, "ls")
+        .ok_or(ScriptLaunchError::MissingApplet("ls"))?;
+    ensure_busybox_applet_alias(&root, &busybox_host, "sh")
+        .ok_or(ScriptLaunchError::MissingApplet("sh"))?;
+    ensure_busybox_applet_alias(&root, &busybox_host, "/bin/sh")
+        .ok_or(ScriptLaunchError::MissingApplet("/bin/sh"))?;
 
-    Some(UserProgramSpec {
+    Ok(UserProgramSpec {
         path: busybox_path.clone(),
         argv: alloc::vec![
             busybox_path.clone(),
@@ -980,9 +1012,7 @@ fn busybox_script_spec(script_path: &str) -> Option<UserProgramSpec> {
     })
 }
 
-pub fn run_script_via_busybox(script_path: &str) -> bool {
-    let Some(spec) = busybox_script_spec(script_path) else {
-        return false;
-    };
-    run_user_program_spec_foreground(&spec)
+fn run_script_via_busybox(script_path: &str) -> Result<(), ScriptLaunchError> {
+    let spec = busybox_script_spec(script_path)?;
+    run_user_program_spec_foreground(&spec).map_err(ScriptLaunchError::CreateTask)
 }

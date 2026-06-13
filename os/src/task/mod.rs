@@ -690,6 +690,58 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     crate::fs::fd::flush_console_buffer_for_pid(task.thread_group.tgid());
 }
 
+fn detach_thread_group_shared_memory(members: &[Arc<TaskControlBlock>]) {
+    let mut seen_memory_sets = Vec::new();
+    for member in members {
+        let key = Arc::as_ptr(&member.memory_set) as usize;
+        if seen_memory_sets.iter().any(|seen| *seen == key) {
+            continue;
+        }
+        seen_memory_sets.push(key);
+        crate::syscall::mm::detach_task_shared_memory(member);
+    }
+}
+
+fn release_process_runtime_resources(members: &[Arc<TaskControlBlock>]) {
+    crate::trap::restore_kernel_page_table();
+
+    let mut released_memory_sets = Vec::new();
+    let mut closed_fd_tables = Vec::new();
+    let mut reset_mm_contexts = Vec::new();
+
+    for member in members {
+        let memory_key = Arc::as_ptr(&member.memory_set) as usize;
+        if !released_memory_sets.iter().any(|seen| *seen == memory_key) {
+            released_memory_sets.push(memory_key);
+            member.memory_set.lock().release_user_areas();
+        }
+
+        let fd_table = member.inner.lock().fd_table.clone();
+        let fd_key = Arc::as_ptr(&fd_table) as usize;
+        if !closed_fd_tables.iter().any(|seen| *seen == fd_key) {
+            closed_fd_tables.push(fd_key);
+            fd_table.lock().close_all();
+        }
+
+        let mm_key = Arc::as_ptr(&member.mm) as usize;
+        if !reset_mm_contexts.iter().any(|seen| *seen == mm_key) {
+            reset_mm_contexts.push(mm_key);
+            let mut mm = member.mm.lock();
+            mm.program_break = crate::config::USER_HEAP_START;
+            mm.mapped_break = crate::config::USER_HEAP_START;
+            mm.next_mmap = 0x4000_0000;
+        }
+
+        let mut inner = member.inner.lock();
+        inner.program_break = crate::config::USER_HEAP_START;
+        inner.mapped_break = crate::config::USER_HEAP_START;
+        inner.next_mmap = 0x4000_0000;
+        inner.clear_child_tid = 0;
+        inner.robust_list_head = 0;
+        inner.robust_list_len = 0;
+    }
+}
+
 fn purge_wait_state_for_task(task: &Arc<TaskControlBlock>) {
     let removed = manager::remove_task_instances(task)
         + wait_queue::remove_core_waiters_for_task(task)
@@ -710,11 +762,13 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
         return;
     }
 
-    crate::syscall::mm::detach_task_shared_memory(task);
+    let members = task.thread_group.user_members();
+    detach_thread_group_shared_memory(&members);
+    release_process_runtime_resources(&members);
     crate::syscall::signal::notify_child_exit(task);
 
     let mut orphans = Vec::new();
-    for member in task.thread_group.user_members() {
+    for member in &members {
         let mut inner = member.inner.lock();
         orphans.extend(core::mem::take(&mut inner.children));
     }
