@@ -641,6 +641,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     crate::syscall::signal::install_signal_trampoline(&mut new_memory_set)?;
     if let Some(task) = current_task() {
         crate::task::terminate_thread_group_peers_for_exec(&task);
+        crate::syscall::mm::detach_task_shared_memory(&task);
         crate::syscall::signal::reset_signal_handlers_for_exec(&task);
         {
             let mut inner = task.inner.lock();
@@ -968,6 +969,9 @@ pub fn sys_clone(
     });
     crate::task::manager::register_task(&child);
     thread_group.add_member(&child);
+    if !share_vm {
+        crate::syscall::mm::inherit_task_shared_memory(&child);
+    }
     // RISC-V uses clone(flags, stack, parent_tidptr, tls, child_tidptr);
     // LoongArch musl uses clone(flags, stack, parent_tidptr, child_tidptr, tls).
     if (clone_bits & CLONE_PARENT_SETTID) != 0 && parent_tid != 0 {

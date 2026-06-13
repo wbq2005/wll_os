@@ -710,6 +710,7 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
         return;
     }
 
+    crate::syscall::mm::detach_task_shared_memory(task);
     crate::syscall::signal::notify_child_exit(task);
 
     let mut orphans = Vec::new();

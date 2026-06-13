@@ -14,6 +14,7 @@ pub enum MapAreaBacking {
     },
     SharedMemory {
         shmid: usize,
+        base: usize,
         offset: usize,
     },
 }
@@ -31,8 +32,13 @@ impl MapAreaBacking {
                 offset: offset.saturating_add(delta),
                 shared: *shared,
             },
-            Self::SharedMemory { shmid, offset } => Self::SharedMemory {
+            Self::SharedMemory {
+                shmid,
+                base,
+                offset,
+            } => Self::SharedMemory {
                 shmid: *shmid,
+                base: *base,
                 offset: offset.saturating_add(delta),
             },
         }
@@ -74,13 +80,19 @@ impl MapAreaBacking {
             (
                 Self::SharedMemory {
                     shmid: left_shmid,
+                    base: left_base,
                     offset: left_offset,
                 },
                 Self::SharedMemory {
                     shmid: right_shmid,
+                    base: right_base,
                     offset: right_offset,
                 },
-            ) => left_shmid == right_shmid && left_offset.saturating_add(left_len) == *right_offset,
+            ) => {
+                left_shmid == right_shmid
+                    && left_base == right_base
+                    && left_offset.saturating_add(left_len) == *right_offset
+            }
             _ => false,
         }
     }

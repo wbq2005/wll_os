@@ -190,6 +190,62 @@ fn shm_alloc_frames(size: usize) -> Result<Vec<FrameTracker>, SysErrNo> {
     Ok(frames)
 }
 
+// A single shmat attachment can split into several VMAs after mprotect/munmap.
+fn task_shared_memory_attachments(task: &crate::task::TaskControlBlock) -> Vec<(usize, usize)> {
+    let ms = task.memory_set.lock();
+    let mut attachments = Vec::new();
+    for area in &ms.areas {
+        let MapAreaBacking::SharedMemory { shmid, base, .. } = &area.backing else {
+            continue;
+        };
+        if attachments
+            .iter()
+            .any(|(id, attach_base)| *id == *shmid && *attach_base == *base)
+        {
+            continue;
+        }
+        attachments.push((*shmid, *base));
+    }
+    attachments
+}
+
+pub(crate) fn inherit_task_shared_memory(task: &crate::task::TaskControlBlock) {
+    let attachments = task_shared_memory_attachments(task);
+    if attachments.is_empty() {
+        return;
+    }
+    let mut segments = SHM_SEGMENTS.lock();
+    for (shmid, _) in attachments {
+        if let Some(segment) = segments.get_mut(&shmid) {
+            segment.attach_count = segment.attach_count.saturating_add(1);
+        }
+    }
+}
+
+pub(crate) fn detach_task_shared_memory(task: &crate::task::TaskControlBlock) {
+    let attachments = task_shared_memory_attachments(task);
+    if attachments.is_empty() {
+        return;
+    }
+    let now = current_time_sec();
+    let mut remove_ids = Vec::new();
+    let mut segments = SHM_SEGMENTS.lock();
+    for (shmid, _) in attachments {
+        let Some(segment) = segments.get_mut(&shmid) else {
+            continue;
+        };
+        segment.attach_count = segment.attach_count.saturating_sub(1);
+        segment.lpid = task.thread_group.tgid();
+        segment.dtime = now;
+        if segment.marked_for_remove && segment.attach_count == 0 {
+            remove_ids.push(shmid);
+        }
+    }
+    for shmid in remove_ids {
+        segments.remove(&shmid);
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UserIpcPerm {
@@ -693,7 +749,11 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SyscallRet {
                 VirtAddr::new(start),
                 VirtAddr::new(end),
                 pte_flags,
-                MapAreaBacking::SharedMemory { shmid, offset: 0 },
+                MapAreaBacking::SharedMemory {
+                    shmid,
+                    base: start,
+                    offset: 0,
+                },
                 &frames,
             )?;
             ms.activate();
@@ -722,21 +782,44 @@ pub fn sys_shmdt(shmaddr: usize) -> SyscallRet {
         return Err(SysErrNo::EINVAL);
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let (shmid, end) = {
+    let (shmid, ranges) = {
         let ms = task.memory_set.lock();
         let area = ms
             .areas
             .iter()
-            .find(|area| area.start_va.raw() == shmaddr)
+            .find(|area| {
+                matches!(
+                    &area.backing,
+                    MapAreaBacking::SharedMemory { base, .. } if *base == shmaddr
+                )
+            })
             .ok_or(SysErrNo::EINVAL)?;
-        let MapAreaBacking::SharedMemory { shmid, .. } = area.backing else {
+        let MapAreaBacking::SharedMemory { shmid, base, .. } = &area.backing else {
             return Err(SysErrNo::EINVAL);
         };
-        (shmid, area.end_va.raw())
+        let shmid = *shmid;
+        let base = *base;
+        let ranges: Vec<(usize, usize)> = ms
+            .areas
+            .iter()
+            .filter_map(|area| match &area.backing {
+                MapAreaBacking::SharedMemory {
+                    shmid: area_shmid,
+                    base: area_base,
+                    ..
+                } if *area_shmid == shmid && *area_base == base => {
+                    Some((area.start_va.raw(), area.end_va.raw()))
+                }
+                _ => None,
+            })
+            .collect();
+        (shmid, ranges)
     };
     {
         let mut ms = task.memory_set.lock();
-        ms.unmap_range(VirtAddr::new(shmaddr), VirtAddr::new(end))?;
+        for (start, end) in ranges {
+            ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
+        }
         ms.activate();
     }
     {
