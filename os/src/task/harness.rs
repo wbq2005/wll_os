@@ -781,7 +781,7 @@ fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
     if spec
         .argv
         .iter()
-        .any(|arg| basename(arg) == "iozone_testcode.sh")
+        .any(|arg| testcode_stem(arg).and_then(TestGroup::from_stem) == Some(TestGroup::Iozone))
     {
         IOZONE_RUN_TIMEOUT_US
     } else {
