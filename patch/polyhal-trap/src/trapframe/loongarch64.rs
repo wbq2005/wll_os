@@ -13,6 +13,12 @@ pub struct TrapFrame {
     pub prmd: usize,
     /// Exception Return Address
     pub era: usize,
+    /// Floating-point registers f0-f31.
+    pub f: [u64; 32],
+    /// Packed floating-point condition code registers fcc0-fcc7.
+    pub fcc: u64,
+    /// Floating-point control and status register.
+    pub fcsr: u64,
 }
 
 impl TrapFrame {
@@ -30,6 +36,13 @@ impl TrapFrame {
 }
 
 impl TrapFrame {
+    #[inline]
+    pub fn clear_fp_state(&mut self) {
+        self.f = [0; 32];
+        self.fcc = 0;
+        self.fcsr = 0;
+    }
+
     pub fn syscall_ok(&mut self) {
         self.era += 4;
     }

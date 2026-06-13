@@ -14,6 +14,7 @@ use ext4_rs::{Errno, Ext4, Ext4Error, InodeFileType};
 /// ext4 标准根 inode 号（与 `ext4_rs` 内部一致，crate 根未再导出该常量）。
 const ROOT_INODE: u32 = 2;
 const MAX_FILE_OFFSET: usize = isize::MAX as usize;
+const REGULAR_CACHE_LIMIT: usize = 4 * 1024 * 1024;
 
 fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
     let end = offset.checked_add(len).ok_or(SysErrNo::EFBIG)?;
@@ -64,6 +65,19 @@ lazy_static! {
 struct CachedRegularFile {
     data: Vec<u8>,
     dirty: bool,
+    mtime_sec: u32,
+    mtime_extra: u32,
+    ctime_sec: u32,
+    ctime_extra: u32,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRegularInfo {
+    size: usize,
+    mtime_sec: u32,
+    mtime_extra: u32,
+    ctime_sec: u32,
+    ctime_extra: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +167,15 @@ fn note_data_write(ino: u32) {
     DATA_TIME_OVERRIDES.lock().insert(ino, (now, 0, now, 0));
 }
 
+fn note_cached_data_write(cached: &mut CachedRegularFile) {
+    let now = current_ext4_time();
+    cached.dirty = true;
+    cached.mtime_sec = now;
+    cached.mtime_extra = 0;
+    cached.ctime_sec = now;
+    cached.ctime_extra = 0;
+}
+
 fn regular_blocks(size: u64) -> u64 {
     size.div_ceil(512)
 }
@@ -171,16 +194,27 @@ fn load_regular_data(fs: &Ext4, ino: u32) -> Result<Vec<u8>, SysErrNo> {
     Ok(data)
 }
 
-fn ensure_regular_cache(ino: u32) -> Result<(), SysErrNo> {
+fn ensure_regular_cache(ino: u32) -> Result<bool, SysErrNo> {
     if REGULAR_FILE_CACHE.lock().contains_key(&ino) {
-        return Ok(());
+        return Ok(true);
     }
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let inode = fs.get_inode_ref(ino).inode;
+    if inode.size() > REGULAR_CACHE_LIMIT as u64 {
+        return Ok(false);
+    }
     let data = load_regular_data(&fs, ino)?;
     REGULAR_FILE_CACHE
         .lock()
-        .insert(ino, CachedRegularFile { data, dirty: false });
-    Ok(())
+        .insert(ino, CachedRegularFile {
+            data,
+            dirty: false,
+            mtime_sec: inode.mtime(),
+            mtime_extra: inode.i_mtime_extra(),
+            ctime_sec: inode.ctime(),
+            ctime_extra: inode.i_ctime_extra(),
+        });
+    Ok(true)
 }
 
 fn cached_regular_read(ino: u32, offset: usize, buf: &mut [u8]) -> Option<usize> {
@@ -198,13 +232,74 @@ fn cached_regular_size(ino: u32) -> Option<usize> {
     REGULAR_FILE_CACHE.lock().get(&ino).map(|cached| cached.data.len())
 }
 
+fn cached_regular_info(ino: u32) -> Option<CachedRegularInfo> {
+    REGULAR_FILE_CACHE.lock().get(&ino).map(|cached| CachedRegularInfo {
+        size: cached.data.len(),
+        mtime_sec: cached.mtime_sec,
+        mtime_extra: cached.mtime_extra,
+        ctime_sec: cached.ctime_sec,
+        ctime_extra: cached.ctime_extra,
+    })
+}
+
+fn cached_regular_resize(ino: u32, new_len: usize) -> Result<(), SysErrNo> {
+    let mut cache = REGULAR_FILE_CACHE.lock();
+    let cached = cache.get_mut(&ino).ok_or(SysErrNo::ENOENT)?;
+    cached.data.resize(new_len, 0);
+    note_cached_data_write(cached);
+    Ok(())
+}
+
+fn cached_regular_write(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {
+    let end = offset + buf.len();
+    let mut cache = REGULAR_FILE_CACHE.lock();
+    let cached = cache.get_mut(&ino).ok_or(SysErrNo::ENOENT)?;
+    if end > cached.data.len() {
+        cached.data.resize(end, 0);
+    }
+    cached.data[offset..end].copy_from_slice(buf);
+    note_cached_data_write(cached);
+    Ok(buf.len())
+}
+
+fn is_regular_cached(ino: u32) -> bool {
+    REGULAR_FILE_CACHE.lock().contains_key(&ino)
+}
+
 fn discard_regular_cache(ino: u32) {
     REGULAR_FILE_CACHE.lock().remove(&ino);
     DATA_TIME_OVERRIDES.lock().remove(&ino);
 }
 
+fn cache_empty_regular(ino: u32, dirty: bool) {
+    let now = current_ext4_time();
+    REGULAR_FILE_CACHE.lock().insert(
+        ino,
+        CachedRegularFile {
+            data: Vec::new(),
+            dirty,
+            mtime_sec: now,
+            mtime_extra: 0,
+            ctime_sec: now,
+            ctime_extra: 0,
+        },
+    );
+}
+
+fn uncached_regular_write(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let written = fs.write_at(ino, offset, buf).map_err(map_ext4_err)?;
+    if written != 0 {
+        note_data_write(ino);
+    }
+    Ok(written)
+}
+
 pub fn flush_cached_ino(ino: u32) -> Result<(), SysErrNo> {
-    let data = {
+    let (data, mtime_sec, mtime_extra, ctime_sec, ctime_extra) = {
         let cache = REGULAR_FILE_CACHE.lock();
         let Some(cached) = cache.get(&ino) else {
             return Ok(());
@@ -212,13 +307,19 @@ pub fn flush_cached_ino(ino: u32) -> Result<(), SysErrNo> {
         if !cached.dirty {
             return Ok(());
         }
-        cached.data.clone()
+        (
+            cached.data.clone(),
+            cached.mtime_sec,
+            cached.mtime_extra,
+            cached.ctime_sec,
+            cached.ctime_extra,
+        )
     };
 
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    let mut iref = fs.get_inode_ref(ino);
-    let old_size = iref.inode.size();
+    let old_size = fs.get_inode_ref(ino).inode.size();
     if (data.len() as u64) < old_size {
+        let mut iref = fs.get_inode_ref(ino);
         fs.truncate_inode(&mut iref, data.len() as u64)
             .map_err(map_ext4_err)?;
     }
@@ -228,9 +329,16 @@ pub fn flush_cached_ino(ino: u32) -> Result<(), SysErrNo> {
             return Err(SysErrNo::EIO);
         }
     } else if old_size != 0 {
+        let mut iref = fs.get_inode_ref(ino);
         fs.truncate_inode(&mut iref, 0).map_err(map_ext4_err)?;
     }
-    touch_inode(&fs, ino, false, true, true);
+    let mut iref = fs.get_inode_ref(ino);
+    iref.inode.set_mtime(mtime_sec);
+    iref.inode.set_i_mtime_extra(mtime_extra);
+    iref.inode.set_ctime(ctime_sec);
+    iref.inode.set_i_ctime_extra(ctime_extra);
+    fs.write_back_inode(&mut iref);
+    DATA_TIME_OVERRIDES.lock().remove(&ino);
 
     if let Some(cached) = REGULAR_FILE_CACHE.lock().get_mut(&ino) {
         cached.dirty = false;
@@ -253,14 +361,14 @@ pub fn flush_all_cached() -> Result<(), SysErrNo> {
 fn metadata_for_ino(fs: &Ext4, ino: u32) -> Ext4Metadata {
     let iref = fs.get_inode_ref(ino);
     let inode = iref.inode;
-    let cached_size = cached_regular_size(ino);
+    let cached_info = cached_regular_info(ino);
     let mut meta = Ext4Metadata {
         ino,
         mode: inode.mode() as u32,
         nlink: inode.links_count() as u32,
         uid: inode.uid() as u32,
         gid: inode.gid() as u32,
-        size: cached_size.map(|size| size as u64).unwrap_or_else(|| inode.size()),
+        size: cached_info.map(|info| info.size as u64).unwrap_or_else(|| inode.size()),
         blocks: inode.blocks_count(),
         atime_sec: inode.atime() as isize,
         atime_nsec: ext4_extra_nsec(inode.i_atime_extra()),
@@ -269,7 +377,12 @@ fn metadata_for_ino(fs: &Ext4, ino: u32) -> Ext4Metadata {
         ctime_sec: inode.ctime() as isize,
         ctime_nsec: ext4_extra_nsec(inode.i_ctime_extra()),
     };
-    if let Some((mtime, mtime_extra, ctime, ctime_extra)) =
+    if let Some(info) = cached_info {
+        meta.mtime_sec = info.mtime_sec as isize;
+        meta.mtime_nsec = ext4_extra_nsec(info.mtime_extra);
+        meta.ctime_sec = info.ctime_sec as isize;
+        meta.ctime_nsec = ext4_extra_nsec(info.ctime_extra);
+    } else if let Some((mtime, mtime_extra, ctime, ctime_extra)) =
         DATA_TIME_OVERRIDES.lock().get(&ino).copied()
     {
         meta.mtime_sec = mtime as isize;
@@ -281,9 +394,19 @@ fn metadata_for_ino(fs: &Ext4, ino: u32) -> Ext4Metadata {
     meta
 }
 
-fn clear_metadata_cache() {
+fn clear_namespace_cache() {
+    // Path and directory caches only depend on namespace topology. Regular-file
+    // data writes update size/time through REGULAR_FILE_CACHE, or through
+    // DATA_TIME_OVERRIDES for uncached writes, so they should not churn these
+    // global caches.
     PATH_CACHE.lock().clear();
     DIR_CACHE.lock().clear();
+}
+
+fn clear_all_caches() {
+    clear_namespace_cache();
+    DATA_TIME_OVERRIDES.lock().clear();
+    REGULAR_FILE_CACHE.lock().clear();
 }
 
 pub fn is_ext4_mounted() -> bool {
@@ -347,14 +470,15 @@ pub fn mount_block_device(device: Arc<dyn ext4_rs::BlockDevice>) {
         0 => log::warn!("[fs] EXT4 root dir appears empty — expected test scripts here"),
         n => log::info!("[fs] EXT4 root dir has {} entries", n),
     }
-    clear_metadata_cache();
+    clear_all_caches();
     *ROOT_EXT4.lock() = Some(Arc::new(fs));
     log::info!("[fs] EXT4 mounted as runtime root backing");
 }
 
 /// 卸载运行时 ext4 根（`umount2` / 回退 MemFS）。
 pub fn unmount_root() {
-    clear_metadata_cache();
+    let _ = flush_all_cached();
+    clear_all_caches();
     *ROOT_EXT4.lock() = None;
     log::info!("[fs] EXT4 unmounted");
 }
@@ -377,7 +501,7 @@ fn split_parent_name(norm: &str) -> Result<(String, String), SysErrNo> {
 
 /// 删除 ext4 上的普通文件（非目录）。
 pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
-    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let mut fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
     let (parent_path, name) = split_parent_name(&norm)?;
     let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
@@ -392,12 +516,21 @@ pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
     if child_kind == Ext4NodeKind::Directory {
         return Err(SysErrNo::EISDIR);
     }
-    discard_regular_cache(child_ino);
     let mut parent_ref = fs.get_inode_ref(parent_ino);
     let mut child_ref = fs.get_inode_ref(child_ino);
+    let old_links = child_ref.inode.links_count();
+    if old_links > 1 {
+        drop(child_ref);
+        drop(parent_ref);
+        flush_cached_ino(child_ino)?;
+        fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+        parent_ref = fs.get_inode_ref(parent_ino);
+        child_ref = fs.get_inode_ref(child_ino);
+    } else {
+        discard_regular_cache(child_ino);
+    }
     fs.dir_remove_entry(&mut parent_ref, &name)
         .map_err(map_ext4_err)?;
-    let old_links = child_ref.inode.links_count();
     if old_links > 0 {
         child_ref.inode.set_links_count(old_links - 1);
     }
@@ -414,7 +547,7 @@ pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
     }
     fs.write_back_inode(&mut parent_ref);
     fs.write_back_inode(&mut child_ref);
-    clear_metadata_cache();
+    clear_namespace_cache();
     Ok(())
 }
 
@@ -448,7 +581,7 @@ pub fn mkdir_ext4_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
     child_ref.inode.set_ctime(now);
     fs.write_back_inode(&mut child_ref);
     touch_inode(&fs, parent_ino, false, true, true);
-    clear_metadata_cache();
+    clear_namespace_cache();
     Ok(())
 }
 
@@ -497,7 +630,7 @@ pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
     parent_ref.inode.set_ctime(now);
     fs.write_back_inode(&mut child_ref);
     fs.write_back_inode(&mut parent_ref);
-    clear_metadata_cache();
+    clear_namespace_cache();
     Ok(())
 }
 
@@ -526,7 +659,8 @@ pub fn create_regular_ext4_with_mode(path: &str, mode: u32) -> Result<u32, SysEr
     iref.inode.set_ctime(now);
     fs.write_back_inode(&mut iref);
     touch_inode(&fs, parent_ino, false, true, true);
-    clear_metadata_cache();
+    cache_empty_regular(iref.inode_num, false);
+    clear_namespace_cache();
     Ok(iref.inode_num)
 }
 
@@ -546,21 +680,20 @@ pub fn truncate_regular_ino(ino: u32, size: u64) -> Result<(), SysErrNo> {
     if kind != Ext4NodeKind::Regular && kind != Ext4NodeKind::Symlink {
         return Err(SysErrNo::EINVAL);
     }
-    if kind == Ext4NodeKind::Regular && REGULAR_FILE_CACHE.lock().contains_key(&ino) {
-        let new_len = size as usize;
-        let mut cache = REGULAR_FILE_CACHE.lock();
-        let cached = cache.get_mut(&ino).ok_or(SysErrNo::ENOENT)?;
-        cached.data.resize(new_len, 0);
-        cached.dirty = true;
-        drop(cache);
-        note_data_write(ino);
-        clear_metadata_cache();
-        return Ok(());
+    if kind == Ext4NodeKind::Regular && is_regular_cached(ino) {
+        if size as usize <= REGULAR_CACHE_LIMIT {
+            return cached_regular_resize(ino, size as usize);
+        }
+        flush_cached_ino(ino)?;
+        discard_regular_cache(ino);
     }
     let mut iref = fs.get_inode_ref(ino);
     let old_size = iref.inode.size();
     if size < old_size {
         fs.truncate_inode(&mut iref, size).map_err(map_ext4_err)?;
+        if kind == Ext4NodeKind::Regular && size == 0 {
+            cache_empty_regular(ino, true);
+        }
     } else if size > old_size {
         let zeroes = alloc::vec![0u8; 4096];
         let mut off = old_size as usize;
@@ -575,7 +708,6 @@ pub fn truncate_regular_ino(ino: u32, size: u64) -> Result<(), SysErrNo> {
         }
     }
     touch_inode(&fs, ino, false, true, true);
-    clear_metadata_cache();
     Ok(())
 }
 
@@ -601,20 +733,22 @@ pub fn ext4_read_at(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usize, Sy
 
 pub fn ext4_write_at(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {
     checked_file_end(offset, buf.len())?;
-    ensure_regular_cache(ino)?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
     let end = offset + buf.len();
-    let mut cache = REGULAR_FILE_CACHE.lock();
-    let cached = cache.get_mut(&ino).ok_or(SysErrNo::ENOENT)?;
-    if end > cached.data.len() {
-        cached.data.resize(end, 0);
+    if end > REGULAR_CACHE_LIMIT {
+        if is_regular_cached(ino) {
+            flush_cached_ino(ino)?;
+            discard_regular_cache(ino);
+        }
+        return uncached_regular_write(ino, offset, buf);
     }
-    cached.data[offset..end].copy_from_slice(buf);
-    cached.dirty = true;
-    drop(cache);
-    if !buf.is_empty() {
-        note_data_write(ino);
+    if ensure_regular_cache(ino)? {
+        cached_regular_write(ino, offset, buf)
+    } else {
+        uncached_regular_write(ino, offset, buf)
     }
-    Ok(buf.len())
 }
 
 pub fn lookup_path(path: &str) -> Option<(u32, bool)> {
@@ -661,7 +795,15 @@ pub fn set_times_ino(
     iref.inode.set_i_ctime_extra(0);
     fs.write_back_inode(&mut iref);
     DATA_TIME_OVERRIDES.lock().remove(&ino);
-    clear_metadata_cache();
+    if let Some(cached) = REGULAR_FILE_CACHE.lock().get_mut(&ino) {
+        if let Some((sec, nsec)) = mtime {
+            cached.mtime_sec = (sec.max(0) as usize).min(u32::MAX as usize) as u32;
+            cached.mtime_extra = ext4_nsec_extra(nsec);
+        }
+        cached.ctime_sec = now;
+        cached.ctime_extra = 0;
+    }
+    clear_namespace_cache();
     Ok(())
 }
 
@@ -821,7 +963,7 @@ pub fn create_symlink_ext4(target: &str, link_path: &str) -> Result<(), SysErrNo
     }
     touch_inode(&fs, iref.inode_num, false, true, true);
     touch_inode(&fs, parent_ino, false, true, true);
-    clear_metadata_cache();
+    clear_namespace_cache();
     Ok(())
 }
 
@@ -860,7 +1002,7 @@ pub fn link_ext4(old_path: &str, new_path: &str, follow_old: bool) -> Result<(),
     child_ref.inode.set_ctime(now);
     fs.write_back_inode(&mut parent_ref);
     fs.write_back_inode(&mut child_ref);
-    clear_metadata_cache();
+    clear_namespace_cache();
     Ok(())
 }
 
@@ -957,7 +1099,7 @@ pub fn rename_ext4(old_path: &str, new_path: &str, no_replace: bool) -> Result<(
     }
     child_ref.inode.set_ctime(now);
     fs.write_back_inode(&mut child_ref);
-    clear_metadata_cache();
+    clear_namespace_cache();
     Ok(())
 }
 

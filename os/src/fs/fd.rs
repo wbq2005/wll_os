@@ -628,6 +628,9 @@ impl FileDescriptor {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(buf.len());
                 }
+                if buf.is_empty() {
+                    return Ok(0);
+                }
                 refresh_mem_file(name, content, times);
                 let end = Self::checked_file_end(offset, buf.len())?;
                 if end > content.len() {
@@ -678,6 +681,9 @@ impl FileDescriptor {
                 }
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(buf.len());
+                }
+                if buf.is_empty() {
+                    return Ok(0);
                 }
                 refresh_mem_file(name, content, times);
                 if *append {

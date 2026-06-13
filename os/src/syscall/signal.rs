@@ -299,7 +299,9 @@ struct UserMContext {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ArchSignalExtra {
-    _reserved: usize,
+    f: [u64; 32],
+    fcc: u64,
+    fcsr: u64,
 }
 
 fn valid_signal(signum: i32) -> bool {
@@ -841,9 +843,12 @@ fn user_ucontext_from_trapframe(tf: &TrapFrame, old_mask: usize) -> UserUContext
 fn user_mcontext_from_trapframe(tf: &TrapFrame) -> UserMContext {
     let mut gregs = tf.x;
     gregs[0] = tf.sepc;
+    let mut fpregs = [0; 66];
+    fpregs[..32].copy_from_slice(&tf.f);
+    fpregs[32] = tf.fcsr;
     UserMContext {
         gregs,
-        fpregs: [0; 66],
+        fpregs,
     }
 }
 
@@ -862,6 +867,8 @@ fn restore_trapframe(saved: &UserMContext, extra: &ArchSignalExtra, tf: &mut Tra
     tf.sstatus = unsafe { core::mem::transmute(extra.sstatus) };
     tf.sepc = saved.gregs[0];
     tf.fsx = extra.fsx;
+    tf.f.copy_from_slice(&saved.fpregs[..32]);
+    tf.fcsr = saved.fpregs[32];
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -874,13 +881,20 @@ fn user_mcontext_from_trapframe(tf: &TrapFrame) -> UserMContext {
 }
 
 #[cfg(target_arch = "loongarch64")]
-fn arch_extra_from_trapframe(_tf: &TrapFrame) -> ArchSignalExtra {
-    ArchSignalExtra { _reserved: 0 }
+fn arch_extra_from_trapframe(tf: &TrapFrame) -> ArchSignalExtra {
+    ArchSignalExtra {
+        f: tf.f,
+        fcc: tf.fcc,
+        fcsr: tf.fcsr,
+    }
 }
 
 #[cfg(target_arch = "loongarch64")]
-fn restore_trapframe(saved: &UserMContext, _extra: &ArchSignalExtra, tf: &mut TrapFrame) {
+fn restore_trapframe(saved: &UserMContext, extra: &ArchSignalExtra, tf: &mut TrapFrame) {
     tf.regs = saved.regs;
     tf.prmd = saved.prmd;
     tf.era = saved.era;
+    tf.f = extra.f;
+    tf.fcc = extra.fcc;
+    tf.fcsr = extra.fcsr;
 }

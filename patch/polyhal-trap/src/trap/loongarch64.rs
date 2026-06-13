@@ -19,6 +19,7 @@ pub unsafe extern "C" fn user_vec() {
         "
             csrrd   $sp,  KSAVE_CTX
             SAVE_REGS
+            SAVE_FP_REGS
 
             csrrd   $sp,  KSAVE_KSP
             ld.d    $ra,  $sp, 0*8
@@ -66,6 +67,7 @@ pub unsafe extern "C" fn user_restore(context: *mut TrapFrame) {
                 move     $sp, $a0         // TIPS: csrwr will write the old value to rd
                 csrwr    $a0, KSAVE_CTX   // SAVE user context addr to SAVEn(1)
 
+                LOAD_FP_REGS
                 LOAD_REGS
 
                 ertn

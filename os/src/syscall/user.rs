@@ -4,6 +4,7 @@ use core::mem::{self, MaybeUninit};
 
 use polyhal::VirtAddr;
 
+use crate::config::PAGE_SIZE;
 use crate::mm::memory_set::MemorySet;
 use crate::task::current_task;
 use crate::utils::error::SysErrNo;
@@ -37,13 +38,18 @@ pub fn copy_to_user_in_memory_set(
     if dst == 0 && !src.is_empty() {
         return Err(SysErrNo::EFAULT);
     }
-    for (i, &byte) in src.iter().enumerate() {
+    let mut copied = 0usize;
+    while copied < src.len() {
+        let va = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
         let pa = memory_set
-            .translate(VirtAddr::new(dst + i))
+            .translate(VirtAddr::new(va))
             .ok_or(SysErrNo::EFAULT)?;
+        let page_left = PAGE_SIZE - va % PAGE_SIZE;
+        let n = page_left.min(src.len() - copied);
         unsafe {
-            *(pa.raw() as *mut u8) = byte;
+            core::ptr::copy_nonoverlapping(src[copied..].as_ptr(), pa.raw() as *mut u8, n);
         }
+        copied += n;
     }
     Ok(())
 }
@@ -56,11 +62,18 @@ pub fn copy_from_user_in_memory_set(
     if src == 0 && !dst.is_empty() {
         return Err(SysErrNo::EFAULT);
     }
-    for (i, byte) in dst.iter_mut().enumerate() {
+    let mut copied = 0usize;
+    while copied < dst.len() {
+        let va = src.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
         let pa = memory_set
-            .translate(VirtAddr::new(src + i))
+            .translate(VirtAddr::new(va))
             .ok_or(SysErrNo::EFAULT)?;
-        *byte = unsafe { *(pa.raw() as *const u8) };
+        let page_left = PAGE_SIZE - va % PAGE_SIZE;
+        let n = page_left.min(dst.len() - copied);
+        unsafe {
+            core::ptr::copy_nonoverlapping(pa.raw() as *const u8, dst[copied..].as_mut_ptr(), n);
+        }
+        copied += n;
     }
     Ok(())
 }

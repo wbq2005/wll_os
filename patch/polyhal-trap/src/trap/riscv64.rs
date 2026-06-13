@@ -190,6 +190,9 @@ unsafe extern "C" fn user_restore(context: *mut TrapFrame) {
                 csrw     sscratch, a0
                 mv       sp, a0
 
+                li       t0, 3 << 13
+                csrs     sstatus, t0
+                LOAD_FP_REGS
                 LOAD_GENERAL_REGS
                 sret
             ",
@@ -205,6 +208,7 @@ pub unsafe extern "C" fn uservec() {
         // 保存 general registers, 除了 sp
         "
         SAVE_GENERAL_REGS
+        SAVE_FP_REGS
         csrw    sscratch, x0
 
         mv      a0, sp

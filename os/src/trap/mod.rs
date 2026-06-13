@@ -70,7 +70,7 @@ pub fn prepare_user_trapframe(tf: &mut TrapFrame) {
     #[cfg(target_arch = "riscv64")]
     {
         let bits = unsafe { core::mem::transmute::<_, usize>(tf.sstatus) };
-        let bits = (bits & !(1 << 8)) | (1 << 5);
+        let bits = (bits & !(1 << 8)) | (1 << 5) | (3 << 13);
         tf.sstatus = unsafe { core::mem::transmute(bits) };
     }
     #[cfg(target_arch = "loongarch64")]

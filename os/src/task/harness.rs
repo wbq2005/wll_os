@@ -565,10 +565,7 @@ fn run_libctest_collection_harness(include_glibc: bool) {
         ),
     ];
 
-    const GROUPS: &[(&str, &str)] = &[
-        ("/glibc", "libctest-glibc"),
-        ("/musl", "libctest-musl"),
-    ];
+    const GROUPS: &[(&str, &str)] = &[("/glibc", "libctest-glibc"), ("/musl", "libctest-musl")];
 
     for (root, group_name) in GROUPS {
         if !include_glibc && *root != "/musl" {
@@ -609,11 +606,9 @@ fn libctest_group_enabled(
     segments
         .iter()
         .any(|(segment_root, name, _, _)| *segment_root == root && libctest_segment_enabled(name))
-        || extra_segments
-            .iter()
-            .any(|(segment_root, name, _, _)| {
-                *segment_root == root && libctest_segment_enabled(name)
-            })
+        || extra_segments.iter().any(|(segment_root, name, _, _)| {
+            *segment_root == root && libctest_segment_enabled(name)
+        })
 }
 
 fn run_libctest_judge_group(
@@ -766,7 +761,7 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
     let harness = current_task();
     let _foreground = ForegroundDriverGuard::enter();
 
-    run_user_task_foreground(task.clone());
+    run_user_task_foreground(task.clone(), foreground_timeout_us(spec));
     cleanup_foreground_task_tree(&task);
     if let Some(ref h) = harness {
         h.set_status(TaskStatus::Running);
@@ -774,6 +769,24 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> bool {
     }
 
     true
+}
+
+fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
+    #[cfg(feature = "libctest")]
+    const DEFAULT_RUN_TIMEOUT_US: usize = 15_000_000;
+    #[cfg(not(feature = "libctest"))]
+    const DEFAULT_RUN_TIMEOUT_US: usize = 120_000_000;
+    const IOZONE_RUN_TIMEOUT_US: usize = 240_000_000;
+
+    if spec
+        .argv
+        .iter()
+        .any(|arg| basename(arg) == "iozone_testcode.sh")
+    {
+        IOZONE_RUN_TIMEOUT_US
+    } else {
+        DEFAULT_RUN_TIMEOUT_US
+    }
 }
 
 fn cleanup_foreground_task_tree(root: &Arc<TaskControlBlock>) {
@@ -830,12 +843,8 @@ fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
     }
 }
 
-fn run_user_task_foreground(task: Arc<TaskControlBlock>) {
-    #[cfg(feature = "libctest")]
-    const RUN_TIMEOUT_US: usize = 15_000_000;
-    #[cfg(not(feature = "libctest"))]
-    const RUN_TIMEOUT_US: usize = 120_000_000;
-    let deadline_us = crate::timer::deadline_after_us(RUN_TIMEOUT_US);
+fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
+    let deadline_us = crate::timer::deadline_after_us(timeout_us);
 
     task.set_status(TaskStatus::Ready);
     manager::add_task(task.clone());

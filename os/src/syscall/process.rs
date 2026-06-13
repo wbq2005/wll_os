@@ -200,12 +200,12 @@ fn reset_exec_trapframe(tf: &mut TrapFrame, entry: usize, sp: usize, argc: usize
     #[cfg(target_arch = "riscv64")]
     {
         tf.x = [0; 32];
-        tf.fsx = [0; 2];
     }
     #[cfg(target_arch = "loongarch64")]
     {
         tf.regs = [0; 32];
     }
+    tf.clear_fp_state();
 
     tf[TrapFrameArgs::SEPC] = entry;
     set_user_entry_registers(tf, sp, argc);

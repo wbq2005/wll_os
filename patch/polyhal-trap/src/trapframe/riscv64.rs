@@ -15,6 +15,8 @@ pub struct TrapFrame {
     pub sstatus: Sstatus,
     pub sepc: usize,
     pub fsx: [usize; 2],
+    pub f: [u64; 32],
+    pub fcsr: u64,
 }
 
 impl Debug for TrapFrame {
@@ -54,6 +56,7 @@ impl Debug for TrapFrame {
             .field("sstatus", &self.sstatus)
             .field("sepc", &self.sepc)
             .field("fsx", &self.fsx)
+            .field("fcsr", &self.fcsr)
             .finish()
     }
 }
@@ -67,7 +70,16 @@ impl TrapFrame {
             sstatus: sstatus::read(),
             sepc: 0,
             fsx: [0; 2],
+            f: [0; 32],
+            fcsr: 0,
         }
+    }
+
+    #[inline]
+    pub fn clear_fp_state(&mut self) {
+        self.f = [0; 32];
+        self.fcsr = 0;
+        self.fsx = [0; 2];
     }
 
     #[inline]
