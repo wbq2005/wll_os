@@ -154,17 +154,15 @@ fn is_enabled_script(path: &str) -> bool {
 }
 
 fn script_rank(path: &str) -> usize {
-    let libc_rank = if path.starts_with("/glibc/") {
-        0usize
-    } else if path.starts_with("/musl/") {
-        1
-    } else {
-        2
+    let group = testcode_stem(path).and_then(TestGroup::from_stem);
+    let libc_rank = match group {
+        Some(TestGroup::Iozone) if path.starts_with("/musl/") => 0usize,
+        Some(TestGroup::Iozone) if path.starts_with("/glibc/") => 1,
+        _ if path.starts_with("/glibc/") => 0,
+        _ if path.starts_with("/musl/") => 1,
+        _ => 2,
     };
-    let suite_rank = testcode_stem(path)
-        .and_then(TestGroup::from_stem)
-        .map(TestGroup::rank)
-        .unwrap_or(99);
+    let suite_rank = group.map(TestGroup::rank).unwrap_or(99);
     suite_rank + libc_rank
 }
 
@@ -226,7 +224,8 @@ fn run_runtime_test_harness() -> ! {
         let mut ran_libctest = false;
 
         for script in &scripts {
-            if testcode_stem(script).and_then(TestGroup::from_stem) == Some(TestGroup::LibcTest) {
+            let group = testcode_stem(script).and_then(TestGroup::from_stem);
+            if group == Some(TestGroup::LibcTest) {
                 if !ran_libctest {
                     run_libctest_collection_harness(false);
                     ran_libctest = true;
