@@ -18,6 +18,7 @@ enum TestGroup {
     Lua,
     LibcTest,
     Iozone,
+    LibcBench,
     Lmbench,
     UnixBench,
     Ltp,
@@ -33,6 +34,7 @@ impl TestGroup {
             TestGroup::Lua => &["lua"],
             TestGroup::LibcTest => &["libc-test", "libctest"],
             TestGroup::Iozone => &["iozone"],
+            TestGroup::LibcBench => &["libcbench", "libc-bench"],
             TestGroup::Lmbench => &["lmbench"],
             TestGroup::UnixBench => &["unixbench", "UnixBench"],
             TestGroup::Ltp => &["ltp"],
@@ -49,6 +51,7 @@ impl TestGroup {
             TestGroup::Iozone => 30,
             TestGroup::Lmbench => 35,
             TestGroup::LibcTest => 40,
+            TestGroup::LibcBench => 50,
             TestGroup::UnixBench => 60,
             TestGroup::Ltp => 70,
             TestGroup::Iperf => 80,
@@ -63,6 +66,7 @@ impl TestGroup {
             TestGroup::Lua,
             TestGroup::LibcTest,
             TestGroup::Iozone,
+            TestGroup::LibcBench,
             TestGroup::Lmbench,
             TestGroup::UnixBench,
             TestGroup::Ltp,
@@ -80,7 +84,11 @@ impl TestGroup {
 #[cfg(all(not(feature = "libctest"), feature = "lmbench"))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Lmbench];
 
-#[cfg(all(not(feature = "libctest"), not(feature = "iozone"), not(feature = "lmbench")))]
+#[cfg(all(
+    not(feature = "libctest"),
+    not(feature = "iozone"),
+    not(feature = "lmbench")
+))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Basic,
     TestGroup::Busybox,
@@ -91,13 +99,18 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
 #[cfg(feature = "libctest")]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::LibcTest];
 
-#[cfg(all(not(feature = "libctest"), feature = "iozone", not(feature = "lmbench")))]
+#[cfg(all(
+    not(feature = "libctest"),
+    feature = "iozone",
+    not(feature = "lmbench")
+))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Basic,
     TestGroup::Busybox,
     TestGroup::Lua,
     TestGroup::Iozone,
     TestGroup::LibcTest,
+    TestGroup::LibcBench,
 ];
 
 fn console_write(msg: &str) {
@@ -819,9 +832,11 @@ fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
         .any(|arg| testcode_stem(arg).and_then(TestGroup::from_stem) == Some(TestGroup::Iozone))
     {
         IOZONE_RUN_TIMEOUT_US
-    } else if spec.argv.iter().any(|arg| {
-        testcode_stem(arg).and_then(TestGroup::from_stem) == Some(TestGroup::Lmbench)
-    }) {
+    } else if spec
+        .argv
+        .iter()
+        .any(|arg| testcode_stem(arg).and_then(TestGroup::from_stem) == Some(TestGroup::Lmbench))
+    {
         LMBENCH_RUN_TIMEOUT_US
     } else {
         DEFAULT_RUN_TIMEOUT_US
