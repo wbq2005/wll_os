@@ -1339,6 +1339,9 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
                     }
                 }
                 Err(SysErrNo::EAGAIN) => {
+                    if written != 0 {
+                        return Ok(written);
+                    }
                     let (is_pipe_write, nb_pipe, would_block) = {
                         let inner = task.inner.lock();
                         let fds = inner.fd_table.lock();

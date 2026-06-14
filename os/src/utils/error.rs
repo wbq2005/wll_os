@@ -51,6 +51,7 @@ pub enum SysErrNo {
     ECONNREFUSED = 111, // Connection refused
     EALREADY = 114,  // Operation already in progress
     EINPROGRESS = 115, // Operation now in progress
+    ERESTARTSYS = 512, // Internal restart marker for parked syscalls
     ENOSYS = 38,     // Invalid system call number
 }
 

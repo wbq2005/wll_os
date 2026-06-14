@@ -98,6 +98,10 @@ impl WaitQueue {
 
         block_current_for(self.reason, deadline_us);
 
+        if crate::trap::syscall_parked() {
+            return Err(SysErrNo::ERESTARTSYS);
+        }
+
         *task.block_reason.lock() = None;
         let still_waiting = self.remove_waiter(task.pid.0, token);
         if deadline_us.is_some() {

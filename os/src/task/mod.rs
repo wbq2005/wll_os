@@ -528,8 +528,12 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
     task.set_status(TaskStatus::Blocked);
     *CURRENT_TASK.lock() = None;
 
+    if crate::trap::foreground_driver_active() && deadline_us.is_none() {
+        crate::trap::signal_syscall_parked();
+        return;
+    }
+
     let mut no_runnable_spins = 0usize;
-    let mut parked_syscall = false;
     while task.status() == TaskStatus::Blocked {
         if crate::trap::foreground_driver_active() {
             if run_ready_task_once() {
@@ -548,16 +552,7 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
         if crate::trap::foreground_driver_active() {
             no_runnable_spins += 1;
             if no_runnable_spins >= FOREGROUND_NO_RUNNABLE_SPINS {
-                if matches!(*task.block_reason.lock(), Some(wait_queue::BlockReason::Futex)) {
-                    crate::trap::signal_syscall_parked();
-                    parked_syscall = true;
-                    break;
-                } else {
-                    if deadline_us.is_none() {
-                        wake_blocked_task(&task, wait_queue::WaitOutcome::Interrupted);
-                        break;
-                    }
-                }
+                core::hint::spin_loop();
             }
             core::hint::spin_loop();
         } else {
@@ -566,9 +561,6 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
     }
 
     manager::remove_task_instances(&task);
-    if parked_syscall {
-        return;
-    }
     if task.status() == TaskStatus::Ready {
         *task.block_reason.lock() = None;
         task.set_status(TaskStatus::Running);

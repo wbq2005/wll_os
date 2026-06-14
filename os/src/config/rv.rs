@@ -18,8 +18,8 @@ pub const KERNEL_VADDR_END: usize = 0xffff_ffff_ffffffff;
 // 用户空间配置
 /// 用户程序起始地址
 pub const USER_START_ADDR: usize = 0x1000;
-/// 用户栈大小 (64KB)
-pub const USER_STACK_SIZE: usize = 0x1_0000;
+/// 用户栈大小 (512KB)
+pub const USER_STACK_SIZE: usize = 0x8_0000;
 /// 用户栈顶地址（初始 SP，栈从高地址向下生长）
 /// 使用用户空间高地址区域
 pub const USER_STACK_TOP: usize = 0x7fff_f000;
