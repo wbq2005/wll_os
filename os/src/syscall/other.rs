@@ -51,6 +51,27 @@ struct TimeVal {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct RUsage {
+    ru_utime: TimeVal,
+    ru_stime: TimeVal,
+    ru_maxrss: isize,
+    ru_ixrss: isize,
+    ru_idrss: isize,
+    ru_isrss: isize,
+    ru_minflt: isize,
+    ru_majflt: isize,
+    ru_nswap: isize,
+    ru_inblock: isize,
+    ru_oublock: isize,
+    ru_msgsnd: isize,
+    ru_msgrcv: isize,
+    ru_nsignals: isize,
+    ru_nvcsw: isize,
+    ru_nivcsw: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct Tms {
     tms_utime: isize,
     tms_stime: isize,
@@ -129,6 +150,13 @@ fn read_user_i32(addr: usize) -> Result<i32, SysErrNo> {
 
 fn write_user_i32(addr: usize, value: i32) -> Result<(), SysErrNo> {
     super::user::copy_to_user(addr, &value.to_le_bytes())
+}
+
+fn timeval_from_us(us: usize) -> TimeVal {
+    TimeVal {
+        tv_sec: us / 1_000_000,
+        tv_usec: us % 1_000_000,
+    }
 }
 
 fn validate_futex_uaddr(uaddr: usize) -> Result<(), SysErrNo> {
@@ -507,10 +535,48 @@ pub fn sys_syslog(action: usize, buf: usize, len: usize) -> SyscallRet {
     }
 }
 
-pub fn sys_getrusage(_who: usize, usage: usize) -> SyscallRet {
-    if usage != 0 {
-        copy_to_user(usage, &[0; 144])?;
+pub fn sys_getrusage(who: usize, usage: usize) -> SyscallRet {
+    const RUSAGE_CHILDREN: isize = -1;
+    const RUSAGE_SELF: isize = 0;
+    const RUSAGE_THREAD: isize = 1;
+
+    if usage == 0 {
+        return Err(SysErrNo::EFAULT);
     }
+
+    let who = who as isize;
+    let elapsed_us = match who {
+        RUSAGE_SELF | RUSAGE_THREAD => current_task()
+            .map(|task| timer::get_time_us().saturating_sub(task.start_time_us))
+            .ok_or(SysErrNo::ESRCH)?,
+        RUSAGE_CHILDREN => 0,
+        _ => return Err(SysErrNo::EINVAL),
+    };
+
+    copy_object_to_user(
+        usage,
+        &RUsage {
+            ru_utime: timeval_from_us(elapsed_us),
+            ru_stime: TimeVal {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            ru_maxrss: 0,
+            ru_ixrss: 0,
+            ru_idrss: 0,
+            ru_isrss: 0,
+            ru_minflt: 0,
+            ru_majflt: 0,
+            ru_nswap: 0,
+            ru_inblock: 0,
+            ru_oublock: 0,
+            ru_msgsnd: 0,
+            ru_msgrcv: 0,
+            ru_nsignals: 0,
+            ru_nvcsw: 0,
+            ru_nivcsw: 0,
+        },
+    )?;
     Ok(0)
 }
 

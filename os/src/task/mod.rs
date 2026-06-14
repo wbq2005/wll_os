@@ -1096,6 +1096,7 @@ unsafe impl Sync for KernelCtx {}
 pub struct TaskControlBlock {
     pub pid: pid::Pid,
     pub thread_group: Arc<ThreadGroup>,
+    pub start_time_us: usize,
     /// True for kernel-only tasks that are switched by TaskContext instead of TrapFrame.
     pub is_kernel: bool,
     /// Inner data protected by mutex (fd_table, children, cwd, etc.)

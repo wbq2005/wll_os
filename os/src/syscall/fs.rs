@@ -1380,6 +1380,10 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
                         Err(err) => return Err(err),
                     }
                 }
+                Err(SysErrNo::EPIPE) if written == 0 => {
+                    crate::syscall::signal::send_sigpipe_to_current();
+                    return Err(SysErrNo::EPIPE);
+                }
                 Err(err) => {
                     return if written != 0 {
                         Ok(written)
@@ -1840,19 +1844,19 @@ fn store_fdset(base: usize, set: &[usize]) -> Result<(), SysErrNo> {
     Ok(())
 }
 
-fn pselect_once(
-    nfds: usize,
-    readfds: usize,
-    writefds: usize,
-    exceptfds: usize,
-) -> Result<usize, SysErrNo> {
-    if nfds > fd::MAX_FD_NUM {
-        return Err(SysErrNo::EINVAL);
-    }
+struct PselectPollResult {
+    ready: usize,
+    read_out: Vec<usize>,
+    write_out: Vec<usize>,
+    except_out: Vec<usize>,
+}
 
-    let read_in = load_fdset(readfds, nfds)?;
-    let write_in = load_fdset(writefds, nfds)?;
-    let except_in = load_fdset(exceptfds, nfds)?;
+fn pselect_poll(
+    nfds: usize,
+    read_in: &[usize],
+    write_in: &[usize],
+    except_in: &[usize],
+) -> Result<PselectPollResult, SysErrNo> {
     let mut read_out = alloc::vec![0usize; read_in.len()];
     let mut write_out = alloc::vec![0usize; write_in.len()];
     let except_out = alloc::vec![0usize; except_in.len()];
@@ -1886,10 +1890,24 @@ fn pselect_once(
     drop(fd_table);
     drop(inner);
 
-    store_fdset(readfds, &read_out)?;
-    store_fdset(writefds, &write_out)?;
-    store_fdset(exceptfds, &except_out)?;
-    Ok(ready)
+    Ok(PselectPollResult {
+        ready,
+        read_out,
+        write_out,
+        except_out,
+    })
+}
+
+fn store_pselect_result(
+    readfds: usize,
+    writefds: usize,
+    exceptfds: usize,
+    result: &PselectPollResult,
+) -> Result<(), SysErrNo> {
+    store_fdset(readfds, &result.read_out)?;
+    store_fdset(writefds, &result.write_out)?;
+    store_fdset(exceptfds, &result.except_out)?;
+    Ok(())
 }
 
 pub fn sys_pselect6(
@@ -1901,6 +1919,9 @@ pub fn sys_pselect6(
     _sigmask: usize,
 ) -> SyscallRet {
     let deadline = deadline_from_timespec_ptr(timeout)?;
+    if nfds > fd::MAX_FD_NUM {
+        return Err(SysErrNo::EINVAL);
+    }
     if nfds == 0 {
         if let Some(deadline) = deadline {
             let _ = crate::timer::sleep_until_us(deadline)?;
@@ -1908,24 +1929,32 @@ pub fn sys_pselect6(
         return Ok(0);
     }
 
+    let read_in = load_fdset(readfds, nfds)?;
+    let write_in = load_fdset(writefds, nfds)?;
+    let except_in = load_fdset(exceptfds, nfds)?;
+
     loop {
-        let ready = pselect_once(nfds, readfds, writefds, exceptfds)?;
-        if ready != 0 {
-            return Ok(ready);
+        let result = pselect_poll(nfds, &read_in, &write_in, &except_in)?;
+        if result.ready != 0 {
+            store_pselect_result(readfds, writefds, exceptfds, &result)?;
+            return Ok(result.ready);
         }
         if let Some(deadline) = deadline {
             if crate::timer::get_time_us() >= deadline {
+                store_pselect_result(readfds, writefds, exceptfds, &result)?;
                 return Ok(0);
             }
             if sleep_on_io_if(Some(deadline), || {
-                Ok(pselect_once(nfds, readfds, writefds, exceptfds)? == 0)
+                Ok(pselect_poll(nfds, &read_in, &write_in, &except_in)?.ready == 0)
             })? == WaitOutcome::TimedOut
             {
-                return Ok(0);
+                let result = pselect_poll(nfds, &read_in, &write_in, &except_in)?;
+                store_pselect_result(readfds, writefds, exceptfds, &result)?;
+                return Ok(result.ready);
             }
         } else {
             let _ = sleep_on_io_if(None, || {
-                Ok(pselect_once(nfds, readfds, writefds, exceptfds)? == 0)
+                Ok(pselect_poll(nfds, &read_in, &write_in, &except_in)?.ready == 0)
             })?;
         }
     }

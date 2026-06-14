@@ -930,6 +930,7 @@ pub fn sys_clone(
     let child = Arc::new(crate::task::TaskControlBlock {
         pid: child_pid_obj,
         thread_group: thread_group.clone(),
+        start_time_us: crate::timer::get_time_us(),
         is_kernel: false,
         inner: Mutex::new(crate::task::TaskControlBlockInner {
             exit_code: 0,

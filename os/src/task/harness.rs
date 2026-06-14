@@ -18,6 +18,7 @@ enum TestGroup {
     Lua,
     LibcTest,
     Iozone,
+    Lmbench,
     UnixBench,
     Ltp,
     Iperf,
@@ -32,6 +33,7 @@ impl TestGroup {
             TestGroup::Lua => &["lua"],
             TestGroup::LibcTest => &["libc-test", "libctest"],
             TestGroup::Iozone => &["iozone"],
+            TestGroup::Lmbench => &["lmbench"],
             TestGroup::UnixBench => &["unixbench", "UnixBench"],
             TestGroup::Ltp => &["ltp"],
             TestGroup::Iperf => &["iperf"],
@@ -45,11 +47,12 @@ impl TestGroup {
             TestGroup::Busybox => 10,
             TestGroup::Lua => 20,
             TestGroup::Iozone => 30,
+            TestGroup::Lmbench => 35,
             TestGroup::LibcTest => 40,
-            TestGroup::UnixBench => 50,
-            TestGroup::Ltp => 60,
-            TestGroup::Iperf => 70,
-            TestGroup::Netperf => 71,
+            TestGroup::UnixBench => 60,
+            TestGroup::Ltp => 70,
+            TestGroup::Iperf => 80,
+            TestGroup::Netperf => 81,
         }
     }
 
@@ -60,6 +63,7 @@ impl TestGroup {
             TestGroup::Lua,
             TestGroup::LibcTest,
             TestGroup::Iozone,
+            TestGroup::Lmbench,
             TestGroup::UnixBench,
             TestGroup::Ltp,
             TestGroup::Iperf,
@@ -73,7 +77,10 @@ impl TestGroup {
     }
 }
 
-#[cfg(all(not(feature = "libctest"), not(feature = "iozone")))]
+#[cfg(all(not(feature = "libctest"), feature = "lmbench"))]
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Lmbench];
+
+#[cfg(all(not(feature = "libctest"), not(feature = "iozone"), not(feature = "lmbench")))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Basic,
     TestGroup::Busybox,
@@ -84,7 +91,7 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
 #[cfg(feature = "libctest")]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::LibcTest];
 
-#[cfg(all(not(feature = "libctest"), feature = "iozone"))]
+#[cfg(all(not(feature = "libctest"), feature = "iozone", not(feature = "lmbench")))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Basic,
     TestGroup::Busybox,
@@ -804,6 +811,7 @@ fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
     #[cfg(not(feature = "libctest"))]
     const DEFAULT_RUN_TIMEOUT_US: usize = 120_000_000;
     const IOZONE_RUN_TIMEOUT_US: usize = 240_000_000;
+    const LMBENCH_RUN_TIMEOUT_US: usize = 240_000_000;
 
     if spec
         .argv
@@ -811,6 +819,10 @@ fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
         .any(|arg| testcode_stem(arg).and_then(TestGroup::from_stem) == Some(TestGroup::Iozone))
     {
         IOZONE_RUN_TIMEOUT_US
+    } else if spec.argv.iter().any(|arg| {
+        testcode_stem(arg).and_then(TestGroup::from_stem) == Some(TestGroup::Lmbench)
+    }) {
+        LMBENCH_RUN_TIMEOUT_US
     } else {
         DEFAULT_RUN_TIMEOUT_US
     }
@@ -993,6 +1005,15 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
     ensure_busybox_applet_alias(&root, &busybox_host, "/bin/sh")
         .ok_or(ScriptLaunchError::MissingApplet("/bin/sh"))?;
 
+    let mut envp = alloc::vec![
+        String::from("PATH=.:/:/bin:/usr/bin"),
+        String::from("LD_LIBRARY_PATH=/lib"),
+        alloc::format!("SHELL={}", busybox_path),
+    ];
+    if testcode_stem(&logical_script).and_then(TestGroup::from_stem) == Some(TestGroup::Lmbench) {
+        envp.push(String::from("ENOUGH=5000"));
+    }
+
     Ok(UserProgramSpec {
         path: busybox_path.clone(),
         argv: alloc::vec![
@@ -1000,11 +1021,7 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
             String::from("sh"),
             logical_script.clone(),
         ],
-        envp: alloc::vec![
-            String::from("PATH=.:/:/bin:/usr/bin"),
-            String::from("LD_LIBRARY_PATH=/lib"),
-            alloc::format!("SHELL={}", busybox_path),
-        ],
+        envp,
         cwd: dirname(&logical_script),
         root,
         marker_name: None,

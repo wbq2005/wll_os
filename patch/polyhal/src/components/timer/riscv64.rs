@@ -3,7 +3,7 @@ use core::time::Duration;
 // TODO: Get CLOCK_FREQUENCY CLOCK_FREQ
 use riscv::register::{sie, time};
 
-const CLOCK_FREQ: u64 = 12500000;
+const CLOCK_FREQ: u64 = 10000000;
 
 /// Get ticks from system clock
 ///

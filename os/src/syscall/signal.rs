@@ -19,6 +19,7 @@ const SIG_DFL: usize = 0;
 const SIG_IGN: usize = 1;
 
 const SIGKILL: i32 = 9;
+const SIGPIPE: i32 = 13;
 const SIGSEGV: i32 = 11;
 const SIGCHLD: i32 = 17;
 const SIGCONT: i32 = 18;
@@ -642,6 +643,12 @@ pub(crate) fn notify_child_exit(child: &Arc<TaskControlBlock>) {
             sender_uid: 0,
         },
     );
+}
+
+pub(crate) fn send_sigpipe_to_current() {
+    if let Some(task) = current_task() {
+        queue_signal(&task, SIGPIPE, PendingSignalInfo::from_current(SI_USER));
+    }
 }
 
 pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {

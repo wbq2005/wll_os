@@ -42,6 +42,7 @@ no-init-idle = []
 dev-preload = []
 libctest = []
 iozone = []
+lmbench = []
 
 [[bin]]
 name = "wll_OS"

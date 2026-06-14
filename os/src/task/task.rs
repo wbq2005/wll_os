@@ -77,6 +77,7 @@ impl TaskControlBlock {
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
+            start_time_us: crate::timer::get_time_us(),
             is_kernel: false,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
@@ -266,6 +267,7 @@ impl TaskControlBlock {
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
+            start_time_us: crate::timer::get_time_us(),
             is_kernel: false,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
@@ -325,6 +327,7 @@ impl TaskControlBlock {
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
+            start_time_us: crate::timer::get_time_us(),
             is_kernel: false,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,
@@ -382,6 +385,7 @@ impl TaskControlBlock {
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
+            start_time_us: crate::timer::get_time_us(),
             is_kernel: true,
             inner: Mutex::new(TaskControlBlockInner {
                 exit_code: 0,

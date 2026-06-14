@@ -7,7 +7,9 @@ param(
 
     [switch]$LibcTest,
 
-    [switch]$Iozone
+    [switch]$Iozone,
+
+    [switch]$Lmbench
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,6 +48,9 @@ function Build-Arch {
         }
         if ($Iozone) {
             $cargoArgs += @("--features", "iozone")
+        }
+        if ($Lmbench) {
+            $cargoArgs += @("--features", "lmbench")
         }
         Write-Host "[$TargetArch] cargo @($cargoArgs)" -ForegroundColor Gray
         & cargo $cargoArgs
