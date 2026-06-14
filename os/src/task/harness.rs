@@ -44,8 +44,8 @@ impl TestGroup {
             TestGroup::Basic => 0,
             TestGroup::Busybox => 10,
             TestGroup::Lua => 20,
-            TestGroup::LibcTest => 30,
-            TestGroup::Iozone => 40,
+            TestGroup::Iozone => 30,
+            TestGroup::LibcTest => 40,
             TestGroup::UnixBench => 50,
             TestGroup::Ltp => 60,
             TestGroup::Iperf => 70,
@@ -89,8 +89,8 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Basic,
     TestGroup::Busybox,
     TestGroup::Lua,
-    TestGroup::LibcTest,
     TestGroup::Iozone,
+    TestGroup::LibcTest,
 ];
 
 fn console_write(msg: &str) {
