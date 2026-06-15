@@ -111,6 +111,7 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Iozone,
     TestGroup::LibcTest,
     TestGroup::LibcBench,
+    TestGroup::Lmbench,
 ];
 
 fn console_write(msg: &str) {
@@ -1019,6 +1020,8 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
         .ok_or(ScriptLaunchError::MissingApplet("sh"))?;
     ensure_busybox_applet_alias(&root, &busybox_host, "/bin/sh")
         .ok_or(ScriptLaunchError::MissingApplet("/bin/sh"))?;
+    ensure_busybox_applet_alias(&root, &busybox_host, "cp")
+        .ok_or(ScriptLaunchError::MissingApplet("cp"))?;
 
     let mut envp = alloc::vec![
         String::from("PATH=.:/:/bin:/usr/bin"),
