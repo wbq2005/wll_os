@@ -45,6 +45,26 @@ fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
     }
 }
 
+fn map_area_page_window(
+    page_table: &PageTableWrapper,
+    area: &MapArea,
+    start_idx: usize,
+    page_count: usize,
+) {
+    if !has_leaf_permission(area.flags) {
+        return;
+    }
+
+    let mf: MappingFlags = area.flags.into();
+    let end_idx = start_idx.saturating_add(page_count).min(area.frames.len());
+    for idx in start_idx..end_idx {
+        let frame = &area.frames[idx];
+        let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
+        let paddr = PhysAddr::new(frame.ppn().addr());
+        page_table.map_page(vaddr, paddr, mf, MappingSize::Page4KB);
+    }
+}
+
 fn unmap_area_pages(page_table: &PageTableWrapper, area: &MapArea, flags: PTEFlags) {
     if !has_leaf_permission(flags) || !area.has_frames() {
         return;
@@ -75,6 +95,17 @@ fn populate_area_frames(area: &mut MapArea) -> Result<(), SysErrNo> {
     }
     area.frames = frames;
     Ok(())
+}
+
+fn read_file_page(backing: &MapAreaBacking) -> Result<Vec<u8>, SysErrNo> {
+    let MapAreaBacking::File { file, offset, .. } = backing else {
+        return Ok(alloc::vec![0u8; PAGE_SIZE]);
+    };
+
+    let mut data = alloc::vec![0u8; PAGE_SIZE];
+    let mut file = file.clone();
+    let _ = crate::syscall::with_kernel_page_table(|| file.read_at(*offset, &mut data))?;
+    Ok(data)
 }
 
 /// Per-process address space.
@@ -426,6 +457,110 @@ impl MemorySet {
             }
             copied += copy_len;
         }
+        Ok(())
+    }
+
+    pub fn invalidate_file_range(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+    ) -> Result<(), SysErrNo> {
+        let start = start_va.raw();
+        let end = end_va.raw();
+        if start >= end || start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
+            return Err(SysErrNo::EINVAL);
+        }
+        if !self.range_covered(start, end) {
+            return Err(SysErrNo::ENOMEM);
+        }
+
+        self.split_area_at(start);
+        self.split_area_at(end);
+
+        for area in &mut self.areas {
+            if area.start_va.raw() >= start
+                && area.end_va.raw() <= end
+                && matches!(area.backing, MapAreaBacking::File { .. })
+            {
+                unmap_area_pages(&self.page_table, area, area.flags);
+            }
+        }
+        self.coalesce_areas();
+        Ok(())
+    }
+
+    pub fn handle_page_fault(
+        &mut self,
+        fault_addr: usize,
+        is_store: bool,
+        is_exec: bool,
+    ) -> Result<(), SysErrNo> {
+        let page_start = align_down(fault_addr);
+        let page_end = page_start.checked_add(PAGE_SIZE).ok_or(SysErrNo::EFAULT)?;
+        let Some(area) = self
+            .areas
+            .iter()
+            .find(|area| area.contains(VirtAddr::new(fault_addr)))
+        else {
+            return Err(SysErrNo::EFAULT);
+        };
+
+        if !has_leaf_permission(area.flags) {
+            return Err(SysErrNo::EFAULT);
+        }
+        if is_exec {
+            if !area.flags.contains(PTEFlags::X) {
+                return Err(SysErrNo::EFAULT);
+            }
+        } else if is_store {
+            if !area.flags.contains(PTEFlags::W) {
+                return Err(SysErrNo::EFAULT);
+            }
+        } else if !area.flags.contains(PTEFlags::R) {
+            return Err(SysErrNo::EFAULT);
+        }
+        if self.translate(VirtAddr::new(page_start)).is_some() {
+            self.activate();
+            return Ok(());
+        }
+        if matches!(area.backing, MapAreaBacking::File { .. }) && area.has_frames() {
+            let page_idx = (page_start - area.start_va.raw()) / PAGE_SIZE;
+            map_area_page_window(&self.page_table, area, page_idx, 1);
+            self.activate();
+            return Ok(());
+        }
+
+        self.split_area_at(page_start);
+        self.split_area_at(page_end);
+
+        let Some(idx) = self
+            .areas
+            .iter()
+            .position(|area| area.start_va.raw() == page_start && area.end_va.raw() == page_end)
+        else {
+            return Err(SysErrNo::EFAULT);
+        };
+
+        if self.areas[idx].has_frames() {
+            map_area_pages(&self.page_table, &self.areas[idx]);
+            self.activate();
+            return Ok(());
+        }
+
+        let Some(frame) = frame_allocator::alloc_frame() else {
+            return Err(SysErrNo::ENOMEM);
+        };
+        let data = read_file_page(&self.areas[idx].backing)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                frame.ppn().addr() as *mut u8,
+                PAGE_SIZE,
+            );
+        }
+        self.areas[idx].frames.push(frame);
+        map_area_pages(&self.page_table, &self.areas[idx]);
+        self.activate();
         Ok(())
     }
 

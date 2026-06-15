@@ -246,6 +246,17 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         | TrapType::LoadPageFault(vaddr)
         | TrapType::InstructionPageFault(vaddr)) => {
             if let Some(task) = crate::task::current_task() {
+                let is_store = matches!(trap, TrapType::StorePageFault(_));
+                let is_exec = matches!(trap, TrapType::InstructionPageFault(_));
+                if task
+                    .memory_set
+                    .lock()
+                    .handle_page_fault(vaddr, is_store, is_exec)
+                    .is_ok()
+                {
+                    return;
+                }
+
                 let sepc = ctx[TrapFrameArgs::SEPC];
                 let sp = ctx[TrapFrameArgs::SP];
                 let ms = task.memory_set.lock();

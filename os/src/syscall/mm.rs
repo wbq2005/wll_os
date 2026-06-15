@@ -153,6 +153,9 @@ fn collect_shared_file_writes(
         if !*shared || !area.flags.contains(PTEFlags::W) {
             continue;
         }
+        if area.frames.is_empty() {
+            continue;
+        }
         let copy_start = start.max(area.start_va.raw());
         let copy_end = end.min(area.end_va.raw());
         let mut data = alloc::vec![0u8; copy_end - copy_start];
@@ -618,6 +621,11 @@ pub fn sys_msync(addr: usize, length: usize, flags: usize) -> SyscallRet {
     }
     let writes = collect_shared_file_writes(&task, start, end)?;
     write_back_shared_files(writes)?;
+    if (flags & MS_INVALIDATE) != 0 {
+        let mut ms = task.memory_set.lock();
+        ms.invalidate_file_range(VirtAddr::new(start), VirtAddr::new(end))?;
+        ms.activate();
+    }
     Ok(0)
 }
 

@@ -41,6 +41,8 @@ struct RLimit {
 }
 
 const RLIMIT_NOFILE: usize = 7;
+const RLIMIT_STACK: usize = 3;
+const DEFAULT_STACK_LIMIT: usize = 256 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -321,18 +323,23 @@ pub fn sys_getegid() -> SyscallRet {
 }
 
 fn resource_limit_snapshot(resource: usize) -> Result<RLimit, SysErrNo> {
-    if resource == RLIMIT_NOFILE {
-        let task = current_task().ok_or(SysErrNo::ESRCH)?;
-        let inner = task.inner.lock();
-        Ok(RLimit {
-            rlim_cur: inner.rlimit_nofile,
-            rlim_max: inner.rlimit_nofile_max,
-        })
-    } else {
-        Ok(RLimit {
+    match resource {
+        RLIMIT_STACK => Ok(RLimit {
+            rlim_cur: DEFAULT_STACK_LIMIT,
+            rlim_max: DEFAULT_STACK_LIMIT,
+        }),
+        RLIMIT_NOFILE => {
+            let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            let inner = task.inner.lock();
+            Ok(RLimit {
+                rlim_cur: inner.rlimit_nofile,
+                rlim_max: inner.rlimit_nofile_max,
+            })
+        }
+        _ => Ok(RLimit {
             rlim_cur: usize::MAX,
             rlim_max: usize::MAX,
-        })
+        }),
     }
 }
 
@@ -343,6 +350,9 @@ fn apply_resource_limit(resource: usize, limit_ptr: usize) -> Result<(), SysErrN
     let limit = copy_object_from_user::<RLimit>(limit_ptr)?;
     if limit.rlim_cur > limit.rlim_max {
         return Err(SysErrNo::EINVAL);
+    }
+    if resource == RLIMIT_STACK {
+        return Ok(());
     }
     if resource != RLIMIT_NOFILE {
         return Ok(());
