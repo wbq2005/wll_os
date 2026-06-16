@@ -1,6 +1,6 @@
 use super::SyscallRet;
 use crate::config::{PAGE_SIZE, USER_HEAP_START, USER_STACK_TOP};
-use crate::fs::fd::FileDescriptor;
+use crate::fs::{ext4_vol, fd::FileDescriptor};
 use crate::mm::frame_allocator::{self, FrameTracker};
 use crate::mm::map_area::{MapArea, MapAreaBacking};
 use crate::mm::page_table::PTEFlags;
@@ -487,8 +487,8 @@ pub fn sys_mmap(
     }
 
     let map_has_leaf = pte_has_leaf_permission(pte_flags);
-    let (backing, file_data) = if anonymous {
-        (MapAreaBacking::Anonymous, None)
+    let (backing, file_data, lazy_clean_mmap) = if anonymous {
+        (MapAreaBacking::Anonymous, None, false)
     } else {
         let inner = task.inner.lock();
         let mut fds = inner.fd_table.lock();
@@ -500,7 +500,14 @@ pub fn sys_mmap(
             return Err(SysErrNo::EACCES);
         }
 
-        let data = if map_has_leaf {
+        let use_clean_page_cache = map_has_leaf
+            && (prot & PROT_WRITE) == 0
+            && match file_desc {
+                FileDescriptor::Ext4Regular { ino, .. } => ext4_vol::can_use_clean_page_cache(*ino),
+                _ => false,
+            };
+
+        let data = if map_has_leaf && !use_clean_page_cache {
             let mut data = Vec::new();
             data.resize(length, 0);
             let n = super::with_kernel_page_table(|| file_desc.read_at(offset, &mut data))?;
@@ -516,6 +523,7 @@ pub fn sys_mmap(
                 shared,
             },
             data,
+            use_clean_page_cache,
         )
     };
 
@@ -535,14 +543,23 @@ pub fn sys_mmap(
             return Err(SysErrNo::ENOMEM);
         }
 
-        ms.insert_framed_area_with_backing(
-            VirtAddr::new(start),
-            VirtAddr::new(end),
-            pte_flags,
-            backing,
-        )?;
-        if let Some(data) = file_data {
-            ms.write_bytes(start, &data)?;
+        if lazy_clean_mmap {
+            ms.insert_lazy_area_with_backing(
+                VirtAddr::new(start),
+                VirtAddr::new(end),
+                pte_flags,
+                backing,
+            )?;
+        } else {
+            ms.insert_framed_area_with_backing(
+                VirtAddr::new(start),
+                VirtAddr::new(end),
+                pte_flags,
+                backing,
+            )?;
+            if let Some(data) = file_data {
+                ms.write_bytes(start, &data)?;
+            }
         }
         ms.activate();
     }

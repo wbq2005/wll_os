@@ -7,6 +7,7 @@ use super::frame_allocator::{self, FrameTracker};
 use super::map_area::{MapArea, MapAreaBacking};
 use super::page_table::{self, PTEFlags};
 use crate::config::PAGE_SIZE;
+use crate::fs::fd::FileDescriptor;
 use crate::utils::error::SysErrNo;
 
 fn align_down(value: usize) -> usize {
@@ -97,6 +98,29 @@ fn populate_area_frames(area: &mut MapArea) -> Result<(), SysErrNo> {
     Ok(())
 }
 
+fn copy_area_frames(area: &mut MapArea) -> Result<(), SysErrNo> {
+    if area.frames.is_empty() {
+        return Ok(());
+    }
+
+    let mut frames = Vec::new();
+    for src_frame in &area.frames {
+        let Some(frame) = frame_allocator::alloc_frame() else {
+            return Err(SysErrNo::ENOMEM);
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src_frame.ppn().addr() as *const u8,
+                frame.ppn().addr() as *mut u8,
+                PAGE_SIZE,
+            );
+        }
+        frames.push(frame);
+    }
+    area.frames = frames;
+    Ok(())
+}
+
 fn read_file_page(backing: &MapAreaBacking) -> Result<Vec<u8>, SysErrNo> {
     let MapAreaBacking::File { file, offset, .. } = backing else {
         return Ok(alloc::vec![0u8; PAGE_SIZE]);
@@ -104,7 +128,8 @@ fn read_file_page(backing: &MapAreaBacking) -> Result<Vec<u8>, SysErrNo> {
 
     let mut data = alloc::vec![0u8; PAGE_SIZE];
     let mut file = file.clone();
-    let _ = crate::syscall::with_kernel_page_table(|| file.read_at(*offset, &mut data))?;
+    crate::trap::restore_kernel_page_table();
+    let _ = file.read_at(*offset, &mut data)?;
     Ok(data)
 }
 
@@ -186,6 +211,29 @@ impl MemorySet {
         }
 
         self.areas.push(area);
+        self.coalesce_areas();
+        Ok(())
+    }
+
+    pub fn insert_lazy_area_with_backing(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: PTEFlags,
+        backing: MapAreaBacking,
+    ) -> Result<(), SysErrNo> {
+        let start = align_down(start_va.raw());
+        let end = align_up(end_va.raw()).ok_or(SysErrNo::EINVAL)?;
+        if start >= end {
+            return Err(SysErrNo::EINVAL);
+        }
+
+        self.areas.push(MapArea::with_backing(
+            VirtAddr::new(start),
+            VirtAddr::new(end),
+            permission,
+            backing,
+        ));
         self.coalesce_areas();
         Ok(())
     }
@@ -424,7 +472,11 @@ impl MemorySet {
         for area in &mut self.areas {
             if area.start_va.raw() >= start && area.end_va.raw() <= end {
                 let old_flags = area.flags;
-                if has_leaf_permission(flags) {
+                let file_backed = matches!(area.backing, MapAreaBacking::File { .. });
+                if file_backed && flags.contains(PTEFlags::W) && area.has_frames() {
+                    copy_area_frames(area)?;
+                }
+                if has_leaf_permission(flags) && !file_backed {
                     populate_area_frames(area)?;
                 }
                 area.flags = flags;
@@ -519,6 +571,21 @@ impl MemorySet {
         } else if !area.flags.contains(PTEFlags::R) {
             return Err(SysErrNo::EFAULT);
         }
+        let clean_cache_page = if !is_store && !area.flags.contains(PTEFlags::W) {
+            match &area.backing {
+                MapAreaBacking::File {
+                    file: FileDescriptor::Ext4Regular { ino, .. },
+                    offset,
+                    ..
+                } if crate::fs::ext4_vol::can_use_clean_page_cache(*ino) => Some((
+                    *ino,
+                    offset.saturating_add(page_start - area.start_va.raw()),
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
         if self.translate(VirtAddr::new(page_start)).is_some() {
             self.activate();
             return Ok(());
@@ -547,10 +614,28 @@ impl MemorySet {
             return Ok(());
         }
 
+        if let Some((ino, file_offset)) = clean_cache_page {
+            crate::trap::restore_kernel_page_table();
+            let cache_frame_result = crate::fs::ext4_vol::clean_page_cache_frame(ino, file_offset);
+            if cache_frame_result.is_err() {
+                self.activate();
+            }
+            let cache_frame = cache_frame_result?;
+            self.areas[idx].frames.push(cache_frame);
+            map_area_pages(&self.page_table, &self.areas[idx]);
+            self.activate();
+            return Ok(());
+        }
+
         let Some(frame) = frame_allocator::alloc_frame() else {
             return Err(SysErrNo::ENOMEM);
         };
-        let data = read_file_page(&self.areas[idx].backing)?;
+        crate::trap::restore_kernel_page_table();
+        let data_result = read_file_page(&self.areas[idx].backing);
+        if data_result.is_err() {
+            self.activate();
+        }
+        let data = data_result?;
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), frame.ppn().addr() as *mut u8, PAGE_SIZE);
         }
