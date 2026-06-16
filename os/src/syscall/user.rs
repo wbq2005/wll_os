@@ -126,15 +126,22 @@ fn read_cstr_inner(
     let mut bytes = Vec::new();
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let memory_set = task.memory_set.lock();
-    for i in 0..MAX_CSTR_LEN {
+    let mut offset = 0usize;
+    while offset < MAX_CSTR_LEN {
+        let va = addr.checked_add(offset).ok_or(SysErrNo::EFAULT)?;
         let pa = memory_set
-            .translate(VirtAddr::new(addr + i))
+            .translate(VirtAddr::new(va))
             .ok_or(SysErrNo::EFAULT)?;
-        let byte = unsafe { *(pa.raw() as *const u8) };
-        if byte == 0 {
-            return String::from_utf8(bytes).map_err(|_| SysErrNo::EINVAL);
+        let page_left = PAGE_SIZE - va % PAGE_SIZE;
+        let span = page_left.min(MAX_CSTR_LEN - offset);
+        let src = unsafe { core::slice::from_raw_parts(pa.raw() as *const u8, span) };
+        for &byte in src {
+            if byte == 0 {
+                return String::from_utf8(bytes).map_err(|_| SysErrNo::EINVAL);
+            }
+            bytes.push(byte);
         }
-        bytes.push(byte);
+        offset += span;
     }
     Err(unterminated_err)
 }

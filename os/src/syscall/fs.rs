@@ -208,28 +208,36 @@ fn with_fixed_io_fd_mut<T>(
     f(file_desc)
 }
 
-fn load_user_iovecs(iov: *const u8, iovcnt: usize) -> Result<Vec<IoVec>, SysErrNo> {
-    if iovcnt == 0 {
-        return Ok(Vec::new());
-    }
-    if iovcnt > IOV_MAX {
-        return Err(SysErrNo::EINVAL);
-    }
-    if iov.is_null() {
-        return Err(SysErrNo::EFAULT);
+fn load_user_iovecs_batch(
+    iov: *const u8,
+    start: usize,
+    iovcnt: usize,
+    max_total_len: usize,
+) -> Result<(Vec<IoVec>, usize, usize), SysErrNo> {
+    if start >= iovcnt {
+        return Ok((Vec::new(), start, 0));
     }
 
-    let mut iovecs = Vec::with_capacity(iovcnt);
+    let mut iovecs = Vec::new();
     let mut total_len = 0usize;
-    for i in 0..iovcnt {
-        let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(i) })?;
+    let mut index = start;
+    while index < iovcnt {
+        let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(index) })?;
+        index += 1;
+        if iovec.iov_len == 0 {
+            continue;
+        }
         total_len = total_len
             .checked_add(iovec.iov_len)
-            .filter(|sum| *sum <= isize::MAX as usize)
+            .filter(|sum| *sum <= max_total_len)
             .ok_or(SysErrNo::EINVAL)?;
         iovecs.push(iovec);
+        if total_len >= VECTORED_IO_CHUNK {
+            break;
+        }
     }
-    Ok(iovecs)
+
+    Ok((iovecs, index, total_len))
 }
 
 fn user_iov_addr(iovec: &IoVec, offset: usize) -> Result<usize, SysErrNo> {
@@ -294,8 +302,7 @@ fn read_fixed_at_to_user(
 ) -> SyscallRet {
     if count <= SMALL_IO_STACK_BUF {
         let mut kbuf = [0u8; SMALL_IO_STACK_BUF];
-        let n =
-            super::with_kernel_page_table(|| file_desc.read_at(offset, &mut kbuf[..count]))?;
+        let n = super::with_kernel_page_table(|| file_desc.read_at(offset, &mut kbuf[..count]))?;
         copy_to_user(buf, &kbuf[..n])?;
         return Ok(n);
     }
@@ -429,6 +436,212 @@ fn vectored_write_at_from_user(
             }
             Err(err) => {
                 return if total != 0 { Ok(total) } else { Err(err) };
+            }
+        }
+
+        if pending_user_error.is_some() {
+            return Ok(total);
+        }
+    }
+
+    Ok(total)
+}
+
+fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut total = 0usize;
+    let mut cursor = IovCursor::new();
+    let mut kbuf = Vec::new();
+
+    while cursor.index < iovecs.len() {
+        let want = cursor.remaining_bytes_capped(iovecs, VECTORED_IO_CHUNK);
+        if want == 0 {
+            break;
+        }
+
+        kbuf.resize(want, 0);
+        let res = {
+            let inner = task.inner.lock();
+            let mut fds = inner.fd_table.lock();
+            match fds.get_mut(fd) {
+                Some(file_desc) => {
+                    super::with_kernel_page_table(|| file_desc.read(&mut kbuf[..want]))
+                }
+                None => Err(SysErrNo::EBADF),
+            }
+        };
+
+        match res {
+            Ok(n) => {
+                if n == 0 {
+                    break;
+                }
+
+                let mut copied = 0usize;
+                while copied < n {
+                    let Some(remaining) = cursor.remaining_span(iovecs) else {
+                        break;
+                    };
+                    let to_copy = remaining.min(n - copied);
+                    let dst = match cursor.user_addr(iovecs) {
+                        Ok(addr) => addr as *mut u8,
+                        Err(err) => {
+                            return if total + copied != 0 {
+                                Ok(total + copied)
+                            } else {
+                                Err(err)
+                            };
+                        }
+                    };
+                    match copy_to_user(dst, &kbuf[copied..copied + to_copy]) {
+                        Ok(()) => {
+                            copied += to_copy;
+                            cursor.advance(to_copy);
+                        }
+                        Err(err) => {
+                            return if total + copied != 0 {
+                                Ok(total + copied)
+                            } else {
+                                Err(err)
+                            };
+                        }
+                    }
+                }
+
+                total += copied;
+                if n < want || copied < n {
+                    break;
+                }
+            }
+            Err(SysErrNo::EAGAIN) => {
+                if total != 0 {
+                    return Ok(total);
+                }
+                let (is_pipe_read, nb_pipe, would_block) = {
+                    let inner = task.inner.lock();
+                    let fds = inner.fd_table.lock();
+                    fds.get(fd)
+                        .map(|f| {
+                            (
+                                f.is_pipe_read(),
+                                f.pipe_read_nonblocking(),
+                                f.pipe_read_would_block(),
+                            )
+                        })
+                        .unwrap_or((false, false, false))
+                };
+                if !is_pipe_read || nb_pipe {
+                    return Err(SysErrNo::EAGAIN);
+                }
+                if !would_block {
+                    continue;
+                }
+                let _ = sleep_on_io_if(None, || {
+                    let inner = task.inner.lock();
+                    let fds = inner.fd_table.lock();
+                    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+                    Ok(file_desc.pipe_read_would_block())
+                })?;
+            }
+            Err(err) => {
+                return if total != 0 { Ok(total) } else { Err(err) };
+            }
+        }
+    }
+
+    Ok(total)
+}
+
+fn vectored_write_from_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut total = 0usize;
+    let mut cursor = IovCursor::new();
+    let mut heap_buf = Vec::new();
+
+    while cursor.index < iovecs.len() {
+        let remaining = cursor.remaining_bytes_capped(iovecs, VECTORED_STACK_BUF + 1);
+        if remaining == 0 {
+            break;
+        }
+
+        let mut stack_buf;
+        let (copied, pending_user_error, write_buf) = if remaining <= VECTORED_STACK_BUF {
+            stack_buf = [0u8; VECTORED_STACK_BUF];
+            let (copied, err) =
+                fill_vectored_write_buf(iovecs, &mut cursor, &mut stack_buf[..remaining]);
+            (copied, err, &stack_buf[..copied])
+        } else {
+            heap_buf.resize(VECTORED_IO_CHUNK, 0);
+            let (copied, err) = fill_vectored_write_buf(iovecs, &mut cursor, &mut heap_buf);
+            (copied, err, &heap_buf[..copied])
+        };
+
+        if copied == 0 {
+            return match pending_user_error {
+                Some(err) if total == 0 => Err(err),
+                _ => Ok(total),
+            };
+        }
+
+        loop {
+            let res = {
+                let inner = task.inner.lock();
+                let mut fds = inner.fd_table.lock();
+                match fds.get_mut(fd) {
+                    Some(file_desc) => super::with_kernel_page_table(|| file_desc.write(write_buf)),
+                    None => Err(SysErrNo::EBADF),
+                }
+            };
+
+            match res {
+                Ok(n) => {
+                    total += n;
+                    if n < copied {
+                        return Ok(total);
+                    }
+                    break;
+                }
+                Err(SysErrNo::EAGAIN) => {
+                    if total != 0 {
+                        return Ok(total);
+                    }
+                    let (is_pipe_write, nb_pipe, would_block) = {
+                        let inner = task.inner.lock();
+                        let fds = inner.fd_table.lock();
+                        fds.get(fd)
+                            .map(|f| {
+                                (
+                                    f.is_pipe_write(),
+                                    f.pipe_write_nonblocking(),
+                                    f.pipe_write_would_block(),
+                                )
+                            })
+                            .unwrap_or((false, false, false))
+                    };
+                    if !is_pipe_write || nb_pipe {
+                        return Err(SysErrNo::EAGAIN);
+                    }
+                    if !would_block {
+                        continue;
+                    }
+                    match sleep_on_io_if(None, || {
+                        let inner = task.inner.lock();
+                        let fds = inner.fd_table.lock();
+                        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+                        Ok(file_desc.pipe_write_would_block())
+                    }) {
+                        Ok(_) => {}
+                        Err(SysErrNo::EINTR) if total != 0 => return Ok(total),
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(SysErrNo::EPIPE) if total == 0 => {
+                    crate::syscall::signal::send_sigpipe_to_current();
+                    return Err(SysErrNo::EPIPE);
+                }
+                Err(err) => {
+                    return if total != 0 { Ok(total) } else { Err(err) };
+                }
             }
         }
 
@@ -1238,13 +1451,24 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
             let mut fds = inner.fd_table.lock();
             match fds.get_mut(fd) {
                 Some(file_desc) => {
-                    let mut kbuf = alloc::vec![0u8; count];
-                    match super::with_kernel_page_table(|| file_desc.read(&mut kbuf)) {
-                        Ok(n) => {
-                            copy_to_user(buf, &kbuf[..n])?;
-                            Ok(n)
+                    if count <= SMALL_IO_STACK_BUF {
+                        let mut kbuf = [0u8; SMALL_IO_STACK_BUF];
+                        match super::with_kernel_page_table(|| file_desc.read(&mut kbuf[..count])) {
+                            Ok(n) => {
+                                copy_to_user(buf, &kbuf[..n])?;
+                                Ok(n)
+                            }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
+                    } else {
+                        let mut kbuf = alloc::vec![0u8; count];
+                        match super::with_kernel_page_table(|| file_desc.read(&mut kbuf)) {
+                            Ok(n) => {
+                                copy_to_user(buf, &kbuf[..n])?;
+                                Ok(n)
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
                 }
                 None => Err(SysErrNo::EBADF),
@@ -1388,11 +1612,7 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
                     return Err(SysErrNo::EPIPE);
                 }
                 Err(err) => {
-                    return if written != 0 {
-                        Ok(written)
-                    } else {
-                        Err(err)
-                    };
+                    return if written != 0 { Ok(written) } else { Err(err) };
                 }
             }
         }
@@ -1635,22 +1855,27 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {
     if iov.is_null() {
         return Err(SysErrNo::EFAULT);
     }
+
     let mut total = 0usize;
-    for i in 0..iovcnt {
-        let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(i) })?;
-        if total
-            .checked_add(iovec.iov_len)
-            .filter(|sum| *sum <= isize::MAX as usize)
-            .is_none()
-        {
-            return Err(SysErrNo::EINVAL);
+    let mut index = 0usize;
+    while index < iovcnt {
+        let remaining_limit = (isize::MAX as usize).saturating_sub(total);
+        let (iovecs, next_index, want) =
+            match load_user_iovecs_batch(iov, index, iovcnt, remaining_limit) {
+                Ok(batch) => batch,
+                Err(err) => return if total != 0 { Ok(total) } else { Err(err) },
+            };
+        index = next_index;
+        if iovecs.is_empty() {
+            break;
         }
-        if iovec.iov_len == 0 {
-            continue;
-        }
-        let n = sys_read(fd, iovec.iov_base, iovec.iov_len)?;
+
+        let n = match vectored_read_to_user(fd, &iovecs) {
+            Ok(n) => n,
+            Err(err) => return if total != 0 { Ok(total) } else { Err(err) },
+        };
         total += n;
-        if n < iovec.iov_len {
+        if n < want {
             break;
         }
     }
@@ -1667,28 +1892,28 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> SyscallRet {
     if iov.is_null() {
         return Err(SysErrNo::EFAULT);
     }
+
     let mut total = 0usize;
-    for i in 0..iovcnt {
-        let iovec = copy_object_from_user(unsafe { (iov as *const IoVec).add(i) })?;
-        if total
-            .checked_add(iovec.iov_len)
-            .filter(|sum| *sum <= isize::MAX as usize)
-            .is_none()
-        {
-            return Err(SysErrNo::EINVAL);
+    let mut index = 0usize;
+    while index < iovcnt {
+        let remaining_limit = (isize::MAX as usize).saturating_sub(total);
+        let (iovecs, next_index, want) =
+            match load_user_iovecs_batch(iov, index, iovcnt, remaining_limit) {
+                Ok(batch) => batch,
+                Err(err) => return if total != 0 { Ok(total) } else { Err(err) },
+            };
+        index = next_index;
+        if iovecs.is_empty() {
+            break;
         }
-        if iovec.iov_len == 0 {
-            continue;
-        }
-        match sys_write(fd, iovec.iov_base as *const u8, iovec.iov_len) {
-            Ok(n) => {
-                total += n;
-                if n < iovec.iov_len {
-                    break;
-                }
-            }
-            Err(_) if total != 0 => return Ok(total),
-            Err(err) => return Err(err),
+
+        let n = match vectored_write_from_user(fd, &iovecs) {
+            Ok(n) => n,
+            Err(err) => return if total != 0 { Ok(total) } else { Err(err) },
+        };
+        total += n;
+        if n < want {
+            break;
         }
     }
     Ok(total)
@@ -1698,20 +1923,80 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> Sy
     if iovcnt == 0 {
         return Ok(0);
     }
-    let iovecs = load_user_iovecs(iov, iovcnt)?;
-    with_fixed_io_fd_mut(fd, |file_desc| {
-        vectored_read_at_to_user(file_desc, &iovecs, offset)
-    })
+    if iovcnt > IOV_MAX {
+        return Err(SysErrNo::EINVAL);
+    }
+    if iov.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+
+    let mut total = 0usize;
+    let mut index = 0usize;
+    while index < iovcnt {
+        let remaining_limit = (isize::MAX as usize).saturating_sub(total);
+        let (iovecs, next_index, want) =
+            match load_user_iovecs_batch(iov, index, iovcnt, remaining_limit) {
+                Ok(batch) => batch,
+                Err(err) => return if total != 0 { Ok(total) } else { Err(err) },
+            };
+        index = next_index;
+        if iovecs.is_empty() {
+            break;
+        }
+
+        let fixed_offset = checked_fixed_offset(offset, total)?;
+        let n = match with_fixed_io_fd_mut(fd, |file_desc| {
+            vectored_read_at_to_user(file_desc, &iovecs, fixed_offset)
+        }) {
+            Ok(n) => n,
+            Err(err) => return if total != 0 { Ok(total) } else { Err(err) },
+        };
+        total += n;
+        if n < want {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> SyscallRet {
     if iovcnt == 0 {
         return Ok(0);
     }
-    let iovecs = load_user_iovecs(iov, iovcnt)?;
-    with_fixed_io_fd_mut(fd, |file_desc| {
-        vectored_write_at_from_user(file_desc, &iovecs, offset)
-    })
+    if iovcnt > IOV_MAX {
+        return Err(SysErrNo::EINVAL);
+    }
+    if iov.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+
+    let mut total = 0usize;
+    let mut index = 0usize;
+    while index < iovcnt {
+        let remaining_limit = (isize::MAX as usize).saturating_sub(total);
+        let (iovecs, next_index, want) =
+            match load_user_iovecs_batch(iov, index, iovcnt, remaining_limit) {
+                Ok(batch) => batch,
+                Err(err) => return if total != 0 { Ok(total) } else { Err(err) },
+            };
+        index = next_index;
+        if iovecs.is_empty() {
+            break;
+        }
+
+        let fixed_offset = checked_fixed_offset(offset, total)?;
+        let n = match with_fixed_io_fd_mut(fd, |file_desc| {
+            vectored_write_at_from_user(file_desc, &iovecs, fixed_offset)
+        }) {
+            Ok(n) => n,
+            Err(err) => return if total != 0 { Ok(total) } else { Err(err) },
+        };
+        total += n;
+        if n < want {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 fn poll_once(fds: *mut PollFd, nfds: usize) -> Result<usize, SysErrNo> {

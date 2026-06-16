@@ -132,7 +132,11 @@ fn register_bound_socket(
     Ok(())
 }
 
-fn find_bound_socket(domain: i32, sock_type: usize, addr: &[u8]) -> Option<Arc<Mutex<SocketState>>> {
+fn find_bound_socket(
+    domain: i32,
+    sock_type: usize,
+    addr: &[u8],
+) -> Option<Arc<Mutex<SocketState>>> {
     let mut bindings = SOCKET_BINDINGS.lock();
     purge_dead_bindings(&mut bindings);
     bindings

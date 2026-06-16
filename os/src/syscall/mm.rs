@@ -304,7 +304,11 @@ fn user_shmid_ds(shmid: usize, segment: &SharedMemorySegment) -> UserShmidDs {
     }
 }
 
-fn copy_shmid_ds_to_user(addr: usize, shmid: usize, segment: &SharedMemorySegment) -> Result<(), SysErrNo> {
+fn copy_shmid_ds_to_user(
+    addr: usize,
+    shmid: usize,
+    segment: &SharedMemorySegment,
+) -> Result<(), SysErrNo> {
     if addr == 0 {
         return Err(SysErrNo::EFAULT);
     }
@@ -647,7 +651,13 @@ pub fn sys_shmget(key: isize, size: usize, shmflg: i32) -> SyscallRet {
             if create && excl {
                 return Err(SysErrNo::EEXIST);
             }
-            if size != 0 && size > segments.get(&existing).map(|segment| segment.size).unwrap_or(0) {
+            if size != 0
+                && size
+                    > segments
+                        .get(&existing)
+                        .map(|segment| segment.size)
+                        .unwrap_or(0)
+            {
                 return Err(SysErrNo::EINVAL);
             }
             return Ok(existing);

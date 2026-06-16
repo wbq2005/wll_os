@@ -552,11 +552,7 @@ impl MemorySet {
         };
         let data = read_file_page(&self.areas[idx].backing)?;
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                frame.ppn().addr() as *mut u8,
-                PAGE_SIZE,
-            );
+            core::ptr::copy_nonoverlapping(data.as_ptr(), frame.ppn().addr() as *mut u8, PAGE_SIZE);
         }
         self.areas[idx].frames.push(frame);
         map_area_pages(&self.page_table, &self.areas[idx]);

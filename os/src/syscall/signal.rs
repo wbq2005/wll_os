@@ -853,10 +853,7 @@ fn user_mcontext_from_trapframe(tf: &TrapFrame) -> UserMContext {
     let mut fpregs = [0; 66];
     fpregs[..32].copy_from_slice(&tf.f);
     fpregs[32] = tf.fcsr;
-    UserMContext {
-        gregs,
-        fpregs,
-    }
+    UserMContext { gregs, fpregs }
 }
 
 #[cfg(target_arch = "riscv64")]

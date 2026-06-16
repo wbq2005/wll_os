@@ -152,9 +152,8 @@ impl MapArea {
     }
 
     pub fn can_merge_with(&self, next: &Self) -> bool {
-        let compatible_frames =
-            (self.frames.is_empty() && next.frames.is_empty())
-                || (self.has_full_frames() && next.has_full_frames());
+        let compatible_frames = (self.frames.is_empty() && next.frames.is_empty())
+            || (self.has_full_frames() && next.has_full_frames());
         self.end_va.raw() == next.start_va.raw()
             && self.flags.bits() == next.flags.bits()
             && self.backing.can_merge_with(self.size(), &next.backing)
