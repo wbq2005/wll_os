@@ -14,7 +14,7 @@ use ext4_rs::{Errno, Ext4, Ext4Error, InodeFileType};
 /// ext4 标准根 inode 号（与 `ext4_rs` 内部一致，crate 根未再导出该常量）。
 const ROOT_INODE: u32 = 2;
 const MAX_FILE_OFFSET: usize = isize::MAX as usize;
-const REGULAR_CACHE_LIMIT: usize = 4 * 1024 * 1024;
+const REGULAR_CACHE_LIMIT: usize = 8 * 1024 * 1024;
 
 fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
     let end = offset.checked_add(len).ok_or(SysErrNo::EFBIG)?;
@@ -59,6 +59,8 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     static ref REGULAR_FILE_CACHE: Mutex<BTreeMap<u32, CachedRegularFile>> =
         Mutex::new(BTreeMap::new());
+    static ref OPEN_REGULAR_REFS: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
+    static ref PENDING_UNLINK_REGULAR: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 }
 
 #[derive(Clone, Debug)]
@@ -185,7 +187,9 @@ fn load_regular_data(fs: &Ext4, ino: u32) -> Result<Vec<u8>, SysErrNo> {
     let mut data = alloc::vec![0u8; size];
     let mut off = 0usize;
     while off < size {
-        let n = fs.read_at(ino, off, &mut data[off..]).map_err(map_ext4_err)?;
+        let n = fs
+            .read_at(ino, off, &mut data[off..])
+            .map_err(map_ext4_err)?;
         if n == 0 {
             return Err(SysErrNo::EIO);
         }
@@ -204,16 +208,17 @@ fn ensure_regular_cache(ino: u32) -> Result<bool, SysErrNo> {
         return Ok(false);
     }
     let data = load_regular_data(&fs, ino)?;
-    REGULAR_FILE_CACHE
-        .lock()
-        .insert(ino, CachedRegularFile {
+    REGULAR_FILE_CACHE.lock().insert(
+        ino,
+        CachedRegularFile {
             data,
             dirty: false,
             mtime_sec: inode.mtime(),
             mtime_extra: inode.i_mtime_extra(),
             ctime_sec: inode.ctime(),
             ctime_extra: inode.i_ctime_extra(),
-        });
+        },
+    );
     Ok(true)
 }
 
@@ -229,17 +234,23 @@ fn cached_regular_read(ino: u32, offset: usize, buf: &mut [u8]) -> Option<usize>
 }
 
 fn cached_regular_size(ino: u32) -> Option<usize> {
-    REGULAR_FILE_CACHE.lock().get(&ino).map(|cached| cached.data.len())
+    REGULAR_FILE_CACHE
+        .lock()
+        .get(&ino)
+        .map(|cached| cached.data.len())
 }
 
 fn cached_regular_info(ino: u32) -> Option<CachedRegularInfo> {
-    REGULAR_FILE_CACHE.lock().get(&ino).map(|cached| CachedRegularInfo {
-        size: cached.data.len(),
-        mtime_sec: cached.mtime_sec,
-        mtime_extra: cached.mtime_extra,
-        ctime_sec: cached.ctime_sec,
-        ctime_extra: cached.ctime_extra,
-    })
+    REGULAR_FILE_CACHE
+        .lock()
+        .get(&ino)
+        .map(|cached| CachedRegularInfo {
+            size: cached.data.len(),
+            mtime_sec: cached.mtime_sec,
+            mtime_extra: cached.mtime_extra,
+            ctime_sec: cached.ctime_sec,
+            ctime_extra: cached.ctime_extra,
+        })
 }
 
 fn cached_regular_resize(ino: u32, new_len: usize) -> Result<(), SysErrNo> {
@@ -269,6 +280,54 @@ fn is_regular_cached(ino: u32) -> bool {
 fn discard_regular_cache(ino: u32) {
     REGULAR_FILE_CACHE.lock().remove(&ino);
     DATA_TIME_OVERRIDES.lock().remove(&ino);
+}
+
+fn has_open_regular_ref(ino: u32) -> bool {
+    OPEN_REGULAR_REFS
+        .lock()
+        .get(&ino)
+        .copied()
+        .unwrap_or(0)
+        > 0
+}
+
+pub fn open_regular_ino(ino: u32) {
+    let mut refs = OPEN_REGULAR_REFS.lock();
+    *refs.entry(ino).or_insert(0) += 1;
+}
+
+pub fn close_regular_ino(ino: u32) {
+    let last_ref = {
+        let mut refs = OPEN_REGULAR_REFS.lock();
+        let Some(count) = refs.get_mut(&ino) else {
+            return;
+        };
+        if *count > 1 {
+            *count -= 1;
+            false
+        } else {
+            refs.remove(&ino);
+            true
+        }
+    };
+    if last_ref && PENDING_UNLINK_REGULAR.lock().remove(&ino) {
+        let _ = finish_unlinked_regular(ino);
+    }
+}
+
+fn finish_unlinked_regular(ino: u32) -> Result<(), SysErrNo> {
+    discard_regular_cache(ino);
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let mut iref = fs.get_inode_ref(ino);
+    if iref.inode.size() > 0 {
+        fs.truncate_inode(&mut iref, 0).map_err(map_ext4_err)?;
+    }
+    let now = current_ext4_time();
+    iref.inode.set_links_count(0);
+    iref.inode.set_ctime(now);
+    iref.inode.set_dtime(now);
+    fs.write_back_inode(&mut iref);
+    Ok(())
 }
 
 fn cache_empty_regular(ino: u32, dirty: bool) {
@@ -368,7 +427,9 @@ fn metadata_for_ino(fs: &Ext4, ino: u32) -> Ext4Metadata {
         nlink: inode.links_count() as u32,
         uid: inode.uid() as u32,
         gid: inode.gid() as u32,
-        size: cached_info.map(|info| info.size as u64).unwrap_or_else(|| inode.size()),
+        size: cached_info
+            .map(|info| info.size as u64)
+            .unwrap_or_else(|| inode.size()),
         blocks: inode.blocks_count(),
         atime_sec: inode.atime() as isize,
         atime_nsec: ext4_extra_nsec(inode.i_atime_extra()),
@@ -407,6 +468,8 @@ fn clear_all_caches() {
     clear_namespace_cache();
     DATA_TIME_OVERRIDES.lock().clear();
     REGULAR_FILE_CACHE.lock().clear();
+    OPEN_REGULAR_REFS.lock().clear();
+    PENDING_UNLINK_REGULAR.lock().clear();
 }
 
 pub fn is_ext4_mounted() -> bool {
@@ -519,6 +582,7 @@ pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
     let mut parent_ref = fs.get_inode_ref(parent_ino);
     let mut child_ref = fs.get_inode_ref(child_ino);
     let old_links = child_ref.inode.links_count();
+    let delay_delete = old_links <= 1 && has_open_regular_ref(child_ino);
     if old_links > 1 {
         drop(child_ref);
         drop(parent_ref);
@@ -526,7 +590,7 @@ pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
         fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
         parent_ref = fs.get_inode_ref(parent_ino);
         child_ref = fs.get_inode_ref(child_ino);
-    } else {
+    } else if !delay_delete {
         discard_regular_cache(child_ino);
     }
     fs.dir_remove_entry(&mut parent_ref, &name)
@@ -538,7 +602,9 @@ pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
     parent_ref.inode.set_mtime(now);
     parent_ref.inode.set_ctime(now);
     child_ref.inode.set_ctime(now);
-    if old_links <= 1 {
+    if delay_delete {
+        PENDING_UNLINK_REGULAR.lock().insert(child_ino);
+    } else if old_links <= 1 {
         let old_size = child_ref.inode.size();
         if old_size > 0 {
             fs.truncate_inode(&mut child_ref, 0).map_err(map_ext4_err)?;

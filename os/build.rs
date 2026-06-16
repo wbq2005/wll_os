@@ -42,6 +42,7 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DEV_PRELOAD");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LIBCTEST");
     println!("cargo:rerun-if-env-changed=LIBCTEST_FILTER");
+    println!("cargo:rerun-if-env-changed=WLL_HARNESS_GROUPS");
     let dev_preload = env::var_os("CARGO_FEATURE_DEV_PRELOAD").is_some();
 
     let mut code = String::from("fn preload_generated_programs() {\n");
@@ -213,7 +214,11 @@ struct LibcTestExtraSpec {
 fn emit_libctest_runtime_libs(code: &mut String, target: &str) {
     let specs = libctest_runtime_lib_specs(target);
     for (install_path, candidates) in specs {
-        let Some(path) = candidates.iter().map(PathBuf::from).find(|path| path.is_file()) else {
+        let Some(path) = candidates
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+        else {
             println!(
                 "cargo:warning=skip libc-test runtime lib {}: no candidate found",
                 install_path
@@ -316,15 +321,18 @@ fn compile_libctest_extra(
     } else {
         return Err(format!("unsupported target {target}"));
     };
-    let link_kind = if spec.static_link { "static" } else { "dynamic" };
+    let link_kind = if spec.static_link {
+        "static"
+    } else {
+        "dynamic"
+    };
     let out = out_dir
         .join("libctest-extra")
         .join(arch)
         .join(spec.libc)
         .join(format!("libctest-extra-{link_kind}.exe"));
     if let Some(parent) = out.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("create {}: {err}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
 
     let mut args = vec![

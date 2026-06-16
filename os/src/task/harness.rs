@@ -79,6 +79,26 @@ impl TestGroup {
             .copied()
             .find(|group| group.aliases().iter().any(|alias| *alias == stem))
     }
+
+    fn enabled_by_filter(self) -> bool {
+        match option_env!("WLL_HARNESS_GROUPS") {
+            Some(filter) => {
+                let mut any = false;
+                for part in filter.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    any = true;
+                    if self.aliases().iter().any(|alias| *alias == part) {
+                        return true;
+                    }
+                }
+                !any
+            }
+            None => true,
+        }
+    }
 }
 
 #[cfg(all(not(feature = "libctest"), feature = "lmbench"))]
@@ -169,6 +189,9 @@ fn is_enabled_script(path: &str) -> bool {
     let Some(group) = testcode_stem(path).and_then(TestGroup::from_stem) else {
         return false;
     };
+    if !group.enabled_by_filter() {
+        return false;
+    }
     DEFAULT_ENABLED_GROUPS
         .iter()
         .any(|enabled| *enabled == group)

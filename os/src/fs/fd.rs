@@ -39,14 +39,34 @@ fn is_dev_zero_path(path: &str) -> bool {
     matches!(path, "/dev/zero" | "/glibc/dev/zero" | "/musl/dev/zero")
 }
 
-fn refresh_mem_file(name: &str, content: &mut Vec<u8>, times: &mut FileTimes) {
+fn refresh_mem_file(name: &str, content: &mut Vec<u8>, times: &mut FileTimes) -> bool {
     if is_dev_null_path(name) || is_dev_zero_path(name) {
-        return;
+        return true;
     }
     if let Some(file) = MEM_FS.lock().get_file(name) {
         *content = file.content.clone();
         *times = file.times;
+        true
+    } else {
+        false
     }
+}
+
+fn write_mem_content(content: &mut Vec<u8>, offset: usize, buf: &[u8]) -> usize {
+    let end = offset + buf.len();
+    if offset == content.len() {
+        let spare = content.capacity().saturating_sub(content.len());
+        if spare < buf.len() {
+            content.reserve((64 * 1024).max(buf.len()));
+        }
+        content.extend_from_slice(buf);
+    } else {
+        if end > content.len() {
+            content.resize(end, 0);
+        }
+        content[offset..end].copy_from_slice(buf);
+    }
+    end
 }
 
 lazy_static! {
@@ -510,15 +530,10 @@ impl FileDescriptor {
                         }
                         return Err(SysErrNo::EAGAIN);
                     }
-                    let mut n = 0usize;
-                    while n < buf.len() {
-                        if let Some(b) = pipe.buf.pop_front() {
-                            buf[n] = b;
-                            n += 1;
-                        } else {
-                            break;
-                        }
-                    }
+                    let contiguous = pipe.buf.make_contiguous();
+                    let n = buf.len().min(contiguous.len());
+                    buf[..n].copy_from_slice(&contiguous[..n]);
+                    pipe.buf.drain(..n);
                     n
                 };
                 if n > 0 {
@@ -631,16 +646,15 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                refresh_mem_file(name, content, times);
-                let end = Self::checked_file_end(offset, buf.len())?;
-                if end > content.len() {
-                    content.resize(end, 0);
-                }
-                content[offset..end].copy_from_slice(buf);
+                let mem_live = refresh_mem_file(name, content, times);
+                Self::checked_file_end(offset, buf.len())?;
+                write_mem_content(content, offset, buf);
                 times.touch_modified();
-                MEM_FS
-                    .lock()
-                    .write_file_content(name, content.clone(), *times);
+                if mem_live {
+                    MEM_FS
+                        .lock()
+                        .write_file_content(name, content.clone(), *times);
+                }
                 Ok(buf.len())
             }
             FileDescriptor::Ext4Regular { ino, writable, .. } => {
@@ -685,21 +699,20 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                refresh_mem_file(name, content, times);
+                let mem_live = refresh_mem_file(name, content, times);
                 if *append {
                     *offset = content.len();
                 }
                 let start = *offset;
                 let end = Self::checked_file_end(start, buf.len())?;
-                if end > content.len() {
-                    content.resize(end, 0);
-                }
-                content[start..end].copy_from_slice(buf);
+                write_mem_content(content, start, buf);
                 *offset = end;
                 times.touch_modified();
-                MEM_FS
-                    .lock()
-                    .write_file_content(name, content.clone(), *times);
+                if mem_live {
+                    MEM_FS
+                        .lock()
+                        .write_file_content(name, content.clone(), *times);
+                }
 
                 Ok(buf.len())
             }
@@ -879,12 +892,14 @@ impl FileDescriptor {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(());
                 }
-                refresh_mem_file(name, content, times);
+                let mem_live = refresh_mem_file(name, content, times);
                 content.resize(new_len, 0);
                 times.touch_modified();
-                MEM_FS
-                    .lock()
-                    .write_file_content(name, content.clone(), *times);
+                if mem_live {
+                    MEM_FS
+                        .lock()
+                        .write_file_content(name, content.clone(), *times);
+                }
                 Ok(())
             }
             FileDescriptor::Ext4Regular { ino, writable, .. } => {
@@ -1021,13 +1036,16 @@ impl Clone for FileDescriptor {
                 readable,
                 writable,
                 append,
-            } => FileDescriptor::Ext4Regular {
-                ino: *ino,
-                offset: *offset,
-                readable: *readable,
-                writable: *writable,
-                append: *append,
-            },
+            } => {
+                crate::fs::ext4_vol::open_regular_ino(*ino);
+                FileDescriptor::Ext4Regular {
+                    ino: *ino,
+                    offset: *offset,
+                    readable: *readable,
+                    writable: *writable,
+                    append: *append,
+                }
+            }
             FileDescriptor::Ext4Dir { path, ino, offset } => FileDescriptor::Ext4Dir {
                 path: path.clone(),
                 ino: *ino,
@@ -1075,6 +1093,9 @@ impl Drop for FileDescriptor {
             FileDescriptor::Socket { .. } => {
                 wake_io = true;
             }
+            FileDescriptor::Ext4Regular { ino, .. } => {
+                crate::fs::ext4_vol::close_regular_ino(*ino);
+            }
             _ => {}
         }
         if wake_io {
@@ -1088,6 +1109,8 @@ impl Drop for FileDescriptor {
 pub struct FileDescriptorTable {
     fds: Vec<Option<FileDescriptor>>,
     fd_flags: Vec<usize>,
+    next_fd_hint: usize,
+    cloexec_count: usize,
 }
 
 impl FileDescriptorTable {
@@ -1104,7 +1127,79 @@ impl FileDescriptorTable {
         Self {
             fds,
             fd_flags: alloc::vec![0; MAX_FD_NUM],
+            next_fd_hint: 3,
+            cloexec_count: 0,
         }
+    }
+
+    fn count_cloexec(flags: usize) -> usize {
+        usize::from((flags & FD_CLOEXEC) != 0)
+    }
+
+    fn set_slot(&mut self, index: usize, fd: FileDescriptor, flags: usize) {
+        self.cloexec_count = self
+            .cloexec_count
+            .saturating_sub(Self::count_cloexec(self.fd_flags[index]));
+        self.fds[index] = Some(fd);
+        self.fd_flags[index] = flags & FD_CLOEXEC;
+        self.cloexec_count += Self::count_cloexec(self.fd_flags[index]);
+        if self.next_fd_hint == MAX_FD_NUM || index <= self.next_fd_hint {
+            self.next_fd_hint = index.saturating_add(1).min(MAX_FD_NUM);
+        }
+    }
+
+    fn clear_slot(&mut self, index: usize) {
+        self.cloexec_count = self
+            .cloexec_count
+            .saturating_sub(Self::count_cloexec(self.fd_flags[index]));
+        self.fds[index] = None;
+        self.fd_flags[index] = 0;
+        if index < self.next_fd_hint {
+            self.next_fd_hint = index;
+        }
+    }
+
+    fn alloc_slot_from(
+        &mut self,
+        start: usize,
+        limit: usize,
+        fd: FileDescriptor,
+        flags: usize,
+    ) -> Option<usize> {
+        let limit = limit.min(MAX_FD_NUM);
+        if start >= limit {
+            return None;
+        }
+        let scan_start = if start == 0 {
+            self.next_fd_hint.min(limit)
+        } else {
+            start
+        };
+        if let Some(index) = self
+            .fds
+            .iter()
+            .enumerate()
+            .take(limit)
+            .skip(scan_start)
+            .find_map(|(i, slot)| if slot.is_none() { Some(i) } else { None })
+        {
+            self.set_slot(index, fd, flags);
+            return Some(index);
+        }
+        if scan_start > start {
+            if let Some(index) = self
+                .fds
+                .iter()
+                .enumerate()
+                .take(scan_start)
+                .skip(start)
+                .find_map(|(i, slot)| if slot.is_none() { Some(i) } else { None })
+            {
+                self.set_slot(index, fd, flags);
+                return Some(index);
+            }
+        }
+        None
     }
 
     pub fn alloc(&mut self, fd: FileDescriptor) -> Option<usize> {
@@ -1121,15 +1216,7 @@ impl FileDescriptorTable {
         flags: usize,
         limit: usize,
     ) -> Option<usize> {
-        let limit = limit.min(MAX_FD_NUM);
-        for (i, slot) in self.fds.iter_mut().enumerate().take(limit) {
-            if slot.is_none() {
-                *slot = Some(fd);
-                self.fd_flags[i] = flags & FD_CLOEXEC;
-                return Some(i);
-            }
-        }
-        None
+        self.alloc_slot_from(0, limit, fd, flags)
     }
 
     pub fn alloc_from(&mut self, start: usize, fd: FileDescriptor) -> Option<usize> {
@@ -1152,23 +1239,14 @@ impl FileDescriptorTable {
         flags: usize,
         limit: usize,
     ) -> Option<usize> {
-        let limit = limit.min(MAX_FD_NUM);
-        for (i, slot) in self.fds.iter_mut().enumerate().take(limit).skip(start) {
-            if slot.is_none() {
-                *slot = Some(fd);
-                self.fd_flags[i] = flags & FD_CLOEXEC;
-                return Some(i);
-            }
-        }
-        None
+        self.alloc_slot_from(start, limit, fd, flags)
     }
 
     pub fn alloc_at(&mut self, index: usize, fd: FileDescriptor) -> Result<(), SysErrNo> {
         if index >= MAX_FD_NUM {
             return Err(SysErrNo::EBADF);
         }
-        self.fds[index] = Some(fd);
-        self.fd_flags[index] = 0;
+        self.set_slot(index, fd, 0);
         Ok(())
     }
 
@@ -1193,8 +1271,7 @@ impl FileDescriptorTable {
         if self.fds[fd].is_none() {
             return Err(SysErrNo::EBADF);
         }
-        self.fds[fd] = None;
-        self.fd_flags[fd] = 0;
+        self.clear_slot(fd);
         Ok(())
     }
 
@@ -1209,15 +1286,20 @@ impl FileDescriptorTable {
         if fd >= MAX_FD_NUM || self.fds[fd].is_none() {
             return Err(SysErrNo::EBADF);
         }
+        let old = self.fd_flags[fd];
         self.fd_flags[fd] = flags & FD_CLOEXEC;
+        self.cloexec_count = self.cloexec_count.saturating_sub(Self::count_cloexec(old))
+            + Self::count_cloexec(self.fd_flags[fd]);
         Ok(())
     }
 
     pub fn close_on_exec(&mut self) {
+        if self.cloexec_count == 0 {
+            return;
+        }
         for index in 0..MAX_FD_NUM {
             if self.fds[index].is_some() && (self.fd_flags[index] & FD_CLOEXEC) != 0 {
-                self.fds[index] = None;
-                self.fd_flags[index] = 0;
+                self.clear_slot(index);
             }
         }
     }
@@ -1227,6 +1309,8 @@ impl FileDescriptorTable {
             self.fds[index] = None;
             self.fd_flags[index] = 0;
         }
+        self.next_fd_hint = 0;
+        self.cloexec_count = 0;
     }
 
     pub fn dup(&mut self, old_fd: usize) -> Result<usize, SysErrNo> {
@@ -1267,8 +1351,7 @@ impl FileDescriptorTable {
             let _ = self.free(new_fd);
         }
         let fd = self.fds[old_fd].clone().unwrap();
-        self.fds[new_fd] = Some(fd);
-        self.fd_flags[new_fd] = 0;
+        self.set_slot(new_fd, fd, 0);
         Ok(new_fd)
     }
 
@@ -1427,6 +1510,7 @@ fn open_file_legacy_unused(
         } else {
             0
         };
+        crate::fs::ext4_vol::open_regular_ino(ino);
         return Ok(FileDescriptor::Ext4Regular {
             ino,
             offset: base_off,
@@ -1438,8 +1522,28 @@ fn open_file_legacy_unused(
 
     if want_create {
         let parent = fs::parent_path(&path_norm);
-        if ext4_vol::ext4_dir_path_exists(&parent) {
+        let mem_parent = fs::MEM_FS.lock().is_dir(&parent);
+        let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+        if mem_parent && (fs::is_memfs_volatile_dir(&parent) || !ext_parent) {
+            fs::MEM_FS.lock().add_file(&path_norm, Vec::new());
+            let times = fs::MEM_FS
+                .lock()
+                .get_file(&path_norm)
+                .map(|file| file.times)
+                .unwrap_or_else(FileTimes::now);
+            return Ok(FileDescriptor::MemFile {
+                name: path_norm,
+                content: Vec::new(),
+                times,
+                offset: 0,
+                readable: read_ok,
+                writable: write_ok,
+                append,
+            });
+        }
+        if ext_parent {
             let ino = ext4_vol::create_regular_ext4_with_mode(&path_norm, mode)?;
+            crate::fs::ext4_vol::open_regular_ino(ino);
             return Ok(FileDescriptor::Ext4Regular {
                 ino,
                 offset: 0,
@@ -1448,7 +1552,7 @@ fn open_file_legacy_unused(
                 append,
             });
         }
-        if fs::MEM_FS.lock().is_dir(&parent) {
+        if mem_parent {
             fs::MEM_FS.lock().add_file(&path_norm, Vec::new());
             let times = fs::MEM_FS
                 .lock()

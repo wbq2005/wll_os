@@ -808,11 +808,18 @@ pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EEXIST);
     }
     clear_whiteout(&norm);
-    if ext4_vol::ext4_dir_path_exists(&parent_path(&norm)) {
+    let parent = parent_path(&norm);
+    let mem_parent = MEM_FS.lock().is_dir(&parent);
+    let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+    if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
+        MEM_FS.lock().add_dir(&norm);
+        return Ok(());
+    }
+    if ext_parent {
         ext4_vol::mkdir_ext4_with_mode(&norm, mode)?;
         return Ok(());
     }
-    if MEM_FS.lock().is_dir(&parent_path(&norm)) {
+    if mem_parent {
         MEM_FS.lock().add_dir(&norm);
         return Ok(());
     }
@@ -830,10 +837,16 @@ pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
     }
     clear_whiteout(&norm);
     let parent = parent_path(&norm);
-    if ext4_vol::ext4_dir_path_exists(&parent) {
+    let mem_parent = MEM_FS.lock().is_dir(&parent);
+    let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+    if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
+        MEM_FS.lock().add_file(&norm, Vec::new());
+        return Ok(pseudo_inode(&norm) as u32);
+    }
+    if ext_parent {
         return ext4_vol::create_regular_ext4_with_mode(&norm, mode);
     }
-    if MEM_FS.lock().is_dir(&parent) {
+    if mem_parent {
         MEM_FS.lock().add_file(&norm, Vec::new());
         return Ok(pseudo_inode(&norm) as u32);
     }
@@ -1016,6 +1029,7 @@ pub fn open_path(
         } else {
             0
         };
+        ext4_vol::open_regular_ino(ino);
         return Ok(fd::FileDescriptor::Ext4Regular {
             ino,
             offset: base_off,
@@ -1027,9 +1041,30 @@ pub fn open_path(
 
     if want_create {
         let parent = parent_path(&path_norm);
-        if ext4_vol::ext4_dir_path_exists(&parent) {
+        let mem_parent = MEM_FS.lock().is_dir(&parent);
+        let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+        if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
+            MEM_FS.lock().add_file(&path_norm, Vec::new());
+            clear_whiteout(&path_norm);
+            let times = MEM_FS
+                .lock()
+                .get_file(&path_norm)
+                .map(|file| file.times)
+                .unwrap_or_else(super::FileTimes::now);
+            return Ok(fd::FileDescriptor::MemFile {
+                name: path_norm,
+                content: Vec::new(),
+                times,
+                offset: 0,
+                readable: read_ok,
+                writable: write_ok,
+                append,
+            });
+        }
+        if ext_parent {
             let ino = ext4_vol::create_regular_ext4_with_mode(&path_norm, mode)?;
             clear_whiteout(&path_norm);
+            ext4_vol::open_regular_ino(ino);
             return Ok(fd::FileDescriptor::Ext4Regular {
                 ino,
                 offset: 0,
@@ -1038,7 +1073,7 @@ pub fn open_path(
                 append,
             });
         }
-        if MEM_FS.lock().is_dir(&parent) {
+        if mem_parent {
             MEM_FS.lock().add_file(&path_norm, Vec::new());
             clear_whiteout(&path_norm);
             let times = MEM_FS

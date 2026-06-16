@@ -471,6 +471,31 @@ pub fn parent_path(path: &str) -> String {
     }
 }
 
+pub fn is_memfs_volatile_dir(path: &str) -> bool {
+    let norm = normalize_path(path);
+    let local = ["/musl", "/glibc"]
+        .iter()
+        .find_map(|root| {
+            norm.strip_prefix(root).and_then(|tail| {
+                if tail.is_empty() {
+                    Some("/")
+                } else if tail.starts_with('/') {
+                    Some(tail)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(norm.as_str());
+
+    local == "/tmp"
+        || local.starts_with("/tmp/")
+        || local == "/var/tmp"
+        || local.starts_with("/var/tmp/")
+        || local == "/dev/shm"
+        || local.starts_with("/dev/shm/")
+}
+
 fn child_name(parent: &str, child: &str) -> Option<String> {
     if child == parent || !child.starts_with(parent) {
         return None;
