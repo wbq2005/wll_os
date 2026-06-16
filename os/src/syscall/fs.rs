@@ -1763,10 +1763,13 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
 
 fn sys_sync_fd(fd: usize, data_only: bool) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let inner = task.inner.lock();
-    let fds = inner.fd_table.lock();
-    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-    super::with_kernel_page_table(|| crate::fs::sync_fd(file_desc, data_only))?;
+    let file_desc = {
+        let inner = task.inner.lock();
+        let fds = inner.fd_table.lock();
+        fds.get(fd).ok_or(SysErrNo::EBADF)?.clone()
+    };
+    super::mm::write_back_shared_mappings_for_file(&file_desc)?;
+    super::with_kernel_page_table(|| crate::fs::sync_fd(&file_desc, data_only))?;
     Ok(0)
 }
 
@@ -1779,6 +1782,7 @@ pub fn sys_fdatasync(fd: usize) -> SyscallRet {
 }
 
 pub fn sys_sync() -> SyscallRet {
+    super::mm::write_back_all_shared_file_mappings()?;
     super::with_kernel_page_table(crate::fs::sync_all)?;
     Ok(0)
 }

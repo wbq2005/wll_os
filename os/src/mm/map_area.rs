@@ -45,17 +45,7 @@ impl MapAreaBacking {
     }
 
     fn same_file(left: &FileDescriptor, right: &FileDescriptor) -> bool {
-        match (left, right) {
-            (
-                FileDescriptor::MemFile { name: left, .. },
-                FileDescriptor::MemFile { name: right, .. },
-            ) => left == right,
-            (
-                FileDescriptor::Ext4Regular { ino: left, .. },
-                FileDescriptor::Ext4Regular { ino: right, .. },
-            ) => left == right,
-            _ => false,
-        }
+        left.same_file_identity(right)
     }
 
     fn can_merge_with(&self, left_len: usize, right: &Self) -> bool {

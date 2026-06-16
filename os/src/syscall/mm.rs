@@ -131,10 +131,11 @@ fn read_area_bytes(area: &MapArea, src: usize, dst: &mut [u8]) -> Result<(), Sys
     Ok(())
 }
 
-fn collect_shared_file_writes(
+fn collect_shared_file_writes_for(
     task: &crate::task::TaskControlBlock,
     start: usize,
     end: usize,
+    target_file: Option<&FileDescriptor>,
 ) -> Result<Vec<(FileDescriptor, usize, Vec<u8>)>, SysErrNo> {
     let ms = task.memory_set.lock();
     let mut writes = Vec::new();
@@ -153,6 +154,12 @@ fn collect_shared_file_writes(
         if !*shared || !area.flags.contains(PTEFlags::W) {
             continue;
         }
+        if target_file
+            .map(|target| !file.same_file_identity(target))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if area.frames.is_empty() {
             continue;
         }
@@ -169,9 +176,40 @@ fn collect_shared_file_writes(
     Ok(writes)
 }
 
+fn collect_shared_file_writes(
+    task: &crate::task::TaskControlBlock,
+    start: usize,
+    end: usize,
+) -> Result<Vec<(FileDescriptor, usize, Vec<u8>)>, SysErrNo> {
+    collect_shared_file_writes_for(task, start, end, None)
+}
+
 fn write_back_shared_files(writes: Vec<(FileDescriptor, usize, Vec<u8>)>) -> Result<(), SysErrNo> {
     for (mut file, offset, data) in writes {
-        super::with_kernel_page_table(|| file.write_at(offset, &data))?;
+        if data.is_empty() {
+            continue;
+        }
+        let written = super::with_kernel_page_table(|| file.write_at(offset, &data))?;
+        if written != data.len() {
+            return Err(SysErrNo::EIO);
+        }
+        super::with_kernel_page_table(|| file.sync(false))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_back_shared_mappings_for_file(file: &FileDescriptor) -> Result<(), SysErrNo> {
+    for task in crate::task::manager::all_user_tasks() {
+        let writes = collect_shared_file_writes_for(&task, 0, USER_STACK_TOP, Some(file))?;
+        write_back_shared_files(writes)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_back_all_shared_file_mappings() -> Result<(), SysErrNo> {
+    for task in crate::task::manager::all_user_tasks() {
+        let writes = collect_shared_file_writes(&task, 0, USER_STACK_TOP)?;
+        write_back_shared_files(writes)?;
     }
     Ok(())
 }

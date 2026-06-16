@@ -312,6 +312,20 @@ impl FileDescriptor {
         matches!(self, FileDescriptor::PipeWrite { .. })
     }
 
+    pub fn same_file_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                FileDescriptor::MemFile { name: left, .. },
+                FileDescriptor::MemFile { name: right, .. },
+            ) => left == right,
+            (
+                FileDescriptor::Ext4Regular { ino: left, .. },
+                FileDescriptor::Ext4Regular { ino: right, .. },
+            ) => left == right,
+            _ => false,
+        }
+    }
+
     pub fn socket_state(&self) -> Option<Arc<Mutex<SocketState>>> {
         match self {
             FileDescriptor::Socket { state } => Some(state.clone()),
