@@ -3,7 +3,7 @@
 //! `ext4_rs::ext4_file_open` 在 crates.io 版中有误（打开类型被写成目录），此处不用它；
 //! 目录项逐级 `ext4_dir_get_entries`/`compare_name`，文件内容 [`Ext4::read_at`]。
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -16,7 +16,9 @@ const ROOT_INODE: u32 = 2;
 const MAX_FILE_OFFSET: usize = isize::MAX as usize;
 const REGULAR_CACHE_LIMIT: usize = 8 * 1024 * 1024;
 const DIRTY_RANGE_FILE_LIMIT: usize = 256 * 1024;
+const ASYNC_WRITEBACK_MIN_FILE: usize = 256 * 1024;
 const CLEAN_PAGE_CACHE_LIMIT: usize = 2048;
+const DEFAULT_WRITEBACK_WORKER_ENABLED: bool = false;
 fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
     let end = offset.checked_add(len).ok_or(SysErrNo::EFBIG)?;
     if end > MAX_FILE_OFFSET {
@@ -65,6 +67,49 @@ lazy_static! {
     static ref CLEAN_PAGE_CACHE: Mutex<CleanPageCache> = Mutex::new(CleanPageCache::new());
     static ref OPEN_REGULAR_REFS: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
     static ref PENDING_UNLINK_REGULAR: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+    static ref WRITEBACK_QUEUE: Mutex<WritebackQueue> = Mutex::new(WritebackQueue::new());
+}
+
+struct WritebackQueue {
+    pending: VecDeque<u32>,
+    queued: BTreeSet<u32>,
+}
+
+impl WritebackQueue {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            queued: BTreeSet::new(),
+        }
+    }
+
+    fn push(&mut self, ino: u32) {
+        if self.queued.insert(ino) {
+            self.pending.push_back(ino);
+        }
+    }
+
+    fn pop(&mut self) -> Option<u32> {
+        while let Some(ino) = self.pending.pop_front() {
+            if self.queued.remove(&ino) {
+                return Some(ino);
+            }
+        }
+        None
+    }
+
+    fn remove(&mut self, ino: u32) {
+        self.queued.remove(&ino);
+    }
+
+    fn has_work(&self) -> bool {
+        !self.queued.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.queued.clear();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +122,7 @@ struct DirtyRange {
 enum PageCacheWritebackState {
     Clean,
     Dirty,
+    Queued,
     Writeback,
     DirtyDuringWriteback,
 }
@@ -87,6 +133,7 @@ struct PageCacheDirtyModel {
     full_dirty: bool,
     size_dirty: bool,
     writeback: PageCacheWritebackState,
+    last_error: Option<SysErrNo>,
     seq: u64,
 }
 
@@ -97,6 +144,7 @@ impl PageCacheDirtyModel {
             full_dirty: false,
             size_dirty: false,
             writeback: PageCacheWritebackState::Clean,
+            last_error: None,
             seq: 0,
         }
     }
@@ -107,6 +155,7 @@ impl PageCacheDirtyModel {
             full_dirty: true,
             size_dirty: true,
             writeback: PageCacheWritebackState::Dirty,
+            last_error: None,
             seq: 1,
         }
     }
@@ -144,23 +193,47 @@ impl PageCacheDirtyModel {
         };
     }
 
-    fn begin_writeback(&mut self) -> u64 {
-        self.writeback = PageCacheWritebackState::Writeback;
-        self.seq
+    fn note_queued(&mut self) {
+        if self.data_dirty()
+            && matches!(
+                self.writeback,
+                PageCacheWritebackState::Dirty | PageCacheWritebackState::Queued
+            )
+        {
+            self.writeback = PageCacheWritebackState::Queued;
+        }
     }
 
-    fn finish_writeback(&mut self, seq: u64) {
+    fn writeback_active(&self) -> bool {
+        matches!(
+            self.writeback,
+            PageCacheWritebackState::Writeback | PageCacheWritebackState::DirtyDuringWriteback
+        )
+    }
+
+    fn begin_writeback(&mut self) -> Option<u64> {
+        if self.writeback_active() || !self.data_dirty() {
+            return None;
+        }
+        self.writeback = PageCacheWritebackState::Writeback;
+        Some(self.seq)
+    }
+
+    fn finish_writeback(&mut self, seq: u64) -> bool {
         if self.seq == seq {
             self.ranges.clear();
             self.full_dirty = false;
             self.size_dirty = false;
             self.writeback = PageCacheWritebackState::Clean;
+            self.last_error = None;
         } else {
             self.writeback = PageCacheWritebackState::Dirty;
         }
+        self.data_dirty()
     }
 
-    fn fail_writeback(&mut self) {
+    fn fail_writeback(&mut self, err: SysErrNo) {
+        self.last_error = Some(err);
         self.writeback = if self.data_dirty() {
             PageCacheWritebackState::Dirty
         } else {
@@ -192,6 +265,30 @@ struct CachedRegularInfo {
     mtime_extra: u32,
     ctime_sec: u32,
     ctime_extra: u32,
+}
+
+enum WritebackData {
+    Whole(Vec<u8>),
+    Ranges(Vec<(usize, Vec<u8>)>),
+}
+
+struct WritebackSnapshot {
+    ino: u32,
+    target_len: usize,
+    data: WritebackData,
+    dirty_seq: u64,
+    mtime_sec: u32,
+    mtime_extra: u32,
+    ctime_sec: u32,
+    ctime_extra: u32,
+}
+
+enum WritebackSnapshotResult {
+    NoCache,
+    Clean,
+    Failed(SysErrNo),
+    Busy,
+    Snapshot(WritebackSnapshot),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -389,6 +486,82 @@ fn note_cached_data_write(cached: &mut CachedRegularFile) {
     cached.mtime_extra = 0;
     cached.ctime_sec = now;
     cached.ctime_extra = 0;
+}
+
+fn cached_file_async_writeback_ok(cached: &CachedRegularFile) -> bool {
+    cached.data.len() >= ASYNC_WRITEBACK_MIN_FILE && cached.data.len() <= REGULAR_CACHE_LIMIT
+}
+
+fn schedule_cached_writeback_if_ready(ino: u32) {
+    let should_queue = {
+        let mut cache = REGULAR_FILE_CACHE.lock();
+        let Some(cached) = cache.get_mut(&ino) else {
+            return;
+        };
+        if !cached.is_dirty()
+            || cached.dirty.writeback_active()
+            || !cached_file_async_writeback_ok(cached)
+        {
+            false
+        } else {
+            cached.dirty.note_queued();
+            true
+        }
+    };
+    if should_queue {
+        queue_writeback_ino(ino);
+    }
+}
+
+fn wake_writeback_waiters() {
+    crate::task::wait_queue::wake_io_waiters();
+}
+
+pub fn start_writeback_worker_explicit() -> Result<(), SysErrNo> {
+    if !DEFAULT_WRITEBACK_WORKER_ENABLED {
+        return Err(SysErrNo::ENOSYS);
+    }
+    // The foreground judge harness fetches normal tasks as user contexts. Keep
+    // the worker hook explicit but disabled until the scheduler has a separate
+    // kernel-worker lane.
+    Err(SysErrNo::ENOSYS)
+}
+
+fn queue_writeback_ino(ino: u32) {
+    WRITEBACK_QUEUE.lock().push(ino);
+    wake_writeback_waiters();
+}
+
+fn cancel_queued_writeback(ino: u32) {
+    WRITEBACK_QUEUE.lock().remove(ino);
+}
+
+fn writeback_worker_main() -> ! {
+    loop {
+        if let Some(ino) = WRITEBACK_QUEUE.lock().pop() {
+            if let Err(err) = drain_queued_writeback_ino(ino) {
+                log::debug!("[fs] async writeback ino={} failed: {:?}", ino, err);
+            }
+            crate::task::suspend_current_and_run_next();
+            continue;
+        }
+
+        let _ = crate::task::wait_queue::sleep_on_io_if(None, || {
+            Ok(!WRITEBACK_QUEUE.lock().has_work())
+        });
+    }
+}
+
+fn opportunistic_drain_one_queued_writeback() {
+    let Some(ino) = WRITEBACK_QUEUE.lock().pop() else {
+        return;
+    };
+    let _ = drain_queued_writeback_ino(ino);
+}
+
+fn opportunistic_drain_queued_writeback_ino(ino: u32) {
+    cancel_queued_writeback(ino);
+    let _ = drain_queued_writeback_ino(ino);
 }
 
 fn mark_dirty_range(cached: &mut CachedRegularFile, start: usize, end: usize) {
@@ -614,6 +787,7 @@ fn cached_regular_info(ino: u32) -> Option<CachedRegularInfo> {
 }
 
 fn cached_regular_resize(ino: u32, new_len: usize) -> Result<(), SysErrNo> {
+    cancel_queued_writeback(ino);
     invalidate_clean_pages_ino(ino);
     let mut cache = REGULAR_FILE_CACHE.lock();
     let cached = cache.get_mut(&ino).ok_or(SysErrNo::ENOENT)?;
@@ -626,6 +800,8 @@ fn cached_regular_resize(ino: u32, new_len: usize) -> Result<(), SysErrNo> {
     }
     cached.dirty.size_dirty = true;
     note_cached_data_write(cached);
+    drop(cache);
+    schedule_cached_writeback_if_ready(ino);
     Ok(())
 }
 
@@ -648,6 +824,8 @@ fn cached_regular_write(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, Sy
         mark_dirty_range(cached, offset, end);
     }
     note_cached_data_write(cached);
+    drop(cache);
+    schedule_cached_writeback_if_ready(ino);
     Ok(buf.len())
 }
 
@@ -660,6 +838,7 @@ pub fn can_use_clean_page_cache(ino: u32) -> bool {
 }
 
 fn discard_regular_cache(ino: u32) {
+    cancel_queued_writeback(ino);
     REGULAR_FILE_CACHE.lock().remove(&ino);
     invalidate_clean_pages_ino(ino);
     DATA_TIME_OVERRIDES.lock().remove(&ino);
@@ -689,11 +868,13 @@ pub fn close_regular_ino(ino: u32) {
         }
     };
     if last_ref && PENDING_UNLINK_REGULAR.lock().remove(&ino) {
+        cancel_queued_writeback(ino);
         let _ = finish_unlinked_regular(ino);
     }
 }
 
 fn finish_unlinked_regular(ino: u32) -> Result<(), SysErrNo> {
+    cancel_queued_writeback(ino);
     discard_regular_cache(ino);
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let mut iref = fs.get_inode_ref(ino);
@@ -759,129 +940,206 @@ fn flush_time_override(ino: u32) -> Result<(), SysErrNo> {
     Ok(())
 }
 
-pub fn flush_cached_ino(ino: u32) -> Result<(), SysErrNo> {
-    let (
-        target_len,
-        whole_data,
-        dirty_ranges,
-        dirty_seq,
-        mtime_sec,
-        mtime_extra,
-        ctime_sec,
-        ctime_extra,
-    ) = {
-        let mut cache = REGULAR_FILE_CACHE.lock();
-        let Some(cached) = cache.get_mut(&ino) else {
-            return flush_time_override(ino);
-        };
-        if !cached.is_dirty() {
-            return flush_time_override(ino);
-        }
-        let dirty_bytes = cached.dirty.ranges.iter().fold(0usize, |total, range| {
-            total.saturating_add(range.end.saturating_sub(range.start))
-        });
-        let write_whole =
-            cached.dirty.full_dirty || dirty_bytes.saturating_mul(2) >= cached.data.len();
-        let dirty_seq = cached.dirty.begin_writeback();
-        (
-            cached.data.len(),
-            write_whole.then(|| cached.data.clone()),
-            cached.dirty.ranges.clone(),
-            dirty_seq,
-            cached.mtime_sec,
-            cached.mtime_extra,
-            cached.ctime_sec,
-            cached.ctime_extra,
-        )
+fn take_writeback_snapshot(ino: u32) -> WritebackSnapshotResult {
+    let mut cache = REGULAR_FILE_CACHE.lock();
+    let Some(cached) = cache.get_mut(&ino) else {
+        return WritebackSnapshotResult::NoCache;
+    };
+    if !cached.is_dirty() {
+        return WritebackSnapshotResult::Clean;
+    }
+    if let Some(err) = cached.dirty.last_error {
+        return WritebackSnapshotResult::Failed(err);
+    }
+    let Some(dirty_seq) = cached.dirty.begin_writeback() else {
+        return WritebackSnapshotResult::Busy;
     };
 
-    let result = (|| -> Result<(), SysErrNo> {
-        let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-        let old_size = fs.get_inode_ref(ino).inode.size();
-        if (target_len as u64) < old_size {
-            let mut iref = fs.get_inode_ref(ino);
-            fs.truncate_inode(&mut iref, target_len as u64)
-                .map_err(map_ext4_err)?;
+    let dirty_bytes = cached.dirty.ranges.iter().fold(0usize, |total, range| {
+        total.saturating_add(range.end.saturating_sub(range.start))
+    });
+    let write_whole = cached.dirty.full_dirty || dirty_bytes.saturating_mul(2) >= cached.data.len();
+    let data = if write_whole {
+        WritebackData::Whole(cached.data.clone())
+    } else {
+        let mut ranges = Vec::new();
+        for range in cached.dirty.ranges.iter().copied() {
+            let end = range.end.min(cached.data.len());
+            if range.start < end {
+                ranges.push((range.start, cached.data[range.start..end].to_vec()));
+            }
         }
+        WritebackData::Ranges(ranges)
+    };
 
-        if let Some(data) = whole_data {
+    WritebackSnapshotResult::Snapshot(WritebackSnapshot {
+        ino,
+        target_len: cached.data.len(),
+        data,
+        dirty_seq,
+        mtime_sec: cached.mtime_sec,
+        mtime_extra: cached.mtime_extra,
+        ctime_sec: cached.ctime_sec,
+        ctime_extra: cached.ctime_extra,
+    })
+}
+
+fn apply_writeback_snapshot(snapshot: &WritebackSnapshot) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let old_size = fs.get_inode_ref(snapshot.ino).inode.size();
+    if (snapshot.target_len as u64) < old_size {
+        let mut iref = fs.get_inode_ref(snapshot.ino);
+        fs.truncate_inode(&mut iref, snapshot.target_len as u64)
+            .map_err(map_ext4_err)?;
+    }
+
+    match &snapshot.data {
+        WritebackData::Whole(data) => {
             if !data.is_empty() {
-                let written = fs.write_at(ino, 0, &data).map_err(map_ext4_err)?;
+                let written = fs.write_at(snapshot.ino, 0, data).map_err(map_ext4_err)?;
                 if written != data.len() {
                     return Err(SysErrNo::EIO);
                 }
             }
-        } else {
-            for range in dirty_ranges {
-                let end = range.end.min(target_len);
-                if range.start >= end {
-                    continue;
-                }
-                let data = {
-                    let cache = REGULAR_FILE_CACHE.lock();
-                    let Some(cached) = cache.get(&ino) else {
-                        return Ok(());
-                    };
-                    let current_end = end.min(cached.data.len());
-                    if range.start >= current_end {
-                        Vec::new()
-                    } else {
-                        cached.data[range.start..current_end].to_vec()
-                    }
-                };
+        }
+        WritebackData::Ranges(ranges) => {
+            for (start, data) in ranges {
                 if data.is_empty() {
                     continue;
                 }
-                let written = fs.write_at(ino, range.start, &data).map_err(map_ext4_err)?;
+                let written = fs
+                    .write_at(snapshot.ino, *start, data)
+                    .map_err(map_ext4_err)?;
                 if written != data.len() {
                     return Err(SysErrNo::EIO);
                 }
             }
         }
+    }
 
-        if target_len == 0 && old_size != 0 {
-            let current_size = fs.get_inode_ref(ino).inode.size();
-            if current_size != 0 {
-                return Err(SysErrNo::EIO);
+    if snapshot.target_len == 0 && old_size != 0 {
+        let current_size = fs.get_inode_ref(snapshot.ino).inode.size();
+        if current_size != 0 {
+            return Err(SysErrNo::EIO);
+        }
+    }
+
+    let mut iref = fs.get_inode_ref(snapshot.ino);
+    iref.inode.set_mtime(snapshot.mtime_sec);
+    iref.inode.set_i_mtime_extra(snapshot.mtime_extra);
+    iref.inode.set_ctime(snapshot.ctime_sec);
+    iref.inode.set_i_ctime_extra(snapshot.ctime_extra);
+    fs.write_back_inode(&mut iref);
+    DATA_TIME_OVERRIDES.lock().remove(&snapshot.ino);
+    Ok(())
+}
+
+fn finish_writeback_snapshot(
+    snapshot: &WritebackSnapshot,
+    result: Result<(), SysErrNo>,
+) -> Result<(), SysErrNo> {
+    let mut requeue = false;
+    {
+        let mut cache = REGULAR_FILE_CACHE.lock();
+        if let Some(cached) = cache.get_mut(&snapshot.ino) {
+            if result.is_ok() {
+                requeue = cached.dirty.finish_writeback(snapshot.dirty_seq);
+            } else {
+                cached
+                    .dirty
+                    .fail_writeback(result.as_ref().err().copied().unwrap_or(SysErrNo::EIO));
             }
         }
-
-        let mut iref = fs.get_inode_ref(ino);
-        iref.inode.set_mtime(mtime_sec);
-        iref.inode.set_i_mtime_extra(mtime_extra);
-        iref.inode.set_ctime(ctime_sec);
-        iref.inode.set_i_ctime_extra(ctime_extra);
-        fs.write_back_inode(&mut iref);
-        DATA_TIME_OVERRIDES.lock().remove(&ino);
-        Ok(())
-    })();
-
-    let mut cache = REGULAR_FILE_CACHE.lock();
-    if let Some(cached) = cache.get_mut(&ino) {
-        if result.is_ok() {
-            cached.dirty.finish_writeback(dirty_seq);
-        } else {
-            cached.dirty.fail_writeback();
-        }
+    }
+    if requeue {
+        schedule_cached_writeback_if_ready(snapshot.ino);
     }
     result
 }
 
+fn acknowledge_writeback_error(ino: u32, err: SysErrNo) {
+    let mut cache = REGULAR_FILE_CACHE.lock();
+    if let Some(cached) = cache.get_mut(&ino) {
+        if cached.dirty.last_error == Some(err) {
+            cached.dirty.last_error = None;
+        }
+    }
+}
+
+fn drain_queued_writeback_ino(ino: u32) -> Result<(), SysErrNo> {
+    match take_writeback_snapshot(ino) {
+        WritebackSnapshotResult::NoCache | WritebackSnapshotResult::Clean => Ok(()),
+        WritebackSnapshotResult::Failed(err) => Err(err),
+        WritebackSnapshotResult::Busy => {
+            queue_writeback_ino(ino);
+            Ok(())
+        }
+        WritebackSnapshotResult::Snapshot(snapshot) => {
+            let result = apply_writeback_snapshot(&snapshot);
+            finish_writeback_snapshot(&snapshot, result)
+        }
+    }
+}
+
+fn wait_for_writeback_progress() -> Result<(), SysErrNo> {
+    if crate::trap::foreground_driver_active() {
+        return Err(SysErrNo::EBUSY);
+    }
+    if crate::task::yield_current_once() {
+        Ok(())
+    } else {
+        Err(SysErrNo::EBUSY)
+    }
+}
+
+pub fn flush_cached_ino(ino: u32) -> Result<(), SysErrNo> {
+    cancel_queued_writeback(ino);
+    loop {
+        cancel_queued_writeback(ino);
+        match take_writeback_snapshot(ino) {
+            WritebackSnapshotResult::NoCache | WritebackSnapshotResult::Clean => {
+                return flush_time_override(ino);
+            }
+            WritebackSnapshotResult::Failed(err) => {
+                acknowledge_writeback_error(ino, err);
+                return Err(err);
+            }
+            WritebackSnapshotResult::Busy => {
+                wait_for_writeback_progress()?;
+                continue;
+            }
+            WritebackSnapshotResult::Snapshot(snapshot) => {
+                let result = apply_writeback_snapshot(&snapshot);
+                finish_writeback_snapshot(&snapshot, result)?;
+            }
+        }
+    }
+}
+
 pub fn flush_all_cached() -> Result<(), SysErrNo> {
+    let mut first_error = None;
     let inos: Vec<u32> = REGULAR_FILE_CACHE
         .lock()
         .iter()
         .filter_map(|(ino, cached)| cached.is_dirty().then_some(*ino))
         .collect();
     for ino in inos {
-        flush_cached_ino(ino)?;
+        if let Err(err) = flush_cached_ino(ino) {
+            first_error.get_or_insert(err);
+        }
     }
     let override_inos: Vec<u32> = DATA_TIME_OVERRIDES.lock().keys().copied().collect();
     for ino in override_inos {
-        flush_time_override(ino)?;
+        if let Err(err) = flush_time_override(ino) {
+            first_error.get_or_insert(err);
+        }
     }
     clear_clean_page_cache();
-    Ok(())
+    if let Some(err) = first_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 fn metadata_for_ino(fs: &Ext4, ino: u32) -> Ext4Metadata {
@@ -933,6 +1191,7 @@ fn clear_namespace_cache() {
 
 fn clear_all_caches() {
     clear_namespace_cache();
+    WRITEBACK_QUEUE.lock().clear();
     DATA_TIME_OVERRIDES.lock().clear();
     REGULAR_FILE_CACHE.lock().clear();
     clear_clean_page_cache();
