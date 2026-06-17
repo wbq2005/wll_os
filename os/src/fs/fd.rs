@@ -28,6 +28,8 @@ pub type FileOffset = usize;
 const CONSOLE_LINE_CAP: usize = 512;
 const MAX_FILE_OFFSET: usize = isize::MAX as usize;
 const PIPE_CAPACITY: usize = 64 * 1024;
+const MEM_FILE_INLINE_LIMIT: usize = 1024 * 1024;
+const MEM_FILE_CHUNK_SIZE: usize = 64 * 1024;
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
 
@@ -39,34 +41,176 @@ fn is_dev_zero_path(path: &str) -> bool {
     matches!(path, "/dev/zero" | "/glibc/dev/zero" | "/musl/dev/zero")
 }
 
-fn refresh_mem_file(name: &str, content: &mut Vec<u8>, times: &mut FileTimes) -> bool {
+#[derive(Debug, Clone)]
+pub enum MemFileContent {
+    Inline(Vec<u8>),
+    Chunked { len: usize, chunks: Vec<Vec<u8>> },
+}
+
+impl MemFileContent {
+    pub fn new() -> Self {
+        Self::Inline(Vec::new())
+    }
+
+    pub fn from_slice(content: &[u8]) -> Self {
+        if content.len() <= MEM_FILE_INLINE_LIMIT {
+            return Self::Inline(content.to_vec());
+        }
+        let mut chunks = Vec::new();
+        for part in content.chunks(MEM_FILE_CHUNK_SIZE) {
+            chunks.push(part.to_vec());
+        }
+        Self::Chunked {
+            len: content.len(),
+            chunks,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Inline(content) => content.len(),
+            Self::Chunked { len, .. } => *len,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    pub fn is_elf_image(&self) -> bool {
+        let mut magic = [0u8; 4];
+        self.read_at(0, &mut magic) == 4 && magic == [0x7f, b'E', b'L', b'F']
+    }
+
+    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let len = self.len();
+        if offset >= len || buf.is_empty() {
+            return 0;
+        }
+        let to_read = buf.len().min(len - offset);
+        match self {
+            Self::Inline(content) => {
+                buf[..to_read].copy_from_slice(&content[offset..offset + to_read]);
+            }
+            Self::Chunked { chunks, .. } => {
+                let mut copied = 0usize;
+                while copied < to_read {
+                    let pos = offset + copied;
+                    let chunk_idx = pos / MEM_FILE_CHUNK_SIZE;
+                    let chunk_off = pos % MEM_FILE_CHUNK_SIZE;
+                    let n = (to_read - copied).min(chunks[chunk_idx].len() - chunk_off);
+                    buf[copied..copied + n]
+                        .copy_from_slice(&chunks[chunk_idx][chunk_off..chunk_off + n]);
+                    copied += n;
+                }
+            }
+        }
+        to_read
+    }
+
+    pub fn write_at(&mut self, offset: usize, buf: &[u8]) -> usize {
+        let end = offset + buf.len();
+        self.resize(end);
+        match self {
+            Self::Inline(content) => {
+                content[offset..end].copy_from_slice(buf);
+            }
+            Self::Chunked { chunks, .. } => {
+                let mut copied = 0usize;
+                while copied < buf.len() {
+                    let pos = offset + copied;
+                    let chunk_idx = pos / MEM_FILE_CHUNK_SIZE;
+                    let chunk_off = pos % MEM_FILE_CHUNK_SIZE;
+                    let n = (buf.len() - copied).min(MEM_FILE_CHUNK_SIZE - chunk_off);
+                    chunks[chunk_idx][chunk_off..chunk_off + n]
+                        .copy_from_slice(&buf[copied..copied + n]);
+                    copied += n;
+                }
+            }
+        }
+        end
+    }
+
+    pub fn resize(&mut self, new_len: usize) {
+        match self {
+            Self::Inline(content) if new_len <= MEM_FILE_INLINE_LIMIT => {
+                content.resize(new_len, 0);
+            }
+            Self::Inline(content) => {
+                let old = core::mem::take(content);
+                let mut chunks = Vec::new();
+                for part in old.chunks(MEM_FILE_CHUNK_SIZE) {
+                    chunks.push(part.to_vec());
+                }
+                *self = Self::Chunked {
+                    len: old.len(),
+                    chunks,
+                };
+                self.resize(new_len);
+            }
+            Self::Chunked { len, chunks } => {
+                let needed = if new_len == 0 {
+                    0
+                } else {
+                    (new_len + MEM_FILE_CHUNK_SIZE - 1) / MEM_FILE_CHUNK_SIZE
+                };
+                while chunks.len() < needed {
+                    chunks.push(Vec::new());
+                }
+                chunks.truncate(needed);
+                for idx in 0..needed {
+                    let start = idx * MEM_FILE_CHUNK_SIZE;
+                    let target = (new_len - start).min(MEM_FILE_CHUNK_SIZE);
+                    chunks[idx].resize(target, 0);
+                }
+                *len = new_len;
+                if new_len <= MEM_FILE_INLINE_LIMIT {
+                    let flattened = self.to_vec();
+                    *self = Self::Inline(flattened);
+                }
+            }
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        match self {
+            Self::Inline(content) => content.clone(),
+            Self::Chunked { len, chunks } => {
+                let mut out = Vec::with_capacity(*len);
+                for chunk in chunks {
+                    out.extend_from_slice(chunk);
+                }
+                out.truncate(*len);
+                out
+            }
+        }
+    }
+}
+
+fn refresh_mem_file(
+    name: &str,
+    content: &mut MemFileContent,
+    times: &mut FileTimes,
+    linked: &mut bool,
+) -> bool {
     if is_dev_null_path(name) || is_dev_zero_path(name) {
         return true;
     }
+    if !*linked {
+        return false;
+    }
     if let Some(file) = MEM_FS.lock().get_file(name) {
-        *content = file.content.clone();
+        *content = MemFileContent::from_slice(&file.content);
         *times = file.times;
         true
     } else {
+        *linked = false;
         false
     }
 }
 
-fn write_mem_content(content: &mut Vec<u8>, offset: usize, buf: &[u8]) -> usize {
-    let end = offset + buf.len();
-    if offset == content.len() {
-        let spare = content.capacity().saturating_sub(content.len());
-        if spare < buf.len() {
-            content.reserve((64 * 1024).max(buf.len()));
-        }
-        content.extend_from_slice(buf);
-    } else {
-        if end > content.len() {
-            content.resize(end, 0);
-        }
-        content[offset..end].copy_from_slice(buf);
-    }
-    end
+fn write_mem_content(content: &mut MemFileContent, offset: usize, buf: &[u8]) -> usize {
+    content.write_at(offset, buf)
 }
 
 lazy_static! {
@@ -142,12 +286,13 @@ pub enum FileDescriptor {
     /// 内存文件（预载只读 `writable=false`；`O_CREAT` 可走可写）
     MemFile {
         name: String,
-        content: Vec<u8>,
+        content: MemFileContent,
         times: FileTimes,
         offset: FileOffset,
         readable: bool,
         writable: bool,
         append: bool,
+        linked: bool,
     },
     /// 内存目录
     MemDir {
@@ -494,6 +639,7 @@ impl FileDescriptor {
                 times,
                 offset,
                 readable,
+                linked,
                 ..
             } => {
                 if !*readable {
@@ -507,13 +653,11 @@ impl FileDescriptor {
                     *offset = (*offset).saturating_add(buf.len());
                     return Ok(buf.len());
                 }
-                refresh_mem_file(name, content, times);
+                refresh_mem_file(name, content, times, linked);
                 if *offset >= content.len() {
                     return Ok(0);
                 }
-                let remaining = content.len() - *offset;
-                let to_read = buf.len().min(remaining);
-                buf[..to_read].copy_from_slice(&content[*offset..*offset + to_read]);
+                let to_read = content.read_at(*offset, buf);
                 *offset += to_read;
                 Ok(to_read)
             }
@@ -607,6 +751,7 @@ impl FileDescriptor {
                 content,
                 times,
                 readable,
+                linked,
                 ..
             } => {
                 if !*readable {
@@ -619,12 +764,11 @@ impl FileDescriptor {
                     buf.fill(0);
                     return Ok(buf.len());
                 }
-                refresh_mem_file(name, content, times);
+                refresh_mem_file(name, content, times, linked);
                 if offset >= content.len() {
                     return Ok(0);
                 }
-                let to_read = buf.len().min(content.len() - offset);
-                buf[..to_read].copy_from_slice(&content[offset..offset + to_read]);
+                let to_read = content.read_at(offset, buf);
                 Ok(to_read)
             }
             FileDescriptor::Ext4Regular { ino, readable, .. } => {
@@ -649,6 +793,7 @@ impl FileDescriptor {
                 content,
                 times,
                 writable,
+                linked,
                 ..
             } => {
                 if !*writable {
@@ -660,14 +805,14 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                let mem_live = refresh_mem_file(name, content, times);
+                let mem_live = refresh_mem_file(name, content, times, linked);
                 Self::checked_file_end(offset, buf.len())?;
                 write_mem_content(content, offset, buf);
                 times.touch_modified();
                 if mem_live {
                     MEM_FS
                         .lock()
-                        .write_file_content(name, content.clone(), *times);
+                        .write_file_content(name, content.to_vec(), *times);
                 }
                 Ok(buf.len())
             }
@@ -702,6 +847,7 @@ impl FileDescriptor {
                 offset,
                 writable,
                 append,
+                linked,
                 ..
             } => {
                 if !*writable {
@@ -713,7 +859,7 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                let mem_live = refresh_mem_file(name, content, times);
+                let mem_live = refresh_mem_file(name, content, times, linked);
                 if *append {
                     *offset = content.len();
                 }
@@ -725,7 +871,7 @@ impl FileDescriptor {
                 if mem_live {
                     MEM_FS
                         .lock()
-                        .write_file_content(name, content.clone(), *times);
+                        .write_file_content(name, content.to_vec(), *times);
                 }
 
                 Ok(buf.len())
@@ -865,9 +1011,16 @@ impl FileDescriptor {
     /// 获取文件大小
     pub fn size(&self) -> usize {
         match self {
-            FileDescriptor::MemFile { name, content, .. } => {
+            FileDescriptor::MemFile {
+                name,
+                content,
+                linked,
+                ..
+            } => {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     0
+                } else if !*linked {
+                    content.len()
                 } else {
                     MEM_FS
                         .lock()
@@ -898,6 +1051,7 @@ impl FileDescriptor {
                 content,
                 times,
                 writable,
+                linked,
                 ..
             } => {
                 if !*writable {
@@ -906,13 +1060,13 @@ impl FileDescriptor {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(());
                 }
-                let mem_live = refresh_mem_file(name, content, times);
-                content.resize(new_len, 0);
+                let mem_live = refresh_mem_file(name, content, times, linked);
+                content.resize(new_len);
                 times.touch_modified();
                 if mem_live {
                     MEM_FS
                         .lock()
-                        .write_file_content(name, content.clone(), *times);
+                        .write_file_content(name, content.to_vec(), *times);
                 }
                 Ok(())
             }
@@ -1026,6 +1180,7 @@ impl Clone for FileDescriptor {
                 readable,
                 writable,
                 append,
+                linked,
             } => FileDescriptor::MemFile {
                 name: name.clone(),
                 content: content.clone(),
@@ -1034,6 +1189,7 @@ impl Clone for FileDescriptor {
                 readable: *readable,
                 writable: *writable,
                 append: *append,
+                linked: *linked,
             },
             FileDescriptor::MemDir {
                 path,
@@ -1442,8 +1598,9 @@ fn open_file_legacy_unused(
         let source = fs::MEM_FS
             .lock()
             .get_file(&path_norm)
-            .map(|file| (file.content.clone(), file.times));
-        let (mut content, mut times) = source.unwrap_or_else(|| (Vec::new(), FileTimes::now()));
+            .map(|file| (MemFileContent::from_slice(&file.content), file.times));
+        let (mut content, mut times) =
+            source.unwrap_or_else(|| (MemFileContent::new(), FileTimes::now()));
         if want_trunc && write_ok {
             content.clear();
             fs::MEM_FS.lock().truncate_file(&path_norm, 0)?;
@@ -1460,6 +1617,7 @@ fn open_file_legacy_unused(
             readable: read_ok,
             writable: write_ok,
             append,
+            linked: true,
         });
     }
 
@@ -1547,12 +1705,13 @@ fn open_file_legacy_unused(
                 .unwrap_or_else(FileTimes::now);
             return Ok(FileDescriptor::MemFile {
                 name: path_norm,
-                content: Vec::new(),
+                content: MemFileContent::new(),
                 times,
                 offset: 0,
                 readable: read_ok,
                 writable: write_ok,
                 append,
+                linked: true,
             });
         }
         if ext_parent {
@@ -1564,6 +1723,7 @@ fn open_file_legacy_unused(
                 readable: read_ok,
                 writable: write_ok,
                 append,
+                linked: true,
             });
         }
         if mem_parent {
@@ -1575,12 +1735,13 @@ fn open_file_legacy_unused(
                 .unwrap_or_else(FileTimes::now);
             return Ok(FileDescriptor::MemFile {
                 name: path_norm,
-                content: Vec::new(),
+                content: MemFileContent::new(),
                 times,
                 offset: 0,
                 readable: read_ok,
                 writable: write_ok,
                 append,
+                linked: true,
             });
         }
         return Err(SysErrNo::ENOENT);

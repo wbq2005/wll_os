@@ -190,25 +190,25 @@ fn metadata_for_char_device(path: &str, major: u32, minor: u32) -> VfsMetadata {
     meta
 }
 
-fn metadata_for_mem_file(name: &str, content: &[u8]) -> VfsMetadata {
+fn metadata_for_mem_file(name: &str, len: usize, is_elf: bool) -> VfsMetadata {
     if is_dev_null_path(name) {
         return metadata_for_char_device(name, DEV_NULL_MAJOR, DEV_NULL_MINOR);
     }
     if is_dev_zero_path(name) {
         return metadata_for_char_device(name, DEV_ZERO_MAJOR, DEV_ZERO_MINOR);
     }
-    let perm = if is_elf_image(content) { 0o777 } else { 0o666 };
+    let perm = if is_elf { 0o777 } else { 0o666 };
     synthetic_metadata(
         name,
         VfsNodeKind::Regular,
         S_IFREG | perm,
-        content.len() as u64,
+        len as u64,
         1,
     )
 }
 
 fn metadata_from_mem_file(file: &super::MemFile) -> VfsMetadata {
-    let mut meta = metadata_for_mem_file(&file.name, &file.content);
+    let mut meta = metadata_for_mem_file(&file.name, file.content.len(), is_elf_image(&file.content));
     meta.atime_sec = file.times.atime_sec;
     meta.atime_nsec = file.times.atime_nsec;
     meta.mtime_sec = file.times.mtime_sec;
@@ -218,8 +218,12 @@ fn metadata_from_mem_file(file: &super::MemFile) -> VfsMetadata {
     meta
 }
 
-fn metadata_from_mem_fd(name: &str, content: &[u8], times: super::FileTimes) -> VfsMetadata {
-    let mut meta = metadata_for_mem_file(name, content);
+fn metadata_from_mem_fd(
+    name: &str,
+    content: &fd::MemFileContent,
+    times: super::FileTimes,
+) -> VfsMetadata {
+    let mut meta = metadata_for_mem_file(name, content.len(), content.is_elf_image());
     meta.atime_sec = times.atime_sec;
     meta.atime_nsec = times.atime_nsec;
     meta.mtime_sec = times.mtime_sec;
@@ -307,11 +311,16 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
             name,
             content,
             times,
+            linked,
             ..
         } => {
-            let mem = MEM_FS.lock();
-            if let Some(file) = mem.get_file(name) {
-                Ok(metadata_from_mem_file(file))
+            if *linked {
+                let mem = MEM_FS.lock();
+                if let Some(file) = mem.get_file(name) {
+                    Ok(metadata_from_mem_file(file))
+                } else {
+                    Ok(metadata_from_mem_fd(name, content, *times))
+                }
             } else {
                 Ok(metadata_from_mem_fd(name, content, *times))
             }
@@ -970,9 +979,9 @@ pub fn open_path(
         let source = MEM_FS
             .lock()
             .get_file(&path_norm)
-            .map(|file| (file.content.clone(), file.times));
+            .map(|file| (fd::MemFileContent::from_slice(&file.content), file.times));
         let (mut content, mut times) =
-            source.unwrap_or_else(|| (Vec::new(), super::FileTimes::now()));
+            source.unwrap_or_else(|| (fd::MemFileContent::new(), super::FileTimes::now()));
         if want_trunc && write_ok {
             content.clear();
             MEM_FS.lock().truncate_file(&path_norm, 0)?;
@@ -982,13 +991,14 @@ pub fn open_path(
         }
         let base_off = if append && write_ok { content.len() } else { 0 };
         return Ok(fd::FileDescriptor::MemFile {
-            name: path_norm,
-            content,
-            times,
+                name: path_norm,
+                content,
+                times,
             offset: base_off,
             readable: read_ok,
             writable: write_ok,
             append,
+            linked: true,
         });
     }
 
@@ -1053,12 +1063,13 @@ pub fn open_path(
                 .unwrap_or_else(super::FileTimes::now);
             return Ok(fd::FileDescriptor::MemFile {
                 name: path_norm,
-                content: Vec::new(),
+                content: fd::MemFileContent::new(),
                 times,
                 offset: 0,
                 readable: read_ok,
                 writable: write_ok,
                 append,
+                linked: true,
             });
         }
         if ext_parent {
@@ -1083,12 +1094,13 @@ pub fn open_path(
                 .unwrap_or_else(super::FileTimes::now);
             return Ok(fd::FileDescriptor::MemFile {
                 name: path_norm,
-                content: Vec::new(),
+                content: fd::MemFileContent::new(),
                 times,
                 offset: 0,
                 readable: read_ok,
                 writable: write_ok,
                 append,
+                linked: true,
             });
         }
         return Err(missing_path_errno(&path_norm));
