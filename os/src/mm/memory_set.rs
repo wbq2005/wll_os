@@ -24,15 +24,6 @@ fn has_leaf_permission(flags: PTEFlags) -> bool {
     flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X)
 }
 
-fn ranges_overlap(
-    left_start: usize,
-    left_end: usize,
-    right_start: usize,
-    right_end: usize,
-) -> bool {
-    left_start < right_end && right_start < left_end
-}
-
 fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
     if !has_leaf_permission(area.flags) {
         return;
@@ -258,6 +249,7 @@ impl MemorySet {
             VirtAddr::new(end),
             permission,
         ));
+        self.sort_areas();
 
         let mut frames: Vec<FrameTracker> = Vec::new();
         for vpn in start_vpn..end_vpn {
@@ -374,24 +366,20 @@ impl MemorySet {
     }
 
     pub fn range_overlaps(&self, start: usize, end: usize) -> bool {
-        self.areas.iter().any(|area| area.overlaps(start, end))
+        if start >= end {
+            return false;
+        }
+        let index = self.first_area_ending_after(start);
+        index < self.areas.len() && self.areas[index].start_va.raw() < end
     }
 
     pub fn range_covered(&self, start: usize, end: usize) -> bool {
         let mut cursor = start;
         while cursor < end {
-            let mut next = cursor;
-            for area in &self.areas {
-                let area_start = area.start_va.raw();
-                let area_end = area.end_va.raw();
-                if area_start <= cursor && cursor < area_end && area_end > next {
-                    next = area_end;
-                }
-            }
-            if next == cursor {
+            let Some(index) = self.area_index_containing(cursor) else {
                 return false;
-            }
-            cursor = next;
+            };
+            cursor = self.areas[index].end_va.raw();
         }
         true
     }
@@ -401,23 +389,23 @@ impl MemorySet {
             return None;
         }
         let mut candidate = align_up(hint.max(PAGE_SIZE))?;
+        let mut index = self.first_area_ending_after(candidate);
         loop {
             let end = candidate.checked_add(length)?;
             if end > limit {
                 return None;
             }
 
-            let mut bumped = false;
-            for area in &self.areas {
-                if ranges_overlap(candidate, end, area.start_va.raw(), area.end_va.raw()) {
-                    candidate = align_up(area.end_va.raw())?;
-                    bumped = true;
-                    break;
-                }
+            while index < self.areas.len() && self.areas[index].end_va.raw() <= candidate {
+                index += 1;
             }
-            if !bumped {
+
+            if index == self.areas.len() || self.areas[index].start_va.raw() >= end {
                 return Some(candidate);
             }
+
+            candidate = align_up(self.areas[index].end_va.raw())?;
+            index += 1;
         }
     }
 
@@ -491,13 +479,10 @@ impl MemorySet {
         let mut copied = 0usize;
         while copied < src.len() {
             let addr = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
-            let Some(area) = self
-                .areas
-                .iter()
-                .find(|area| area.contains(VirtAddr::new(addr)))
-            else {
+            let Some(index) = self.area_index_containing(addr) else {
                 return Err(SysErrNo::EFAULT);
             };
+            let area = &self.areas[index];
 
             let page_idx = (align_down(addr) - area.start_va.raw()) / PAGE_SIZE;
             let page_off = addr % PAGE_SIZE;
@@ -549,13 +534,10 @@ impl MemorySet {
     ) -> Result<(), SysErrNo> {
         let page_start = align_down(fault_addr);
         let page_end = page_start.checked_add(PAGE_SIZE).ok_or(SysErrNo::EFAULT)?;
-        let Some(area) = self
-            .areas
-            .iter()
-            .find(|area| area.contains(VirtAddr::new(fault_addr)))
-        else {
+        let Some(area_index) = self.area_index_containing(fault_addr) else {
             return Err(SysErrNo::EFAULT);
         };
+        let area = &self.areas[area_index];
 
         if !has_leaf_permission(area.flags) {
             return Err(SysErrNo::EFAULT);
@@ -600,13 +582,13 @@ impl MemorySet {
         self.split_area_at(page_start);
         self.split_area_at(page_end);
 
-        let Some(idx) = self
-            .areas
-            .iter()
-            .position(|area| area.start_va.raw() == page_start && area.end_va.raw() == page_end)
-        else {
+        let Some(idx) = self.area_index_containing(page_start) else {
             return Err(SysErrNo::EFAULT);
         };
+        if self.areas[idx].start_va.raw() != page_start || self.areas[idx].end_va.raw() != page_end
+        {
+            return Err(SysErrNo::EFAULT);
+        }
 
         if self.areas[idx].has_frames() {
             map_area_pages(&self.page_table, &self.areas[idx]);
@@ -650,22 +632,48 @@ impl MemorySet {
             return;
         }
 
-        let mut split = Vec::new();
-        for mut area in mem::take(&mut self.areas) {
-            if let Some(right) = area.split_at(VirtAddr::new(addr)) {
-                split.push(area);
-                split.push(right);
-            } else {
-                split.push(area);
-            }
+        let Some(index) = self.area_index_containing(addr) else {
+            return;
+        };
+        if let Some(right) = self.areas[index].split_at(VirtAddr::new(addr)) {
+            self.areas.insert(index + 1, right);
         }
-        self.areas = split;
-        self.sort_areas();
     }
 
     fn sort_areas(&mut self) {
         self.areas
             .sort_by(|left, right| left.start_va.raw().cmp(&right.start_va.raw()));
+    }
+
+    fn area_index_containing(&self, addr: usize) -> Option<usize> {
+        let mut left = 0usize;
+        let mut right = self.areas.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let area = &self.areas[mid];
+            if addr < area.start_va.raw() {
+                right = mid;
+            } else if addr >= area.end_va.raw() {
+                left = mid + 1;
+            } else {
+                return Some(mid);
+            }
+        }
+        None
+    }
+
+    fn first_area_ending_after(&self, addr: usize) -> usize {
+        let mut left = 0usize;
+        let mut right = self.areas.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.areas[mid].end_va.raw() <= addr {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left
     }
 
     fn coalesce_areas(&mut self) {
