@@ -26,18 +26,19 @@ pub fn copy_to_user(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EFAULT);
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
-    copy_to_user_in_memory_set(&memory_set, dst, src)
+    let mut memory_set = task.memory_set.lock();
+    copy_to_user_in_memory_set(&mut memory_set, dst, src)
 }
 
 pub fn copy_to_user_in_memory_set(
-    memory_set: &MemorySet,
+    memory_set: &mut MemorySet,
     dst: usize,
     src: &[u8],
 ) -> Result<(), SysErrNo> {
     if dst == 0 && !src.is_empty() {
         return Err(SysErrNo::EFAULT);
     }
+    memory_set.prepare_write(dst, src.len())?;
     let mut copied = 0usize;
     while copied < src.len() {
         let va = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;

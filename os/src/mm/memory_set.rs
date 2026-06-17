@@ -24,12 +24,34 @@ fn has_leaf_permission(flags: PTEFlags) -> bool {
     flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X)
 }
 
+fn effective_mapping_flags(flags: PTEFlags) -> MappingFlags {
+    let mut effective = flags;
+    if effective.contains(PTEFlags::COW) {
+        effective.remove(PTEFlags::W);
+    }
+    effective.into()
+}
+
+fn is_anonymous_cow_candidate(area: &MapArea) -> bool {
+    matches!(area.backing, MapAreaBacking::Anonymous)
+        && area.has_frames()
+        && area.flags.contains(PTEFlags::W)
+        && has_leaf_permission(area.flags)
+}
+
+fn is_anonymous_readonly_share_candidate(area: &MapArea) -> bool {
+    matches!(area.backing, MapAreaBacking::Anonymous)
+        && area.has_frames()
+        && !area.flags.contains(PTEFlags::W)
+        && has_leaf_permission(area.flags)
+}
+
 fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
     if !has_leaf_permission(area.flags) {
         return;
     }
 
-    let mf: MappingFlags = area.flags.into();
+    let mf = effective_mapping_flags(area.flags);
     for (idx, frame) in area.frames.iter().enumerate() {
         let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
         let paddr = PhysAddr::new(frame.ppn().addr());
@@ -47,7 +69,7 @@ fn map_area_page_window(
         return;
     }
 
-    let mf: MappingFlags = area.flags.into();
+    let mf = effective_mapping_flags(area.flags);
     let end_idx = start_idx.saturating_add(page_count).min(area.frames.len());
     for idx in start_idx..end_idx {
         let frame = &area.frames[idx];
@@ -194,7 +216,7 @@ impl MemorySet {
             let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
             let paddr = PhysAddr::new(ppn.addr());
             if has_leaf_permission(permission) {
-                let mf: MappingFlags = permission.into();
+                let mf = effective_mapping_flags(permission);
                 self.page_table
                     .map_page(vaddr, paddr, mf, MappingSize::Page4KB);
             }
@@ -258,7 +280,7 @@ impl MemorySet {
                 let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
                 let paddr = PhysAddr::new(ppn.addr());
                 if has_leaf_permission(permission) {
-                    let mf: MappingFlags = permission.into();
+                    let mf = effective_mapping_flags(permission);
                     self.page_table
                         .map_page(vaddr, paddr, mf, MappingSize::Page4KB);
                 }
@@ -293,7 +315,7 @@ impl MemorySet {
         );
         area.frames = frames.to_vec();
         if has_leaf_permission(permission) {
-            let mf: MappingFlags = permission.into();
+            let mf = effective_mapping_flags(permission);
             for (idx, frame) in area.frames.iter().enumerate() {
                 let vaddr = VirtAddr::new(start + idx * PAGE_SIZE);
                 let paddr = PhysAddr::new(frame.ppn().addr());
@@ -461,17 +483,114 @@ impl MemorySet {
             if area.start_va.raw() >= start && area.end_va.raw() <= end {
                 let old_flags = area.flags;
                 let file_backed = matches!(area.backing, MapAreaBacking::File { .. });
+                let anonymous = matches!(area.backing, MapAreaBacking::Anonymous);
+                let mut new_flags = flags;
                 if file_backed && flags.contains(PTEFlags::W) && area.has_frames() {
                     copy_area_frames(area)?;
                 }
-                if has_leaf_permission(flags) && !file_backed {
+                if anonymous
+                    && flags.contains(PTEFlags::W)
+                    && area.has_frames()
+                    && area.flags.contains(PTEFlags::COW)
+                {
+                    new_flags |= PTEFlags::COW;
+                } else if anonymous
+                    && flags.contains(PTEFlags::W)
+                    && area.has_frames()
+                    && area.frames.iter().any(|frame| frame.ref_count() > 1)
+                {
+                    copy_area_frames(area)?;
+                }
+                if has_leaf_permission(new_flags) && !file_backed {
                     populate_area_frames(area)?;
                 }
-                area.flags = flags;
+                area.flags = new_flags;
                 remap_area_pages(&self.page_table, area, old_flags);
             }
         }
         self.coalesce_areas();
+        Ok(())
+    }
+
+    fn resolve_cow_page(&mut self, page_start: usize) -> Result<(), SysErrNo> {
+        let page_end = page_start.checked_add(PAGE_SIZE).ok_or(SysErrNo::EFAULT)?;
+        self.split_area_at(page_start);
+        self.split_area_at(page_end);
+
+        let Some(index) = self.area_index_containing(page_start) else {
+            return Err(SysErrNo::EFAULT);
+        };
+        if self.areas[index].start_va.raw() != page_start
+            || self.areas[index].end_va.raw() != page_end
+        {
+            return Err(SysErrNo::EFAULT);
+        }
+
+        let old_flags = self.areas[index].flags;
+        if !matches!(self.areas[index].backing, MapAreaBacking::Anonymous)
+            || !old_flags.contains(PTEFlags::COW)
+            || !old_flags.contains(PTEFlags::W)
+        {
+            return Err(SysErrNo::EFAULT);
+        }
+        let shared = self.areas[index]
+            .frames
+            .first()
+            .map(|frame| frame.ref_count() > 1)
+            .ok_or(SysErrNo::EFAULT)?;
+
+        let replacement = if shared {
+            let src_frame = self.areas[index].frames[0].clone();
+            let Some(frame) = frame_allocator::alloc_frame() else {
+                return Err(SysErrNo::ENOMEM);
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src_frame.ppn().addr() as *const u8,
+                    frame.ppn().addr() as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+            Some(frame)
+        } else {
+            None
+        };
+
+        {
+            let area = &mut self.areas[index];
+            if let Some(frame) = replacement {
+                area.frames[0] = frame;
+            }
+            area.flags.remove(PTEFlags::COW);
+        }
+        remap_area_pages(&self.page_table, &self.areas[index], old_flags);
+        Ok(())
+    }
+
+    fn ensure_page_writable(&mut self, page_start: usize) -> Result<(), SysErrNo> {
+        let Some(index) = self.area_index_containing(page_start) else {
+            return Err(SysErrNo::EFAULT);
+        };
+        let flags = self.areas[index].flags;
+        if !has_leaf_permission(flags) || !flags.contains(PTEFlags::W) {
+            return Err(SysErrNo::EFAULT);
+        }
+        if flags.contains(PTEFlags::COW) {
+            return self.resolve_cow_page(page_start);
+        }
+        if self.translate(VirtAddr::new(page_start)).is_none() {
+            self.handle_page_fault(page_start, true, false)?;
+        }
+        Ok(())
+    }
+
+    pub fn prepare_write(&mut self, dst: usize, len: usize) -> Result<(), SysErrNo> {
+        let mut checked = 0usize;
+        while checked < len {
+            let addr = dst.checked_add(checked).ok_or(SysErrNo::EFAULT)?;
+            self.ensure_page_writable(align_down(addr))?;
+            checked += (PAGE_SIZE - addr % PAGE_SIZE).min(len - checked);
+        }
         Ok(())
     }
 
@@ -552,6 +671,11 @@ impl MemorySet {
             }
         } else if !area.flags.contains(PTEFlags::R) {
             return Err(SysErrNo::EFAULT);
+        }
+        if is_store && area.flags.contains(PTEFlags::COW) {
+            self.resolve_cow_page(page_start)?;
+            self.activate();
+            return Ok(());
         }
         let clean_cache_page = if !is_store && !area.flags.contains(PTEFlags::W) {
             match &area.backing {
@@ -690,6 +814,70 @@ impl MemorySet {
         }
         self.areas = merged;
     }
+
+    pub fn fork_cow(&mut self) -> Result<Self, SysErrNo> {
+        let mut new_ms = Self::from_kernel();
+
+        for area in &mut self.areas {
+            let mut new_area =
+                MapArea::with_backing(area.start_va, area.end_va, area.flags, area.backing.clone());
+
+            if matches!(area.backing, MapAreaBacking::SharedMemory { .. }) {
+                new_area.frames = area.frames.clone();
+                map_area_pages(&new_ms.page_table, &new_area);
+                new_ms.areas.push(new_area);
+                continue;
+            }
+
+            if is_anonymous_cow_candidate(area) {
+                let old_flags = area.flags;
+                area.flags |= PTEFlags::COW;
+                if old_flags.bits() != area.flags.bits() {
+                    remap_area_pages(&self.page_table, area, old_flags);
+                }
+                new_area.flags = area.flags;
+                new_area.frames = area.frames.clone();
+                map_area_pages(&new_ms.page_table, &new_area);
+                new_ms.areas.push(new_area);
+                continue;
+            }
+
+            if is_anonymous_readonly_share_candidate(area) {
+                new_area.frames = area.frames.clone();
+                map_area_pages(&new_ms.page_table, &new_area);
+                new_ms.areas.push(new_area);
+                continue;
+            }
+
+            for (idx, src_frame) in area.frames.iter().enumerate() {
+                let Some(frame) = frame_allocator::alloc_frame() else {
+                    return Err(SysErrNo::ENOMEM);
+                };
+                let new_paddr = PhysAddr::new(frame.ppn().addr());
+                let src_paddr = PhysAddr::new(src_frame.ppn().addr());
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src_paddr.raw() as *const u8,
+                        new_paddr.raw() as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+
+                if has_leaf_permission(area.flags) {
+                    let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
+                    let mf = effective_mapping_flags(area.flags);
+                    new_ms
+                        .page_table
+                        .map_page(vaddr, new_paddr, mf, MappingSize::Page4KB);
+                }
+                new_area.frames.push(frame);
+            }
+
+            new_ms.areas.push(new_area);
+        }
+        new_ms.coalesce_areas();
+        Ok(new_ms)
+    }
 }
 
 impl Clone for MemorySet {
@@ -697,8 +885,10 @@ impl Clone for MemorySet {
         let mut new_ms = Self::from_kernel();
 
         for area in &self.areas {
+            let mut new_flags = area.flags;
+            new_flags.remove(PTEFlags::COW);
             let mut new_area =
-                MapArea::with_backing(area.start_va, area.end_va, area.flags, area.backing.clone());
+                MapArea::with_backing(area.start_va, area.end_va, new_flags, area.backing.clone());
 
             if matches!(area.backing, MapAreaBacking::SharedMemory { .. }) {
                 new_area.frames = area.frames.clone();
@@ -721,7 +911,7 @@ impl Clone for MemorySet {
 
                     if has_leaf_permission(area.flags) {
                         let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
-                        let mf: MappingFlags = area.flags.into();
+                        let mf = effective_mapping_flags(new_flags);
                         new_ms
                             .page_table
                             .map_page(vaddr, new_paddr, mf, MappingSize::Page4KB);

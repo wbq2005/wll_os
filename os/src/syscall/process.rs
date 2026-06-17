@@ -522,12 +522,12 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
                 interp_host_path
             );
             let interp_elf = ElfFile::parse(&interp_data)?;
-            let interp_bias = 0x0010_0000usize;
             let target_bias = if elf.header.e_type == 3 {
                 0x0040_0000
             } else {
                 0
             };
+            let interp_bias = ElfFile::choose_interpreter_bias(&elf, target_bias, &interp_elf)?;
             let mut memory_set = crate::mm::memory_set::MemorySet::from_kernel();
             log::info!("[syscall] execve: loading target segments");
             elf.load_segments_into(&mut memory_set, target_bias)?;
@@ -878,7 +878,10 @@ pub fn sys_clone(
     let memory_set = if share_vm {
         parent.memory_set.clone()
     } else {
-        new_shared_memory_set(parent.memory_set.lock().clone())
+        let mut parent_memory = parent.memory_set.lock();
+        let child_memory = parent_memory.fork_cow()?;
+        parent_memory.activate();
+        new_shared_memory_set(child_memory)
     };
     let mm = if share_vm {
         parent.mm.clone()
@@ -980,8 +983,8 @@ pub fn sys_clone(
     }
     if (clone_bits & CLONE_CHILD_SETTID) != 0 && child_tid != 0 {
         let bytes = (child_pid as i32).to_ne_bytes();
-        let child_memory = child.memory_set.lock();
-        super::user::copy_to_user_in_memory_set(&child_memory, child_tid, &bytes)?;
+        let mut child_memory = child.memory_set.lock();
+        super::user::copy_to_user_in_memory_set(&mut child_memory, child_tid, &bytes)?;
     }
 
     if !is_thread {

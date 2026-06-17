@@ -8,6 +8,26 @@ use crate::mm::memory_set::MemorySet;
 use crate::mm::page_table::PTEFlags;
 use crate::utils::error::SysErrNo;
 
+fn align_down(value: usize) -> usize {
+    value / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE
+}
+
+fn align_up(value: usize) -> Option<usize> {
+    value
+        .checked_add(crate::config::PAGE_SIZE - 1)
+        .map(|value| value / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE)
+}
+
+fn align_up_to(value: usize, align: usize) -> Option<usize> {
+    value
+        .checked_add(align - 1)
+        .map(|value| value / align * align)
+}
+
+fn ranges_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
 /// ELF 魔数
 pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
@@ -233,6 +253,61 @@ impl<'a> ElfFile<'a> {
         self.entry() + bias
     }
 
+    pub fn load_bounds_with_bias(&self, bias: usize) -> Option<(usize, usize)> {
+        let mut start = usize::MAX;
+        let mut end = 0usize;
+        let mut found = false;
+
+        for ph in &self.program_headers {
+            if ph.p_type != PT_LOAD {
+                continue;
+            }
+            let seg_start = ph.p_vaddr.checked_add(bias)?;
+            let seg_end = ph.p_vaddr.checked_add(ph.p_memsz)?.checked_add(bias)?;
+            start = start.min(align_down(seg_start));
+            end = end.max(align_up(seg_end)?);
+            found = true;
+        }
+
+        found.then_some((start, end))
+    }
+
+    pub fn choose_interpreter_bias(
+        target: &Self,
+        target_bias: usize,
+        interpreter: &Self,
+    ) -> Result<usize, SysErrNo> {
+        const INTERP_MIN_BIAS: usize = 0x0010_0000;
+        const INTERP_ALIGN: usize = 0x0010_0000;
+
+        let Some((target_start, target_end)) = target.load_bounds_with_bias(target_bias) else {
+            return Ok(INTERP_MIN_BIAS);
+        };
+        let Some((interp_start, interp_end)) = interpreter.load_bounds_with_bias(0) else {
+            return Ok(INTERP_MIN_BIAS);
+        };
+
+        let mut bias = INTERP_MIN_BIAS;
+        let mut start = interp_start.checked_add(bias).ok_or(SysErrNo::ENOMEM)?;
+        let mut end = interp_end.checked_add(bias).ok_or(SysErrNo::ENOMEM)?;
+
+        if ranges_overlap(start, end, target_start, target_end) {
+            let needed = target_end.saturating_sub(interp_start);
+            bias = align_up_to(needed, INTERP_ALIGN)
+                .ok_or(SysErrNo::ENOMEM)?
+                .max(INTERP_MIN_BIAS);
+            start = interp_start.checked_add(bias).ok_or(SysErrNo::ENOMEM)?;
+            end = interp_end.checked_add(bias).ok_or(SysErrNo::ENOMEM)?;
+        }
+
+        if ranges_overlap(start, end, target_start, target_end)
+            || end >= crate::config::USER_HEAP_START
+        {
+            return Err(SysErrNo::ENOMEM);
+        }
+        Ok(bias)
+    }
+
     pub fn can_enter_without_interpreter(&self) -> bool {
         let Some(dynamic) = self
             .program_headers
@@ -297,12 +372,12 @@ impl<'a> ElfFile<'a> {
             }
             let start_va = VirtAddr::new(ph.p_vaddr + bias);
             let end_va = VirtAddr::new(ph.p_vaddr + ph.p_memsz + bias);
-            let mut flags = PTEFlags::U | PTEFlags::V | PTEFlags::W;
+            let mut flags = PTEFlags::U | PTEFlags::V;
             if ph.p_flags & 1 != 0 {
                 flags |= PTEFlags::X;
             }
             if ph.p_flags & 2 != 0 {
-                flags |= PTEFlags::W;
+                flags |= PTEFlags::R | PTEFlags::W;
             }
             if ph.p_flags & 4 != 0 {
                 flags |= PTEFlags::R;
@@ -380,7 +455,7 @@ impl<'a> ElfFile<'a> {
                     flags |= PTEFlags::X; // 可执行
                 }
                 if ph.p_flags & 2 != 0 {
-                    flags |= PTEFlags::W; // 可写
+                    flags |= PTEFlags::R | PTEFlags::W; // 可写
                 }
                 if ph.p_flags & 4 != 0 {
                     flags |= PTEFlags::R; // 可读

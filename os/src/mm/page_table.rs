@@ -16,6 +16,7 @@ bitflags! {
         const G = 1 << 5;   // Global
         const A = 1 << 6;   // Accessed
         const D = 1 << 7;   // Dirty
+        const COW = 1 << 8; // Software: copy-on-write user page
     }
 }
 

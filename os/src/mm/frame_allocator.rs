@@ -67,6 +67,10 @@ impl FrameTracker {
     pub fn ppn(&self) -> PhysPageNum {
         self.inner.ppn
     }
+
+    pub fn ref_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
 }
 
 lazy_static! {

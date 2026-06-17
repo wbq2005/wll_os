@@ -934,19 +934,21 @@ pub(crate) fn process_robust_list_on_exit(task: &Arc<crate::task::TaskControlBlo
         return;
     }
 
-    let memory_set = task.memory_set.lock();
     let read_usize_at = |addr: usize| -> Result<usize, SysErrNo> {
         let mut bytes = [0u8; core::mem::size_of::<usize>()];
+        let memory_set = task.memory_set.lock();
         super::user::copy_from_user_in_memory_set(&memory_set, addr, &mut bytes)?;
         Ok(usize::from_ne_bytes(bytes))
     };
     let read_i32_at = |addr: usize| -> Result<i32, SysErrNo> {
         let mut bytes = [0u8; core::mem::size_of::<i32>()];
+        let memory_set = task.memory_set.lock();
         super::user::copy_from_user_in_memory_set(&memory_set, addr, &mut bytes)?;
         Ok(i32::from_ne_bytes(bytes))
     };
     let write_i32_at = |addr: usize, value: i32| -> Result<(), SysErrNo> {
-        super::user::copy_to_user_in_memory_set(&memory_set, addr, &value.to_ne_bytes())
+        let mut memory_set = task.memory_set.lock();
+        super::user::copy_to_user_in_memory_set(&mut memory_set, addr, &value.to_ne_bytes())
     };
 
     let futex_offset = match read_usize_at(state.head + core::mem::size_of::<usize>()) {

@@ -658,9 +658,9 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     };
     if clear_child_tid != 0 {
         let bytes = 0i32.to_ne_bytes();
-        let memory_set = task.memory_set.lock();
+        let mut memory_set = task.memory_set.lock();
         if let Err(err) =
-            crate::syscall::user::copy_to_user_in_memory_set(&memory_set, clear_child_tid, &bytes)
+            crate::syscall::user::copy_to_user_in_memory_set(&mut memory_set, clear_child_tid, &bytes)
         {
             log::debug!(
                 "[task] clear_child_tid failed tid={} addr={:#x} err={:?}",

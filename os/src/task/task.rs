@@ -172,12 +172,13 @@ impl TaskControlBlock {
                     spec.root
                 );
                 let interp_elf = ElfFile::parse(&launch_elf_data)?;
-                let interp_bias = 0x0010_0000usize;
                 let target_bias = if target_elf.header.e_type == 3 {
                     0x0040_0000
                 } else {
                     0
                 };
+                let interp_bias =
+                    ElfFile::choose_interpreter_bias(&target_elf, target_bias, &interp_elf)?;
                 // Consume auxv-visible ELF metadata before loading segments so
                 // later copy/zero-fill work cannot perturb the launch contract.
                 let interp_entry = interp_elf.entry_with_bias(interp_bias);
