@@ -7,8 +7,10 @@ use spin::Mutex;
 use super::{TaskControlBlock, TaskStatus};
 
 lazy_static! {
-    /// 全局就绪队列
-    static ref READY_QUEUE: Mutex<VecDeque<Arc<TaskControlBlock>>> = Mutex::new(VecDeque::new());
+    static ref USER_READY_QUEUE: Mutex<VecDeque<Arc<TaskControlBlock>>> =
+        Mutex::new(VecDeque::new());
+    static ref KERNEL_READY_QUEUE: Mutex<VecDeque<Arc<TaskControlBlock>>> =
+        Mutex::new(VecDeque::new());
     static ref TASK_REGISTRY: Mutex<Vec<Weak<TaskControlBlock>>> = Mutex::new(Vec::new());
     static ref EXITED_TASKS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 }
@@ -24,9 +26,26 @@ pub fn record_exited_task(pid: usize, tgid: usize) {
     }
 }
 
-/// 添加任务到就绪队列
 pub fn add_task(task: Arc<TaskControlBlock>) {
-    let mut queue = READY_QUEUE.lock();
+    if task.is_kernel {
+        add_kernel_task(task);
+    } else {
+        add_user_task(task);
+    }
+}
+
+pub fn add_user_task(task: Arc<TaskControlBlock>) {
+    debug_assert!(!task.is_kernel);
+    push_task_back(&USER_READY_QUEUE, task);
+}
+
+pub fn add_kernel_task(task: Arc<TaskControlBlock>) {
+    debug_assert!(task.is_kernel);
+    push_task_back(&KERNEL_READY_QUEUE, task);
+}
+
+fn push_task_back(queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>, task: Arc<TaskControlBlock>) {
+    let mut queue = queue.lock();
     if queue
         .iter()
         .any(|queued| Arc::ptr_eq(queued, &task) || queued.pid.0 == task.pid.0)
@@ -37,7 +56,15 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 }
 
 pub fn add_task_front(task: Arc<TaskControlBlock>) {
-    let mut queue = READY_QUEUE.lock();
+    if task.is_kernel {
+        push_task_front(&KERNEL_READY_QUEUE, task);
+    } else {
+        push_task_front(&USER_READY_QUEUE, task);
+    }
+}
+
+fn push_task_front(queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>, task: Arc<TaskControlBlock>) {
+    let mut queue = queue.lock();
     if queue
         .iter()
         .any(|queued| Arc::ptr_eq(queued, &task) || queued.pid.0 == task.pid.0)
@@ -47,9 +74,22 @@ pub fn add_task_front(task: Arc<TaskControlBlock>) {
     queue.push_front(task);
 }
 
-/// 从就绪队列取出一个任务
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    let mut queue = READY_QUEUE.lock();
+    fetch_user_task_for_foreground().or_else(fetch_kernel_task)
+}
+
+pub fn fetch_user_task_for_foreground() -> Option<Arc<TaskControlBlock>> {
+    fetch_from_queue(&USER_READY_QUEUE)
+}
+
+pub fn fetch_kernel_task() -> Option<Arc<TaskControlBlock>> {
+    fetch_from_queue(&KERNEL_READY_QUEUE)
+}
+
+fn fetch_from_queue(
+    queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>,
+) -> Option<Arc<TaskControlBlock>> {
+    let mut queue = queue.lock();
     while let Some(task) = queue.pop_front() {
         if !matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
             return Some(task);
@@ -58,23 +98,50 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     None
 }
 
-/// 检查就绪队列是否有任务
 pub fn has_task() -> bool {
-    READY_QUEUE
+    has_user_task() || has_kernel_task()
+}
+
+pub fn has_user_task() -> bool {
+    has_runnable_task(&USER_READY_QUEUE)
+}
+
+pub fn has_kernel_task() -> bool {
+    has_runnable_task(&KERNEL_READY_QUEUE)
+}
+
+fn has_runnable_task(queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>) -> bool {
+    queue
         .lock()
         .iter()
         .any(|task| !matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked))
 }
 
 pub fn remove_task(pid: usize) -> Option<Arc<TaskControlBlock>> {
-    let mut queue = READY_QUEUE.lock();
+    remove_task_from_queue(&USER_READY_QUEUE, pid)
+        .or_else(|| remove_task_from_queue(&KERNEL_READY_QUEUE, pid))
+}
+
+fn remove_task_from_queue(
+    queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>,
+    pid: usize,
+) -> Option<Arc<TaskControlBlock>> {
+    let mut queue = queue.lock();
     let index = queue.iter().position(|task| task.pid.0 == pid)?;
     queue.remove(index)
 }
 
 pub fn remove_task_instances(task: &Arc<TaskControlBlock>) -> usize {
+    remove_task_instances_from_queue(&USER_READY_QUEUE, task)
+        + remove_task_instances_from_queue(&KERNEL_READY_QUEUE, task)
+}
+
+fn remove_task_instances_from_queue(
+    queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>,
+    task: &Arc<TaskControlBlock>,
+) -> usize {
     let mut removed = 0usize;
-    let mut queue = READY_QUEUE.lock();
+    let mut queue = queue.lock();
     let mut kept = VecDeque::new();
     while let Some(queued) = queue.pop_front() {
         if Arc::ptr_eq(&queued, task) || queued.pid.0 == task.pid.0 {
@@ -88,7 +155,15 @@ pub fn remove_task_instances(task: &Arc<TaskControlBlock>) -> usize {
 }
 
 pub fn retain_tasks(mut keep: impl FnMut(&Arc<TaskControlBlock>) -> bool) {
-    let mut queue = READY_QUEUE.lock();
+    retain_queue(&USER_READY_QUEUE, &mut keep);
+    retain_queue(&KERNEL_READY_QUEUE, &mut keep);
+}
+
+fn retain_queue(
+    queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>,
+    keep: &mut impl FnMut(&Arc<TaskControlBlock>) -> bool,
+) {
+    let mut queue = queue.lock();
     let mut kept = VecDeque::new();
     while let Some(task) = queue.pop_front() {
         if keep(&task) {
@@ -98,7 +173,6 @@ pub fn retain_tasks(mut keep: impl FnMut(&Arc<TaskControlBlock>) -> bool) {
     *queue = kept;
 }
 
-/// Snapshot live tasks from the weak registry and compact stale entries.
 fn live_tasks() -> Vec<Arc<TaskControlBlock>> {
     let mut registry = TASK_REGISTRY.lock();
     let mut tasks = Vec::new();
@@ -140,7 +214,14 @@ pub fn was_thread_group_seen(tgid: usize) -> bool {
             .any(|(_, seen_tgid)| *seen_tgid == tgid)
 }
 
-/// 返回就绪队列长度（诊断用）
 pub fn queue_len() -> usize {
-    READY_QUEUE.lock().len()
+    user_queue_len() + kernel_queue_len()
+}
+
+pub fn user_queue_len() -> usize {
+    USER_READY_QUEUE.lock().len()
+}
+
+pub fn kernel_queue_len() -> usize {
+    KERNEL_READY_QUEUE.lock().len()
 }

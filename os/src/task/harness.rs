@@ -929,7 +929,7 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
 
     loop {
         crate::timer::wake_expired_timers();
-        if task.status() == TaskStatus::Zombie && !manager::has_task() {
+        if task.status() == TaskStatus::Zombie && !manager::has_user_task() {
             break;
         }
         if crate::timer::get_time_us() >= deadline_us {
@@ -940,7 +940,7 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
             break;
         }
 
-        let Some(active) = manager::fetch_task() else {
+        let Some(active) = manager::fetch_user_task_for_foreground() else {
             continue;
         };
         if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
@@ -953,7 +953,12 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
         let mut tf_guard = active.trap_frame.lock();
         let mut ctx = match tf_guard.as_ref() {
             None => {
-                break;
+                log::error!(
+                    "[harness] foreground user task {} missing trap frame",
+                    active.pid.0
+                );
+                *CURRENT_TASK.lock() = None;
+                continue;
             }
             Some(_) => tf_guard.take().unwrap(),
         };

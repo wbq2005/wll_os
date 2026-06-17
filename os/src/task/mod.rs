@@ -273,10 +273,10 @@ fn take_foreground_requeue_front(pid: usize) -> bool {
     }
 }
 
-fn fetch_dispatchable_task() -> Option<Arc<TaskControlBlock>> {
+fn fetch_dispatchable_user_task() -> Option<Arc<TaskControlBlock>> {
     let mut skipped_active = Vec::new();
     loop {
-        let Some(task) = manager::fetch_task() else {
+        let Some(task) = manager::fetch_user_task_for_foreground() else {
             for task in skipped_active {
                 manager::add_task(task);
             }
@@ -291,6 +291,16 @@ fn fetch_dispatchable_task() -> Option<Arc<TaskControlBlock>> {
         }
         return Some(task);
     }
+}
+
+fn fetch_dispatchable_task() -> Option<Arc<TaskControlBlock>> {
+    if let Some(task) = fetch_dispatchable_user_task() {
+        return Some(task);
+    }
+    if crate::trap::foreground_driver_active() {
+        return None;
+    }
+    manager::fetch_kernel_task()
 }
 
 pub(crate) fn signal_exit_code(signum: i32) -> i32 {
@@ -390,7 +400,28 @@ fn switch_kernel_task_back_to_scheduler(task: &Arc<TaskControlBlock>) {
     }
 }
 
-/// 初始化内核页表
+fn switch_to_kernel_task(task: &Arc<TaskControlBlock>) {
+    let task_ctx = task_ctx_ptr(task);
+    unsafe {
+        SCHEDULER_CONTEXT.ra = kernel_task_return as usize;
+        SCHEDULER_CONTEXT.sp = 0;
+        SCHEDULER_CONTEXT.s = [0; 12];
+    }
+    let scheduler_ctx = core::ptr::addr_of_mut!(SCHEDULER_CONTEXT);
+    SCHEDULER_CONTEXT_PTR.store(scheduler_ctx as usize, Ordering::SeqCst);
+
+    log::debug!(
+        "[task] Starting kernel task {} via context switch",
+        task.pid.0
+    );
+
+    unsafe {
+        context::switch_to(scheduler_ctx, task_ctx as *const TaskContext);
+    }
+
+    SCHEDULER_CONTEXT_PTR.store(0, Ordering::SeqCst);
+}
+
 pub fn init_kernel_page() {
     crate::mm::page_table::init_kernel_page_table();
 }
@@ -505,7 +536,7 @@ pub fn yield_current_once() -> bool {
     crate::timer::wake_expired_timers();
     if crate::trap::foreground_driver_active() {
         task.set_status(TaskStatus::Ready);
-        return manager::has_task();
+        return manager::has_user_task();
     }
     suspend_current_and_run_next();
     true
@@ -545,9 +576,15 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
         if task.status() != TaskStatus::Blocked {
             break;
         }
-        if !crate::trap::foreground_driver_active() && run_ready_task_once() {
-            no_runnable_spins = 0;
-            continue;
+        if !crate::trap::foreground_driver_active() {
+            if run_ready_task_once() {
+                no_runnable_spins = 0;
+                continue;
+            }
+            if drain_kernel_ready_once() {
+                no_runnable_spins = 0;
+                continue;
+            }
         }
         if crate::trap::foreground_driver_active() {
             no_runnable_spins += 1;
@@ -659,9 +696,11 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     if clear_child_tid != 0 {
         let bytes = 0i32.to_ne_bytes();
         let mut memory_set = task.memory_set.lock();
-        if let Err(err) =
-            crate::syscall::user::copy_to_user_in_memory_set(&mut memory_set, clear_child_tid, &bytes)
-        {
+        if let Err(err) = crate::syscall::user::copy_to_user_in_memory_set(
+            &mut memory_set,
+            clear_child_tid,
+            &bytes,
+        ) {
             log::debug!(
                 "[task] clear_child_tid failed tid={} addr={:#x} err={:?}",
                 task.pid.0,
@@ -806,6 +845,10 @@ pub(crate) fn run_next_task() {
         task.set_status(TaskStatus::Running);
 
         log::debug!("[task] Switching to task pid={}", task.pid.0);
+        if task.is_kernel {
+            switch_to_kernel_task(&task);
+            return;
+        }
         // UART marker: 'T' = about to get trap_frame
         // 获取任务的 TrapFrame（用户态上下文）
         // 如果任务有保存的 TrapFrame，从那里恢复
@@ -859,26 +902,8 @@ pub(crate) fn run_next_task() {
             run_next_task();
             return;
         } else {
-            // 内核任务：使用 task_ctx 进行上下文切换
-            let task_ctx = task_ctx_ptr(&task);
-            unsafe {
-                SCHEDULER_CONTEXT.ra = kernel_task_return as usize;
-                SCHEDULER_CONTEXT.sp = 0;
-                SCHEDULER_CONTEXT.s = [0; 12];
-            }
-            let idle_ctx = core::ptr::addr_of_mut!(SCHEDULER_CONTEXT);
-            SCHEDULER_CONTEXT_PTR.store(idle_ctx as usize, Ordering::SeqCst);
-
-            log::debug!(
-                "[task] Starting kernel task {} via context switch",
-                task.pid.0
-            );
-
-            unsafe {
-                context::switch_to(idle_ctx, task_ctx as *const TaskContext);
-            }
-
-            SCHEDULER_CONTEXT_PTR.store(0, Ordering::SeqCst);
+            log::error!("[task] user task {} missing trap frame", task.pid.0);
+            *CURRENT_TASK.lock() = None;
             return;
         }
     } else {
@@ -961,7 +986,7 @@ fn wait_for_interrupt() {
 }
 
 pub(crate) fn run_ready_task_once() -> bool {
-    let Some(active) = fetch_dispatchable_task() else {
+    let Some(active) = fetch_dispatchable_user_task() else {
         return false;
     };
     if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
@@ -1004,20 +1029,28 @@ pub(crate) fn run_ready_task_once() -> bool {
         *CURRENT_TASK.lock() = None;
         true
     } else {
-        let task_ctx = task_ctx_ptr(&active);
-        unsafe {
-            SCHEDULER_CONTEXT.ra = kernel_task_return as usize;
-            SCHEDULER_CONTEXT.sp = 0;
-            SCHEDULER_CONTEXT.s = [0; 12];
-        }
-        let idle_ctx = core::ptr::addr_of_mut!(SCHEDULER_CONTEXT);
-        SCHEDULER_CONTEXT_PTR.store(idle_ctx as usize, Ordering::SeqCst);
-        unsafe {
-            context::switch_to(idle_ctx, task_ctx as *const TaskContext);
-        }
-        SCHEDULER_CONTEXT_PTR.store(0, Ordering::SeqCst);
+        log::error!("[task] ready user task {} missing trap frame", active.pid.0);
+        *CURRENT_TASK.lock() = None;
         true
     }
+}
+
+pub(crate) fn drain_kernel_ready_once() -> bool {
+    if crate::trap::foreground_driver_active() {
+        return false;
+    }
+    let Some(active) = manager::fetch_kernel_task() else {
+        return false;
+    };
+    if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+        return true;
+    }
+
+    active.set_status(TaskStatus::Running);
+    *CURRENT_TASK.lock() = Some(active.clone());
+    switch_to_kernel_task(&active);
+    *CURRENT_TASK.lock() = None;
+    true
 }
 
 fn mark_blocked_task_ready(task: &Arc<TaskControlBlock>, outcome: wait_queue::WaitOutcome) -> bool {
