@@ -112,6 +112,8 @@ impl TaskControlBlock {
             block_reason: Mutex::new(None),
             wait_outcome: Mutex::new(None),
             wait_token: AtomicUsize::new(0),
+            sched_policy: AtomicUsize::new(crate::task::SCHED_OTHER),
+            sched_priority: AtomicUsize::new(0),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -303,6 +305,8 @@ impl TaskControlBlock {
             block_reason: Mutex::new(None),
             wait_outcome: Mutex::new(None),
             wait_token: AtomicUsize::new(0),
+            sched_policy: AtomicUsize::new(crate::task::SCHED_OTHER),
+            sched_priority: AtomicUsize::new(0),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -363,6 +367,8 @@ impl TaskControlBlock {
             block_reason: Mutex::new(None),
             wait_outcome: Mutex::new(None),
             wait_token: AtomicUsize::new(0),
+            sched_policy: AtomicUsize::new(crate::task::SCHED_OTHER),
+            sched_priority: AtomicUsize::new(0),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -421,6 +427,8 @@ impl TaskControlBlock {
             block_reason: Mutex::new(None),
             wait_outcome: Mutex::new(None),
             wait_token: AtomicUsize::new(0),
+            sched_policy: AtomicUsize::new(crate::task::SCHED_OTHER),
+            sched_priority: AtomicUsize::new(0),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);

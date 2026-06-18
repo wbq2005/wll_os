@@ -20,6 +20,7 @@ enum TestGroup {
     Iozone,
     LibcBench,
     Lmbench,
+    Cyclictest,
     UnixBench,
     Ltp,
     Iperf,
@@ -36,6 +37,7 @@ impl TestGroup {
             TestGroup::Iozone => &["iozone"],
             TestGroup::LibcBench => &["libcbench", "libc-bench"],
             TestGroup::Lmbench => &["lmbench"],
+            TestGroup::Cyclictest => &["cyclictest"],
             TestGroup::UnixBench => &["unixbench", "UnixBench"],
             TestGroup::Ltp => &["ltp"],
             TestGroup::Iperf => &["iperf"],
@@ -52,6 +54,7 @@ impl TestGroup {
             TestGroup::LibcTest => 40,
             TestGroup::LibcBench => 50,
             TestGroup::Iozone => 55,
+            TestGroup::Cyclictest => 58,
             TestGroup::UnixBench => 60,
             TestGroup::Ltp => 70,
             TestGroup::Iperf => 80,
@@ -68,6 +71,7 @@ impl TestGroup {
             TestGroup::Iozone,
             TestGroup::LibcBench,
             TestGroup::Lmbench,
+            TestGroup::Cyclictest,
             TestGroup::UnixBench,
             TestGroup::Ltp,
             TestGroup::Iperf,
@@ -132,6 +136,8 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::LibcTest,
     TestGroup::LibcBench,
     TestGroup::Lmbench,
+    #[cfg(target_arch = "riscv64")]
+    TestGroup::Cyclictest,
 ];
 
 fn console_write(msg: &str) {
@@ -1057,6 +1063,8 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
         .ok_or(ScriptLaunchError::MissingApplet("/bin/sh"))?;
     ensure_busybox_applet_alias(&root, &busybox_host, "cp")
         .ok_or(ScriptLaunchError::MissingApplet("cp"))?;
+    ensure_busybox_applet_alias(&root, &busybox_host, "sleep")
+        .ok_or(ScriptLaunchError::MissingApplet("sleep"))?;
 
     let mut envp = alloc::vec![
         String::from("PATH=.:/:/bin:/usr/bin"),

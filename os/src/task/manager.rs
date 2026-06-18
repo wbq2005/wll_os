@@ -1,6 +1,7 @@
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -14,6 +15,9 @@ lazy_static! {
     static ref TASK_REGISTRY: Mutex<Vec<Weak<TaskControlBlock>>> = Mutex::new(Vec::new());
     static ref EXITED_TASKS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 }
+
+const RT_RUN_BUDGET: usize = 64;
+static RT_RUNS_SINCE_NORMAL: AtomicUsize = AtomicUsize::new(0);
 
 pub fn register_task(task: &Arc<TaskControlBlock>) {
     TASK_REGISTRY.lock().push(Arc::downgrade(task));
@@ -90,12 +94,43 @@ fn fetch_from_queue(
     queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>,
 ) -> Option<Arc<TaskControlBlock>> {
     let mut queue = queue.lock();
-    while let Some(task) = queue.pop_front() {
-        if !matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
-            return Some(task);
+    let mut best_index = None;
+    let mut best_priority = 0;
+    let mut first_normal_index = None;
+    let mut index = 0;
+    while index < queue.len() {
+        let task = &queue[index];
+        if matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+            queue.remove(index);
+            continue;
         }
+        let priority = task.effective_sched_priority();
+        if priority == 0 && first_normal_index.is_none() {
+            first_normal_index = Some(index);
+        }
+        if best_index.is_none() || priority > best_priority {
+            best_index = Some(index);
+            best_priority = priority;
+        }
+        index += 1;
     }
-    None
+    let chosen_index = if best_priority > 0 {
+        let rt_runs = RT_RUNS_SINCE_NORMAL.load(Ordering::Relaxed);
+        if rt_runs >= RT_RUN_BUDGET {
+            first_normal_index.or(best_index)
+        } else {
+            best_index
+        }
+    } else {
+        best_index
+    }?;
+    let task = queue.remove(chosen_index)?;
+    if best_priority > 0 && task.effective_sched_priority() > 0 {
+        RT_RUNS_SINCE_NORMAL.fetch_add(1, Ordering::Relaxed);
+    } else {
+        RT_RUNS_SINCE_NORMAL.store(0, Ordering::Relaxed);
+    }
+    Some(task)
 }
 
 pub fn has_task() -> bool {

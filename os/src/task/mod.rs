@@ -29,6 +29,12 @@ static mut SCHEDULER_CONTEXT: TaskContext = TaskContext {
 };
 static SCHEDULER_CONTEXT_PTR: AtomicUsize = AtomicUsize::new(0);
 const SIGNAL_EXIT_CODE_BASE: i32 = -0x1000;
+pub const SCHED_OTHER: usize = 0;
+pub const SCHED_FIFO: usize = 1;
+pub const SCHED_RR: usize = 2;
+pub const SCHED_BATCH: usize = 3;
+pub const SCHED_IDLE: usize = 5;
+pub const SCHED_DEADLINE: usize = 6;
 
 /// Flag set when the scheduler is context-switching FROM a user task that called exit()
 /// (via ECANCELED in the trap handler). When this flag is set, kernel_task_return()
@@ -1144,6 +1150,10 @@ pub struct TaskControlBlock {
     pub wait_outcome: Mutex<Option<wait_queue::WaitOutcome>>,
     /// Monotonic wait token used to reject stale timeout wakeups.
     pub wait_token: AtomicUsize,
+    /// Linux scheduling policy requested by sched_setscheduler(2).
+    pub sched_policy: AtomicUsize,
+    /// Static scheduling priority requested by sched_setscheduler/setparam.
+    pub sched_priority: AtomicUsize,
 }
 
 unsafe impl Send for TaskControlBlock {}
@@ -1180,4 +1190,18 @@ pub enum TaskStatus {
     Zombie,
     /// 阻塞状态 - 等待某个事件
     Blocked,
+}
+
+impl TaskControlBlock {
+    pub fn effective_sched_priority(&self) -> usize {
+        match self.sched_policy.load(Ordering::Relaxed) {
+            SCHED_FIFO | SCHED_RR => self.sched_priority.load(Ordering::Relaxed),
+            _ => 0,
+        }
+    }
+
+    pub fn set_sched_params(&self, policy: usize, priority: usize) {
+        self.sched_priority.store(priority, Ordering::Relaxed);
+        self.sched_policy.store(policy, Ordering::Relaxed);
+    }
 }

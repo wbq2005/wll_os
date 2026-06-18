@@ -305,12 +305,77 @@ pub fn sys_socket(domain: usize, raw_type: usize, protocol: usize) -> SyscallRet
 }
 
 pub fn sys_socketpair(
-    _domain: usize,
-    _raw_type: usize,
-    _protocol: usize,
-    _sv: usize,
+    domain: usize,
+    raw_type: usize,
+    protocol: usize,
+    sv: usize,
 ) -> SyscallRet {
-    Err(SysErrNo::EOPNOTSUPP)
+    if sv == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let domain = domain as i32;
+    if domain != AF_UNIX {
+        return Err(SysErrNo::EOPNOTSUPP);
+    }
+    let (sock_type, nonblock, flags) = socket_type(raw_type)?;
+    let protocol = protocol as i32;
+    validate_protocol(sock_type, protocol)?;
+
+    let left = Arc::new(Mutex::new(SocketState::new(
+        domain, sock_type, protocol, nonblock,
+    )));
+    let right = Arc::new(Mutex::new(SocketState::new(
+        domain, sock_type, protocol, nonblock,
+    )));
+    {
+        let mut left_socket = left.lock();
+        left_socket.bound = true;
+        left_socket.connected = true;
+        left_socket.local_addr = Some(default_sockaddr(domain));
+        left_socket.peer_addr = Some(default_sockaddr(domain));
+        left_socket.peer = Some(right.clone());
+    }
+    {
+        let mut right_socket = right.lock();
+        right_socket.bound = true;
+        right_socket.connected = true;
+        right_socket.local_addr = Some(default_sockaddr(domain));
+        right_socket.peer_addr = Some(default_sockaddr(domain));
+        right_socket.peer = Some(left.clone());
+    }
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let nofile_limit = inner.rlimit_nofile;
+    let mut fds = inner.fd_table.lock();
+    let fd_flags = if (flags & SOCK_CLOEXEC) != 0 {
+        fd::FD_CLOEXEC
+    } else {
+        0
+    };
+    let left_fd = fds
+        .alloc_with_flags_below(FileDescriptor::Socket { state: left }, fd_flags, nofile_limit)
+        .ok_or(SysErrNo::EMFILE)?;
+    let right_fd = match fds.alloc_with_flags_below(
+        FileDescriptor::Socket { state: right },
+        fd_flags,
+        nofile_limit,
+    ) {
+        Some(fd) => fd,
+        None => {
+            let _ = fds.free(left_fd);
+            return Err(SysErrNo::EMFILE);
+        }
+    };
+    let sv_vals = [left_fd as i32, right_fd as i32];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            sv_vals.as_ptr() as *const u8,
+            core::mem::size_of_val(&sv_vals),
+        )
+    };
+    super::user::copy_to_user(sv, bytes)?;
+    Ok(0)
 }
 
 pub fn sys_bind(fd: usize, addr: usize, addrlen: usize) -> SyscallRet {

@@ -10,7 +10,7 @@ use crate::utils::error::SysErrNo;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use polyhal::VirtAddr;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 use spin::Mutex;
@@ -970,6 +970,8 @@ pub fn sys_clone(
         block_reason: Mutex::new(None),
         wait_outcome: Mutex::new(None),
         wait_token: AtomicUsize::new(0),
+        sched_policy: AtomicUsize::new(parent.sched_policy.load(Ordering::Relaxed)),
+        sched_priority: AtomicUsize::new(parent.sched_priority.load(Ordering::Relaxed)),
     });
     crate::task::manager::register_task(&child);
     thread_group.add_member(&child);

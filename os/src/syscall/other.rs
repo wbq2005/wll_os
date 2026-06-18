@@ -1,5 +1,8 @@
 use super::SyscallRet;
-use crate::task::current_task;
+use crate::task::{
+    current_task, manager, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_OTHER,
+    SCHED_RR,
+};
 use crate::task::wait_queue::WaitOutcome;
 use crate::timer;
 use crate::utils::error::SysErrNo;
@@ -80,6 +83,15 @@ struct Tms {
     tms_cutime: isize,
     tms_cstime: isize,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SchedParam {
+    sched_priority: i32,
+}
+
+const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
+const SCHED_POLICY_UNCHANGED: usize = usize::MAX;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -209,6 +221,33 @@ pub fn sys_nanosleep(req: usize, rem: usize) -> SyscallRet {
         )?;
     }
 
+    Ok(0)
+}
+
+pub fn sys_clock_nanosleep(_clock_id: usize, flags: usize, req: usize, rem: usize) -> SyscallRet {
+    const TIMER_ABSTIME: usize = 1;
+
+    if req == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let req_ts = copy_object_from_user::<TimeSpec>(req)?;
+    let deadline_us = if flags & TIMER_ABSTIME != 0 {
+        timespec_to_us(req_ts)?
+    } else {
+        timer::deadline_after_us(duration_us_from_timespec(req_ts)?)
+    };
+    if deadline_us > timer::get_time_us() {
+        let _ = timer::sleep_until_us(deadline_us)?;
+    }
+    if rem != 0 {
+        copy_object_to_user(
+            rem,
+            &TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        )?;
+    }
     Ok(0)
 }
 
@@ -608,7 +647,125 @@ pub fn sys_membarrier(_cmd: usize, _flags: usize) -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_sched_stub() -> SyscallRet {
+pub fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> SyscallRet {
+    if mask == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if cpusetsize == 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let mut bytes = Vec::new();
+    bytes.resize(cpusetsize.min(128), 0);
+    bytes[0] = 1;
+    copy_to_user(mask, &bytes)?;
+    Ok(bytes.len())
+}
+
+pub fn sys_sched_setaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> SyscallRet {
+    if cpusetsize != 0 && mask == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if cpusetsize != 0 {
+        let mut bytes = Vec::new();
+        bytes.resize(cpusetsize.min(128), 0);
+        super::user::copy_from_user(mask, &mut bytes)?;
+    }
+    Ok(0)
+}
+
+fn sched_task_for_pid(pid: usize) -> Result<Arc<crate::task::TaskControlBlock>, SysErrNo> {
+    if pid == 0 {
+        current_task().ok_or(SysErrNo::ESRCH)
+    } else {
+        manager::find_task(pid).ok_or(SysErrNo::ESRCH)
+    }
+}
+
+fn base_sched_policy(policy: usize) -> usize {
+    policy & !SCHED_RESET_ON_FORK
+}
+
+fn validate_sched_param(policy: usize, priority: i32) -> Result<usize, SysErrNo> {
+    let policy = base_sched_policy(policy);
+    match policy {
+        SCHED_FIFO | SCHED_RR if (1..=99).contains(&priority) => Ok(priority as usize),
+        SCHED_FIFO | SCHED_RR => Err(SysErrNo::EINVAL),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE if priority == 0 => Ok(0),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Err(SysErrNo::EINVAL),
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+pub fn sys_sched_getscheduler(pid: usize) -> SyscallRet {
+    let task = sched_task_for_pid(pid)?;
+    Ok(task
+        .sched_policy
+        .load(core::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn sys_sched_setscheduler(pid: usize, policy: usize, param: usize) -> SyscallRet {
+    if param == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let sched_param = copy_object_from_user::<SchedParam>(param)?;
+    if policy == SCHED_POLICY_UNCHANGED {
+        let _ = sched_task_for_pid(pid)?;
+        return Ok(0);
+    }
+    let base_policy = base_sched_policy(policy);
+    let priority = validate_sched_param(base_policy, sched_param.sched_priority)?;
+    let task = sched_task_for_pid(pid)?;
+    task.set_sched_params(base_policy, priority);
+    Ok(0)
+}
+
+pub fn sys_sched_getparam(_pid: usize, param: usize) -> SyscallRet {
+    if param == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let task = sched_task_for_pid(_pid)?;
+    copy_object_to_user(
+        param,
+        &SchedParam {
+            sched_priority: task
+                .sched_priority
+                .load(core::sync::atomic::Ordering::Relaxed) as i32,
+        },
+    )?;
+    Ok(0)
+}
+
+pub fn sys_sched_setparam(pid: usize, param: usize) -> SyscallRet {
+    if param == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let sched_param = copy_object_from_user::<SchedParam>(param)?;
+    let task = sched_task_for_pid(pid)?;
+    let policy = task
+        .sched_policy
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let priority = validate_sched_param(policy, sched_param.sched_priority)?;
+    task.set_sched_params(policy, priority);
+    Ok(0)
+}
+
+pub fn sys_sched_get_priority_max(policy: usize) -> SyscallRet {
+    match policy {
+        SCHED_FIFO | SCHED_RR => Ok(99),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok(0),
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+pub fn sys_sched_get_priority_min(policy: usize) -> SyscallRet {
+    match policy {
+        SCHED_FIFO | SCHED_RR => Ok(1),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok(0),
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+pub fn sys_memory_lock_noop() -> SyscallRet {
     Ok(0)
 }
 

@@ -141,6 +141,10 @@ pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 pub const SYSCALL_MPROTECT: usize = 226;
 pub const SYSCALL_MSYNC: usize = 227;
+pub const SYSCALL_MLOCK: usize = 228;
+pub const SYSCALL_MUNLOCK: usize = 229;
+pub const SYSCALL_MLOCKALL: usize = 230;
+pub const SYSCALL_MUNLOCKALL: usize = 231;
 pub const SYSCALL_MADVISE: usize = 233;
 pub const SYSCALL_ACCEPT4: usize = 242;
 pub const SYSCALL_WAIT4: usize = 260;
@@ -349,15 +353,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_MPROTECT => mm::sys_mprotect(args[0], args[1], args[2] as i32),
         SYSCALL_MADVISE => Ok(0), // madvise advisory, ignore
 
-        // sched stubs
-        SYSCALL_SCHED_GETAFFINITY => other::sys_sched_stub(),
-        SYSCALL_SCHED_SETAFFINITY => other::sys_sched_stub(),
-        SYSCALL_SCHED_GETSCHEDULER => Ok(0),
-        SYSCALL_SCHED_SETSCHEDULER => Ok(0),
-        SYSCALL_SCHED_GETPARAM => other::sys_sched_stub(),
-        SYSCALL_SCHED_SETPARAM => Ok(0),
-        SYSCALL_SCHED_GET_PRIORITY_MAX => Ok(0),
-        SYSCALL_SCHED_GET_PRIORITY_MIN => Ok(0),
+        // sched stubs / single-CPU policy
+        SYSCALL_SCHED_GETAFFINITY => other::sys_sched_getaffinity(args[0], args[1], args[2]),
+        SYSCALL_SCHED_SETAFFINITY => other::sys_sched_setaffinity(args[0], args[1], args[2]),
+        SYSCALL_SCHED_GETSCHEDULER => other::sys_sched_getscheduler(args[0]),
+        SYSCALL_SCHED_SETSCHEDULER => other::sys_sched_setscheduler(args[0], args[1], args[2]),
+        SYSCALL_SCHED_GETPARAM => other::sys_sched_getparam(args[0], args[1]),
+        SYSCALL_SCHED_SETPARAM => other::sys_sched_setparam(args[0], args[1]),
+        SYSCALL_SCHED_GET_PRIORITY_MAX => other::sys_sched_get_priority_max(args[0]),
+        SYSCALL_SCHED_GET_PRIORITY_MIN => other::sys_sched_get_priority_min(args[0]),
 
         // signals
         SYSCALL_KILL => signal::sys_kill(args[0] as i32, args[1] as i32),
@@ -387,7 +391,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_FUTEX => {
             other::sys_futex_stub(args[0], args[1], args[2], args[3], args[4], args[5])
         }
-        SYSCALL_CLOCK_NANOSLEEP => other::sys_nanosleep(args[2], args[3]),
+        SYSCALL_CLOCK_NANOSLEEP => other::sys_clock_nanosleep(args[0], args[1], args[2], args[3]),
+        SYSCALL_MLOCK | SYSCALL_MUNLOCK | SYSCALL_MLOCKALL | SYSCALL_MUNLOCKALL => {
+            other::sys_memory_lock_noop()
+        }
         SYSCALL_SETSID => other::sys_getpgid(0),
 
         _ => {
