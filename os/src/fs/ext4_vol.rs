@@ -521,9 +521,9 @@ pub fn start_writeback_worker_explicit() -> Result<(), SysErrNo> {
     if !DEFAULT_WRITEBACK_WORKER_ENABLED {
         return Err(SysErrNo::ENOSYS);
     }
-    // The foreground judge harness fetches normal tasks as user contexts. Keep
-    // the worker hook explicit but disabled until the scheduler has a separate
-    // kernel-worker lane.
+    // The kernel lane exists, but 5E-0 keeps writeback worker startup explicit and
+    // disabled by default. mount/open/close/sync paths must not auto-start it, and
+    // fsync/fdatasync/sync_all must continue to synchronously drain dirty cache.
     Err(SysErrNo::ENOSYS)
 }
 
