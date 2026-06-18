@@ -847,8 +847,7 @@ fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
     const DEFAULT_RUN_TIMEOUT_US: usize = 15_000_000;
     #[cfg(not(feature = "libctest"))]
     const DEFAULT_RUN_TIMEOUT_US: usize = 120_000_000;
-    const BUSYBOX_RUN_TIMEOUT_US: usize = 300_000_000;
-    const IOZONE_RUN_TIMEOUT_US: usize = 900_000_000;
+    const IOZONE_RUN_TIMEOUT_US: usize = 240_000_000;
     const LMBENCH_RUN_TIMEOUT_US: usize = 240_000_000;
 
     if spec
@@ -857,12 +856,6 @@ fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
         .any(|arg| testcode_stem(arg).and_then(TestGroup::from_stem) == Some(TestGroup::Iozone))
     {
         IOZONE_RUN_TIMEOUT_US
-    } else if spec
-        .argv
-        .iter()
-        .any(|arg| testcode_stem(arg).and_then(TestGroup::from_stem) == Some(TestGroup::Busybox))
-    {
-        BUSYBOX_RUN_TIMEOUT_US
     } else if spec
         .argv
         .iter()
