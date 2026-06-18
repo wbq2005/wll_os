@@ -1,0 +1,1 @@
+WLL_HARNESS_GROUPS=iozone make ARCH=riscv64 build IOZONE=1 LMBENCH=0 && cp target/riscv64gc-unknown-none-elf/release/wll_OS /workspace/results/20260618-0946-riscv64-iozone-summary/kernel-riscv64-iozone

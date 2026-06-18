@@ -1,0 +1,1 @@
+docker run --rm -v D:\wll_os-master1:/workspace -w /workspace zhouzhouyi/os-contest:20260510 bash -lc make ARCH=riscv64 build IOZONE=1 LMBENCH=0 && cp target/riscv64gc-unknown-none-elf/release/wll_OS /workspace/results/20260617-2305-riscv64-all-summary/kernel-riscv64-all

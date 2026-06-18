@@ -1,0 +1,132 @@
+{
+  "groups": {
+    "iozone-glibc": [
+      {
+        "closed": true,
+        "count": 20,
+        "group": "iozone-glibc",
+        "libc": "glibc",
+        "parser": "D:\\wll_os-master1\\testdata\\judge_iozone-glibc.py",
+        "score": 24.630503654986764,
+        "status": "ok",
+        "suite": "iozone",
+        "top_low": [
+          {
+            "baseline": 7140.81,
+            "name": "iozone random-read 4 random writers (kb/sec)",
+            "result": 3731.23,
+            "score": 1.0
+          },
+          {
+            "baseline": 11848.11,
+            "name": "iozone stride-read 4 stride readers (kb/sec)",
+            "result": 5038.23,
+            "score": 1.0
+          },
+          {
+            "baseline": 10743.42,
+            "name": "iozone read-backwards 4 reverse readers (kb/sec)",
+            "result": 5057.81,
+            "score": 1.0
+          },
+          {
+            "baseline": 11082.03,
+            "name": "iozone random-read 4 random readers (kb/sec)",
+            "result": 5089.72,
+            "score": 1.0
+          },
+          {
+            "baseline": 13135.64,
+            "name": "iozone write/read 4 readers (kb/sec)",
+            "result": 7550.73,
+            "score": 1.0
+          },
+          {
+            "baseline": 13064.75,
+            "name": "iozone write/read 4 re-readers (kb/sec)",
+            "result": 8179.57,
+            "score": 1.0
+          },
+          {
+            "baseline": 14183.61,
+            "name": "iozone pwrite/pread 4 pread readers (kb/sec)",
+            "result": 9892.19,
+            "score": 1.0
+          },
+          {
+            "baseline": 8305.9,
+            "name": "iozone pwritev/preadv 4 rewriters (kb/sec)",
+            "result": 8741.83,
+            "score": 1.0498671330831189
+          }
+        ],
+        "zero": 0
+      }
+    ],
+    "iozone-musl": [
+      {
+        "closed": true,
+        "count": 20,
+        "group": "iozone-musl",
+        "libc": "musl",
+        "parser": "D:\\wll_os-master1\\testdata\\judge_iozone-musl.py",
+        "score": 24.994815548250287,
+        "status": "ok",
+        "suite": "iozone",
+        "top_low": [
+          {
+            "baseline": 11848.11,
+            "name": "iozone stride-read 4 stride readers (kb/sec)",
+            "result": 4174.34,
+            "score": 1.0
+          },
+          {
+            "baseline": 10743.42,
+            "name": "iozone read-backwards 4 reverse readers (kb/sec)",
+            "result": 4226.88,
+            "score": 1.0
+          },
+          {
+            "baseline": 7140.81,
+            "name": "iozone random-read 4 random writers (kb/sec)",
+            "result": 4643.1,
+            "score": 1.0
+          },
+          {
+            "baseline": 11082.03,
+            "name": "iozone random-read 4 random readers (kb/sec)",
+            "result": 4836.74,
+            "score": 1.0
+          },
+          {
+            "baseline": 14183.61,
+            "name": "iozone pwrite/pread 4 pread readers (kb/sec)",
+            "result": 8229.39,
+            "score": 1.0
+          },
+          {
+            "baseline": 13135.64,
+            "name": "iozone write/read 4 readers (kb/sec)",
+            "result": 9521.86,
+            "score": 1.0
+          },
+          {
+            "baseline": 13064.75,
+            "name": "iozone write/read 4 re-readers (kb/sec)",
+            "result": 9963.9,
+            "score": 1.0
+          },
+          {
+            "baseline": 7004.64,
+            "name": "iozone stride-read 4 rewriters (kb/sec)",
+            "result": 7736.59,
+            "score": 1.094608865146014
+          }
+        ],
+        "zero": 0
+      }
+    ]
+  },
+  "runs": 1,
+  "suite_profile": "iozone"
+}

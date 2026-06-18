@@ -1,0 +1,377 @@
+{
+  "groups": {
+    "iozone-glibc": {
+      "closed": true,
+      "count": 20,
+      "group": "iozone-glibc",
+      "libc": "glibc",
+      "parser": "D:\\wll_os-master1\\testdata\\judge_iozone-glibc.py",
+      "score": 23.97285198864356,
+      "status": "ok",
+      "suite": "iozone",
+      "top_low": [
+        {
+          "baseline": 7140.81,
+          "name": "iozone random-read 4 random writers (kb/sec)",
+          "result": 3160.17,
+          "score": 1.0
+        },
+        {
+          "baseline": 10743.42,
+          "name": "iozone read-backwards 4 reverse readers (kb/sec)",
+          "result": 3309.69,
+          "score": 1.0
+        },
+        {
+          "baseline": 11848.11,
+          "name": "iozone stride-read 4 stride readers (kb/sec)",
+          "result": 3949.46,
+          "score": 1.0
+        },
+        {
+          "baseline": 11082.03,
+          "name": "iozone random-read 4 random readers (kb/sec)",
+          "result": 5595.75,
+          "score": 1.0
+        },
+        {
+          "baseline": 7196.32,
+          "name": "iozone random-read 4 rewriters (kb/sec)",
+          "result": 6004.88,
+          "score": 1.0
+        },
+        {
+          "baseline": 7471.07,
+          "name": "iozone write/read 4 rewriters (kb/sec)",
+          "result": 6746.65,
+          "score": 1.0
+        },
+        {
+          "baseline": 8305.9,
+          "name": "iozone pwritev/preadv 4 rewriters (kb/sec)",
+          "result": 7038.82,
+          "score": 1.0
+        },
+        {
+          "baseline": 14183.61,
+          "name": "iozone pwrite/pread 4 pread readers (kb/sec)",
+          "result": 7455.35,
+          "score": 1.0
+        }
+      ],
+      "zero": 0
+    },
+    "iozone-musl": {
+      "closed": true,
+      "count": 20,
+      "group": "iozone-musl",
+      "libc": "musl",
+      "parser": "D:\\wll_os-master1\\testdata\\judge_iozone-musl.py",
+      "score": 24.622434895278303,
+      "status": "ok",
+      "suite": "iozone",
+      "top_low": [
+        {
+          "baseline": 10743.42,
+          "name": "iozone read-backwards 4 reverse readers (kb/sec)",
+          "result": 4862.16,
+          "score": 1.0
+        },
+        {
+          "baseline": 11848.11,
+          "name": "iozone stride-read 4 stride readers (kb/sec)",
+          "result": 4902.03,
+          "score": 1.0
+        },
+        {
+          "baseline": 7140.81,
+          "name": "iozone random-read 4 random writers (kb/sec)",
+          "result": 5005.45,
+          "score": 1.0
+        },
+        {
+          "baseline": 11082.03,
+          "name": "iozone random-read 4 random readers (kb/sec)",
+          "result": 5124.61,
+          "score": 1.0
+        },
+        {
+          "baseline": 7123.18,
+          "name": "iozone fwrite/fread 4 freaders (kb/sec)",
+          "result": 6214.01,
+          "score": 1.0
+        },
+        {
+          "baseline": 14183.61,
+          "name": "iozone pwrite/pread 4 pread readers (kb/sec)",
+          "result": 7465.52,
+          "score": 1.0
+        },
+        {
+          "baseline": 13064.75,
+          "name": "iozone write/read 4 re-readers (kb/sec)",
+          "result": 7902.58,
+          "score": 1.0
+        },
+        {
+          "baseline": 13135.64,
+          "name": "iozone write/read 4 readers (kb/sec)",
+          "result": 9708.37,
+          "score": 1.0
+        }
+      ],
+      "zero": 0
+    },
+    "libcbench-glibc": {
+      "closed": true,
+      "count": 27,
+      "group": "libcbench-glibc",
+      "libc": "glibc",
+      "parser": "D:\\wll_os-master1\\testdata\\judge_libcbench-glibc.py",
+      "score": 39.44094155867969,
+      "status": "ok",
+      "suite": "libcbench",
+      "top_low": [
+        {
+          "baseline": 0.011402239,
+          "name": "libc-bench b_string_strstr (\"abcdefghijklmnopqrstuvwxyz\") (seconds)",
+          "result": 0.012629,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.011749838,
+          "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaaaaaaaaaaaaac\") (seconds)",
+          "result": 0.012932,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.013963025,
+          "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac\") (seconds)",
+          "result": 0.015514,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.011944437,
+          "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaacccccccccccc\") (seconds)",
+          "result": 0.025164,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.036977802,
+          "name": "libc-bench b_utf8_bigbuf (0) (seconds)",
+          "result": 0.055961,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.107088632,
+          "name": "libc-bench b_malloc_big2 (0) (seconds)",
+          "result": 0.160785,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.118578071,
+          "name": "libc-bench b_malloc_big1 (0) (seconds)",
+          "result": 0.269242,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.012811332,
+          "name": "libc-bench b_string_strchr (0) (seconds)",
+          "result": 0.011995,
+          "score": 1.0637195258073087
+        }
+      ],
+      "zero": 0
+    },
+    "libcbench-musl": {
+      "closed": true,
+      "count": 27,
+      "group": "libcbench-musl",
+      "libc": "musl",
+      "parser": "D:\\wll_os-master1\\testdata\\judge_libcbench-musl.py",
+      "score": 35.372165018707285,
+      "status": "ok",
+      "suite": "libcbench",
+      "top_low": [
+        {
+          "baseline": 0.013963025,
+          "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac\") (seconds)",
+          "result": 0.018176,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.020868089,
+          "name": "libc-bench b_string_strstr (\"azbycxdwevfugthsirjqkplomn\") (seconds)",
+          "result": 0.034949,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.036977802,
+          "name": "libc-bench b_utf8_bigbuf (0) (seconds)",
+          "result": 0.040858,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.09632549,
+          "name": "libc-bench b_malloc_thread_stress (0) (seconds)",
+          "result": 0.113061,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.107088632,
+          "name": "libc-bench b_malloc_big2 (0) (seconds)",
+          "result": 0.151471,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.118578071,
+          "name": "libc-bench b_malloc_big1 (0) (seconds)",
+          "result": 0.279039,
+          "score": 1.0
+        },
+        {
+          "baseline": 0.088259223,
+          "name": "libc-bench b_regex_compile (\"(a|b|c)*d*b\") (seconds)",
+          "result": 0.348089,
+          "score": 1.0
+        },
+        {
+          "baseline": 1.006433722,
+          "name": "libc-bench b_pthread_createjoin_serial2 (0) (seconds)",
+          "result": 1.822001,
+          "score": 1.0
+        }
+      ],
+      "zero": 0
+    },
+    "lmbench-glibc": {
+      "closed": true,
+      "count": 36,
+      "group": "lmbench-glibc",
+      "libc": "glibc",
+      "parser": "D:\\wll_os-master1\\testdata\\judge_lmbench-glibc.py",
+      "score": 42.82052212943295,
+      "status": "ok",
+      "suite": "lmbench",
+      "top_low": [
+        {
+          "baseline": 9.25013,
+          "name": "lmbench Simple syscall:(microseconds)",
+          "result": 11.8422,
+          "score": 1.0
+        },
+        {
+          "baseline": 16.87553,
+          "name": "lmbench Simple write:(microseconds)",
+          "result": 17.3725,
+          "score": 1.0
+        },
+        {
+          "baseline": 16.8192,
+          "name": "lmbench Simple read:(microseconds)",
+          "result": 20.7218,
+          "score": 1.0
+        },
+        {
+          "baseline": 29.54674,
+          "name": "lmbench Simple fstat:(microseconds)",
+          "result": 43.1361,
+          "score": 1.0
+        },
+        {
+          "baseline": 187.0208,
+          "name": "lmbench bw_mmap_rd open2close",
+          "result": 95.34,
+          "score": 1.0
+        },
+        {
+          "baseline": 41.58071,
+          "name": "lmbench context switch 4:(microseconds)",
+          "result": 104.66,
+          "score": 1.0
+        },
+        {
+          "baseline": 2637.494,
+          "name": "lmbench bw_file_rd open2close",
+          "result": 141.81,
+          "score": 1.0
+        },
+        {
+          "baseline": 41.04231,
+          "name": "lmbench context switch 8:(microseconds)",
+          "result": 163.29,
+          "score": 1.0
+        }
+      ],
+      "zero": 0
+    },
+    "lmbench-musl": {
+      "closed": true,
+      "count": 36,
+      "group": "lmbench-musl",
+      "libc": "musl",
+      "parser": "D:\\wll_os-master1\\testdata\\judge_lmbench-musl.py",
+      "score": 43.14488993621358,
+      "status": "ok",
+      "suite": "lmbench",
+      "top_low": [
+        {
+          "baseline": 71703.7,
+          "name": "lmbench bw_file_rd io_only",
+          "result": 23.61,
+          "score": 1.0
+        },
+        {
+          "baseline": 16.87553,
+          "name": "lmbench Simple write:(microseconds)",
+          "result": 24.4727,
+          "score": 1.0
+        },
+        {
+          "baseline": 16.8192,
+          "name": "lmbench Simple read:(microseconds)",
+          "result": 30.9282,
+          "score": 1.0
+        },
+        {
+          "baseline": 187.0208,
+          "name": "lmbench bw_mmap_rd open2close",
+          "result": 80.08,
+          "score": 1.0
+        },
+        {
+          "baseline": 29.54674,
+          "name": "lmbench Simple fstat:(microseconds)",
+          "result": 91.2,
+          "score": 1.0
+        },
+        {
+          "baseline": 41.58071,
+          "name": "lmbench context switch 4:(microseconds)",
+          "result": 94.44,
+          "score": 1.0
+        },
+        {
+          "baseline": 2637.494,
+          "name": "lmbench bw_file_rd open2close",
+          "result": 177.88,
+          "score": 1.0
+        },
+        {
+          "baseline": 141.9106,
+          "name": "lmbench Pipe latency:(microseconds)",
+          "result": 271.4934,
+          "score": 1.0
+        }
+      ],
+      "zero": 0
+    }
+  },
+  "required_suites": [
+    "iozone",
+    "libcbench",
+    "lmbench"
+  ],
+  "source": "D:\\wll_os-master1\\results\\20260617-2036-loongarch64-all-01\\serial.log",
+  "suite_profile": "all"
+}

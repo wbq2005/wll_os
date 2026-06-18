@@ -1,0 +1,1 @@
+WLL_HARNESS_GROUPS=lmbench make ARCH=riscv64 build IOZONE=0 LMBENCH=1 && cp target/riscv64gc-unknown-none-elf/release/wll_OS /workspace/results/20260617-0911-riscv64-lmbench-summary/kernel-riscv64-lmbench

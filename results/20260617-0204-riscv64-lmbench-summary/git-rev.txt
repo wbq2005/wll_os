@@ -1,0 +1,13 @@
+$ git rev-parse --abbrev-ref HEAD
+feat/iozone
+
+$ git rev-parse HEAD
+6dcfb157549212a6d096f14e907d6013888c8725
+
+$ git status --short --branch
+## feat/iozone...origin/feat/iozone
+ M kernel-la.test
+ M kernel-rv.test
+ M os/src/mm/memory_set.rs
+?? results/
+?? scripts/__pycache__/

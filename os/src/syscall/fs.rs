@@ -294,23 +294,12 @@ impl IovCursor {
     }
 }
 
-fn read_fixed_at_to_user(
+fn read_fixed_at_into_kernel(
     file_desc: &mut FileDescriptor,
-    buf: *mut u8,
-    count: usize,
     offset: usize,
+    buf: &mut [u8],
 ) -> SyscallRet {
-    if count <= SMALL_IO_STACK_BUF {
-        let mut kbuf = [0u8; SMALL_IO_STACK_BUF];
-        let n = super::with_kernel_page_table(|| file_desc.read_at(offset, &mut kbuf[..count]))?;
-        copy_to_user(buf, &kbuf[..n])?;
-        return Ok(n);
-    }
-
-    let mut kbuf = alloc::vec![0u8; count];
-    let n = super::with_kernel_page_table(|| file_desc.read_at(offset, &mut kbuf))?;
-    copy_to_user(buf, &kbuf[..n])?;
-    Ok(n)
+    super::with_kernel_page_table(|| file_desc.read_at(offset, buf))
 }
 
 fn write_fixed_at_from_kernel(
@@ -321,11 +310,7 @@ fn write_fixed_at_from_kernel(
     super::with_kernel_page_table(|| file_desc.write_at(offset, buf))
 }
 
-fn vectored_read_at_to_user(
-    file_desc: &mut FileDescriptor,
-    iovecs: &[IoVec],
-    offset: usize,
-) -> SyscallRet {
+fn vectored_read_at_to_user(fd: usize, iovecs: &[IoVec], offset: usize) -> SyscallRet {
     let mut total = 0usize;
     let mut cursor = IovCursor::new();
     let mut kbuf = Vec::new();
@@ -347,8 +332,9 @@ fn vectored_read_at_to_user(
 
         let fixed_offset = checked_fixed_offset(offset, total)?;
         kbuf.resize(want, 0);
-        let n =
-            super::with_kernel_page_table(|| file_desc.read_at(fixed_offset, &mut kbuf[..want]))?;
+        let n = with_fixed_io_fd_mut(fd, |file_desc| {
+            read_fixed_at_into_kernel(file_desc, fixed_offset, &mut kbuf[..want])
+        })?;
         if n == 0 {
             break;
         }
@@ -449,6 +435,7 @@ fn vectored_write_at_from_user(
 
 fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let fd_table = task.inner.lock().fd_table.clone();
     let mut total = 0usize;
     let mut cursor = IovCursor::new();
     let mut kbuf = Vec::new();
@@ -461,8 +448,7 @@ fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
 
         kbuf.resize(want, 0);
         let res = {
-            let inner = task.inner.lock();
-            let mut fds = inner.fd_table.lock();
+            let mut fds = fd_table.lock();
             match fds.get_mut(fd) {
                 Some(file_desc) => {
                     super::with_kernel_page_table(|| file_desc.read(&mut kbuf[..want]))
@@ -518,8 +504,7 @@ fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
                     return Ok(total);
                 }
                 let (is_pipe_read, nb_pipe, would_block) = {
-                    let inner = task.inner.lock();
-                    let fds = inner.fd_table.lock();
+                    let fds = fd_table.lock();
                     fds.get(fd)
                         .map(|f| {
                             (
@@ -537,8 +522,7 @@ fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
                     continue;
                 }
                 let _ = sleep_on_io_if(None, || {
-                    let inner = task.inner.lock();
-                    let fds = inner.fd_table.lock();
+                    let fds = fd_table.lock();
                     let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
                     Ok(file_desc.pipe_read_would_block())
                 })?;
@@ -1424,8 +1408,8 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
 
     if count == 0 {
         let task = current_task().ok_or(SysErrNo::ESRCH)?;
-        let mut inner = task.inner.lock();
-        let mut fds = inner.fd_table.lock();
+        let fd_table = task.inner.lock().fd_table.clone();
+        let mut fds = fd_table.lock();
         let mut empty: [u8; 0] = [];
         return match fds.get_mut(fd) {
             Some(file_desc) => super::with_kernel_page_table(|| file_desc.read(&mut empty)),
@@ -1444,43 +1428,77 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
     }
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let fd_table = task.inner.lock().fd_table.clone();
 
+    if count <= SMALL_IO_STACK_BUF {
+        let mut kbuf = [0u8; SMALL_IO_STACK_BUF];
+        loop {
+            let res = {
+                let mut fds = fd_table.lock();
+                match fds.get_mut(fd) {
+                    Some(file_desc) => {
+                        super::with_kernel_page_table(|| file_desc.read(&mut kbuf[..count]))
+                    }
+                    None => Err(SysErrNo::EBADF),
+                }
+            };
+
+            match res {
+                Ok(n) => {
+                    copy_to_user(buf, &kbuf[..n])?;
+                    return Ok(n);
+                }
+                Err(SysErrNo::EAGAIN) => {
+                    let (is_pipe_read, nb_pipe, would_block) = {
+                        let fds = fd_table.lock();
+                        fds.get(fd)
+                            .map(|f| {
+                                (
+                                    f.is_pipe_read(),
+                                    f.pipe_read_nonblocking(),
+                                    f.pipe_read_would_block(),
+                                )
+                            })
+                            .unwrap_or((false, false, false))
+                    };
+                    if !is_pipe_read {
+                        return Err(SysErrNo::EAGAIN);
+                    }
+                    if nb_pipe {
+                        return Err(SysErrNo::EAGAIN);
+                    }
+                    if !would_block {
+                        continue;
+                    }
+                    let _ = sleep_on_io_if(None, || {
+                        let fds = fd_table.lock();
+                        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+                        Ok(file_desc.pipe_read_would_block())
+                    })?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    let mut kbuf = alloc::vec![0u8; count];
     loop {
         let res = {
-            let mut inner = task.inner.lock();
-            let mut fds = inner.fd_table.lock();
+            let mut fds = fd_table.lock();
             match fds.get_mut(fd) {
-                Some(file_desc) => {
-                    if count <= SMALL_IO_STACK_BUF {
-                        let mut kbuf = [0u8; SMALL_IO_STACK_BUF];
-                        match super::with_kernel_page_table(|| file_desc.read(&mut kbuf[..count])) {
-                            Ok(n) => {
-                                copy_to_user(buf, &kbuf[..n])?;
-                                Ok(n)
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        let mut kbuf = alloc::vec![0u8; count];
-                        match super::with_kernel_page_table(|| file_desc.read(&mut kbuf)) {
-                            Ok(n) => {
-                                copy_to_user(buf, &kbuf[..n])?;
-                                Ok(n)
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                }
+                Some(file_desc) => super::with_kernel_page_table(|| file_desc.read(&mut kbuf)),
                 None => Err(SysErrNo::EBADF),
             }
         };
 
         match res {
-            Ok(n) => return Ok(n),
+            Ok(n) => {
+                copy_to_user(buf, &kbuf[..n])?;
+                return Ok(n);
+            }
             Err(SysErrNo::EAGAIN) => {
                 let (is_pipe_read, nb_pipe, would_block) = {
-                    let inner = task.inner.lock();
-                    let fds = inner.fd_table.lock();
+                    let fds = fd_table.lock();
                     fds.get(fd)
                         .map(|f| {
                             (
@@ -1501,8 +1519,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
                     continue;
                 }
                 let _ = sleep_on_io_if(None, || {
-                    let inner = task.inner.lock();
-                    let fds = inner.fd_table.lock();
+                    let fds = fd_table.lock();
                     let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
                     Ok(file_desc.pipe_read_would_block())
                 })?;
@@ -1659,9 +1676,21 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, count: usize, offset: usize) -> Sysc
     }
     checked_io_count(count)?;
 
-    with_fixed_io_fd_mut(fd, |file_desc| {
-        read_fixed_at_to_user(file_desc, buf, count, offset)
-    })
+    if count <= SMALL_IO_STACK_BUF {
+        let mut kbuf = [0u8; SMALL_IO_STACK_BUF];
+        let n = with_fixed_io_fd_mut(fd, |file_desc| {
+            read_fixed_at_into_kernel(file_desc, offset, &mut kbuf[..count])
+        })?;
+        copy_to_user(buf, &kbuf[..n])?;
+        return Ok(n);
+    }
+
+    let mut kbuf = alloc::vec![0u8; count];
+    let n = with_fixed_io_fd_mut(fd, |file_desc| {
+        read_fixed_at_into_kernel(file_desc, offset, &mut kbuf)
+    })?;
+    copy_to_user(buf, &kbuf[..n])?;
+    Ok(n)
 }
 
 pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: usize) -> SyscallRet {
@@ -1949,9 +1978,7 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> Sy
         }
 
         let fixed_offset = checked_fixed_offset(offset, total)?;
-        let n = match with_fixed_io_fd_mut(fd, |file_desc| {
-            vectored_read_at_to_user(file_desc, &iovecs, fixed_offset)
-        }) {
+        let n = match vectored_read_at_to_user(fd, &iovecs, fixed_offset) {
             Ok(n) => n,
             Err(err) => return if total != 0 { Ok(total) } else { Err(err) },
         };

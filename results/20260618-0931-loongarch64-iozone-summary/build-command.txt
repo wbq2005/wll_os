@@ -1,0 +1,1 @@
+WLL_HARNESS_GROUPS=iozone make ARCH=loongarch64 build IOZONE=1 LMBENCH=0 && cp target/loongarch64-unknown-none/release/wll_OS /workspace/results/20260618-0931-loongarch64-iozone-summary/kernel-loongarch64-iozone

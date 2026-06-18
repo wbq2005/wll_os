@@ -1,0 +1,132 @@
+{
+  "groups": {
+    "lmbench-glibc": [
+      {
+        "closed": true,
+        "count": 36,
+        "group": "lmbench-glibc",
+        "libc": "glibc",
+        "parser": "D:\\wll_os-master1\\testdata\\judge_lmbench-glibc.py",
+        "score": 42.13443046386573,
+        "status": "ok",
+        "suite": "lmbench",
+        "top_low": [
+          {
+            "baseline": 9.25013,
+            "name": "lmbench Simple syscall:(microseconds)",
+            "result": 16.1,
+            "score": 1.0
+          },
+          {
+            "baseline": 18.84948,
+            "name": "lmbench Signal handler installation:(microseconds)",
+            "result": 21.6704,
+            "score": 1.0
+          },
+          {
+            "baseline": 16.8192,
+            "name": "lmbench Simple read:(microseconds)",
+            "result": 28.9681,
+            "score": 1.0
+          },
+          {
+            "baseline": 16.87553,
+            "name": "lmbench Simple write:(microseconds)",
+            "result": 30.7282,
+            "score": 1.0
+          },
+          {
+            "baseline": 29.54674,
+            "name": "lmbench Simple fstat:(microseconds)",
+            "result": 37.4143,
+            "score": 1.0
+          },
+          {
+            "baseline": 41.58071,
+            "name": "lmbench context switch 4:(microseconds)",
+            "result": 66.19,
+            "score": 1.0
+          },
+          {
+            "baseline": 41.04231,
+            "name": "lmbench context switch 8:(microseconds)",
+            "result": 132.93,
+            "score": 1.0
+          },
+          {
+            "baseline": 2637.494,
+            "name": "lmbench bw_file_rd open2close",
+            "result": 179.31,
+            "score": 1.0
+          }
+        ],
+        "zero": 0
+      }
+    ],
+    "lmbench-musl": [
+      {
+        "closed": true,
+        "count": 36,
+        "group": "lmbench-musl",
+        "libc": "musl",
+        "parser": "D:\\wll_os-master1\\testdata\\judge_lmbench-musl.py",
+        "score": 41.70113134674612,
+        "status": "ok",
+        "suite": "lmbench",
+        "top_low": [
+          {
+            "baseline": 9.25013,
+            "name": "lmbench Simple syscall:(microseconds)",
+            "result": 15.4538,
+            "score": 1.0
+          },
+          {
+            "baseline": 16.8192,
+            "name": "lmbench Simple read:(microseconds)",
+            "result": 18.3946,
+            "score": 1.0
+          },
+          {
+            "baseline": 18.84948,
+            "name": "lmbench Signal handler installation:(microseconds)",
+            "result": 20.2078,
+            "score": 1.0
+          },
+          {
+            "baseline": 16.87553,
+            "name": "lmbench Simple write:(microseconds)",
+            "result": 29.0889,
+            "score": 1.0
+          },
+          {
+            "baseline": 41.24,
+            "name": "lmbench context switch 2:(microseconds)",
+            "result": 43.11,
+            "score": 1.0
+          },
+          {
+            "baseline": 187.0208,
+            "name": "lmbench bw_mmap_rd open2close",
+            "result": 74.84,
+            "score": 1.0
+          },
+          {
+            "baseline": 41.58071,
+            "name": "lmbench context switch 4:(microseconds)",
+            "result": 149.55,
+            "score": 1.0
+          },
+          {
+            "baseline": 2637.494,
+            "name": "lmbench bw_file_rd open2close",
+            "result": 187.08,
+            "score": 1.0
+          }
+        ],
+        "zero": 0
+      }
+    ]
+  },
+  "runs": 1,
+  "suite_profile": "lmbench"
+}

@@ -1,0 +1,21 @@
+$ git rev-parse --abbrev-ref HEAD
+feat/iozone
+
+$ git rev-parse HEAD
+21b7c48f2201e8556d71d3291a51a3fb6ad596e0
+
+$ git status --short --branch
+## feat/iozone...origin/feat/iozone
+ M kernel-la.test
+ M kernel-rv.test
+ M os/src/mm/elf_loader.rs
+ M os/src/mm/frame_allocator.rs
+ M os/src/mm/memory_set.rs
+ M os/src/mm/page_table.rs
+ M os/src/syscall/other.rs
+ M os/src/syscall/process.rs
+ M os/src/syscall/user.rs
+ M os/src/task/mod.rs
+ M os/src/task/task.rs
+?? results/
+?? scripts/__pycache__/

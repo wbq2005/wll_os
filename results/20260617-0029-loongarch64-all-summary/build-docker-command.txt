@@ -1,0 +1,1 @@
+docker run --rm -v D:\wll_os-master1:/workspace -w /workspace zhouzhouyi/os-contest:20260510 bash -lc make ARCH=loongarch64 build IOZONE=1 LMBENCH=0 && cp target/loongarch64-unknown-none/release/wll_OS /workspace/results/20260617-0029-loongarch64-all-summary/kernel-loongarch64-all

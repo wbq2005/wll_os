@@ -1,0 +1,1 @@
+docker run --rm -v D:\wll_os-master1:/workspace -w /workspace zhouzhouyi/os-contest:20260510 bash -lc WLL_HARNESS_GROUPS=libcbench make ARCH=loongarch64 build IOZONE=1 LMBENCH=0 && cp target/loongarch64-unknown-none/release/wll_OS /workspace/results/20260617-0022-loongarch64-libcbench-summary/kernel-loongarch64-libcbench

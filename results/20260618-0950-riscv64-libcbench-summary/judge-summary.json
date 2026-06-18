@@ -1,0 +1,132 @@
+{
+  "groups": {
+    "libcbench-glibc": [
+      {
+        "closed": true,
+        "count": 27,
+        "group": "libcbench-glibc",
+        "libc": "glibc",
+        "parser": "D:\\wll_os-master1\\testdata\\judge_libcbench-glibc.py",
+        "score": 33.21330756833387,
+        "status": "ok",
+        "suite": "libcbench",
+        "top_low": [
+          {
+            "baseline": 0.013459429,
+            "name": "libc-bench b_string_strlen (0) (seconds)",
+            "result": 0.018029,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.011402239,
+            "name": "libc-bench b_string_strstr (\"abcdefghijklmnopqrstuvwxyz\") (seconds)",
+            "result": 0.021247,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.011749838,
+            "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaaaaaaaaaaaaac\") (seconds)",
+            "result": 0.02383,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.013963025,
+            "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac\") (seconds)",
+            "result": 0.037529,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.011944437,
+            "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaacccccccccccc\") (seconds)",
+            "result": 0.054016,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.036977802,
+            "name": "libc-bench b_utf8_bigbuf (0) (seconds)",
+            "result": 0.084433,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.080551368,
+            "name": "libc-bench b_pthread_uselesslock (0) (seconds)",
+            "result": 0.090323,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.09632549,
+            "name": "libc-bench b_malloc_thread_stress (0) (seconds)",
+            "result": 0.109409,
+            "score": 1.0
+          }
+        ],
+        "zero": 0
+      }
+    ],
+    "libcbench-musl": [
+      {
+        "closed": true,
+        "count": 27,
+        "group": "libcbench-musl",
+        "libc": "musl",
+        "parser": "D:\\wll_os-master1\\testdata\\judge_libcbench-musl.py",
+        "score": 28.239425599775885,
+        "status": "ok",
+        "suite": "libcbench",
+        "top_low": [
+          {
+            "baseline": 0.010810043,
+            "name": "libc-bench b_malloc_tiny2 (0) (seconds)",
+            "result": 0.021641,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.011944437,
+            "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaacccccccccccc\") (seconds)",
+            "result": 0.024712,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.014186324,
+            "name": "libc-bench b_malloc_tiny1 (0) (seconds)",
+            "result": 0.024726,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.013459429,
+            "name": "libc-bench b_string_strlen (0) (seconds)",
+            "result": 0.024861,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.012811332,
+            "name": "libc-bench b_string_strchr (0) (seconds)",
+            "result": 0.026166,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.011402239,
+            "name": "libc-bench b_string_strstr (\"abcdefghijklmnopqrstuvwxyz\") (seconds)",
+            "result": 0.026674,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.011749838,
+            "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaaaaaaaaaaaaac\") (seconds)",
+            "result": 0.026921,
+            "score": 1.0
+          },
+          {
+            "baseline": 0.013963025,
+            "name": "libc-bench b_string_strstr (\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac\") (seconds)",
+            "result": 0.029722,
+            "score": 1.0
+          }
+        ],
+        "zero": 0
+      }
+    ]
+  },
+  "runs": 1,
+  "suite_profile": "libcbench"
+}

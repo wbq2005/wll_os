@@ -1,0 +1,131 @@
+{
+  "groups": {
+    "lmbench-glibc": {
+      "closed": true,
+      "count": 36,
+      "group": "lmbench-glibc",
+      "libc": "glibc",
+      "parser": "D:\\wll_os-master1\\testdata\\judge_lmbench-glibc.py",
+      "score": 41.27260283954948,
+      "status": "ok",
+      "suite": "lmbench",
+      "top_low": [
+        {
+          "baseline": 9.25013,
+          "name": "lmbench Simple syscall:(microseconds)",
+          "result": 15.4238,
+          "score": 1.0
+        },
+        {
+          "baseline": 18.84948,
+          "name": "lmbench Signal handler installation:(microseconds)",
+          "result": 23.0658,
+          "score": 1.0
+        },
+        {
+          "baseline": 16.8192,
+          "name": "lmbench Simple read:(microseconds)",
+          "result": 23.5312,
+          "score": 1.0
+        },
+        {
+          "baseline": 16.87553,
+          "name": "lmbench Simple write:(microseconds)",
+          "result": 34.8333,
+          "score": 1.0
+        },
+        {
+          "baseline": 29.54674,
+          "name": "lmbench Simple fstat:(microseconds)",
+          "result": 39.4412,
+          "score": 1.0
+        },
+        {
+          "baseline": 2637.494,
+          "name": "lmbench bw_file_rd open2close",
+          "result": 86.05,
+          "score": 1.0
+        },
+        {
+          "baseline": 187.0208,
+          "name": "lmbench bw_mmap_rd open2close",
+          "result": 111.48,
+          "score": 1.0
+        },
+        {
+          "baseline": 41.58071,
+          "name": "lmbench context switch 4:(microseconds)",
+          "result": 112.61,
+          "score": 1.0
+        }
+      ],
+      "zero": 0
+    },
+    "lmbench-musl": {
+      "closed": true,
+      "count": 36,
+      "group": "lmbench-musl",
+      "libc": "musl",
+      "parser": "D:\\wll_os-master1\\testdata\\judge_lmbench-musl.py",
+      "score": 40.81589498131676,
+      "status": "ok",
+      "suite": "lmbench",
+      "top_low": [
+        {
+          "baseline": 2637.494,
+          "name": "lmbench bw_file_rd open2close",
+          "result": 11.65,
+          "score": 1.0
+        },
+        {
+          "baseline": 71703.7,
+          "name": "lmbench bw_file_rd io_only",
+          "result": 14.16,
+          "score": 1.0
+        },
+        {
+          "baseline": 9.25013,
+          "name": "lmbench Simple syscall:(microseconds)",
+          "result": 17.2721,
+          "score": 1.0
+        },
+        {
+          "baseline": 18.84948,
+          "name": "lmbench Signal handler installation:(microseconds)",
+          "result": 22.2172,
+          "score": 1.0
+        },
+        {
+          "baseline": 16.8192,
+          "name": "lmbench Simple read:(microseconds)",
+          "result": 24.0721,
+          "score": 1.0
+        },
+        {
+          "baseline": 16.87553,
+          "name": "lmbench Simple write:(microseconds)",
+          "result": 29.3611,
+          "score": 1.0
+        },
+        {
+          "baseline": 187.0208,
+          "name": "lmbench bw_mmap_rd open2close",
+          "result": 37.1,
+          "score": 1.0
+        },
+        {
+          "baseline": 29.54674,
+          "name": "lmbench Simple fstat:(microseconds)",
+          "result": 44.4032,
+          "score": 1.0
+        }
+      ],
+      "zero": 0
+    }
+  },
+  "required_suites": [
+    "lmbench"
+  ],
+  "source": "D:\\wll_os-master1\\results\\20260617-0916-loongarch64-lmbench-01\\serial.log",
+  "suite_profile": "lmbench"
+}
