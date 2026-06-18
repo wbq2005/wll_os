@@ -1,1 +1,0 @@
-make ARCH=riscv64 build IOZONE=1 LMBENCH=0 && cp target/riscv64gc-unknown-none-elf/release/wll_OS /workspace/results/20260617-1314-riscv64-all-summary/kernel-riscv64-all

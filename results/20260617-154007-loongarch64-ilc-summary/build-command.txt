@@ -1,1 +1,0 @@
-WLL_HARNESS_GROUPS=iozone,lmbench,libcbench make ARCH=loongarch64 build IOZONE=1 LMBENCH=0 && cp target/loongarch64-unknown-none/release/wll_OS /workspace/results/20260617-154007-loongarch64-ilc-summary/kernel-loongarch64-ilc

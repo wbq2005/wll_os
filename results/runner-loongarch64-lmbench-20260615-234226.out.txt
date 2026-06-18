@@ -1,2 +1,0 @@
-[loongarch64/lmbench] run 1/1: D:\wll_os-master1\results\20260615-2342-loongarch64-lmbench-01
-[loongarch64/lmbench] summary: D:\wll_os-master1\results\20260615-2342-loongarch64-lmbench-summary

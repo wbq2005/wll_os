@@ -17,6 +17,9 @@ target/
 # Generated kernel/build artifacts; Makefile must recreate kernel-rv and kernel-la.
 kernel-rv
 kernel-la
+kernel-rv*
+kernel-la*
+kernel-*.test
 kernel-rv-test
 kernel-rv.new
 kernel.zip
@@ -25,6 +28,9 @@ kernel.zip
 *.img
 *.iso
 testdata/*.img.gz
+
+# Benchmark/run outputs
+results/
 
 # 日志和临时文件
 *.log
