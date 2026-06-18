@@ -1,0 +1,1 @@
+make ARCH=loongarch64 build IOZONE=1 LMBENCH=0 && cp target/loongarch64-unknown-none/release/wll_OS /workspace/results/20260618-1618-loongarch64-all-summary/kernel-loongarch64-all

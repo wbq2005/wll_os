@@ -1,0 +1,42 @@
+$ git rev-parse --abbrev-ref HEAD
+feat/iozone
+
+$ git rev-parse HEAD
+8ba44d92749eb67aa6471d86c605e9a8ace91711
+
+$ git status --short --branch
+## feat/iozone...origin/feat/iozone
+ M os/src/syscall/fs.rs
+?? results/20260618-1545-loongarch64-iozone-01/
+?? results/20260618-1545-loongarch64-iozone-summary/
+?? results/20260618-1550-loongarch64-libcbench-01/
+?? results/20260618-1550-loongarch64-libcbench-summary/
+?? results/20260618-1602-loongarch64-lmbench-01/
+?? results/20260618-1602-loongarch64-lmbench-summary/
+?? results/20260618-1606-riscv64-iozone-01/
+?? results/20260618-1606-riscv64-iozone-summary/
+?? results/20260618-1612-riscv64-libcbench-01/
+?? results/20260618-1612-riscv64-libcbench-summary/
+?? results/20260618-1614-riscv64-lmbench-01/
+?? results/20260618-1614-riscv64-lmbench-summary/
+?? results/20260618-1618-loongarch64-all-01/
+?? results/20260618-1618-loongarch64-all-summary/
+?? results/20260618-1629-riscv64-all-01/
+?? results/20260618-1629-riscv64-all-summary/
+?? results/20260618-1702-loongarch64-lmbench-01/
+?? results/20260618-1702-loongarch64-lmbench-02/
+?? results/20260618-1702-loongarch64-lmbench-03/
+?? results/20260618-1702-loongarch64-lmbench-04/
+?? results/20260618-1702-loongarch64-lmbench-summary/
+?? results/20260618-1741-loongarch64-lmbench-01/
+?? results/20260618-1741-loongarch64-lmbench-summary/
+?? results/20260618-1745-riscv64-lmbench-01/
+?? results/20260618-1745-riscv64-lmbench-summary/
+?? results/20260618-1749-loongarch64-iozone-01/
+?? results/20260618-1749-loongarch64-iozone-summary/
+?? results/20260618-1754-riscv64-iozone-01/
+?? results/20260618-1754-riscv64-iozone-summary/
+?? results/20260618-1801-loongarch64-all-01/
+?? results/20260618-1801-loongarch64-all-summary/
+?? results/20260618-1811-riscv64-all-01/
+?? results/20260618-1811-riscv64-all-summary/

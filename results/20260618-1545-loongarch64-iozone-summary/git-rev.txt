@@ -1,0 +1,9 @@
+$ git rev-parse --abbrev-ref HEAD
+feat/iozone
+
+$ git rev-parse HEAD
+01587b454caf786cb5215fedf7a1f821b7bf8b38
+
+$ git status --short --branch
+## feat/iozone...origin/feat/iozone
+ M os/src/fs/ext4_vol.rs

@@ -538,6 +538,7 @@ fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
 
 fn vectored_write_from_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let fd_table = task.inner.lock().fd_table.clone();
     let mut total = 0usize;
     let mut cursor = IovCursor::new();
     let mut heap_buf = Vec::new();
@@ -569,8 +570,7 @@ fn vectored_write_from_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
 
         loop {
             let res = {
-                let inner = task.inner.lock();
-                let mut fds = inner.fd_table.lock();
+                let mut fds = fd_table.lock();
                 match fds.get_mut(fd) {
                     Some(file_desc) => super::with_kernel_page_table(|| file_desc.write(write_buf)),
                     None => Err(SysErrNo::EBADF),
@@ -590,8 +590,7 @@ fn vectored_write_from_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
                         return Ok(total);
                     }
                     let (is_pipe_write, nb_pipe, would_block) = {
-                        let inner = task.inner.lock();
-                        let fds = inner.fd_table.lock();
+                        let fds = fd_table.lock();
                         fds.get(fd)
                             .map(|f| {
                                 (
@@ -609,8 +608,7 @@ fn vectored_write_from_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
                         continue;
                     }
                     match sleep_on_io_if(None, || {
-                        let inner = task.inner.lock();
-                        let fds = inner.fd_table.lock();
+                        let fds = fd_table.lock();
                         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
                         Ok(file_desc.pipe_write_would_block())
                     }) {
@@ -1542,8 +1540,8 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
 
     if count == 0 {
         let task = current_task().ok_or(SysErrNo::ESRCH)?;
-        let mut inner = task.inner.lock();
-        let mut fds = inner.fd_table.lock();
+        let fd_table = task.inner.lock().fd_table.clone();
+        let mut fds = fd_table.lock();
         return match fds.get_mut(fd) {
             Some(file_desc) => super::with_kernel_page_table(|| file_desc.write(&[])),
             None => Err(SysErrNo::EBADF),
@@ -1557,13 +1555,13 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
     }
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let fd_table = task.inner.lock().fd_table.clone();
     with_user_read_buf(buf, count, |kbuf| {
         let mut written = 0usize;
 
         loop {
             let res = {
-                let mut inner = task.inner.lock();
-                let mut fds = inner.fd_table.lock();
+                let mut fds = fd_table.lock();
                 match fds.get_mut(fd) {
                     Some(file_desc) => {
                         super::with_kernel_page_table(|| file_desc.write(&kbuf[written..]))
@@ -1584,8 +1582,7 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
                         return Ok(written);
                     }
                     let (is_pipe_write, nb_pipe, would_block) = {
-                        let inner = task.inner.lock();
-                        let fds = inner.fd_table.lock();
+                        let fds = fd_table.lock();
                         fds.get(fd)
                             .map(|f| {
                                 (
@@ -1614,8 +1611,7 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
                         continue;
                     }
                     match sleep_on_io_if(None, || {
-                        let inner = task.inner.lock();
-                        let fds = inner.fd_table.lock();
+                        let fds = fd_table.lock();
                         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
                         Ok(file_desc.pipe_write_would_block())
                     }) {
