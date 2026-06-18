@@ -1057,12 +1057,15 @@ fn finish_writeback_snapshot(
     result
 }
 
-fn acknowledge_writeback_error(ino: u32, err: SysErrNo) {
+fn acknowledge_writeback_error(ino: u32, err: SysErrNo) -> bool {
     let mut cache = REGULAR_FILE_CACHE.lock();
     if let Some(cached) = cache.get_mut(&ino) {
         if cached.dirty.last_error == Some(err) {
             cached.dirty.last_error = None;
         }
+        cached.dirty.is_dirty()
+    } else {
+        false
     }
 }
 
@@ -1101,7 +1104,9 @@ pub fn flush_cached_ino(ino: u32) -> Result<(), SysErrNo> {
                 return flush_time_override(ino);
             }
             WritebackSnapshotResult::Failed(err) => {
-                acknowledge_writeback_error(ino, err);
+                if acknowledge_writeback_error(ino, err) {
+                    continue;
+                }
                 return Err(err);
             }
             WritebackSnapshotResult::Busy => {
