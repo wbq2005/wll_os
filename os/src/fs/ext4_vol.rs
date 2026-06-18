@@ -64,13 +64,15 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     static ref DATA_TIME_OVERRIDES: Mutex<BTreeMap<u32, (u32, u32, u32, u32)>> =
         Mutex::new(BTreeMap::new());
-    static ref REGULAR_FILE_CACHE: Mutex<BTreeMap<u32, CachedRegularFile>> =
+    static ref REGULAR_FILE_CACHE: Mutex<BTreeMap<u32, RegularCacheEntry>> =
         Mutex::new(BTreeMap::new());
     static ref CLEAN_PAGE_CACHE: Mutex<CleanPageCache> = Mutex::new(CleanPageCache::new());
     static ref OPEN_REGULAR_REFS: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
     static ref PENDING_UNLINK_REGULAR: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
     static ref WRITEBACK_QUEUE: Mutex<WritebackQueue> = Mutex::new(WritebackQueue::new());
 }
+
+type RegularCacheEntry = Arc<Mutex<CachedRegularFile>>;
 
 struct WritebackQueue {
     pending: VecDeque<u32>,
@@ -252,11 +254,31 @@ struct CachedRegularFile {
     mtime_extra: u32,
     ctime_sec: u32,
     ctime_extra: u32,
+    evicted: bool,
 }
 
 impl CachedRegularFile {
+    fn new(
+        data: Vec<u8>,
+        dirty: PageCacheDirtyModel,
+        mtime_sec: u32,
+        mtime_extra: u32,
+        ctime_sec: u32,
+        ctime_extra: u32,
+    ) -> Self {
+        Self {
+            data,
+            dirty,
+            mtime_sec,
+            mtime_extra,
+            ctime_sec,
+            ctime_extra,
+            evicted: false,
+        }
+    }
+
     fn is_dirty(&self) -> bool {
-        self.dirty.is_dirty()
+        !self.evicted && self.dirty.is_dirty()
     }
 }
 
@@ -496,13 +518,13 @@ fn cached_file_async_writeback_ok(cached: &CachedRegularFile) -> bool {
 
 fn schedule_cached_writeback_if_ready(ino: u32) {
     let should_queue = {
-        let mut cache = REGULAR_FILE_CACHE.lock();
-        let Some(cached) = cache.get_mut(&ino) else {
+        let Some(entry) = regular_cache_entry(ino) else {
             return;
         };
+        let mut cached = entry.lock();
         if !cached.is_dirty()
             || cached.dirty.writeback_active()
-            || !cached_file_async_writeback_ok(cached)
+            || !cached_file_async_writeback_ok(&cached)
         {
             false
         } else {
@@ -651,6 +673,28 @@ fn load_regular_data(fs: &Ext4, ino: u32) -> Result<Vec<u8>, SysErrNo> {
     Ok(data)
 }
 
+fn regular_cache_entry(ino: u32) -> Option<RegularCacheEntry> {
+    REGULAR_FILE_CACHE.lock().get(&ino).cloned()
+}
+
+fn insert_regular_cache_entry(ino: u32, cached: CachedRegularFile) {
+    let old = REGULAR_FILE_CACHE
+        .lock()
+        .insert(ino, Arc::new(Mutex::new(cached)));
+    if let Some(entry) = old {
+        entry.lock().evicted = true;
+    }
+}
+
+fn clear_regular_file_cache() {
+    let entries: Vec<RegularCacheEntry> =
+        REGULAR_FILE_CACHE.lock().values().cloned().collect();
+    for entry in entries {
+        entry.lock().evicted = true;
+    }
+    REGULAR_FILE_CACHE.lock().clear();
+}
+
 fn clean_page_key(ino: u32, file_offset: usize) -> CleanPageKey {
     CleanPageKey {
         ino,
@@ -744,7 +788,7 @@ fn clear_clean_page_cache() {
 }
 
 fn ensure_regular_cache(ino: u32) -> Result<bool, SysErrNo> {
-    if REGULAR_FILE_CACHE.lock().contains_key(&ino) {
+    if regular_cache_entry(ino).is_some() {
         return Ok(true);
     }
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
@@ -753,23 +797,27 @@ fn ensure_regular_cache(ino: u32) -> Result<bool, SysErrNo> {
         return Ok(false);
     }
     let data = load_regular_data(&fs, ino)?;
-    REGULAR_FILE_CACHE.lock().insert(
-        ino,
-        CachedRegularFile {
-            data,
-            dirty: PageCacheDirtyModel::clean(),
-            mtime_sec: inode.mtime(),
-            mtime_extra: inode.i_mtime_extra(),
-            ctime_sec: inode.ctime(),
-            ctime_extra: inode.i_ctime_extra(),
-        },
+    let cached = CachedRegularFile::new(
+        data,
+        PageCacheDirtyModel::clean(),
+        inode.mtime(),
+        inode.i_mtime_extra(),
+        inode.ctime(),
+        inode.i_ctime_extra(),
     );
+    let mut cache = REGULAR_FILE_CACHE.lock();
+    if !cache.contains_key(&ino) {
+        cache.insert(ino, Arc::new(Mutex::new(cached)));
+    }
     Ok(true)
 }
 
 fn cached_regular_read(ino: u32, offset: usize, buf: &mut [u8]) -> Option<usize> {
-    let cache = REGULAR_FILE_CACHE.lock();
-    let cached = cache.get(&ino)?;
+    let entry = regular_cache_entry(ino)?;
+    let cached = entry.lock();
+    if cached.evicted {
+        return None;
+    }
     if offset >= cached.data.len() {
         return Some(0);
     }
@@ -779,40 +827,44 @@ fn cached_regular_read(ino: u32, offset: usize, buf: &mut [u8]) -> Option<usize>
 }
 
 fn cached_regular_size(ino: u32) -> Option<usize> {
-    REGULAR_FILE_CACHE
-        .lock()
-        .get(&ino)
-        .map(|cached| cached.data.len())
+    let entry = regular_cache_entry(ino)?;
+    let cached = entry.lock();
+    (!cached.evicted).then_some(cached.data.len())
 }
 
 fn cached_regular_info(ino: u32) -> Option<CachedRegularInfo> {
-    REGULAR_FILE_CACHE
-        .lock()
-        .get(&ino)
-        .map(|cached| CachedRegularInfo {
-            size: cached.data.len(),
-            mtime_sec: cached.mtime_sec,
-            mtime_extra: cached.mtime_extra,
-            ctime_sec: cached.ctime_sec,
-            ctime_extra: cached.ctime_extra,
-        })
+    let entry = regular_cache_entry(ino)?;
+    let cached = entry.lock();
+    if cached.evicted {
+        return None;
+    }
+    Some(CachedRegularInfo {
+        size: cached.data.len(),
+        mtime_sec: cached.mtime_sec,
+        mtime_extra: cached.mtime_extra,
+        ctime_sec: cached.ctime_sec,
+        ctime_extra: cached.ctime_extra,
+    })
 }
 
 fn cached_regular_resize(ino: u32, new_len: usize) -> Result<(), SysErrNo> {
     cancel_queued_writeback(ino);
     invalidate_clean_pages_ino(ino);
-    let mut cache = REGULAR_FILE_CACHE.lock();
-    let cached = cache.get_mut(&ino).ok_or(SysErrNo::ENOENT)?;
+    let entry = regular_cache_entry(ino).ok_or(SysErrNo::ENOENT)?;
+    let mut cached = entry.lock();
+    if cached.evicted {
+        return Err(SysErrNo::ENOENT);
+    }
     let old_len = cached.data.len();
     cached.data.resize(new_len, 0);
     if new_len > old_len {
         cached.dirty.full_dirty = true;
     } else if new_len < old_len {
-        clip_dirty_ranges(cached, new_len);
+        clip_dirty_ranges(&mut cached, new_len);
     }
     cached.dirty.size_dirty = true;
-    note_cached_data_write(cached);
-    drop(cache);
+    note_cached_data_write(&mut cached);
+    drop(cached);
     schedule_cached_writeback_if_ready(ino);
     Ok(())
 }
@@ -820,8 +872,11 @@ fn cached_regular_resize(ino: u32, new_len: usize) -> Result<(), SysErrNo> {
 fn cached_regular_write(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {
     let end = offset + buf.len();
     invalidate_clean_pages_range(ino, offset, end);
-    let mut cache = REGULAR_FILE_CACHE.lock();
-    let cached = cache.get_mut(&ino).ok_or(SysErrNo::ENOENT)?;
+    let entry = regular_cache_entry(ino).ok_or(SysErrNo::ENOENT)?;
+    let mut cached = entry.lock();
+    if cached.evicted {
+        return Err(SysErrNo::ENOENT);
+    }
     let old_len = cached.data.len();
     if end > cached.data.len() {
         cached.data.resize(end, 0);
@@ -833,10 +888,10 @@ fn cached_regular_write(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, Sy
             cached.dirty.size_dirty = true;
         }
     } else {
-        mark_dirty_range(cached, offset, end);
+        mark_dirty_range(&mut cached, offset, end);
     }
-    note_cached_data_write(cached);
-    drop(cache);
+    note_cached_data_write(&mut cached);
+    drop(cached);
     schedule_cached_writeback_if_ready(ino);
     Ok(buf.len())
 }
@@ -851,7 +906,17 @@ pub fn can_use_clean_page_cache(ino: u32) -> bool {
 
 fn discard_regular_cache(ino: u32) {
     cancel_queued_writeback(ino);
-    REGULAR_FILE_CACHE.lock().remove(&ino);
+    if let Some(entry) = regular_cache_entry(ino) {
+        entry.lock().evicted = true;
+        let mut cache = REGULAR_FILE_CACHE.lock();
+        let should_remove = cache
+            .get(&ino)
+            .map(|current| Arc::ptr_eq(current, &entry))
+            .unwrap_or(false);
+        if should_remove {
+            cache.remove(&ino);
+        }
+    }
     invalidate_clean_pages_ino(ino);
     DATA_TIME_OVERRIDES.lock().remove(&ino);
 }
@@ -903,20 +968,20 @@ fn finish_unlinked_regular(ino: u32) -> Result<(), SysErrNo> {
 
 fn cache_empty_regular(ino: u32, dirty: bool) {
     let now = current_ext4_time();
-    REGULAR_FILE_CACHE.lock().insert(
+    insert_regular_cache_entry(
         ino,
-        CachedRegularFile {
-            data: Vec::new(),
-            dirty: if dirty {
+        CachedRegularFile::new(
+            Vec::new(),
+            if dirty {
                 PageCacheDirtyModel::dirty_whole_file()
             } else {
                 PageCacheDirtyModel::clean()
             },
-            mtime_sec: now,
-            mtime_extra: 0,
-            ctime_sec: now,
-            ctime_extra: 0,
-        },
+            now,
+            0,
+            now,
+            0,
+        ),
     );
 }
 
@@ -953,10 +1018,13 @@ fn flush_time_override(ino: u32) -> Result<(), SysErrNo> {
 }
 
 fn take_writeback_snapshot(ino: u32) -> WritebackSnapshotResult {
-    let mut cache = REGULAR_FILE_CACHE.lock();
-    let Some(cached) = cache.get_mut(&ino) else {
+    let Some(entry) = regular_cache_entry(ino) else {
         return WritebackSnapshotResult::NoCache;
     };
+    let mut cached = entry.lock();
+    if cached.evicted {
+        return WritebackSnapshotResult::NoCache;
+    }
     if !cached.is_dirty() {
         return WritebackSnapshotResult::Clean;
     }
@@ -1052,8 +1120,11 @@ fn finish_writeback_snapshot(
 ) -> Result<(), SysErrNo> {
     let mut requeue = false;
     {
-        let mut cache = REGULAR_FILE_CACHE.lock();
-        if let Some(cached) = cache.get_mut(&snapshot.ino) {
+        if let Some(entry) = regular_cache_entry(snapshot.ino) {
+            let mut cached = entry.lock();
+            if cached.evicted {
+                return result;
+            }
             if result.is_ok() {
                 requeue = cached.dirty.finish_writeback(snapshot.dirty_seq);
             } else {
@@ -1070,8 +1141,11 @@ fn finish_writeback_snapshot(
 }
 
 fn acknowledge_writeback_error(ino: u32, err: SysErrNo) -> bool {
-    let mut cache = REGULAR_FILE_CACHE.lock();
-    if let Some(cached) = cache.get_mut(&ino) {
+    if let Some(entry) = regular_cache_entry(ino) {
+        let mut cached = entry.lock();
+        if cached.evicted {
+            return false;
+        }
         if cached.dirty.last_error == Some(err) {
             cached.dirty.last_error = None;
         }
@@ -1135,10 +1209,17 @@ pub fn flush_cached_ino(ino: u32) -> Result<(), SysErrNo> {
 
 pub fn flush_all_cached() -> Result<(), SysErrNo> {
     let mut first_error = None;
-    let inos: Vec<u32> = REGULAR_FILE_CACHE
+    let entries: Vec<(u32, RegularCacheEntry)> = REGULAR_FILE_CACHE
         .lock()
         .iter()
-        .filter_map(|(ino, cached)| cached.is_dirty().then_some(*ino))
+        .map(|(ino, entry)| (*ino, entry.clone()))
+        .collect();
+    let inos: Vec<u32> = entries
+        .into_iter()
+        .filter_map(|(ino, entry)| {
+            let cached = entry.lock();
+            cached.is_dirty().then_some(ino)
+        })
         .collect();
     for ino in inos {
         if let Err(err) = flush_cached_ino(ino) {
@@ -1210,7 +1291,7 @@ fn clear_all_caches() {
     clear_namespace_cache();
     WRITEBACK_QUEUE.lock().clear();
     DATA_TIME_OVERRIDES.lock().clear();
-    REGULAR_FILE_CACHE.lock().clear();
+    clear_regular_file_cache();
     clear_clean_page_cache();
     OPEN_REGULAR_REFS.lock().clear();
     PENDING_UNLINK_REGULAR.lock().clear();
@@ -1615,7 +1696,12 @@ pub fn set_times_ino(
     iref.inode.set_i_ctime_extra(0);
     fs.write_back_inode(&mut iref);
     DATA_TIME_OVERRIDES.lock().remove(&ino);
-    if let Some(cached) = REGULAR_FILE_CACHE.lock().get_mut(&ino) {
+    if let Some(entry) = regular_cache_entry(ino) {
+        let mut cached = entry.lock();
+        if cached.evicted {
+            clear_namespace_cache();
+            return Ok(());
+        }
         if let Some((sec, nsec)) = mtime {
             cached.mtime_sec = (sec.max(0) as usize).min(u32::MAX as usize) as u32;
             cached.mtime_extra = ext4_nsec_extra(nsec);
