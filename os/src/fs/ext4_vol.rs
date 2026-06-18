@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use ext4_rs::{Errno, Ext4, Ext4Error, InodeFileType};
+use ext4_rs::{Errno, Ext4, Ext4Error, InodeFileType, BLOCK_SIZE};
 
 /// ext4 标准根 inode 号（与 `ext4_rs` 内部一致，crate 根未再导出该常量）。
 const ROOT_INODE: u32 = 2;
@@ -19,6 +19,8 @@ const REGULAR_CACHE_LIMIT: usize = 8 * 1024 * 1024;
 const DIRTY_RANGE_FILE_LIMIT: usize = 256 * 1024;
 const ASYNC_WRITEBACK_MIN_FILE: usize = 256 * 1024;
 const CLEAN_PAGE_CACHE_LIMIT: usize = 2048;
+const PBLOCK_RUN_CACHE_LIMIT: usize = 2048;
+const PBLOCK_RUN_LOOKAHEAD: u32 = 16;
 const DEFAULT_WRITEBACK_WORKER_ENABLED: bool = false;
 static WRITEBACK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
@@ -67,6 +69,7 @@ lazy_static! {
     static ref REGULAR_FILE_CACHE: Mutex<BTreeMap<u32, RegularCacheEntry>> =
         Mutex::new(BTreeMap::new());
     static ref CLEAN_PAGE_CACHE: Mutex<CleanPageCache> = Mutex::new(CleanPageCache::new());
+    static ref PBLOCK_RUN_CACHE: Mutex<PblockRunCache> = Mutex::new(PblockRunCache::new());
     static ref OPEN_REGULAR_REFS: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
     static ref PENDING_UNLINK_REGULAR: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
     static ref WRITEBACK_QUEUE: Mutex<WritebackQueue> = Mutex::new(WritebackQueue::new());
@@ -329,6 +332,110 @@ struct CachedCleanPage {
 #[derive(Clone, Copy)]
 struct CleanPageReadMetadata {
     file_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PblockRun {
+    start_lblock: u32,
+    len: u32,
+    start_pblock: u64,
+    last_used: u64,
+}
+
+struct PblockRunCache {
+    runs: BTreeMap<(u32, u32), PblockRun>,
+    next_age: u64,
+}
+
+impl PblockRunCache {
+    fn new() -> Self {
+        Self {
+            runs: BTreeMap::new(),
+            next_age: 1,
+        }
+    }
+
+    fn bump_age(&mut self) -> u64 {
+        let age = self.next_age;
+        self.next_age = self.next_age.wrapping_add(1).max(1);
+        age
+    }
+
+    fn get(&mut self, ino: u32, lblock: u32) -> Option<u64> {
+        let (key, run) = self
+            .runs
+            .range(..=(ino, lblock))
+            .next_back()
+            .map(|(key, run)| (*key, *run))?;
+        if key.0 != ino || lblock < run.start_lblock {
+            return None;
+        }
+        let run_offset = lblock - run.start_lblock;
+        if run_offset >= run.len {
+            return None;
+        }
+        let age = self.bump_age();
+        if let Some(run) = self.runs.get_mut(&key) {
+            run.last_used = age;
+        }
+        Some(run.start_pblock + run_offset as u64)
+    }
+
+    fn insert(&mut self, ino: u32, start_lblock: u32, len: u32, start_pblock: u64) {
+        if len == 0 {
+            return;
+        }
+        let key = (ino, start_lblock);
+        let age = self.bump_age();
+        if let Some(run) = self.runs.get_mut(&key) {
+            *run = PblockRun {
+                start_lblock,
+                len,
+                start_pblock,
+                last_used: age,
+            };
+            return;
+        }
+        if self.runs.len() >= PBLOCK_RUN_CACHE_LIMIT {
+            self.evict_one();
+        }
+        self.runs.insert(
+            key,
+            PblockRun {
+                start_lblock,
+                len,
+                start_pblock,
+                last_used: age,
+            },
+        );
+    }
+
+    fn evict_one(&mut self) {
+        let victim = self
+            .runs
+            .iter()
+            .min_by_key(|(_, run)| run.last_used)
+            .map(|(key, _)| *key);
+        if let Some(key) = victim {
+            self.runs.remove(&key);
+        }
+    }
+
+    fn invalidate_ino(&mut self, ino: u32) {
+        let victims: Vec<(u32, u32)> = self
+            .runs
+            .keys()
+            .copied()
+            .filter(|(run_ino, _)| *run_ino == ino)
+            .collect();
+        for key in victims {
+            self.runs.remove(&key);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.runs.clear();
+    }
 }
 
 struct CleanPageCache {
@@ -717,6 +824,76 @@ fn clean_page_read_metadata(fs: &Ext4, ino: u32) -> Result<CleanPageReadMetadata
     })
 }
 
+fn cached_pblock_for_clean_read(
+    fs: &Ext4,
+    ino: u32,
+    lblock: u32,
+    max_run_len: u32,
+) -> Option<u64> {
+    if max_run_len == 0 {
+        return None;
+    }
+    if let Some(pblock) = PBLOCK_RUN_CACHE.lock().get(ino, lblock) {
+        return Some(pblock);
+    }
+
+    let inode_ref = fs.get_inode_ref(ino);
+    if !inode_ref.inode.is_file() {
+        return None;
+    }
+    let first_pblock = fs.get_pblock_idx(&inode_ref, lblock).ok()?;
+    let mut len = 1u32;
+    let mut prev_pblock = first_pblock;
+    while len < max_run_len {
+        let Some(next_lblock) = lblock.checked_add(len) else {
+            break;
+        };
+        let Ok(next_pblock) = fs.get_pblock_idx(&inode_ref, next_lblock) else {
+            break;
+        };
+        if prev_pblock.checked_add(1) != Some(next_pblock) {
+            break;
+        }
+        len += 1;
+        prev_pblock = next_pblock;
+    }
+    PBLOCK_RUN_CACHE
+        .lock()
+        .insert(ino, lblock, len, first_pblock);
+    Some(first_pblock)
+}
+
+fn try_fill_clean_page_frame_fast(
+    fs: &Ext4,
+    ino: u32,
+    page_idx: usize,
+    file_size: usize,
+    read_len: usize,
+    page: &mut [u8],
+) -> bool {
+    if PAGE_SIZE != BLOCK_SIZE || fs.super_block.block_size() as usize != BLOCK_SIZE {
+        return false;
+    }
+    if page_idx > u32::MAX as usize || read_len > PAGE_SIZE {
+        return false;
+    }
+    let total_blocks = file_size.div_ceil(BLOCK_SIZE);
+    let remaining_blocks = total_blocks.saturating_sub(page_idx);
+    let max_run_len = remaining_blocks.min(PBLOCK_RUN_LOOKAHEAD as usize) as u32;
+    let Some(pblock) = cached_pblock_for_clean_read(fs, ino, page_idx as u32, max_run_len) else {
+        return false;
+    };
+    if pblock > (usize::MAX / BLOCK_SIZE) as u64 {
+        return false;
+    }
+    let data = fs.block_device.read_offset(pblock as usize * BLOCK_SIZE);
+    if data.len() < PAGE_SIZE {
+        return false;
+    }
+    page[..read_len].copy_from_slice(&data[..read_len]);
+    true
+}
+
 fn fill_clean_page_frame(
     fs: &Ext4,
     ino: u32,
@@ -736,6 +913,9 @@ fn fill_clean_page_frame(
 
     let read_len = PAGE_SIZE.min(size - page_start);
     let page = unsafe { core::slice::from_raw_parts_mut(frame.ppn().addr() as *mut u8, PAGE_SIZE) };
+    if try_fill_clean_page_frame_fast(fs, ino, page_idx, size, read_len, page) {
+        return Ok(frame);
+    }
     let mut copied = 0usize;
     while copied < read_len {
         let n = fs
@@ -824,6 +1004,14 @@ fn clear_clean_page_cache() {
     CLEAN_PAGE_CACHE.lock().clear();
 }
 
+fn invalidate_pblock_runs_ino(ino: u32) {
+    PBLOCK_RUN_CACHE.lock().invalidate_ino(ino);
+}
+
+fn clear_pblock_run_cache() {
+    PBLOCK_RUN_CACHE.lock().clear();
+}
+
 fn ensure_regular_cache(ino: u32) -> Result<bool, SysErrNo> {
     if regular_cache_entry(ino).is_some() {
         return Ok(true);
@@ -887,6 +1075,7 @@ fn cached_regular_info(ino: u32) -> Option<CachedRegularInfo> {
 fn cached_regular_resize(ino: u32, new_len: usize) -> Result<(), SysErrNo> {
     cancel_queued_writeback(ino);
     invalidate_clean_pages_ino(ino);
+    invalidate_pblock_runs_ino(ino);
     let entry = regular_cache_entry(ino).ok_or(SysErrNo::ENOENT)?;
     let mut cached = entry.lock();
     if cached.evicted {
@@ -909,6 +1098,7 @@ fn cached_regular_resize(ino: u32, new_len: usize) -> Result<(), SysErrNo> {
 fn cached_regular_write(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {
     let end = offset + buf.len();
     invalidate_clean_pages_range(ino, offset, end);
+    invalidate_pblock_runs_ino(ino);
     let entry = regular_cache_entry(ino).ok_or(SysErrNo::ENOENT)?;
     let mut cached = entry.lock();
     if cached.evicted {
@@ -955,6 +1145,7 @@ fn discard_regular_cache(ino: u32) {
         }
     }
     invalidate_clean_pages_ino(ino);
+    invalidate_pblock_runs_ino(ino);
     DATA_TIME_OVERRIDES.lock().remove(&ino);
 }
 
@@ -1004,6 +1195,7 @@ fn finish_unlinked_regular(ino: u32) -> Result<(), SysErrNo> {
 }
 
 fn cache_empty_regular(ino: u32, dirty: bool) {
+    invalidate_pblock_runs_ino(ino);
     let now = current_ext4_time();
     insert_regular_cache_entry(
         ino,
@@ -1026,10 +1218,12 @@ fn uncached_regular_write(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, 
     if buf.is_empty() {
         return Ok(0);
     }
+    invalidate_pblock_runs_ino(ino);
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let written = fs.write_at(ino, offset, buf).map_err(map_ext4_err)?;
     if written != 0 {
         invalidate_clean_pages_range(ino, offset, offset.saturating_add(written));
+        invalidate_pblock_runs_ino(ino);
         note_data_write(ino);
     }
     Ok(written)
@@ -1102,6 +1296,7 @@ fn take_writeback_snapshot(ino: u32) -> WritebackSnapshotResult {
 }
 
 fn apply_writeback_snapshot(snapshot: &WritebackSnapshot) -> Result<(), SysErrNo> {
+    invalidate_pblock_runs_ino(snapshot.ino);
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let old_size = fs.get_inode_ref(snapshot.ino).inode.size();
     if (snapshot.target_len as u64) < old_size {
@@ -1148,6 +1343,7 @@ fn apply_writeback_snapshot(snapshot: &WritebackSnapshot) -> Result<(), SysErrNo
     iref.inode.set_i_ctime_extra(snapshot.ctime_extra);
     fs.write_back_inode(&mut iref);
     DATA_TIME_OVERRIDES.lock().remove(&snapshot.ino);
+    invalidate_pblock_runs_ino(snapshot.ino);
     Ok(())
 }
 
@@ -1270,6 +1466,7 @@ pub fn flush_all_cached() -> Result<(), SysErrNo> {
         }
     }
     clear_clean_page_cache();
+    clear_pblock_run_cache();
     if let Some(err) = first_error {
         Err(err)
     } else {
@@ -1330,6 +1527,7 @@ fn clear_all_caches() {
     DATA_TIME_OVERRIDES.lock().clear();
     clear_regular_file_cache();
     clear_clean_page_cache();
+    clear_pblock_run_cache();
     OPEN_REGULAR_REFS.lock().clear();
     PENDING_UNLINK_REGULAR.lock().clear();
 }
@@ -1442,6 +1640,7 @@ pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EISDIR);
     }
     invalidate_clean_pages_ino(child_ino);
+    invalidate_pblock_runs_ino(child_ino);
     let mut parent_ref = fs.get_inode_ref(parent_ino);
     let mut child_ref = fs.get_inode_ref(child_ino);
     let old_links = child_ref.inode.links_count();
@@ -1589,6 +1788,7 @@ pub fn create_regular_ext4_with_mode(path: &str, mode: u32) -> Result<u32, SysEr
     fs.write_back_inode(&mut iref);
     touch_inode(&fs, parent_ino, false, true, true);
     invalidate_clean_pages_ino(iref.inode_num);
+    invalidate_pblock_runs_ino(iref.inode_num);
     cache_empty_regular(iref.inode_num, false);
     clear_namespace_cache();
     Ok(iref.inode_num)
@@ -1612,6 +1812,7 @@ pub fn truncate_regular_ino(ino: u32, size: u64) -> Result<(), SysErrNo> {
     }
     if kind == Ext4NodeKind::Regular {
         invalidate_clean_pages_ino(ino);
+        invalidate_pblock_runs_ino(ino);
     }
     if kind == Ext4NodeKind::Regular && is_regular_cached(ino) {
         if size as usize <= REGULAR_CACHE_LIMIT {
@@ -1641,6 +1842,9 @@ pub fn truncate_regular_ino(ino: u32, size: u64) -> Result<(), SysErrNo> {
         }
     }
     touch_inode(&fs, ino, false, true, true);
+    if kind == Ext4NodeKind::Regular {
+        invalidate_pblock_runs_ino(ino);
+    }
     Ok(())
 }
 
@@ -1674,6 +1878,7 @@ pub fn ext4_write_at(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysEr
     if buf.is_empty() {
         return Ok(0);
     }
+    invalidate_pblock_runs_ino(ino);
     let end = offset + buf.len();
     if end > REGULAR_CACHE_LIMIT {
         if is_regular_cached(ino) {
