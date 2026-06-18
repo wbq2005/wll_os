@@ -8,6 +8,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use ext4_rs::{Errno, Ext4, Ext4Error, InodeFileType};
 
@@ -19,6 +20,7 @@ const DIRTY_RANGE_FILE_LIMIT: usize = 256 * 1024;
 const ASYNC_WRITEBACK_MIN_FILE: usize = 256 * 1024;
 const CLEAN_PAGE_CACHE_LIMIT: usize = 2048;
 const DEFAULT_WRITEBACK_WORKER_ENABLED: bool = false;
+static WRITEBACK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
     let end = offset.checked_add(len).ok_or(SysErrNo::EFBIG)?;
     if end > MAX_FILE_OFFSET {
@@ -518,13 +520,23 @@ fn wake_writeback_waiters() {
 }
 
 pub fn start_writeback_worker_explicit() -> Result<(), SysErrNo> {
-    if !DEFAULT_WRITEBACK_WORKER_ENABLED {
-        return Err(SysErrNo::ENOSYS);
+    if DEFAULT_WRITEBACK_WORKER_ENABLED {
+        log::warn!("[fs] writeback worker default startup flag is enabled unexpectedly");
     }
-    // The kernel lane exists, but 5E-0 keeps writeback worker startup explicit and
-    // disabled by default. mount/open/close/sync paths must not auto-start it, and
-    // fsync/fdatasync/sync_all must continue to synchronously drain dirty cache.
-    Err(SysErrNo::ENOSYS)
+    if WRITEBACK_WORKER_STARTED.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+
+    let worker = crate::task::TaskControlBlock::new_kernel_task(writeback_worker_main);
+    debug_assert!(worker.is_kernel);
+    let worker_pid = worker.pid.0;
+    crate::task::manager::add_task(worker);
+    wake_writeback_waiters();
+    log::info!(
+        "[fs] writeback worker started explicitly pid={}",
+        worker_pid
+    );
+    Ok(())
 }
 
 fn queue_writeback_ino(ino: u32) {
