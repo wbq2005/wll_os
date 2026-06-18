@@ -326,6 +326,11 @@ struct CachedCleanPage {
     last_used: u64,
 }
 
+#[derive(Clone, Copy)]
+struct CleanPageReadMetadata {
+    file_size: usize,
+}
+
 struct CleanPageCache {
     pages: BTreeMap<CleanPageKey, CachedCleanPage>,
     next_age: u64,
@@ -702,16 +707,29 @@ fn clean_page_key(ino: u32, file_offset: usize) -> CleanPageKey {
     }
 }
 
-fn fill_clean_page_frame(ino: u32, page_idx: usize) -> Result<FrameTracker, SysErrNo> {
-    let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
-    let page_start = page_idx.checked_mul(PAGE_SIZE).ok_or(SysErrNo::EFBIG)?;
-    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+fn clean_page_read_metadata(fs: &Ext4, ino: u32) -> Result<CleanPageReadMetadata, SysErrNo> {
     let inode = fs.get_inode_ref(ino).inode;
     if !inode.is_file() {
         return Err(SysErrNo::EINVAL);
     }
+    Ok(CleanPageReadMetadata {
+        file_size: inode.size() as usize,
+    })
+}
 
-    let size = inode.size() as usize;
+fn fill_clean_page_frame(
+    fs: &Ext4,
+    ino: u32,
+    page_idx: usize,
+    metadata: Option<CleanPageReadMetadata>,
+) -> Result<FrameTracker, SysErrNo> {
+    let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
+    let page_start = page_idx.checked_mul(PAGE_SIZE).ok_or(SysErrNo::EFBIG)?;
+    let metadata = match metadata {
+        Some(metadata) => metadata,
+        None => clean_page_read_metadata(fs, ino)?,
+    };
+    let size = metadata.file_size;
     if page_start >= size {
         return Ok(frame);
     }
@@ -731,13 +749,26 @@ fn fill_clean_page_frame(ino: u32, page_idx: usize) -> Result<FrameTracker, SysE
     Ok(frame)
 }
 
-pub fn clean_page_cache_frame(ino: u32, file_offset: usize) -> Result<FrameTracker, SysErrNo> {
+fn clean_page_cache_frame_with_metadata(
+    fs: &Ext4,
+    ino: u32,
+    file_offset: usize,
+    metadata: Option<CleanPageReadMetadata>,
+) -> Result<FrameTracker, SysErrNo> {
     let key = clean_page_key(ino, file_offset);
+    clean_page_cache_frame_with_key(fs, key, metadata)
+}
+
+fn clean_page_cache_frame_with_key(
+    fs: &Ext4,
+    key: CleanPageKey,
+    metadata: Option<CleanPageReadMetadata>,
+) -> Result<FrameTracker, SysErrNo> {
     if let Some(frame) = CLEAN_PAGE_CACHE.lock().get(key) {
         return Ok(frame);
     }
 
-    let frame = fill_clean_page_frame(ino, key.page_idx)?;
+    let frame = fill_clean_page_frame(fs, key.ino, key.page_idx, metadata)?;
     let mut cache = CLEAN_PAGE_CACHE.lock();
     if let Some(existing) = cache.get(key) {
         return Ok(existing);
@@ -746,16 +777,22 @@ pub fn clean_page_cache_frame(ino: u32, file_offset: usize) -> Result<FrameTrack
     Ok(frame)
 }
 
+pub fn clean_page_cache_frame(ino: u32, file_offset: usize) -> Result<FrameTracker, SysErrNo> {
+    let key = clean_page_key(ino, file_offset);
+    if let Some(frame) = CLEAN_PAGE_CACHE.lock().get(key) {
+        return Ok(frame);
+    }
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    clean_page_cache_frame_with_key(&fs, key, None)
+}
+
 fn clean_page_cached_read(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usize, SysErrNo> {
     if buf.is_empty() {
         return Ok(0);
     }
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    let inode = fs.get_inode_ref(ino).inode;
-    if !inode.is_file() {
-        return Err(SysErrNo::EINVAL);
-    }
-    let size = inode.size() as usize;
+    let metadata = clean_page_read_metadata(&fs, ino)?;
+    let size = metadata.file_size;
     if offset >= size {
         return Ok(0);
     }
@@ -765,7 +802,7 @@ fn clean_page_cached_read(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usi
         let current = offset + copied;
         let page_off = current % PAGE_SIZE;
         let n = (total - copied).min(PAGE_SIZE - page_off);
-        let frame = clean_page_cache_frame(ino, current)?;
+        let frame = clean_page_cache_frame_with_metadata(&fs, ino, current, Some(metadata))?;
         let src = (frame.ppn().addr() + page_off) as *const u8;
         unsafe {
             core::ptr::copy_nonoverlapping(src, buf[copied..].as_mut_ptr(), n);

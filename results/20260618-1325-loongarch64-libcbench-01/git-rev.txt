@@ -1,0 +1,13 @@
+$ git rev-parse --abbrev-ref HEAD
+feat/iozone
+
+$ git rev-parse HEAD
+d9d4ce9d067aba4ec9c6131f08aa3aa15c4214eb
+
+$ git status --short --branch
+## feat/iozone...origin/feat/iozone
+ M os/src/fs/ext4_vol.rs
+?? results/20260618-1320-loongarch64-iozone-01/
+?? results/20260618-1320-loongarch64-iozone-summary/
+?? results/20260618-1325-loongarch64-libcbench-01/
+?? results/20260618-1325-loongarch64-libcbench-summary/

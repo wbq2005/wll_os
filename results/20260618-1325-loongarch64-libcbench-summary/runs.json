@@ -1,0 +1,16 @@
+{
+  "build_script": "WLL_HARNESS_GROUPS=libcbench make ARCH=loongarch64 build IOZONE=1 LMBENCH=0 && cp target/loongarch64-unknown-none/release/wll_OS /workspace/results/20260618-1325-loongarch64-libcbench-summary/kernel-loongarch64-libcbench",
+  "judge_exit_code": 0,
+  "run_exit_code": 0,
+  "runs": [
+    {
+      "elapsed_seconds": 15.411092599970289,
+      "judge_exit_code": 0,
+      "qemu_exit_code": 0,
+      "run_dir": "D:\\wll_os-master1\\results\\20260618-1325-loongarch64-libcbench-01",
+      "run_index": 1,
+      "sdcard_deleted": true,
+      "serial_log": "D:\\wll_os-master1\\results\\20260618-1325-loongarch64-libcbench-01\\serial.log"
+    }
+  ]
+}

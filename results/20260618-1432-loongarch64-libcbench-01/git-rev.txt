@@ -1,0 +1,29 @@
+$ git rev-parse --abbrev-ref HEAD
+feat/iozone
+
+$ git rev-parse HEAD
+1280e2220adcb0691f1e610a25b6045d8349ff81
+
+$ git status --short --branch
+## feat/iozone...origin/feat/iozone [ahead 1]
+ M os/src/fs/ext4_vol.rs
+?? results/20260618-1320-loongarch64-iozone-01/
+?? results/20260618-1320-loongarch64-iozone-summary/
+?? results/20260618-1325-loongarch64-libcbench-01/
+?? results/20260618-1325-loongarch64-libcbench-summary/
+?? results/20260618-1327-loongarch64-lmbench-01/
+?? results/20260618-1327-loongarch64-lmbench-summary/
+?? results/20260618-1331-riscv64-iozone-01/
+?? results/20260618-1331-riscv64-iozone-summary/
+?? results/20260618-1336-riscv64-libcbench-01/
+?? results/20260618-1336-riscv64-libcbench-summary/
+?? results/20260618-1338-riscv64-lmbench-01/
+?? results/20260618-1338-riscv64-lmbench-summary/
+?? results/20260618-1342-loongarch64-all-01/
+?? results/20260618-1342-loongarch64-all-summary/
+?? results/20260618-1352-riscv64-all-01/
+?? results/20260618-1352-riscv64-all-summary/
+?? results/20260618-1426-loongarch64-iozone-01/
+?? results/20260618-1426-loongarch64-iozone-summary/
+?? results/20260618-1432-loongarch64-libcbench-01/
+?? results/20260618-1432-loongarch64-libcbench-summary/
