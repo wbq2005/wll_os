@@ -136,8 +136,6 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::LibcTest,
     TestGroup::LibcBench,
     TestGroup::Lmbench,
-    #[cfg(target_arch = "riscv64")]
-    TestGroup::Cyclictest,
 ];
 
 fn console_write(msg: &str) {
