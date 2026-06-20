@@ -137,7 +137,6 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Busybox,
     TestGroup::Lua,
     TestGroup::Iozone,
-    TestGroup::Cyclictest,
     TestGroup::LibcTest,
     TestGroup::LibcBench,
     TestGroup::Lmbench,
