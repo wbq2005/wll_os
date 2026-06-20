@@ -268,8 +268,7 @@ fn run_runtime_test_harness() -> ! {
     #[cfg(feature = "libctest")]
     {
         run_libctest_collection_harness(true);
-        crate::trap::leave_foreground_driver();
-        polyhal::instruction::shutdown();
+        shutdown_after_harness();
     }
 
     #[cfg(not(feature = "libctest"))]
@@ -294,9 +293,14 @@ fn run_runtime_test_harness() -> ! {
             }
         }
 
-        crate::trap::leave_foreground_driver();
-        polyhal::instruction::shutdown();
+        shutdown_after_harness();
     }
+}
+
+fn shutdown_after_harness() -> ! {
+    console_write("[harness] ALL TESTS DONE, shutting down\n");
+    crate::trap::leave_foreground_driver();
+    polyhal::instruction::shutdown();
 }
 
 fn run_libctest_collection_harness(include_glibc: bool) {
