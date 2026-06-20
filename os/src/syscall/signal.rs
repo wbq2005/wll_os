@@ -6,6 +6,7 @@ use crate::task::{current_task, TaskControlBlock, TaskStatus};
 use crate::timer;
 use crate::utils::error::SysErrNo;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use lazy_static::lazy_static;
 use polyhal::VirtAddr;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
@@ -529,9 +530,12 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallRet {
         crate::task::manager::find_thread_group(pid as usize)
     } else if pid == 0 {
         let current = current_task().ok_or(SysErrNo::ESRCH)?;
-        crate::task::manager::find_thread_group(current.thread_group.tgid())
+        let pgid = current.inner.lock().pgid;
+        crate::task::manager::find_process_group(pgid)
     } else if pid == -1 {
         crate::task::manager::all_user_tasks()
+    } else if pid < -1 {
+        crate::task::manager::find_process_group((-(pid as isize)) as usize)
     } else {
         return Err(SysErrNo::ESRCH);
     };
@@ -546,7 +550,7 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallRet {
         return Ok(0);
     }
 
-    deliver_to_process(&targets, sig, PendingSignalInfo::from_current(SI_USER));
+    deliver_to_processes(&targets, sig, PendingSignalInfo::from_current(SI_USER));
     Ok(0)
 }
 
@@ -717,7 +721,30 @@ fn deliver_to_process(targets: &[Arc<TaskControlBlock>], signum: i32, info: Pend
     }
 }
 
+fn deliver_to_processes(targets: &[Arc<TaskControlBlock>], signum: i32, info: PendingSignalInfo) {
+    let mut delivered_tgids = Vec::new();
+    for task in targets {
+        let tgid = task.thread_group.tgid();
+        if delivered_tgids.contains(&tgid) {
+            continue;
+        }
+        delivered_tgids.push(tgid);
+        let mut members = Vec::new();
+        for member in targets {
+            if member.thread_group.tgid() == tgid {
+                members.push(member.clone());
+            }
+        }
+        deliver_to_process(&members, signum, info);
+    }
+}
+
 fn queue_signal(task: &Arc<TaskControlBlock>, signum: i32, info: PendingSignalInfo) {
+    let action = task.signal_actions.lock().get(signum);
+    if action.handler == SIG_DFL && !default_ignored(signum) && signal_is_unblocked(task, signum) {
+        crate::task::terminate_task_group(task, default_exit_code(signum));
+        return;
+    }
     let mut state = task.signal_state.lock();
     state.pending |= signal_bit(signum);
     state.pending_info[signum as usize] = info;

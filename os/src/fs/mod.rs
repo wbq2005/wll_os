@@ -373,14 +373,81 @@ pub fn init() {
 fn init_pseudo_files() {
     let mounts = b"rootfs / ext4 rw 0 0\n";
     let meminfo = b"MemTotal:       131072 kB\nMemFree:         65536 kB\nMemAvailable:    65536 kB\nBuffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\nSwapFree:            0 kB\n";
+    let proc_self_status = b"Name:\twll_OS\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nMems_allowed:\t1\nMems_allowed_list:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n";
+    let localtime: &[u8] = &[
+        0x54, 0x5a, 0x69, 0x66, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x55, 0x54, 0x43, 0x00, 0x54, 0x5a,
+        0x69, 0x66, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x55, 0x54, 0x43, 0x00, 0x0a, 0x55, 0x54, 0x43,
+        0x30, 0x0a,
+    ];
+    let realtime = b"1\n";
+    let cpu_list = b"0\n";
+    let cpu_map = b"1\n";
+    let node_meminfo = b"Node 0 MemTotal:       131072 kB\nNode 0 MemFree:         65536 kB\n";
     let mut fs = MEM_FS.lock();
     for root in ["", "/musl", "/glibc"] {
         fs.add_dir(&alloc::format!("{}/tmp", root));
         fs.add_dir(&alloc::format!("{}/var/tmp", root));
+        fs.add_dir(&alloc::format!("{}/etc", root));
         fs.add_dir(&alloc::format!("{}/dev/shm", root));
+        fs.add_dir(&alloc::format!("{}/proc", root));
+        fs.add_dir(&alloc::format!("{}/proc/self", root));
+        fs.add_dir(&alloc::format!("{}/sys", root));
+        fs.add_dir(&alloc::format!("{}/sys/kernel", root));
+        fs.add_dir(&alloc::format!("{}/sys/devices", root));
+        fs.add_dir(&alloc::format!("{}/sys/devices/system", root));
+        fs.add_dir(&alloc::format!("{}/sys/devices/system/cpu", root));
+        fs.add_dir(&alloc::format!("{}/sys/devices/system/node", root));
+        fs.add_dir(&alloc::format!("{}/sys/devices/system/node/node0", root));
         fs.add_file(&alloc::format!("{}/proc/mounts", root), mounts.to_vec());
+        fs.add_file(
+            &alloc::format!("{}/proc/self/status", root),
+            proc_self_status.to_vec(),
+        );
         fs.add_file(&alloc::format!("{}/etc/mtab", root), mounts.to_vec());
+        fs.add_file(&alloc::format!("{}/etc/localtime", root), localtime.to_vec());
         fs.add_file(&alloc::format!("{}/proc/meminfo", root), meminfo.to_vec());
+        fs.add_file(
+            &alloc::format!("{}/sys/kernel/realtime", root),
+            realtime.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/sys/devices/system/cpu/online", root),
+            cpu_list.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/sys/devices/system/cpu/possible", root),
+            cpu_list.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/sys/devices/system/cpu/present", root),
+            cpu_list.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/sys/devices/system/node/online", root),
+            cpu_list.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/sys/devices/system/node/possible", root),
+            cpu_list.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/sys/devices/system/node/node0/cpulist", root),
+            cpu_list.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/sys/devices/system/node/node0/cpumap", root),
+            cpu_map.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/sys/devices/system/node/node0/meminfo", root),
+            node_meminfo.to_vec(),
+        );
         fs.add_file(&alloc::format!("{}/dev/null", root), Vec::new());
         fs.add_file(&alloc::format!("{}/dev/zero", root), Vec::new());
         fs.add_file(&alloc::format!("{}/dev/misc/rtc", root), Vec::new());

@@ -63,7 +63,12 @@ fn exit_user_thread_group_for_signal(signum: i32) {
 }
 
 pub fn timer_should_preempt_current_task() -> bool {
-    !foreground_driver_active()
+    if !foreground_driver_active() {
+        return true;
+    }
+    crate::task::current_task()
+        .map(|task| !task.is_kernel && crate::task::manager::user_queue_len() > 0)
+        .unwrap_or(false)
 }
 
 pub fn prepare_user_trapframe(tf: &mut TrapFrame) {

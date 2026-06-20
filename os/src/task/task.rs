@@ -74,6 +74,7 @@ impl TaskControlBlock {
 
         let pid = Pid::alloc();
         let thread_group = ThreadGroup::new(pid.0);
+        let pgid = pid.0;
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
@@ -88,6 +89,7 @@ impl TaskControlBlock {
                 cwd: String::from("/"),
                 root: String::from("/"),
                 exec_path: String::from("/init"),
+                pgid,
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
@@ -267,6 +269,7 @@ impl TaskControlBlock {
 
         let pid = Pid::alloc();
         let thread_group = ThreadGroup::new(pid.0);
+        let pgid = pid.0;
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
@@ -281,6 +284,7 @@ impl TaskControlBlock {
                 cwd: spec.cwd.clone(),
                 root: spec.root.clone(),
                 exec_path: spec.path.clone(),
+                pgid,
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
@@ -329,6 +333,7 @@ impl TaskControlBlock {
 
         let pid = Pid::alloc();
         let thread_group = ThreadGroup::new(pid.0);
+        let pgid = pid.0;
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
@@ -343,6 +348,7 @@ impl TaskControlBlock {
                 cwd: String::from("/"),
                 root: String::from("/"),
                 exec_path: String::new(),
+                pgid,
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,
@@ -389,6 +395,7 @@ impl TaskControlBlock {
 
         let pid = Pid::alloc();
         let thread_group = ThreadGroup::new(pid.0);
+        let pgid = pid.0;
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
@@ -403,6 +410,7 @@ impl TaskControlBlock {
                 cwd: String::from("/"),
                 root: String::from("/"),
                 exec_path: String::new(),
+                pgid,
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
                 next_mmap: 0x4000_0000,

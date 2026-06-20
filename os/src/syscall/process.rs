@@ -888,7 +888,7 @@ pub fn sys_clone(
     } else {
         dup_mm_context(&parent.mm)
     };
-    let (fd_table, exec_path, thread_parent, rlimit_nofile, rlimit_nofile_max) = {
+    let (fd_table, exec_path, thread_parent, pgid, rlimit_nofile, rlimit_nofile_max) = {
         let inner = parent.inner.lock();
         let fd_table = if (clone_bits & CLONE_FILES) != 0 {
             inner.fd_table.clone()
@@ -900,6 +900,7 @@ pub fn sys_clone(
             fd_table,
             inner.exec_path.clone(),
             inner.parent.clone(),
+            inner.pgid,
             inner.rlimit_nofile,
             inner.rlimit_nofile_max,
         )
@@ -944,6 +945,7 @@ pub fn sys_clone(
             cwd: fs_snapshot.cwd.clone(),
             root: fs_snapshot.root.clone(),
             exec_path,
+            pgid,
             program_break: mm_snapshot.program_break,
             mapped_break: mm_snapshot.mapped_break,
             next_mmap: mm_snapshot.next_mmap,
@@ -992,8 +994,12 @@ pub fn sys_clone(
     if !is_thread {
         parent.inner.lock().children.push(child.clone());
     }
-    crate::task::manager::add_task(child);
-    crate::task::request_foreground_requeue_front(parent.pid.0);
+    if crate::trap::foreground_driver_active() && !is_thread {
+        crate::task::manager::add_task_front(child);
+    } else {
+        crate::task::manager::add_task(child);
+        crate::task::request_foreground_requeue_front(parent.pid.0);
+    }
 
     log::info!(
         "[syscall] clone(flags={:#x}, stack={:#x}) parent_pid={} parent_tid={} child_tid={}",

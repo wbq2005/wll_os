@@ -1169,6 +1169,7 @@ pub struct TaskControlBlockInner {
     pub cwd: String,
     pub root: String,
     pub exec_path: String,
+    pub pgid: usize,
     pub program_break: usize,
     pub mapped_break: usize,
     pub next_mmap: usize,

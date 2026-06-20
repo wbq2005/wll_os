@@ -127,6 +127,19 @@ pub fn wake_expired_timers() {
     }
 }
 
+pub fn has_realtime_waiter() -> bool {
+    let now = get_time_us();
+    let horizon = now.saturating_add((TIME_SLICE_MS as usize).saturating_mul(2_000));
+    TIMER_WAITERS
+        .lock()
+        .iter()
+        .any(|waiter| {
+            waiter.task.status() == crate::task::TaskStatus::Blocked
+                && waiter.task.effective_sched_priority() > 0
+                && waiter.deadline_us <= horizon
+        })
+}
+
 pub fn deadline_after_us(duration_us: usize) -> usize {
     get_time_us().saturating_add(duration_us)
 }

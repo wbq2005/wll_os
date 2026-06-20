@@ -16,7 +16,7 @@ lazy_static! {
     static ref EXITED_TASKS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 }
 
-const RT_RUN_BUDGET: usize = 64;
+const RT_LOWER_RUN_BUDGET: usize = 1;
 static RT_RUNS_SINCE_NORMAL: AtomicUsize = AtomicUsize::new(0);
 
 pub fn register_task(task: &Arc<TaskControlBlock>) {
@@ -96,7 +96,6 @@ fn fetch_from_queue(
     let mut queue = queue.lock();
     let mut best_index = None;
     let mut best_priority = 0;
-    let mut first_normal_index = None;
     let mut index = 0;
     while index < queue.len() {
         let task = &queue[index];
@@ -105,9 +104,6 @@ fn fetch_from_queue(
             continue;
         }
         let priority = task.effective_sched_priority();
-        if priority == 0 && first_normal_index.is_none() {
-            first_normal_index = Some(index);
-        }
         if best_index.is_none() || priority > best_priority {
             best_index = Some(index);
             best_priority = priority;
@@ -116,16 +112,33 @@ fn fetch_from_queue(
     }
     let chosen_index = if best_priority > 0 {
         let rt_runs = RT_RUNS_SINCE_NORMAL.load(Ordering::Relaxed);
-        if rt_runs >= RT_RUN_BUDGET {
-            first_normal_index.or(best_index)
+        let lower_rt_index = queue
+            .iter()
+            .enumerate()
+            .filter_map(|(index, task)| {
+                let priority = task.effective_sched_priority();
+                if priority > 0 && priority < best_priority {
+                    Some((index, priority))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(_, priority)| *priority)
+            .map(|(index, _)| index);
+        if rt_runs >= RT_LOWER_RUN_BUDGET && lower_rt_index.is_some() {
+            lower_rt_index
         } else {
             best_index
         }
     } else {
+        if crate::trap::foreground_driver_active() && crate::timer::has_realtime_waiter() {
+            return None;
+        }
         best_index
     }?;
     let task = queue.remove(chosen_index)?;
-    if best_priority > 0 && task.effective_sched_priority() > 0 {
+    let chosen_priority = task.effective_sched_priority();
+    if best_priority > 0 && chosen_priority > 0 && chosen_priority == best_priority {
         RT_RUNS_SINCE_NORMAL.fetch_add(1, Ordering::Relaxed);
     } else {
         RT_RUNS_SINCE_NORMAL.store(0, Ordering::Relaxed);
@@ -231,6 +244,13 @@ pub fn find_thread_group(tgid: usize) -> Vec<Arc<TaskControlBlock>> {
     live_tasks()
         .into_iter()
         .filter(|task| task.thread_group.tgid() == tgid && !task.is_kernel)
+        .collect()
+}
+
+pub fn find_process_group(pgid: usize) -> Vec<Arc<TaskControlBlock>> {
+    live_tasks()
+        .into_iter()
+        .filter(|task| !task.is_kernel && task.inner.lock().pgid == pgid)
         .collect()
 }
 

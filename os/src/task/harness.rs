@@ -87,22 +87,26 @@ impl TestGroup {
     fn enabled_by_filter(self) -> bool {
         match option_env!("WLL_HARNESS_GROUPS") {
             Some(filter) => {
-                let mut any = false;
                 for part in filter.split(',') {
                     let part = part.trim();
                     if part.is_empty() {
                         continue;
                     }
-                    any = true;
                     if self.aliases().iter().any(|alias| *alias == part) {
                         return true;
                     }
                 }
-                !any
+                false
             }
             None => true,
         }
     }
+}
+
+fn harness_filter_active() -> bool {
+    option_env!("WLL_HARNESS_GROUPS")
+        .map(|filter| filter.split(',').any(|part| !part.trim().is_empty()))
+        .unwrap_or(false)
 }
 
 #[cfg(all(not(feature = "libctest"), feature = "lmbench"))]
@@ -133,6 +137,7 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Busybox,
     TestGroup::Lua,
     TestGroup::Iozone,
+    TestGroup::Cyclictest,
     TestGroup::LibcTest,
     TestGroup::LibcBench,
     TestGroup::Lmbench,
@@ -193,12 +198,13 @@ fn is_enabled_script(path: &str) -> bool {
     let Some(group) = testcode_stem(path).and_then(TestGroup::from_stem) else {
         return false;
     };
-    if !group.enabled_by_filter() {
-        return false;
+    if harness_filter_active() {
+        group.enabled_by_filter()
+    } else {
+        DEFAULT_ENABLED_GROUPS
+            .iter()
+            .any(|enabled| *enabled == group)
     }
-    DEFAULT_ENABLED_GROUPS
-        .iter()
-        .any(|enabled| *enabled == group)
 }
 
 fn script_rank(path: &str) -> usize {
@@ -1026,21 +1032,16 @@ fn dirname(path: &str) -> String {
     }
 }
 
-fn ensure_busybox_applet_alias(root: &str, busybox_host: &str, applet: &str) -> Option<()> {
+fn ensure_busybox_applet_alias(root: &str, busybox_data: &[u8], applet: &str) -> Option<()> {
     let alias_logical = if applet.starts_with('/') {
         applet.to_string()
     } else {
         alloc::format!("/{}", applet)
     };
     let alias_host = crate::fs::apply_root(root, &alias_logical);
-    if crate::fs::metadata(&alias_host, true)
-        .map(|meta| meta.kind == crate::fs::VfsNodeKind::Regular && (meta.mode & 0o111) != 0)
-        .unwrap_or(false)
-    {
-        return Some(());
-    }
-    let busybox = crate::fs::read_executable_file(busybox_host)?;
-    crate::fs::MEM_FS.lock().add_file(&alias_host, busybox);
+    crate::fs::MEM_FS
+        .lock()
+        .add_file(&alias_host, busybox_data.to_vec());
     Some(())
 }
 
@@ -1051,18 +1052,21 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
     let busybox_host = crate::fs::apply_root(&root, &busybox_path);
     let script_host = crate::fs::apply_root(&root, &logical_script);
 
-    crate::fs::read_executable_file(&busybox_host).ok_or(ScriptLaunchError::MissingBusybox)?;
+    let busybox_data =
+        crate::fs::read_executable_file(&busybox_host).ok_or(ScriptLaunchError::MissingBusybox)?;
     crate::fs::read_file(&script_host).ok_or(ScriptLaunchError::MissingScript)?;
-    ensure_busybox_applet_alias(&root, &busybox_host, "ls")
-        .ok_or(ScriptLaunchError::MissingApplet("ls"))?;
-    ensure_busybox_applet_alias(&root, &busybox_host, "sh")
-        .ok_or(ScriptLaunchError::MissingApplet("sh"))?;
-    ensure_busybox_applet_alias(&root, &busybox_host, "/bin/sh")
-        .ok_or(ScriptLaunchError::MissingApplet("/bin/sh"))?;
-    ensure_busybox_applet_alias(&root, &busybox_host, "cp")
-        .ok_or(ScriptLaunchError::MissingApplet("cp"))?;
-    ensure_busybox_applet_alias(&root, &busybox_host, "sleep")
-        .ok_or(ScriptLaunchError::MissingApplet("sleep"))?;
+
+    let applets: &[&str] =
+        if testcode_stem(&logical_script).and_then(TestGroup::from_stem) == Some(TestGroup::Cyclictest)
+        {
+            &["sleep"]
+        } else {
+            &["ls", "sh", "/bin/sh", "cp", "sleep"]
+        };
+    for applet in applets {
+        ensure_busybox_applet_alias(&root, &busybox_data, applet)
+            .ok_or(ScriptLaunchError::MissingApplet(applet))?;
+    }
 
     let mut envp = alloc::vec![
         String::from("PATH=.:/:/bin:/usr/bin"),

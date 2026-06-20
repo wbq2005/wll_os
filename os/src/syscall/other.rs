@@ -90,6 +90,22 @@ struct SchedParam {
     sched_priority: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SchedAttr {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+    sched_util_min: u32,
+    sched_util_max: u32,
+}
+
+const SCHED_ATTR_SIZE_VER0: usize = 48;
 const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
 const SCHED_POLICY_UNCHANGED: usize = usize::MAX;
 
@@ -633,13 +649,30 @@ pub fn sys_umask(_mask: usize) -> SyscallRet {
     Ok(0o022)
 }
 
-pub fn sys_getpgid(_pid: usize) -> SyscallRet {
-    current_task()
-        .map(|task| task.thread_group.tgid())
-        .ok_or(SysErrNo::ESRCH)
+pub fn sys_getpgid(pid: usize) -> SyscallRet {
+    let task = if pid == 0 {
+        current_task().ok_or(SysErrNo::ESRCH)?
+    } else {
+        manager::find_task(pid).ok_or(SysErrNo::ESRCH)?
+    };
+    let pgid = task.inner.lock().pgid;
+    Ok(pgid)
 }
 
-pub fn sys_setpgid(_pid: usize, _pgid: usize) -> SyscallRet {
+pub fn sys_setpgid(pid: usize, pgid: usize) -> SyscallRet {
+    let task = if pid == 0 {
+        current_task().ok_or(SysErrNo::ESRCH)?
+    } else {
+        manager::find_task(pid).ok_or(SysErrNo::ESRCH)?
+    };
+    let new_pgid = if pgid == 0 {
+        task.thread_group.tgid()
+    } else {
+        pgid
+    };
+    for member in task.thread_group.user_members() {
+        member.inner.lock().pgid = new_pgid;
+    }
     Ok(0)
 }
 
@@ -648,17 +681,18 @@ pub fn sys_membarrier(_cmd: usize, _flags: usize) -> SyscallRet {
 }
 
 pub fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> SyscallRet {
+    const KERNEL_CPUSET_BYTES: usize = 128;
     if mask == 0 {
         return Err(SysErrNo::EFAULT);
     }
-    if cpusetsize == 0 {
+    if cpusetsize < KERNEL_CPUSET_BYTES {
         return Err(SysErrNo::EINVAL);
     }
     let mut bytes = Vec::new();
-    bytes.resize(cpusetsize.min(128), 0);
+    bytes.resize(KERNEL_CPUSET_BYTES, 0);
     bytes[0] = 1;
     copy_to_user(mask, &bytes)?;
-    Ok(bytes.len())
+    Ok(KERNEL_CPUSET_BYTES)
 }
 
 pub fn sys_sched_setaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> SyscallRet {
@@ -729,7 +763,7 @@ pub fn sys_sched_getparam(_pid: usize, param: usize) -> SyscallRet {
         &SchedParam {
             sched_priority: task
                 .sched_priority
-                .load(core::sync::atomic::Ordering::Relaxed) as i32,
+            .load(core::sync::atomic::Ordering::Relaxed) as i32,
         },
     )?;
     Ok(0)
@@ -749,6 +783,86 @@ pub fn sys_sched_setparam(pid: usize, param: usize) -> SyscallRet {
     Ok(0)
 }
 
+fn sched_attr_from_task(task: &Arc<crate::task::TaskControlBlock>) -> SchedAttr {
+    SchedAttr {
+        size: core::mem::size_of::<SchedAttr>() as u32,
+        sched_policy: task
+            .sched_policy
+            .load(core::sync::atomic::Ordering::Relaxed) as u32,
+        sched_flags: 0,
+        sched_nice: 0,
+        sched_priority: task
+            .sched_priority
+            .load(core::sync::atomic::Ordering::Relaxed) as u32,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+        sched_util_min: 0,
+        sched_util_max: 0,
+    }
+}
+
+pub fn sys_sched_getattr(pid: usize, attr: usize, size: usize, flags: usize) -> SyscallRet {
+    if attr == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if flags != 0 || size < SCHED_ATTR_SIZE_VER0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let task = sched_task_for_pid(pid)?;
+    let kernel_attr = sched_attr_from_task(&task);
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &kernel_attr as *const SchedAttr as *const u8,
+            core::mem::size_of::<SchedAttr>(),
+        )
+    };
+    copy_to_user(attr, &bytes[..size.min(bytes.len())])?;
+    Ok(0)
+}
+
+pub fn sys_sched_setattr(pid: usize, attr: usize, flags: usize) -> SyscallRet {
+    if attr == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if flags != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let mut size_bytes = [0u8; 4];
+    super::user::copy_from_user(attr, &mut size_bytes)?;
+    let user_size = u32::from_le_bytes(size_bytes) as usize;
+    if user_size < SCHED_ATTR_SIZE_VER0 {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let mut kernel_attr = SchedAttr {
+        size: user_size as u32,
+        sched_policy: SCHED_OTHER as u32,
+        sched_flags: 0,
+        sched_nice: 0,
+        sched_priority: 0,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+        sched_util_min: 0,
+        sched_util_max: 0,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut kernel_attr as *mut SchedAttr as *mut u8,
+            core::mem::size_of::<SchedAttr>(),
+        )
+    };
+    let copy_len = user_size.min(bytes.len());
+    super::user::copy_from_user(attr, &mut bytes[..copy_len])?;
+
+    let policy = base_sched_policy(kernel_attr.sched_policy as usize);
+    let priority = validate_sched_param(policy, kernel_attr.sched_priority as i32)?;
+    let task = sched_task_for_pid(pid)?;
+    task.set_sched_params(policy, priority);
+    Ok(0)
+}
+
 pub fn sys_sched_get_priority_max(policy: usize) -> SyscallRet {
     match policy {
         SCHED_FIFO | SCHED_RR => Ok(99),
@@ -763,6 +877,21 @@ pub fn sys_sched_get_priority_min(policy: usize) -> SyscallRet {
         SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok(0),
         _ => Err(SysErrNo::EINVAL),
     }
+}
+
+pub fn sys_sched_rr_get_interval(pid: usize, interval: usize) -> SyscallRet {
+    if interval == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let _ = sched_task_for_pid(pid)?;
+    copy_object_to_user(
+        interval,
+        &TimeSpec {
+            tv_sec: 0,
+            tv_nsec: crate::timer::TIME_SLICE_MS as isize * 1_000_000,
+        },
+    )?;
+    Ok(0)
 }
 
 pub fn sys_memory_lock_noop() -> SyscallRet {
