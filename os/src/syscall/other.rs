@@ -1,9 +1,9 @@
 use super::SyscallRet;
+use crate::task::wait_queue::WaitOutcome;
 use crate::task::{
     current_task, manager, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_OTHER,
     SCHED_RR,
 };
-use crate::task::wait_queue::WaitOutcome;
 use crate::timer;
 use crate::utils::error::SysErrNo;
 use alloc::sync::Arc;
@@ -374,6 +374,72 @@ pub fn sys_getgid() -> SyscallRet {
 }
 
 pub fn sys_getegid() -> SyscallRet {
+    Ok(0)
+}
+
+fn is_current_identity_or_no_change(id: usize) -> bool {
+    id == 0 || id == usize::MAX || id == u32::MAX as usize
+}
+
+fn set_fixed_identity(ids: &[usize]) -> SyscallRet {
+    if ids.iter().all(|id| is_current_identity_or_no_change(*id)) {
+        Ok(0)
+    } else {
+        Err(SysErrNo::EPERM)
+    }
+}
+
+pub fn sys_setuid(uid: usize) -> SyscallRet {
+    if uid == 0 {
+        Ok(0)
+    } else {
+        Err(SysErrNo::EPERM)
+    }
+}
+
+pub fn sys_setgid(gid: usize) -> SyscallRet {
+    if gid == 0 {
+        Ok(0)
+    } else {
+        Err(SysErrNo::EPERM)
+    }
+}
+
+pub fn sys_setreuid(ruid: usize, euid: usize) -> SyscallRet {
+    set_fixed_identity(&[ruid, euid])
+}
+
+pub fn sys_setregid(rgid: usize, egid: usize) -> SyscallRet {
+    set_fixed_identity(&[rgid, egid])
+}
+
+pub fn sys_setresuid(ruid: usize, euid: usize, suid: usize) -> SyscallRet {
+    set_fixed_identity(&[ruid, euid, suid])
+}
+
+pub fn sys_setresgid(rgid: usize, egid: usize, sgid: usize) -> SyscallRet {
+    set_fixed_identity(&[rgid, egid, sgid])
+}
+
+pub fn sys_getresuid(ruid: usize, euid: usize, suid: usize) -> SyscallRet {
+    copy_object_to_user(ruid, &0u32)?;
+    copy_object_to_user(euid, &0u32)?;
+    copy_object_to_user(suid, &0u32)?;
+    Ok(0)
+}
+
+pub fn sys_getresgid(rgid: usize, egid: usize, sgid: usize) -> SyscallRet {
+    copy_object_to_user(rgid, &0u32)?;
+    copy_object_to_user(egid, &0u32)?;
+    copy_object_to_user(sgid, &0u32)?;
+    Ok(0)
+}
+
+pub fn sys_setfsuid(_uid: usize) -> SyscallRet {
+    Ok(0)
+}
+
+pub fn sys_setfsgid(_gid: usize) -> SyscallRet {
     Ok(0)
 }
 
@@ -763,7 +829,7 @@ pub fn sys_sched_getparam(_pid: usize, param: usize) -> SyscallRet {
         &SchedParam {
             sched_priority: task
                 .sched_priority
-            .load(core::sync::atomic::Ordering::Relaxed) as i32,
+                .load(core::sync::atomic::Ordering::Relaxed) as i32,
         },
     )?;
     Ok(0)

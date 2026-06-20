@@ -42,6 +42,10 @@ pub const SYSCALL_STATFS: usize = 43;
 pub const SYSCALL_FSTATFS: usize = 44;
 pub const SYSCALL_FACCESSAT: usize = 48;
 pub const SYSCALL_CHDIR: usize = 49;
+pub const SYSCALL_FCHMOD: usize = 52;
+pub const SYSCALL_FCHMODAT: usize = 53;
+pub const SYSCALL_FCHOWNAT: usize = 54;
+pub const SYSCALL_FCHOWN: usize = 55;
 pub const SYSCALL_OPENAT: usize = 56;
 pub const SYSCALL_CLOSE: usize = 57;
 pub const SYSCALL_PIPE2: usize = 59;
@@ -98,6 +102,16 @@ pub const SYSCALL_SIGACTION: usize = 134;
 pub const SYSCALL_SIGPROCMASK: usize = 135;
 pub const SYSCALL_SIGTIMEDWAIT: usize = 137;
 pub const SYSCALL_SIGRETURN: usize = 139;
+pub const SYSCALL_SETREGID: usize = 143;
+pub const SYSCALL_SETGID: usize = 144;
+pub const SYSCALL_SETREUID: usize = 145;
+pub const SYSCALL_SETUID: usize = 146;
+pub const SYSCALL_SETRESUID: usize = 147;
+pub const SYSCALL_GETRESUID: usize = 148;
+pub const SYSCALL_SETRESGID: usize = 149;
+pub const SYSCALL_GETRESGID: usize = 150;
+pub const SYSCALL_SETFSUID: usize = 151;
+pub const SYSCALL_SETFSGID: usize = 152;
 pub const SYSCALL_TIMES: usize = 153;
 pub const SYSCALL_SETPGID: usize = 154;
 pub const SYSCALL_GETPGID: usize = 155;
@@ -214,6 +228,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_SENDFILE => fs::sys_sendfile(args[0], args[1], args[2], args[3]),
         SYSCALL_TRUNCATE => fs::sys_truncate(args[0] as *const u8, args[1]),
         SYSCALL_FTRUNCATE => fs::sys_ftruncate(args[0], args[1]),
+        SYSCALL_FCHMOD => fs::sys_fchmod(args[0], args[1] as u32),
+        SYSCALL_FCHMODAT => {
+            fs::sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32)
+        }
+        SYSCALL_FCHOWN => fs::sys_fchown(args[0], args[1], args[2]),
+        SYSCALL_FCHOWNAT => fs::sys_fchownat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2],
+            args[3],
+            args[4],
+        ),
         SYSCALL_PPOLL => fs::sys_ppoll(
             args[0] as *mut fs::PollFd,
             args[1],
@@ -337,6 +363,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_GETEUID => other::sys_geteuid(),
         SYSCALL_GETGID => other::sys_getgid(),
         SYSCALL_GETEGID => other::sys_getegid(),
+        SYSCALL_SETUID => other::sys_setuid(args[0]),
+        SYSCALL_SETGID => other::sys_setgid(args[0]),
+        SYSCALL_SETREUID => other::sys_setreuid(args[0], args[1]),
+        SYSCALL_SETREGID => other::sys_setregid(args[0], args[1]),
+        SYSCALL_SETRESUID => other::sys_setresuid(args[0], args[1], args[2]),
+        SYSCALL_SETRESGID => other::sys_setresgid(args[0], args[1], args[2]),
+        SYSCALL_GETRESUID => other::sys_getresuid(args[0], args[1], args[2]),
+        SYSCALL_GETRESGID => other::sys_getresgid(args[0], args[1], args[2]),
+        SYSCALL_SETFSUID => other::sys_setfsuid(args[0]),
+        SYSCALL_SETFSGID => other::sys_setfsgid(args[0]),
         SYSCALL_GETTID => other::sys_gettid(),
         SYSCALL_GETRLIMIT => other::sys_getrlimit(args[0], args[1]),
         SYSCALL_SETRLIMIT => other::sys_setrlimit(args[0], args[1]),

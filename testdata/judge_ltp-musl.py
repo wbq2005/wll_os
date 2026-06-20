@@ -1,5 +1,6 @@
 import sys
 import json
+import re
 
 template = '''
 RUN LTP CASE writev01
@@ -42,15 +43,18 @@ def parse_ltp_log(content):
     current_case = None
     return_code = None
     in_summary = False
+    saw_test_line = False
 
     for line in lines:
         stripped_line = line.strip()
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", stripped_line)
 
         if stripped_line.startswith('RUN LTP CASE'):
             current_case = stripped_line.split()[-1]
             summary_data = {'passed': 0, 'failed': 0, 'broken': 0, 'skipped': 0, 'warnings': 0, 'all': 0}
             return_code = None
             in_summary = False
+            saw_test_line = False
 
         elif current_case and stripped_line.startswith(f'FAIL LTP CASE {current_case}'):
             parts = stripped_line.split()
@@ -69,6 +73,32 @@ def parse_ltp_log(content):
             current_case = None
 
         elif current_case:
+            if "TPASS:" in plain:
+                summary_data['passed'] += 1
+                summary_data['all'] += 1
+                saw_test_line = True
+                continue
+            if "TFAIL:" in plain:
+                summary_data['failed'] += 1
+                summary_data['all'] += 1
+                saw_test_line = True
+                continue
+            if "TBROK:" in plain:
+                summary_data['broken'] += 1
+                summary_data['all'] += 1
+                saw_test_line = True
+                continue
+            if "TCONF:" in plain:
+                summary_data['skipped'] += 1
+                summary_data['all'] += 1
+                saw_test_line = True
+                continue
+            if "TWARN:" in plain:
+                summary_data['warnings'] += 1
+                summary_data['all'] += 1
+                saw_test_line = True
+                continue
+
             if stripped_line == 'Summary:':
                 in_summary = True
                 continue
@@ -80,6 +110,8 @@ def parse_ltp_log(content):
 
                 parts = stripped_line.split()
                 if len(parts) >= 2 and parts[0] in ['passed', 'failed', 'broken', 'skipped', 'warnings']:
+                    if saw_test_line:
+                        continue
                     key = parts[0]
                     value = int(parts[1])
                     summary_data[key] += value

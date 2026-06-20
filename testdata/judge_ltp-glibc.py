@@ -1,5 +1,6 @@
 import sys
 import json
+import re
 
 # This is for reference only and is unused below.
 # Note terminal control sequences (\x1b[...m) should be present in real output, which isn't shown here.
@@ -65,19 +66,21 @@ def parse_ltp_log(content: str):
             passed, failed, broken, skipped, warnings = 0, 0, 0, 0, 0
             continue
 
-        if "\x1b[1;32mTPASS: \x1b[0m" in line:
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
+
+        if "TPASS:" in plain:
             passed += 1
             continue
-        if "\x1b[1;31mTFAIL: \x1b[0m" in line:
+        if "TFAIL:" in plain:
             failed += 1
             continue
-        if "\x1b[1;31mTBROK: \x1b[0m" in line:
+        if "TBROK:" in plain:
             broken += 1
             continue
-        if "\x1b[1;33mTCONF: \x1b[0m" in line:
+        if "TCONF:" in plain:
             skipped += 1
             continue
-        if "\x1b[1;35mTWARN: \x1b[0m" in line:
+        if "TWARN:" in plain:
             warnings += 1
             continue
 

@@ -43,6 +43,7 @@ dev-preload = []
 libctest = []
 iozone = []
 lmbench = []
+ltp = []
 
 [[bin]]
 name = "wll_OS"

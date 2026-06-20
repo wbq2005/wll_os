@@ -109,11 +109,12 @@ fn harness_filter_active() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(all(not(feature = "libctest"), feature = "lmbench"))]
+#[cfg(all(not(feature = "libctest"), not(feature = "ltp"), feature = "lmbench"))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Lmbench];
 
 #[cfg(all(
     not(feature = "libctest"),
+    not(feature = "ltp"),
     not(feature = "iozone"),
     not(feature = "lmbench")
 ))]
@@ -129,6 +130,7 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::LibcTest];
 
 #[cfg(all(
     not(feature = "libctest"),
+    not(feature = "ltp"),
     feature = "iozone",
     not(feature = "lmbench")
 ))]
@@ -137,10 +139,14 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Busybox,
     TestGroup::Lua,
     TestGroup::Iozone,
+    TestGroup::Cyclictest,
     TestGroup::LibcTest,
     TestGroup::LibcBench,
     TestGroup::Lmbench,
 ];
+
+#[cfg(all(not(feature = "libctest"), feature = "ltp"))]
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Ltp];
 
 fn console_write(msg: &str) {
     for b in msg.bytes() {
@@ -287,6 +293,14 @@ fn run_runtime_test_harness() -> ! {
             console_write("[harness] SCRIPT ");
             console_write(script);
             console_write("\n");
+            if group == Some(TestGroup::Ltp) && ltp_cases_filter() != "all" {
+                if !run_ltp_collection_harness(script) {
+                    console_write("[harness] failed to launch LTP collector: ");
+                    console_write(script);
+                    console_write("\n");
+                }
+                continue;
+            }
             if let Err(err) = run_script_via_busybox(script) {
                 log_script_launch_error(script, err);
             }
@@ -663,6 +677,76 @@ fn run_libctest_collection_harness(include_glibc: bool) {
     }
 }
 
+fn ltp_cases_filter() -> &'static str {
+    match option_env!("LTP_CASES") {
+        Some(filter) if !filter.trim().is_empty() => filter,
+        _ => "writev01,setegid02",
+    }
+}
+
+fn ltp_group_name(root: &str) -> &'static str {
+    match root {
+        "/glibc" => "ltp-glibc",
+        "/musl" => "ltp-musl",
+        _ => "ltp",
+    }
+}
+
+fn run_ltp_collection_harness(script_path: &str) -> bool {
+    let Some((root, _logical_script)) = logical_path_for_script(script_path) else {
+        return false;
+    };
+    let group_name = ltp_group_name(&root);
+    let mut launched = false;
+
+    console_write("#### OS COMP TEST GROUP START ");
+    console_write(group_name);
+    console_write(" ####\n");
+
+    for part in ltp_cases_filter().split(',') {
+        let case = part.trim();
+        if case.is_empty() {
+            continue;
+        }
+        launched = true;
+        run_ltp_case(&root, case);
+    }
+
+    console_write("#### OS COMP TEST GROUP END ");
+    console_write(group_name);
+    console_write(" ####\n");
+    launched
+}
+
+fn run_ltp_case(root: &str, case: &str) {
+    let path = format!("/ltp/testcases/bin/{}", case);
+
+    console_write("RUN LTP CASE ");
+    console_write(case);
+    console_write("\n");
+
+    let ret = run_user_program_spec_foreground_exit_code(&UserProgramSpec {
+        path: path.clone(),
+        argv: alloc::vec![path.clone()],
+        envp: alloc::vec![
+            String::from("PATH=.:/:/bin:/usr/bin:/ltp/testcases/bin"),
+            String::from("LD_LIBRARY_PATH=/lib"),
+            String::from("LTPROOT=/ltp"),
+            String::from("TMPDIR=/tmp"),
+        ],
+        cwd: String::from("/"),
+        root: String::from(root),
+        marker_name: None,
+    })
+    .unwrap_or(-1);
+
+    console_write("FAIL LTP CASE ");
+    console_write(case);
+    console_write(" : ");
+    console_write(&format!("{}", ret));
+    console_write("\n");
+}
+
 fn libctest_segment_enabled(name: &str) -> bool {
     match option_env!("LIBCTEST_FILTER") {
         Some(filter) => {
@@ -838,6 +922,10 @@ impl Drop for ForegroundDriverGuard {
 }
 
 fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> Result<(), SysErrNo> {
+    run_user_program_spec_foreground_exit_code(spec).map(|_| ())
+}
+
+fn run_user_program_spec_foreground_exit_code(spec: &UserProgramSpec) -> Result<i32, SysErrNo> {
     let task = match TaskControlBlock::new_user_with_args_env_cwd(spec) {
         Ok(task) => task,
         Err(err) => return Err(err),
@@ -847,13 +935,14 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> Result<(), SysErr
     let _foreground = ForegroundDriverGuard::enter();
 
     run_user_task_foreground(task.clone(), foreground_timeout_us(spec));
+    let exit_code = task.thread_group.exit_code();
     cleanup_foreground_task_tree(&task);
     if let Some(ref h) = harness {
         h.set_status(TaskStatus::Running);
         *CURRENT_TASK.lock() = Some(h.clone());
     }
 
-    Ok(())
+    Ok(exit_code)
 }
 
 fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
@@ -1060,13 +1149,13 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
         crate::fs::read_executable_file(&busybox_host).ok_or(ScriptLaunchError::MissingBusybox)?;
     crate::fs::read_file(&script_host).ok_or(ScriptLaunchError::MissingScript)?;
 
-    let applets: &[&str] =
-        if testcode_stem(&logical_script).and_then(TestGroup::from_stem) == Some(TestGroup::Cyclictest)
-        {
-            &["sleep"]
-        } else {
-            &["ls", "sh", "/bin/sh", "cp", "sleep"]
-        };
+    let applets: &[&str] = if testcode_stem(&logical_script).and_then(TestGroup::from_stem)
+        == Some(TestGroup::Cyclictest)
+    {
+        &["sleep"]
+    } else {
+        &["ls", "sh", "/bin/sh", "cp", "sleep"]
+    };
     for applet in applets {
         ensure_busybox_applet_alias(&root, &busybox_data, applet)
             .ok_or(ScriptLaunchError::MissingApplet(applet))?;

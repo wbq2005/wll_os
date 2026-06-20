@@ -60,29 +60,46 @@ SUITE_PROFILES = {
         "judge_suites": ("iozone", "lmbench", "libcbench"),
         "iozone": "1",
         "lmbench": "0",
+        "ltp": "0",
         "harness_groups": "",
+        "ltp_cases": "",
         "recommended_runs": 7,
     },
     "iozone": {
         "judge_suites": ("iozone",),
         "iozone": "1",
         "lmbench": "0",
+        "ltp": "0",
         "harness_groups": "iozone",
+        "ltp_cases": "",
         "recommended_runs": 5,
     },
     "libcbench": {
         "judge_suites": ("libcbench",),
         "iozone": "1",
         "lmbench": "0",
+        "ltp": "0",
         "harness_groups": "libcbench",
+        "ltp_cases": "",
         "recommended_runs": 5,
     },
     "lmbench": {
         "judge_suites": ("lmbench",),
         "iozone": "0",
         "lmbench": "1",
+        "ltp": "0",
         "harness_groups": "lmbench",
+        "ltp_cases": "",
         "recommended_runs": 7,
+    },
+    "ltp": {
+        "judge_suites": ("ltp",),
+        "iozone": "0",
+        "lmbench": "0",
+        "ltp": "1",
+        "harness_groups": "ltp",
+        "ltp_cases": "writev01,setegid02",
+        "recommended_runs": 1,
     },
 }
 
@@ -212,9 +229,10 @@ def build_kernel(
         if profile["harness_groups"]
         else ""
     )
+    ltp_cases_prefix = f"LTP_CASES={profile['ltp_cases']} " if profile["ltp_cases"] else ""
     script = (
-        f"{harness_prefix}make ARCH={cfg['make_arch']} build "
-        f"IOZONE={profile['iozone']} LMBENCH={profile['lmbench']} && "
+        f"{harness_prefix}{ltp_cases_prefix}make ARCH={cfg['make_arch']} build "
+        f"IOZONE={profile['iozone']} LMBENCH={profile['lmbench']} LTP={profile['ltp']} && "
         f"cp {cfg['target']} {container_path(repo, kernel, results_root)}"
     )
     write_text(summary_dir / "build-command.txt", script + "\n")
@@ -255,7 +273,7 @@ def make_qemu_script(
 
 def parser_value(item: dict[str, Any]) -> float:
     try:
-        return float(item.get("res", item.get("result", 0)) or 0)
+        return float(item.get("res", item.get("result", item.get("pass", 0))) or 0)
     except (TypeError, ValueError):
         return 0.0
 
@@ -442,7 +460,9 @@ def run_one(
             "ARCH": cfg["make_arch"],
             "IOZONE": profile["iozone"],
             "LMBENCH": profile["lmbench"],
+            "LTP": profile["ltp"],
             "WLL_HARNESS_GROUPS": profile["harness_groups"],
+            "LTP_CASES": profile["ltp_cases"],
         },
         "paths": {
             "kernel": str(kernel),

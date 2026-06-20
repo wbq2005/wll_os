@@ -799,8 +799,7 @@ fn insert_regular_cache_entry(ino: u32, cached: CachedRegularFile) {
 }
 
 fn clear_regular_file_cache() {
-    let entries: Vec<RegularCacheEntry> =
-        REGULAR_FILE_CACHE.lock().values().cloned().collect();
+    let entries: Vec<RegularCacheEntry> = REGULAR_FILE_CACHE.lock().values().cloned().collect();
     for entry in entries {
         entry.lock().evicted = true;
     }
@@ -824,12 +823,7 @@ fn clean_page_read_metadata(fs: &Ext4, ino: u32) -> Result<CleanPageReadMetadata
     })
 }
 
-fn cached_pblock_for_clean_read(
-    fs: &Ext4,
-    ino: u32,
-    lblock: u32,
-    max_run_len: u32,
-) -> Option<u64> {
+fn cached_pblock_for_clean_read(fs: &Ext4, ino: u32, lblock: u32, max_run_len: u32) -> Option<u64> {
     if max_run_len == 0 {
         return None;
     }
@@ -1913,6 +1907,55 @@ pub fn metadata(path: &str) -> Result<Ext4Metadata, SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let (ino, _) = resolve_existing(&fs, path).ok_or(SysErrNo::ENOENT)?;
     Ok(metadata_for_ino(&fs, ino))
+}
+
+pub fn set_mode_ino(ino: u32, mode: u32) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let mut iref = fs.get_inode_ref(ino);
+    let file_type = iref.inode.mode() & 0o170000;
+    let perm = (mode as u16) & 0o7777;
+    iref.inode.set_mode(file_type | perm);
+    let now = current_ext4_time();
+    iref.inode.set_ctime(now);
+    iref.inode.set_i_ctime_extra(0);
+    fs.write_back_inode(&mut iref);
+    Ok(())
+}
+
+pub fn set_mode_path(path: &str, mode: u32) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let (ino, _) = resolve_existing(&fs, path).ok_or(SysErrNo::ENOENT)?;
+    drop(fs);
+    set_mode_ino(ino, mode)
+}
+
+pub fn set_owner_ino(ino: u32, uid: Option<u32>, gid: Option<u32>) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let mut iref = fs.get_inode_ref(ino);
+    if let Some(uid) = uid {
+        if uid > u16::MAX as u32 {
+            return Err(SysErrNo::EINVAL);
+        }
+        iref.inode.set_uid(uid as u16);
+    }
+    if let Some(gid) = gid {
+        if gid > u16::MAX as u32 {
+            return Err(SysErrNo::EINVAL);
+        }
+        iref.inode.set_gid(gid as u16);
+    }
+    let now = current_ext4_time();
+    iref.inode.set_ctime(now);
+    iref.inode.set_i_ctime_extra(0);
+    fs.write_back_inode(&mut iref);
+    Ok(())
+}
+
+pub fn set_owner_path(path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let (ino, _) = resolve_existing(&fs, path).ok_or(SysErrNo::ENOENT)?;
+    drop(fs);
+    set_owner_ino(ino, uid, gid)
 }
 
 pub fn set_times_ino(

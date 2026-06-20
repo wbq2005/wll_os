@@ -1090,6 +1090,60 @@ pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
     Ok(0)
 }
 
+pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
+    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    super::with_kernel_page_table(|| crate::fs::set_mode_path(&host_path, true, mode))?;
+    Ok(0)
+}
+
+pub fn sys_fchmod(fd: usize, mode: u32) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let mut fds = inner.fd_table.lock();
+    let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+    super::with_kernel_page_table(|| crate::fs::set_mode_fd(file_desc, mode))?;
+    Ok(0)
+}
+
+fn chown_id(raw: usize) -> Result<Option<u32>, SysErrNo> {
+    if raw == usize::MAX || raw == u32::MAX as usize {
+        Ok(None)
+    } else if raw > u32::MAX as usize {
+        Err(SysErrNo::EINVAL)
+    } else {
+        Ok(Some(raw as u32))
+    }
+}
+
+pub fn sys_fchownat(
+    dirfd: isize,
+    pathname: *const u8,
+    uid: usize,
+    gid: usize,
+    flags: usize,
+) -> SyscallRet {
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let uid = chown_id(uid)?;
+    let gid = chown_id(gid)?;
+    super::with_kernel_page_table(|| crate::fs::set_owner_path(&host_path, follow, uid, gid))?;
+    Ok(0)
+}
+
+pub fn sys_fchown(fd: usize, uid: usize, gid: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let mut fds = inner.fd_table.lock();
+    let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+    let uid = chown_id(uid)?;
+    let gid = chown_id(gid)?;
+    super::with_kernel_page_table(|| crate::fs::set_owner_fd(file_desc, uid, gid))?;
+    Ok(0)
+}
+
 pub fn sys_unlinkat(dirfd: isize, pathname: *const u8, flags: usize) -> SyscallRet {
     const AT_REMOVEDIR: usize = 0x200;
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;

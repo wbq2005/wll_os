@@ -198,17 +198,12 @@ fn metadata_for_mem_file(name: &str, len: usize, is_elf: bool) -> VfsMetadata {
         return metadata_for_char_device(name, DEV_ZERO_MAJOR, DEV_ZERO_MINOR);
     }
     let perm = if is_elf { 0o777 } else { 0o666 };
-    synthetic_metadata(
-        name,
-        VfsNodeKind::Regular,
-        S_IFREG | perm,
-        len as u64,
-        1,
-    )
+    synthetic_metadata(name, VfsNodeKind::Regular, S_IFREG | perm, len as u64, 1)
 }
 
 fn metadata_from_mem_file(file: &super::MemFile) -> VfsMetadata {
-    let mut meta = metadata_for_mem_file(&file.name, file.content.len(), is_elf_image(&file.content));
+    let mut meta =
+        metadata_for_mem_file(&file.name, file.content.len(), is_elf_image(&file.content));
     meta.atime_sec = file.times.atime_sec;
     meta.atime_nsec = file.times.atime_nsec;
     meta.mtime_sec = file.times.mtime_sec;
@@ -766,6 +761,71 @@ pub fn truncate_fd(file: &mut fd::FileDescriptor, size: u64) -> Result<(), SysEr
     file.truncate(size as usize)
 }
 
+pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), SysErrNo> {
+    let norm = normalize_path(path);
+    {
+        let mem = MEM_FS.lock();
+        if mem.is_dir(&norm) || mem.get_file(&norm).is_some() {
+            return Ok(());
+        }
+    }
+    let ext_path = match ext4_vol::lookup_kind(&norm) {
+        Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
+            ext4_vol::resolve_symlinks(&norm)?
+        }
+        Some(_) => norm.clone(),
+        None => return Err(missing_path_errno(&norm)),
+    };
+    ext4_vol::set_mode_path(&ext_path, mode)
+}
+
+pub fn set_mode_fd(file: &mut fd::FileDescriptor, mode: u32) -> Result<(), SysErrNo> {
+    match file {
+        fd::FileDescriptor::MemFile { .. } | fd::FileDescriptor::MemDir { .. } => Ok(()),
+        fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
+            ext4_vol::set_mode_ino(*ino, mode)
+        }
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+pub fn set_owner_path(
+    path: &str,
+    follow_symlink: bool,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), SysErrNo> {
+    let norm = normalize_path(path);
+    {
+        let mem = MEM_FS.lock();
+        if mem.is_dir(&norm) || mem.get_file(&norm).is_some() {
+            return Ok(());
+        }
+    }
+    let ext_path = match ext4_vol::lookup_kind(&norm) {
+        Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
+            ext4_vol::resolve_symlinks(&norm)?
+        }
+        Some(_) => norm.clone(),
+        None => return Err(missing_path_errno(&norm)),
+    };
+    ext4_vol::set_owner_path(&ext_path, uid, gid)
+}
+
+pub fn set_owner_fd(
+    file: &mut fd::FileDescriptor,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), SysErrNo> {
+    match file {
+        fd::FileDescriptor::MemFile { .. } | fd::FileDescriptor::MemDir { .. } => Ok(()),
+        fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
+            ext4_vol::set_owner_ino(*ino, uid, gid)
+        }
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
 pub fn set_times_path(
     path: &str,
     follow_symlink: bool,
@@ -991,9 +1051,9 @@ pub fn open_path(
         }
         let base_off = if append && write_ok { content.len() } else { 0 };
         return Ok(fd::FileDescriptor::MemFile {
-                name: path_norm,
-                content,
-                times,
+            name: path_norm,
+            content,
+            times,
             offset: base_off,
             readable: read_ok,
             writable: write_ok,
