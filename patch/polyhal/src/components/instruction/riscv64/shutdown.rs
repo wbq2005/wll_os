@@ -2,7 +2,19 @@
 #[inline]
 pub fn shutdown() -> ! {
     let _ = sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-    #[allow(deprecated)]
-    sbi_rt::legacy::shutdown();
+
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") sbi_rt::legacy::LEGACY_SHUTDOWN,
+            lateout("a0") _,
+        );
+    }
+
+    loop {
+        unsafe {
+            core::arch::asm!("wfi");
+        }
+    }
 }
  

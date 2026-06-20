@@ -298,6 +298,8 @@ fn run_runtime_test_harness() -> ! {
 
 fn shutdown_after_harness() -> ! {
     console_write("[harness] ALL TESTS DONE, shutting down\n");
+    crate::trap::interrupts::disable_interrupt();
+    crate::trap::leave_foreground_driver();
     polyhal::instruction::shutdown();
 }
 
