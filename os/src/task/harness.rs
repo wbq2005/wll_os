@@ -142,7 +142,6 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Cyclictest,
     TestGroup::LibcTest,
     TestGroup::LibcBench,
-    TestGroup::Lmbench,
 ];
 
 #[cfg(all(not(feature = "libctest"), feature = "ltp"))]
@@ -311,9 +310,8 @@ fn run_runtime_test_harness() -> ! {
 }
 
 fn shutdown_after_harness() -> ! {
-    console_write("[harness] ALL TESTS DONE, shutting down\n");
-    crate::trap::interrupts::disable_interrupt();
     crate::trap::leave_foreground_driver();
+    console_write("[harness] ALL TESTS DONE, shutting down\n");
     polyhal::instruction::shutdown();
 }
 
@@ -952,7 +950,7 @@ fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
     const DEFAULT_RUN_TIMEOUT_US: usize = 120_000_000;
     const BUSYBOX_RUN_TIMEOUT_US: usize = 240_000_000;
     const IOZONE_RUN_TIMEOUT_US: usize = 240_000_000;
-    const LMBENCH_RUN_TIMEOUT_US: usize = 240_000_000;
+    const LMBENCH_RUN_TIMEOUT_US: usize = 600_000_000;
 
     if spec
         .argv

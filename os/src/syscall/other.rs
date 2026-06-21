@@ -362,35 +362,59 @@ pub fn sys_gettid() -> SyscallRet {
 }
 
 pub fn sys_getuid() -> SyscallRet {
-    Ok(0)
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let uid = task.credentials.lock().real_uid;
+    Ok(uid as usize)
 }
 
 pub fn sys_geteuid() -> SyscallRet {
-    Ok(0)
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let uid = task.credentials.lock().effective_uid;
+    Ok(uid as usize)
 }
 
 pub fn sys_getgid() -> SyscallRet {
-    Ok(0)
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let gid = task.credentials.lock().real_gid;
+    Ok(gid as usize)
 }
 
 pub fn sys_getegid() -> SyscallRet {
-    Ok(0)
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let gid = task.credentials.lock().effective_gid;
+    Ok(gid as usize)
 }
 
-fn is_current_identity_or_no_change(id: usize) -> bool {
-    id == 0 || id == usize::MAX || id == u32::MAX as usize
-}
-
-fn set_fixed_identity(ids: &[usize]) -> SyscallRet {
-    if ids.iter().all(|id| is_current_identity_or_no_change(*id)) {
-        Ok(0)
+fn parse_id_arg(raw: usize) -> Result<Option<u32>, SysErrNo> {
+    if raw == usize::MAX || raw == u32::MAX as usize {
+        Ok(None)
+    } else if raw > u32::MAX as usize {
+        Err(SysErrNo::EINVAL)
     } else {
-        Err(SysErrNo::EPERM)
+        Ok(Some(raw as u32))
+    }
+}
+
+fn parse_required_id(raw: usize) -> Result<u32, SysErrNo> {
+    if raw > u32::MAX as usize {
+        Err(SysErrNo::EINVAL)
+    } else {
+        Ok(raw as u32)
     }
 }
 
 pub fn sys_setuid(uid: usize) -> SyscallRet {
-    if uid == 0 {
+    let uid = parse_required_id(uid)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut credentials = task.credentials.lock();
+    if credentials.is_root_capable() {
+        credentials.real_uid = uid;
+        credentials.effective_uid = uid;
+        credentials.saved_uid = uid;
+        return Ok(0);
+    }
+    if credentials.has_uid(uid) {
+        credentials.effective_uid = uid;
         Ok(0)
     } else {
         Err(SysErrNo::EPERM)
@@ -398,7 +422,17 @@ pub fn sys_setuid(uid: usize) -> SyscallRet {
 }
 
 pub fn sys_setgid(gid: usize) -> SyscallRet {
-    if gid == 0 {
+    let gid = parse_required_id(gid)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut credentials = task.credentials.lock();
+    if credentials.is_root_capable() {
+        credentials.real_gid = gid;
+        credentials.effective_gid = gid;
+        credentials.saved_gid = gid;
+        return Ok(0);
+    }
+    if credentials.has_gid(gid) {
+        credentials.effective_gid = gid;
         Ok(0)
     } else {
         Err(SysErrNo::EPERM)
@@ -406,32 +440,134 @@ pub fn sys_setgid(gid: usize) -> SyscallRet {
 }
 
 pub fn sys_setreuid(ruid: usize, euid: usize) -> SyscallRet {
-    set_fixed_identity(&[ruid, euid])
+    let new_ruid = parse_id_arg(ruid)?;
+    let new_euid = parse_id_arg(euid)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut credentials = task.credentials.lock();
+    let old = *credentials;
+    if !old.is_root_capable() {
+        if new_ruid
+            .map(|uid| uid != old.real_uid && uid != old.effective_uid)
+            .unwrap_or(false)
+        {
+            return Err(SysErrNo::EPERM);
+        }
+        if new_euid.map(|uid| !old.has_uid(uid)).unwrap_or(false) {
+            return Err(SysErrNo::EPERM);
+        }
+    }
+    if let Some(uid) = new_ruid {
+        credentials.real_uid = uid;
+    }
+    if let Some(uid) = new_euid {
+        credentials.effective_uid = uid;
+    }
+    if new_ruid.is_some() || new_euid.map(|uid| uid != old.real_uid).unwrap_or(false) {
+        credentials.saved_uid = credentials.effective_uid;
+    }
+    Ok(0)
 }
 
 pub fn sys_setregid(rgid: usize, egid: usize) -> SyscallRet {
-    set_fixed_identity(&[rgid, egid])
+    let new_rgid = parse_id_arg(rgid)?;
+    let new_egid = parse_id_arg(egid)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut credentials = task.credentials.lock();
+    let old = *credentials;
+    if !old.is_root_capable() {
+        if new_rgid
+            .map(|gid| gid != old.real_gid && gid != old.effective_gid)
+            .unwrap_or(false)
+        {
+            return Err(SysErrNo::EPERM);
+        }
+        if new_egid.map(|gid| !old.has_gid(gid)).unwrap_or(false) {
+            return Err(SysErrNo::EPERM);
+        }
+    }
+    if let Some(gid) = new_rgid {
+        credentials.real_gid = gid;
+    }
+    if let Some(gid) = new_egid {
+        credentials.effective_gid = gid;
+    }
+    if new_rgid.is_some() || new_egid.map(|gid| gid != old.real_gid).unwrap_or(false) {
+        credentials.saved_gid = credentials.effective_gid;
+    }
+    Ok(0)
 }
 
 pub fn sys_setresuid(ruid: usize, euid: usize, suid: usize) -> SyscallRet {
-    set_fixed_identity(&[ruid, euid, suid])
+    let new_ruid = parse_id_arg(ruid)?;
+    let new_euid = parse_id_arg(euid)?;
+    let new_suid = parse_id_arg(suid)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut credentials = task.credentials.lock();
+    let old = *credentials;
+    if !old.is_root_capable()
+        && [new_ruid, new_euid, new_suid]
+            .iter()
+            .copied()
+            .flatten()
+            .any(|uid| !old.has_uid(uid))
+    {
+        return Err(SysErrNo::EPERM);
+    }
+    if let Some(uid) = new_ruid {
+        credentials.real_uid = uid;
+    }
+    if let Some(uid) = new_euid {
+        credentials.effective_uid = uid;
+    }
+    if let Some(uid) = new_suid {
+        credentials.saved_uid = uid;
+    }
+    Ok(0)
 }
 
 pub fn sys_setresgid(rgid: usize, egid: usize, sgid: usize) -> SyscallRet {
-    set_fixed_identity(&[rgid, egid, sgid])
+    let new_rgid = parse_id_arg(rgid)?;
+    let new_egid = parse_id_arg(egid)?;
+    let new_sgid = parse_id_arg(sgid)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut credentials = task.credentials.lock();
+    let old = *credentials;
+    if !old.is_root_capable()
+        && [new_rgid, new_egid, new_sgid]
+            .iter()
+            .copied()
+            .flatten()
+            .any(|gid| !old.has_gid(gid))
+    {
+        return Err(SysErrNo::EPERM);
+    }
+    if let Some(gid) = new_rgid {
+        credentials.real_gid = gid;
+    }
+    if let Some(gid) = new_egid {
+        credentials.effective_gid = gid;
+    }
+    if let Some(gid) = new_sgid {
+        credentials.saved_gid = gid;
+    }
+    Ok(0)
 }
 
 pub fn sys_getresuid(ruid: usize, euid: usize, suid: usize) -> SyscallRet {
-    copy_object_to_user(ruid, &0u32)?;
-    copy_object_to_user(euid, &0u32)?;
-    copy_object_to_user(suid, &0u32)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let credentials = *task.credentials.lock();
+    copy_object_to_user(ruid, &credentials.real_uid)?;
+    copy_object_to_user(euid, &credentials.effective_uid)?;
+    copy_object_to_user(suid, &credentials.saved_uid)?;
     Ok(0)
 }
 
 pub fn sys_getresgid(rgid: usize, egid: usize, sgid: usize) -> SyscallRet {
-    copy_object_to_user(rgid, &0u32)?;
-    copy_object_to_user(egid, &0u32)?;
-    copy_object_to_user(sgid, &0u32)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let credentials = *task.credentials.lock();
+    copy_object_to_user(rgid, &credentials.real_gid)?;
+    copy_object_to_user(egid, &credentials.effective_gid)?;
+    copy_object_to_user(sgid, &credentials.saved_gid)?;
     Ok(0)
 }
 
@@ -1288,14 +1424,14 @@ pub(crate) fn process_robust_list_on_exit(task: &Arc<crate::task::TaskControlBlo
 
     let read_usize_at = |addr: usize| -> Result<usize, SysErrNo> {
         let mut bytes = [0u8; core::mem::size_of::<usize>()];
-        let memory_set = task.memory_set.lock();
-        super::user::copy_from_user_in_memory_set(&memory_set, addr, &mut bytes)?;
+        let mut memory_set = task.memory_set.lock();
+        super::user::copy_from_user_in_memory_set(&mut memory_set, addr, &mut bytes)?;
         Ok(usize::from_ne_bytes(bytes))
     };
     let read_i32_at = |addr: usize| -> Result<i32, SysErrNo> {
         let mut bytes = [0u8; core::mem::size_of::<i32>()];
-        let memory_set = task.memory_set.lock();
-        super::user::copy_from_user_in_memory_set(&memory_set, addr, &mut bytes)?;
+        let mut memory_set = task.memory_set.lock();
+        super::user::copy_from_user_in_memory_set(&mut memory_set, addr, &mut bytes)?;
         Ok(i32::from_ne_bytes(bytes))
     };
     let write_i32_at = |addr: usize, value: i32| -> Result<(), SysErrNo> {

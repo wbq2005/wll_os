@@ -56,13 +56,14 @@ pub fn copy_to_user_in_memory_set(
 }
 
 pub fn copy_from_user_in_memory_set(
-    memory_set: &MemorySet,
+    memory_set: &mut MemorySet,
     src: usize,
     dst: &mut [u8],
 ) -> Result<(), SysErrNo> {
     if src == 0 && !dst.is_empty() {
         return Err(SysErrNo::EFAULT);
     }
+    memory_set.prepare_read(src, dst.len())?;
     let mut copied = 0usize;
     while copied < dst.len() {
         let va = src.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
@@ -84,8 +85,8 @@ pub fn copy_from_user(src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EFAULT);
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
-    copy_from_user_in_memory_set(&memory_set, src, dst)
+    let mut memory_set = task.memory_set.lock();
+    copy_from_user_in_memory_set(&mut memory_set, src, dst)
 }
 
 pub fn copy_object_to_user<T>(dst: usize, obj: &T) -> Result<(), SysErrNo> {
@@ -126,15 +127,16 @@ fn read_cstr_inner(
 
     let mut bytes = Vec::new();
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let memory_set = task.memory_set.lock();
+    let mut memory_set = task.memory_set.lock();
     let mut offset = 0usize;
     while offset < MAX_CSTR_LEN {
         let va = addr.checked_add(offset).ok_or(SysErrNo::EFAULT)?;
+        let page_left = PAGE_SIZE - va % PAGE_SIZE;
+        let span = page_left.min(MAX_CSTR_LEN - offset);
+        memory_set.prepare_read(va, span)?;
         let pa = memory_set
             .translate(VirtAddr::new(va))
             .ok_or(SysErrNo::EFAULT)?;
-        let page_left = PAGE_SIZE - va % PAGE_SIZE;
-        let span = page_left.min(MAX_CSTR_LEN - offset);
         let src = unsafe { core::slice::from_raw_parts(pa.raw() as *const u8, span) };
         for &byte in src {
             if byte == 0 {

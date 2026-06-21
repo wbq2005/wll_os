@@ -584,6 +584,30 @@ impl MemorySet {
         Ok(())
     }
 
+    fn ensure_page_readable(&mut self, page_start: usize) -> Result<(), SysErrNo> {
+        let Some(index) = self.area_index_containing(page_start) else {
+            return Err(SysErrNo::EFAULT);
+        };
+        let flags = self.areas[index].flags;
+        if !has_leaf_permission(flags) || !flags.contains(PTEFlags::R) {
+            return Err(SysErrNo::EFAULT);
+        }
+        if self.translate(VirtAddr::new(page_start)).is_none() {
+            self.handle_page_fault(page_start, false, false)?;
+        }
+        Ok(())
+    }
+
+    pub fn prepare_read(&mut self, src: usize, len: usize) -> Result<(), SysErrNo> {
+        let mut checked = 0usize;
+        while checked < len {
+            let addr = src.checked_add(checked).ok_or(SysErrNo::EFAULT)?;
+            self.ensure_page_readable(align_down(addr))?;
+            checked += (PAGE_SIZE - addr % PAGE_SIZE).min(len - checked);
+        }
+        Ok(())
+    }
+
     pub fn prepare_write(&mut self, dst: usize, len: usize) -> Result<(), SysErrNo> {
         let mut checked = 0usize;
         while checked < len {

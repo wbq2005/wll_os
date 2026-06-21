@@ -104,6 +104,41 @@ pub type SharedFdTable = Arc<Mutex<FileDescriptorTable>>;
 pub type SharedFsContext = Arc<Mutex<FsContext>>;
 pub type SharedMmContext = Arc<Mutex<MmContext>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Credentials {
+    pub real_uid: u32,
+    pub effective_uid: u32,
+    pub saved_uid: u32,
+    pub real_gid: u32,
+    pub effective_gid: u32,
+    pub saved_gid: u32,
+}
+
+impl Credentials {
+    pub const fn root() -> Self {
+        Self {
+            real_uid: 0,
+            effective_uid: 0,
+            saved_uid: 0,
+            real_gid: 0,
+            effective_gid: 0,
+            saved_gid: 0,
+        }
+    }
+
+    pub fn has_uid(&self, uid: u32) -> bool {
+        uid == self.real_uid || uid == self.effective_uid || uid == self.saved_uid
+    }
+
+    pub fn has_gid(&self, gid: u32) -> bool {
+        gid == self.real_gid || gid == self.effective_gid || gid == self.saved_gid
+    }
+
+    pub fn is_root_capable(&self) -> bool {
+        self.effective_uid == 0
+    }
+}
+
 #[derive(Clone)]
 pub struct FsContext {
     pub cwd: String,
@@ -1138,6 +1173,7 @@ pub struct TaskControlBlock {
     pub memory_set: SharedMemorySet,
     pub fs: SharedFsContext,
     pub mm: SharedMmContext,
+    pub credentials: Mutex<Credentials>,
     pub signal_actions: crate::syscall::signal::SharedSignalActions,
     pub signal_state: Mutex<crate::syscall::signal::SignalState>,
     /// User trap frame. Outside inner for foreground driver.

@@ -4,7 +4,7 @@ use crate::mm::elf_loader::ElfFile;
 use crate::task::{
     current_task, dup_fd_table, dup_fs_context, dup_mm_context, exit_current_and_run_next,
     exit_thread_group_and_run_next, new_shared_memory_set, suspend_current_and_run_next,
-    yield_current_once, TaskControlBlock, ThreadGroup,
+    yield_current_once, Credentials, TaskControlBlock, ThreadGroup,
 };
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
@@ -249,6 +249,33 @@ pub(crate) fn setup_user_stack(
     phnum: usize,
     interp_base: usize,
 ) -> usize {
+    let credentials = current_task()
+        .map(|task| *task.credentials.lock())
+        .unwrap_or_else(Credentials::root);
+    setup_user_stack_with_credentials(
+        memory_set,
+        stack_top,
+        argv,
+        envp,
+        at_entry,
+        phdr_vaddr,
+        phnum,
+        interp_base,
+        credentials,
+    )
+}
+
+fn setup_user_stack_with_credentials(
+    memory_set: &crate::mm::memory_set::MemorySet,
+    stack_top: usize,
+    argv: &[String],
+    envp: &[String],
+    at_entry: usize,
+    phdr_vaddr: usize,
+    phnum: usize,
+    interp_base: usize,
+    credentials: Credentials,
+) -> usize {
     let mut sp = stack_top;
 
     // 辅助函数：往栈上写 bytes
@@ -350,10 +377,10 @@ pub(crate) fn setup_user_stack(
         (AT_BASE, interp_base),
         (AT_FLAGS, 0),
         (AT_ENTRY, at_entry),
-        (AT_UID, 0),
-        (AT_EUID, 0),
-        (AT_GID, 0),
-        (AT_EGID, 0),
+        (AT_UID, credentials.real_uid as usize),
+        (AT_EUID, credentials.effective_uid as usize),
+        (AT_GID, credentials.real_gid as usize),
+        (AT_EGID, credentials.effective_gid as usize),
         (AT_PLATFORM, platform_addr),
         (AT_HWCAP, LINUX_AT_HWCAP),
         (AT_CLKTCK, 100),
@@ -917,6 +944,7 @@ pub fn sys_clone(
     } else {
         crate::syscall::signal::dup_signal_actions(&parent.signal_actions)
     };
+    let credentials = *parent.credentials.lock();
     let signal_blocked = parent.signal_state.lock().blocked;
     let child_pid_obj = crate::task::pid::Pid::alloc();
     let child_pid = child_pid_obj.0;
@@ -963,6 +991,7 @@ pub fn sys_clone(
         memory_set,
         fs,
         mm,
+        credentials: Mutex::new(credentials),
         signal_actions,
         signal_state: Mutex::new(crate::syscall::signal::SignalState::fork_from(
             signal_blocked,
