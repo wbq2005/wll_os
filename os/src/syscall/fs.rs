@@ -1,7 +1,7 @@
 use super::SyscallRet;
 use crate::console::putchar;
-use crate::task::current_task;
-use crate::task::wait_queue::{sleep_on_io_if, WaitOutcome};
+use crate::task::wait_queue::{sleep_on_io_if, sleep_on_io_key_if, WaitOutcome};
+use crate::task::{current_task, SharedFdTable};
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
 
@@ -310,6 +310,58 @@ fn write_fixed_at_from_kernel(
     super::with_kernel_page_table(|| file_desc.write_at(offset, buf))
 }
 
+fn wait_pipe_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
+    let wait_key = {
+        let fds = fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        if !file_desc.is_pipe_read() {
+            return Err(SysErrNo::EAGAIN);
+        }
+        if file_desc.pipe_read_nonblocking() {
+            return Err(SysErrNo::EAGAIN);
+        }
+        if !file_desc.pipe_read_would_block() {
+            return Ok(false);
+        }
+        file_desc.pipe_read_wait_key().ok_or(SysErrNo::EBADF)?
+    };
+    let _ = sleep_on_io_key_if(wait_key, None, || {
+        let fds = fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        if file_desc.pipe_read_wait_key() != Some(wait_key) {
+            return Ok(false);
+        }
+        Ok(file_desc.pipe_read_would_block())
+    })?;
+    Ok(true)
+}
+
+fn wait_pipe_write_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
+    let wait_key = {
+        let fds = fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        if !file_desc.is_pipe_write() {
+            return Err(SysErrNo::EAGAIN);
+        }
+        if file_desc.pipe_write_nonblocking() {
+            return Err(SysErrNo::EAGAIN);
+        }
+        if !file_desc.pipe_write_would_block() {
+            return Ok(false);
+        }
+        file_desc.pipe_write_wait_key().ok_or(SysErrNo::EBADF)?
+    };
+    let _ = sleep_on_io_key_if(wait_key, None, || {
+        let fds = fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        if file_desc.pipe_write_wait_key() != Some(wait_key) {
+            return Ok(false);
+        }
+        Ok(file_desc.pipe_write_would_block())
+    })?;
+    Ok(true)
+}
+
 fn vectored_read_at_to_user(fd: usize, iovecs: &[IoVec], offset: usize) -> SyscallRet {
     let mut total = 0usize;
     let mut cursor = IovCursor::new();
@@ -503,29 +555,9 @@ fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
                 if total != 0 {
                     return Ok(total);
                 }
-                let (is_pipe_read, nb_pipe, would_block) = {
-                    let fds = fd_table.lock();
-                    fds.get(fd)
-                        .map(|f| {
-                            (
-                                f.is_pipe_read(),
-                                f.pipe_read_nonblocking(),
-                                f.pipe_read_would_block(),
-                            )
-                        })
-                        .unwrap_or((false, false, false))
-                };
-                if !is_pipe_read || nb_pipe {
-                    return Err(SysErrNo::EAGAIN);
-                }
-                if !would_block {
+                if !wait_pipe_read_after_eagain(&fd_table, fd)? {
                     continue;
                 }
-                let _ = sleep_on_io_if(None, || {
-                    let fds = fd_table.lock();
-                    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-                    Ok(file_desc.pipe_read_would_block())
-                })?;
             }
             Err(err) => {
                 return if total != 0 { Ok(total) } else { Err(err) };
@@ -589,29 +621,8 @@ fn vectored_write_from_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
                     if total != 0 {
                         return Ok(total);
                     }
-                    let (is_pipe_write, nb_pipe, would_block) = {
-                        let fds = fd_table.lock();
-                        fds.get(fd)
-                            .map(|f| {
-                                (
-                                    f.is_pipe_write(),
-                                    f.pipe_write_nonblocking(),
-                                    f.pipe_write_would_block(),
-                                )
-                            })
-                            .unwrap_or((false, false, false))
-                    };
-                    if !is_pipe_write || nb_pipe {
-                        return Err(SysErrNo::EAGAIN);
-                    }
-                    if !would_block {
-                        continue;
-                    }
-                    match sleep_on_io_if(None, || {
-                        let fds = fd_table.lock();
-                        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-                        Ok(file_desc.pipe_write_would_block())
-                    }) {
+                    match wait_pipe_write_after_eagain(&fd_table, fd) {
+                        Ok(false) => continue,
                         Ok(_) => {}
                         Err(SysErrNo::EINTR) if total != 0 => return Ok(total),
                         Err(err) => return Err(err),
@@ -1501,32 +1512,9 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
                     return Ok(n);
                 }
                 Err(SysErrNo::EAGAIN) => {
-                    let (is_pipe_read, nb_pipe, would_block) = {
-                        let fds = fd_table.lock();
-                        fds.get(fd)
-                            .map(|f| {
-                                (
-                                    f.is_pipe_read(),
-                                    f.pipe_read_nonblocking(),
-                                    f.pipe_read_would_block(),
-                                )
-                            })
-                            .unwrap_or((false, false, false))
-                    };
-                    if !is_pipe_read {
-                        return Err(SysErrNo::EAGAIN);
-                    }
-                    if nb_pipe {
-                        return Err(SysErrNo::EAGAIN);
-                    }
-                    if !would_block {
+                    if !wait_pipe_read_after_eagain(&fd_table, fd)? {
                         continue;
                     }
-                    let _ = sleep_on_io_if(None, || {
-                        let fds = fd_table.lock();
-                        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-                        Ok(file_desc.pipe_read_would_block())
-                    })?;
                 }
                 Err(e) => return Err(e),
             }
@@ -1549,32 +1537,9 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
                 return Ok(n);
             }
             Err(SysErrNo::EAGAIN) => {
-                let (is_pipe_read, nb_pipe, would_block) = {
-                    let fds = fd_table.lock();
-                    fds.get(fd)
-                        .map(|f| {
-                            (
-                                f.is_pipe_read(),
-                                f.pipe_read_nonblocking(),
-                                f.pipe_read_would_block(),
-                            )
-                        })
-                        .unwrap_or((false, false, false))
-                };
-                if !is_pipe_read {
-                    return Err(SysErrNo::EAGAIN);
-                }
-                if nb_pipe {
-                    return Err(SysErrNo::EAGAIN);
-                }
-                if !would_block {
+                if !wait_pipe_read_after_eagain(&fd_table, fd)? {
                     continue;
                 }
-                let _ = sleep_on_io_if(None, || {
-                    let fds = fd_table.lock();
-                    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-                    Ok(file_desc.pipe_read_would_block())
-                })?;
             }
             Err(e) => return Err(e),
         }
@@ -1635,40 +1600,8 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
                     if written != 0 {
                         return Ok(written);
                     }
-                    let (is_pipe_write, nb_pipe, would_block) = {
-                        let fds = fd_table.lock();
-                        fds.get(fd)
-                            .map(|f| {
-                                (
-                                    f.is_pipe_write(),
-                                    f.pipe_write_nonblocking(),
-                                    f.pipe_write_would_block(),
-                                )
-                            })
-                            .unwrap_or((false, false, false))
-                    };
-                    if !is_pipe_write {
-                        return if written != 0 {
-                            Ok(written)
-                        } else {
-                            Err(SysErrNo::EAGAIN)
-                        };
-                    }
-                    if nb_pipe {
-                        return if written != 0 {
-                            Ok(written)
-                        } else {
-                            Err(SysErrNo::EAGAIN)
-                        };
-                    }
-                    if !would_block {
-                        continue;
-                    }
-                    match sleep_on_io_if(None, || {
-                        let fds = fd_table.lock();
-                        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-                        Ok(file_desc.pipe_write_would_block())
-                    }) {
+                    match wait_pipe_write_after_eagain(&fd_table, fd) {
+                        Ok(false) => continue,
                         Ok(_) => {}
                         Err(SysErrNo::EINTR) if written != 0 => return Ok(written),
                         Err(err) => return Err(err),

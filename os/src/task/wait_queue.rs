@@ -26,11 +26,24 @@ pub enum WaitOutcome {
 struct WaitEntry {
     task: Arc<TaskControlBlock>,
     token: usize,
+    key: Option<WaitKey>,
 }
 
 pub struct WaitQueue {
     waiters: Mutex<VecDeque<WaitEntry>>,
     reason: BlockReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitKey {
+    object: usize,
+    event: usize,
+}
+
+impl WaitKey {
+    pub const fn new(object: usize, event: usize) -> Self {
+        Self { object, event }
+    }
 }
 
 impl WaitQueue {
@@ -57,6 +70,18 @@ impl WaitQueue {
     where
         F: FnOnce() -> Result<bool, SysErrNo>,
     {
+        self.sleep_until_key_if(None, deadline_us, should_sleep)
+    }
+
+    pub fn sleep_until_key_if<F>(
+        &self,
+        key: Option<WaitKey>,
+        deadline_us: Option<usize>,
+        should_sleep: F,
+    ) -> Result<WaitOutcome, SysErrNo>
+    where
+        F: FnOnce() -> Result<bool, SysErrNo>,
+    {
         let task = current_task().ok_or(SysErrNo::ESRCH)?;
 
         if let Some(deadline) = deadline_us {
@@ -71,6 +96,7 @@ impl WaitQueue {
         self.waiters.lock().push_back(WaitEntry {
             task: task.clone(),
             token,
+            key,
         });
 
         let sleep = match should_sleep() {
@@ -135,6 +161,38 @@ impl WaitQueue {
         let mut woke = 0usize;
         loop {
             let entry = self.waiters.lock().pop_front();
+            let Some(entry) = entry else {
+                break;
+            };
+            if wake_task_token_with(&entry.task, entry.token, WaitOutcome::Woken) {
+                woke += 1;
+            }
+        }
+        woke
+    }
+
+    pub fn wake_key(&self, key: WaitKey) -> usize {
+        self.wake_matching(usize::MAX, |entry| entry.key == Some(key))
+    }
+
+    pub fn wake_key_n(&self, key: WaitKey, n: usize) -> usize {
+        self.wake_matching(n, |entry| entry.key == Some(key))
+    }
+
+    pub fn wake_unkeyed(&self) -> usize {
+        self.wake_matching(usize::MAX, |entry| entry.key.is_none())
+    }
+
+    fn wake_matching(&self, limit: usize, mut matches: impl FnMut(&WaitEntry) -> bool) -> usize {
+        let mut woke = 0usize;
+        while woke < limit {
+            let entry = {
+                let mut waiters = self.waiters.lock();
+                let Some(index) = waiters.iter().position(|entry| matches(entry)) else {
+                    break;
+                };
+                waiters.remove(index)
+            };
             let Some(entry) = entry else {
                 break;
             };
@@ -225,8 +283,27 @@ where
     IO_WAIT_QUEUE.sleep_until_if(deadline_us, should_sleep)
 }
 
+pub fn sleep_on_io_key_if<F>(
+    key: WaitKey,
+    deadline_us: Option<usize>,
+    should_sleep: F,
+) -> Result<WaitOutcome, SysErrNo>
+where
+    F: FnOnce() -> Result<bool, SysErrNo>,
+{
+    IO_WAIT_QUEUE.sleep_until_key_if(Some(key), deadline_us, should_sleep)
+}
+
 pub fn wake_io_waiters() -> usize {
-    IO_WAIT_QUEUE.wake_all()
+    IO_WAIT_QUEUE.wake_unkeyed()
+}
+
+pub fn wake_io_keyed_waiters(key: WaitKey) -> usize {
+    IO_WAIT_QUEUE.wake_key(key) + IO_WAIT_QUEUE.wake_unkeyed()
+}
+
+pub fn wake_io_keyed_waiter(key: WaitKey) -> usize {
+    IO_WAIT_QUEUE.wake_key_n(key, 1) + IO_WAIT_QUEUE.wake_unkeyed()
 }
 
 pub fn sleep_on_child_exit() -> Result<WaitOutcome, SysErrNo> {

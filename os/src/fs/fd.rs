@@ -11,6 +11,7 @@ use spin::Mutex;
 use crate::fs::ext4_vol;
 use crate::fs::FileTimes;
 use crate::fs::MEM_FS;
+use crate::task::wait_queue::WaitKey;
 use crate::utils::error::SysErrNo;
 
 /// 最大文件描述符数量
@@ -32,6 +33,28 @@ const MEM_FILE_INLINE_LIMIT: usize = 1024 * 1024;
 const MEM_FILE_CHUNK_SIZE: usize = 64 * 1024;
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
+const PIPE_WAIT_READABLE: usize = 1;
+const PIPE_WAIT_WRITABLE: usize = 2;
+
+fn pipe_wait_key(state: &Arc<Mutex<PipeState>>, event: usize) -> WaitKey {
+    WaitKey::new(Arc::as_ptr(state) as usize, event)
+}
+
+fn wake_pipe_readers(state: &Arc<Mutex<PipeState>>) {
+    crate::task::wait_queue::wake_io_keyed_waiters(pipe_wait_key(state, PIPE_WAIT_READABLE));
+}
+
+fn wake_one_pipe_reader(state: &Arc<Mutex<PipeState>>) {
+    crate::task::wait_queue::wake_io_keyed_waiter(pipe_wait_key(state, PIPE_WAIT_READABLE));
+}
+
+fn wake_pipe_writers(state: &Arc<Mutex<PipeState>>) {
+    crate::task::wait_queue::wake_io_keyed_waiters(pipe_wait_key(state, PIPE_WAIT_WRITABLE));
+}
+
+fn wake_one_pipe_writer(state: &Arc<Mutex<PipeState>>) {
+    crate::task::wait_queue::wake_io_keyed_waiter(pipe_wait_key(state, PIPE_WAIT_WRITABLE));
+}
 
 fn is_dev_null_path(path: &str) -> bool {
     matches!(path, "/dev/null" | "/glibc/dev/null" | "/musl/dev/null")
@@ -336,6 +359,16 @@ pub struct PipeState {
     writers: usize,
 }
 
+impl PipeState {
+    fn new() -> Self {
+        Self {
+            buf: VecDeque::with_capacity(PIPE_CAPACITY),
+            readers: 1,
+            writers: 1,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SocketPacket {
     pub data: Vec<u8>,
@@ -488,6 +521,15 @@ impl FileDescriptor {
         }
     }
 
+    pub fn pipe_read_wait_key(&self) -> Option<WaitKey> {
+        match self {
+            FileDescriptor::PipeRead { state, .. } => {
+                Some(pipe_wait_key(state, PIPE_WAIT_READABLE))
+            }
+            _ => None,
+        }
+    }
+
     pub fn pipe_write_would_block(&self) -> bool {
         match self {
             FileDescriptor::PipeWrite { state, .. } => {
@@ -495,6 +537,15 @@ impl FileDescriptor {
                 pipe.readers > 0 && pipe.buf.len() >= PIPE_CAPACITY
             }
             _ => false,
+        }
+    }
+
+    pub fn pipe_write_wait_key(&self) -> Option<WaitKey> {
+        match self {
+            FileDescriptor::PipeWrite { state, .. } => {
+                Some(pipe_wait_key(state, PIPE_WAIT_WRITABLE))
+            }
+            _ => None,
         }
     }
 
@@ -680,7 +731,7 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                let n = {
+                let (n, wake_readers, wake_writers) = {
                     let mut pipe = state.lock();
                     if pipe.buf.is_empty() {
                         if pipe.writers == 0 {
@@ -692,10 +743,13 @@ impl FileDescriptor {
                     let n = buf.len().min(contiguous.len());
                     buf[..n].copy_from_slice(&contiguous[..n]);
                     pipe.buf.drain(..n);
-                    n
+                    (n, !pipe.buf.is_empty(), pipe.buf.len() < PIPE_CAPACITY)
                 };
-                if n > 0 {
-                    crate::task::wait_queue::wake_io_waiters();
+                if wake_readers {
+                    wake_one_pipe_reader(state);
+                }
+                if wake_writers {
+                    wake_one_pipe_writer(state);
                 }
                 Ok(n)
             }
@@ -899,7 +953,7 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                let written = {
+                let (written, wake_readers, wake_writers) = {
                     let mut pipe = state.lock();
                     if pipe.readers == 0 {
                         return Err(SysErrNo::EPIPE);
@@ -910,9 +964,18 @@ impl FileDescriptor {
                     }
                     let written = buf.len().min(available);
                     pipe.buf.extend(buf[..written].iter().copied());
-                    written
+                    (
+                        written,
+                        !pipe.buf.is_empty(),
+                        pipe.buf.len() < PIPE_CAPACITY,
+                    )
                 };
-                crate::task::wait_queue::wake_io_waiters();
+                if wake_readers {
+                    wake_one_pipe_reader(state);
+                }
+                if wake_writers {
+                    wake_one_pipe_writer(state);
+                }
                 Ok(written)
             }
             FileDescriptor::PipeRead { .. } => Err(SysErrNo::EBADF),
@@ -1247,18 +1310,38 @@ impl Drop for FileDescriptor {
         let mut wake_io = false;
         match self {
             FileDescriptor::PipeRead { state, .. } => {
+                let mut last_reader = false;
+                let mut closed_reader = false;
                 let mut pipe = state.lock();
                 if pipe.readers > 0 {
                     pipe.readers -= 1;
+                    last_reader = pipe.readers == 0;
+                    closed_reader = true;
                 }
-                wake_io = true;
+                drop(pipe);
+                if last_reader {
+                    wake_pipe_readers(state);
+                    wake_pipe_writers(state);
+                } else if closed_reader {
+                    wake_pipe_readers(state);
+                }
             }
             FileDescriptor::PipeWrite { state, .. } => {
+                let mut last_writer = false;
+                let mut closed_writer = false;
                 let mut pipe = state.lock();
                 if pipe.writers > 0 {
                     pipe.writers -= 1;
+                    last_writer = pipe.writers == 0;
+                    closed_writer = true;
                 }
-                wake_io = true;
+                drop(pipe);
+                if last_writer {
+                    wake_pipe_readers(state);
+                    wake_pipe_writers(state);
+                } else if closed_writer {
+                    wake_pipe_writers(state);
+                }
             }
             FileDescriptor::Socket { .. } => {
                 wake_io = true;
@@ -1751,11 +1834,7 @@ fn open_file_legacy_unused(
 }
 
 pub fn create_pipe(nonblock: bool) -> (FileDescriptor, FileDescriptor) {
-    let state = Arc::new(Mutex::new(PipeState {
-        buf: VecDeque::with_capacity(PIPE_CAPACITY),
-        readers: 1,
-        writers: 1,
-    }));
+    let state = Arc::new(Mutex::new(PipeState::new()));
     (
         FileDescriptor::PipeRead {
             state: state.clone(),
