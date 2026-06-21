@@ -1,4 +1,4 @@
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeSet, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -8,18 +8,52 @@ use spin::Mutex;
 use super::{TaskControlBlock, TaskStatus};
 
 lazy_static! {
-    static ref USER_READY_QUEUE: Mutex<VecDeque<Arc<TaskControlBlock>>> =
-        Mutex::new(VecDeque::new());
-    static ref KERNEL_READY_QUEUE: Mutex<VecDeque<Arc<TaskControlBlock>>> =
-        Mutex::new(VecDeque::new());
+    static ref USER_READY_QUEUE: Mutex<ReadyQueue> = Mutex::new(ReadyQueue::new());
+    static ref KERNEL_READY_QUEUE: Mutex<ReadyQueue> = Mutex::new(ReadyQueue::new());
     static ref TASK_REGISTRY: Mutex<Vec<Weak<TaskControlBlock>>> = Mutex::new(Vec::new());
     static ref EXITED_TASKS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 }
 
 const RT_LOWER_RUN_BUDGET: usize = 1;
-const RT_WAITER_NORMAL_DEFER_BUDGET: usize = 64;
 static RT_RUNS_SINCE_NORMAL: AtomicUsize = AtomicUsize::new(0);
-static RT_WAITER_NORMAL_DEFERS: AtomicUsize = AtomicUsize::new(0);
+
+// The deque keeps runnable order; the pid set mirrors its membership so repeated
+// wakeups/requeues can be deduplicated without scanning the whole ready queue.
+struct ReadyQueue {
+    tasks: VecDeque<Arc<TaskControlBlock>>,
+    queued_pids: BTreeSet<usize>,
+}
+
+impl ReadyQueue {
+    fn new() -> Self {
+        Self {
+            tasks: VecDeque::new(),
+            queued_pids: BTreeSet::new(),
+        }
+    }
+
+    fn push_back(&mut self, task: Arc<TaskControlBlock>) {
+        if self.queued_pids.insert(task.pid.0) {
+            self.tasks.push_back(task);
+        }
+    }
+
+    fn push_front(&mut self, task: Arc<TaskControlBlock>) {
+        if self.queued_pids.insert(task.pid.0) {
+            self.tasks.push_front(task);
+        }
+    }
+
+    fn remove_at(&mut self, index: usize) -> Option<Arc<TaskControlBlock>> {
+        let task = self.tasks.remove(index)?;
+        self.queued_pids.remove(&task.pid.0);
+        Some(task)
+    }
+
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+}
 
 pub fn register_task(task: &Arc<TaskControlBlock>) {
     TASK_REGISTRY.lock().push(Arc::downgrade(task));
@@ -50,15 +84,8 @@ pub fn add_kernel_task(task: Arc<TaskControlBlock>) {
     push_task_back(&KERNEL_READY_QUEUE, task);
 }
 
-fn push_task_back(queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>, task: Arc<TaskControlBlock>) {
-    let mut queue = queue.lock();
-    if queue
-        .iter()
-        .any(|queued| Arc::ptr_eq(queued, &task) || queued.pid.0 == task.pid.0)
-    {
-        return;
-    }
-    queue.push_back(task);
+fn push_task_back(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
+    queue.lock().push_back(task);
 }
 
 pub fn add_task_front(task: Arc<TaskControlBlock>) {
@@ -69,15 +96,8 @@ pub fn add_task_front(task: Arc<TaskControlBlock>) {
     }
 }
 
-fn push_task_front(queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>, task: Arc<TaskControlBlock>) {
-    let mut queue = queue.lock();
-    if queue
-        .iter()
-        .any(|queued| Arc::ptr_eq(queued, &task) || queued.pid.0 == task.pid.0)
-    {
-        return;
-    }
-    queue.push_front(task);
+fn push_task_front(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
+    queue.lock().push_front(task);
 }
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
@@ -92,54 +112,50 @@ pub fn fetch_kernel_task() -> Option<Arc<TaskControlBlock>> {
     fetch_from_queue(&KERNEL_READY_QUEUE)
 }
 
-fn fetch_from_queue(
-    queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>,
-) -> Option<Arc<TaskControlBlock>> {
+fn fetch_from_queue(queue: &Mutex<ReadyQueue>) -> Option<Arc<TaskControlBlock>> {
     let mut queue = queue.lock();
     let mut best_index = None;
     let mut best_priority = 0;
+    let mut lower_rt_index = None;
+    let mut lower_rt_priority = 0;
     let mut index = 0;
-    while index < queue.len() {
-        let task = &queue[index];
+    while index < queue.tasks.len() {
+        let task = &queue.tasks[index];
         if matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
-            queue.remove(index);
+            queue.remove_at(index);
             continue;
         }
+        // Scheduling attributes may change while a task is queued, so choose
+        // using the current effective priority instead of caching it at enqueue.
         let priority = task.effective_sched_priority();
-        if best_index.is_none() || priority > best_priority {
+        if priority > best_priority {
+            if best_priority > 0 && best_priority > lower_rt_priority {
+                lower_rt_index = best_index;
+                lower_rt_priority = best_priority;
+            }
             best_index = Some(index);
             best_priority = priority;
+        } else if priority > 0 && priority < best_priority && priority > lower_rt_priority {
+            lower_rt_index = Some(index);
+            lower_rt_priority = priority;
+        } else if best_index.is_none() {
+            best_index = Some(index);
         }
         index += 1;
     }
     let chosen_index = if best_priority > 0 {
-        RT_WAITER_NORMAL_DEFERS.store(0, Ordering::Relaxed);
         let rt_runs = RT_RUNS_SINCE_NORMAL.load(Ordering::Relaxed);
-        let lower_rt_index = queue
-            .iter()
-            .enumerate()
-            .filter_map(|(index, task)| {
-                let priority = task.effective_sched_priority();
-                if priority > 0 && priority < best_priority {
-                    Some((index, priority))
-                } else {
-                    None
-                }
-            })
-            .max_by_key(|(_, priority)| *priority)
-            .map(|(index, _)| index);
+        // Keep the existing bounded fairness behavior among runnable RT tasks:
+        // occasionally run the next lower RT priority instead of the top one.
         if rt_runs >= RT_LOWER_RUN_BUDGET && lower_rt_index.is_some() {
             lower_rt_index
         } else {
             best_index
         }
     } else {
-        if should_defer_normal_for_realtime_waiter() {
-            return None;
-        }
         best_index
     }?;
-    let task = queue.remove(chosen_index)?;
+    let task = queue.remove_at(chosen_index)?;
     let chosen_priority = task.effective_sched_priority();
     if best_priority > 0 && chosen_priority > 0 && chosen_priority == best_priority {
         RT_RUNS_SINCE_NORMAL.fetch_add(1, Ordering::Relaxed);
@@ -147,23 +163,6 @@ fn fetch_from_queue(
         RT_RUNS_SINCE_NORMAL.store(0, Ordering::Relaxed);
     }
     Some(task)
-}
-
-fn should_defer_normal_for_realtime_waiter() -> bool {
-    if !crate::trap::foreground_driver_active() || !crate::timer::has_realtime_waiter() {
-        RT_WAITER_NORMAL_DEFERS.store(0, Ordering::Relaxed);
-        return false;
-    }
-
-    // A sleeping RT task should wake with low latency, but SCHED_OTHER tasks
-    // must still make bounded progress while no RT task is runnable.
-    let defers = RT_WAITER_NORMAL_DEFERS.fetch_add(1, Ordering::Relaxed);
-    if defers < RT_WAITER_NORMAL_DEFER_BUDGET {
-        return true;
-    }
-
-    RT_WAITER_NORMAL_DEFERS.store(0, Ordering::Relaxed);
-    false
 }
 
 pub fn has_task() -> bool {
@@ -178,11 +177,15 @@ pub fn has_kernel_task() -> bool {
     has_runnable_task(&KERNEL_READY_QUEUE)
 }
 
-fn has_runnable_task(queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>) -> bool {
-    queue
-        .lock()
-        .iter()
-        .any(|task| !matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked))
+fn has_runnable_task(queue: &Mutex<ReadyQueue>) -> bool {
+    let mut queue = queue.lock();
+    while let Some(task) = queue.tasks.front() {
+        if !matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+            return true;
+        }
+        queue.remove_at(0);
+    }
+    false
 }
 
 pub fn remove_task(pid: usize) -> Option<Arc<TaskControlBlock>> {
@@ -190,13 +193,10 @@ pub fn remove_task(pid: usize) -> Option<Arc<TaskControlBlock>> {
         .or_else(|| remove_task_from_queue(&KERNEL_READY_QUEUE, pid))
 }
 
-fn remove_task_from_queue(
-    queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>,
-    pid: usize,
-) -> Option<Arc<TaskControlBlock>> {
+fn remove_task_from_queue(queue: &Mutex<ReadyQueue>, pid: usize) -> Option<Arc<TaskControlBlock>> {
     let mut queue = queue.lock();
-    let index = queue.iter().position(|task| task.pid.0 == pid)?;
-    queue.remove(index)
+    let index = queue.tasks.iter().position(|task| task.pid.0 == pid)?;
+    queue.remove_at(index)
 }
 
 pub fn remove_task_instances(task: &Arc<TaskControlBlock>) -> usize {
@@ -205,20 +205,21 @@ pub fn remove_task_instances(task: &Arc<TaskControlBlock>) -> usize {
 }
 
 fn remove_task_instances_from_queue(
-    queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>,
+    queue: &Mutex<ReadyQueue>,
     task: &Arc<TaskControlBlock>,
 ) -> usize {
     let mut removed = 0usize;
     let mut queue = queue.lock();
     let mut kept = VecDeque::new();
-    while let Some(queued) = queue.pop_front() {
+    while let Some(queued) = queue.tasks.pop_front() {
         if Arc::ptr_eq(&queued, task) || queued.pid.0 == task.pid.0 {
+            queue.queued_pids.remove(&queued.pid.0);
             removed += 1;
         } else {
             kept.push_back(queued);
         }
     }
-    *queue = kept;
+    queue.tasks = kept;
     removed
 }
 
@@ -227,18 +228,17 @@ pub fn retain_tasks(mut keep: impl FnMut(&Arc<TaskControlBlock>) -> bool) {
     retain_queue(&KERNEL_READY_QUEUE, &mut keep);
 }
 
-fn retain_queue(
-    queue: &Mutex<VecDeque<Arc<TaskControlBlock>>>,
-    keep: &mut impl FnMut(&Arc<TaskControlBlock>) -> bool,
-) {
+fn retain_queue(queue: &Mutex<ReadyQueue>, keep: &mut impl FnMut(&Arc<TaskControlBlock>) -> bool) {
     let mut queue = queue.lock();
     let mut kept = VecDeque::new();
-    while let Some(task) = queue.pop_front() {
-        if keep(&task) {
+    let mut kept_pids = BTreeSet::new();
+    while let Some(task) = queue.tasks.pop_front() {
+        if keep(&task) && kept_pids.insert(task.pid.0) {
             kept.push_back(task);
         }
     }
-    *queue = kept;
+    queue.tasks = kept;
+    queue.queued_pids = kept_pids;
 }
 
 fn live_tasks() -> Vec<Arc<TaskControlBlock>> {
