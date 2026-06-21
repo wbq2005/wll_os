@@ -872,23 +872,26 @@ pub fn sys_clone(
         return Err(SysErrNo::EINVAL);
     }
 
-    let (area_count, page_count) = {
-        let ms = parent.memory_set.lock();
-        let pages = ms.areas.iter().fold(0usize, |sum, area| {
-            let start = area.start_va.raw() / crate::config::PAGE_SIZE;
-            let end = (area.end_va.raw() + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
-            sum + end.saturating_sub(start)
-        });
-        (ms.areas.len(), pages)
-    };
-    log::info!(
-        "[syscall] clone start flags={:#x} stack={:#x} parent={} areas={} pages={}",
-        flags,
-        stack,
-        parent_pid,
-        area_count,
-        page_count
-    );
+    if log::log_enabled!(log::Level::Info) {
+        let (area_count, page_count) = {
+            let ms = parent.memory_set.lock();
+            let pages = ms.areas.iter().fold(0usize, |sum, area| {
+                let start = area.start_va.raw() / crate::config::PAGE_SIZE;
+                let end =
+                    (area.end_va.raw() + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
+                sum + end.saturating_sub(start)
+            });
+            (ms.areas.len(), pages)
+        };
+        log::info!(
+            "[syscall] clone start flags={:#x} stack={:#x} parent={} areas={} pages={}",
+            flags,
+            stack,
+            parent_pid,
+            area_count,
+            page_count
+        );
+    }
     let mut child_tf = crate::trap::clone_current_trapframe().ok_or(SysErrNo::EINVAL)?;
     child_tf[TrapFrameArgs::RET] = 0;
     child_tf.syscall_ok();
@@ -1023,10 +1026,8 @@ pub fn sys_clone(
     if !is_thread {
         parent.inner.lock().children.push(child.clone());
     }
-    if crate::trap::foreground_driver_active() && !is_thread {
-        crate::task::manager::add_task_front(child);
-    } else {
-        crate::task::manager::add_task(child);
+    crate::task::manager::add_task(child);
+    if crate::trap::foreground_driver_active() {
         crate::task::request_foreground_requeue_front(parent.pid.0);
     }
 

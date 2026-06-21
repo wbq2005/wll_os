@@ -17,7 +17,9 @@ lazy_static! {
 }
 
 const RT_LOWER_RUN_BUDGET: usize = 1;
+const RT_WAITER_NORMAL_DEFER_BUDGET: usize = 64;
 static RT_RUNS_SINCE_NORMAL: AtomicUsize = AtomicUsize::new(0);
+static RT_WAITER_NORMAL_DEFERS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn register_task(task: &Arc<TaskControlBlock>) {
     TASK_REGISTRY.lock().push(Arc::downgrade(task));
@@ -111,6 +113,7 @@ fn fetch_from_queue(
         index += 1;
     }
     let chosen_index = if best_priority > 0 {
+        RT_WAITER_NORMAL_DEFERS.store(0, Ordering::Relaxed);
         let rt_runs = RT_RUNS_SINCE_NORMAL.load(Ordering::Relaxed);
         let lower_rt_index = queue
             .iter()
@@ -131,7 +134,7 @@ fn fetch_from_queue(
             best_index
         }
     } else {
-        if crate::trap::foreground_driver_active() && crate::timer::has_realtime_waiter() {
+        if should_defer_normal_for_realtime_waiter() {
             return None;
         }
         best_index
@@ -144,6 +147,23 @@ fn fetch_from_queue(
         RT_RUNS_SINCE_NORMAL.store(0, Ordering::Relaxed);
     }
     Some(task)
+}
+
+fn should_defer_normal_for_realtime_waiter() -> bool {
+    if !crate::trap::foreground_driver_active() || !crate::timer::has_realtime_waiter() {
+        RT_WAITER_NORMAL_DEFERS.store(0, Ordering::Relaxed);
+        return false;
+    }
+
+    // A sleeping RT task should wake with low latency, but SCHED_OTHER tasks
+    // must still make bounded progress while no RT task is runnable.
+    let defers = RT_WAITER_NORMAL_DEFERS.fetch_add(1, Ordering::Relaxed);
+    if defers < RT_WAITER_NORMAL_DEFER_BUDGET {
+        return true;
+    }
+
+    RT_WAITER_NORMAL_DEFERS.store(0, Ordering::Relaxed);
+    false
 }
 
 pub fn has_task() -> bool {

@@ -66,6 +66,9 @@ pub fn timer_should_preempt_current_task() -> bool {
     if !foreground_driver_active() {
         return true;
     }
+    if crate::task::foreground_deadline_expired() {
+        return true;
+    }
     crate::task::current_task()
         .map(|task| !task.is_kernel && crate::task::manager::user_queue_len() > 0)
         .unwrap_or(false)

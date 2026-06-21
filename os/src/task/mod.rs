@@ -41,6 +41,7 @@ pub const SCHED_DEADLINE: usize = 6;
 /// should NOT call run_next_task() again, because we already switched to the harness
 /// and the harness's loop will handle scheduling. This prevents double-scheduling.
 pub(crate) static RUNNING_FROM_ECANCELED: AtomicUsize = AtomicUsize::new(0);
+static FOREGROUND_DEADLINE_US: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     /// 当前运行的任务
@@ -389,6 +390,36 @@ pub(crate) fn purge_exited_user_task_for_foreground(task: &Arc<TaskControlBlock>
     }
 }
 
+pub(crate) fn set_foreground_deadline_us(deadline_us: usize) {
+    FOREGROUND_DEADLINE_US.store(deadline_us, Ordering::Relaxed);
+}
+
+pub(crate) fn clear_foreground_deadline_us() {
+    FOREGROUND_DEADLINE_US.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn foreground_deadline_expired() -> bool {
+    let deadline_us = FOREGROUND_DEADLINE_US.load(Ordering::Relaxed);
+    deadline_us != 0
+        && crate::trap::foreground_driver_active()
+        && crate::timer::get_time_us() >= deadline_us
+}
+
+fn abort_foreground_user_tasks(exit_code: i32) {
+    let tasks = manager::all_user_tasks();
+    let mut killed_tgids = Vec::new();
+    for task in &tasks {
+        let tgid = task.thread_group.tgid();
+        if task.status() != TaskStatus::Zombie && !killed_tgids.iter().any(|seen| *seen == tgid) {
+            killed_tgids.push(tgid);
+            terminate_task_group(task, exit_code);
+        }
+    }
+    for task in tasks {
+        purge_exited_user_task_for_foreground(&task);
+    }
+}
+
 fn is_kernel_task(task: &Arc<TaskControlBlock>) -> bool {
     task.is_kernel
 }
@@ -562,6 +593,9 @@ pub fn suspend_current_and_run_next() {
         task.set_status(TaskStatus::Ready);
         manager::add_task(task.clone());
         *CURRENT_TASK.lock() = None;
+        if crate::trap::foreground_driver_active() {
+            return;
+        }
         run_next_task();
     }
 }
@@ -607,15 +641,21 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
 
     let mut no_runnable_spins = 0usize;
     while task.status() == TaskStatus::Blocked {
+        // Timed waits must be observed even when other foreground tasks keep
+        // the ready queue non-empty.
+        crate::timer::wake_expired_timers();
+        if foreground_deadline_expired() {
+            abort_foreground_user_tasks(-2);
+            break;
+        }
+        if task.status() != TaskStatus::Blocked {
+            break;
+        }
         if crate::trap::foreground_driver_active() {
             if run_ready_task_once() {
                 no_runnable_spins = 0;
                 continue;
             }
-        }
-        crate::timer::wake_expired_timers();
-        if task.status() != TaskStatus::Blocked {
-            break;
         }
         if !crate::trap::foreground_driver_active() {
             if run_ready_task_once() {

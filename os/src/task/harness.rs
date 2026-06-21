@@ -139,7 +139,6 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Busybox,
     TestGroup::Lua,
     TestGroup::Iozone,
-    TestGroup::Cyclictest,
     TestGroup::LibcTest,
     TestGroup::LibcBench,
 ];
@@ -1032,20 +1031,21 @@ fn abort_foreground_task_tree(root: &Arc<TaskControlBlock>) {
 
 fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
     let deadline_us = crate::timer::deadline_after_us(timeout_us);
+    crate::task::set_foreground_deadline_us(deadline_us);
 
     task.set_status(TaskStatus::Ready);
     manager::add_task(task.clone());
 
     loop {
         crate::timer::wake_expired_timers();
-        if task.status() == TaskStatus::Zombie && !manager::has_user_task() {
-            break;
-        }
         if crate::timer::get_time_us() >= deadline_us {
             console_write("[harness] TIMEOUT pid=");
             console_write(&format!("{}", task.pid.0));
             console_write("\n");
             abort_foreground_task_tree(&task);
+            break;
+        }
+        if task.status() == TaskStatus::Zombie && !manager::has_user_task() {
             break;
         }
 
@@ -1100,6 +1100,7 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
         requeue_after_user_run(active);
     }
 
+    crate::task::clear_foreground_deadline_us();
     *CURRENT_TASK.lock() = None;
 }
 

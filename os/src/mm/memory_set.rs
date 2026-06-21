@@ -32,18 +32,29 @@ fn effective_mapping_flags(flags: PTEFlags) -> MappingFlags {
     effective.into()
 }
 
-fn is_anonymous_cow_candidate(area: &MapArea) -> bool {
-    matches!(area.backing, MapAreaBacking::Anonymous)
-        && area.has_frames()
+fn is_private_cow_candidate(area: &MapArea) -> bool {
+    matches!(
+        area.backing,
+        MapAreaBacking::Anonymous | MapAreaBacking::File { shared: false, .. }
+    ) && area.has_frames()
         && area.flags.contains(PTEFlags::W)
         && has_leaf_permission(area.flags)
 }
 
-fn is_anonymous_readonly_share_candidate(area: &MapArea) -> bool {
-    matches!(area.backing, MapAreaBacking::Anonymous)
-        && area.has_frames()
+fn is_readonly_share_candidate(area: &MapArea) -> bool {
+    matches!(
+        area.backing,
+        MapAreaBacking::Anonymous | MapAreaBacking::File { .. }
+    ) && area.has_frames()
         && !area.flags.contains(PTEFlags::W)
         && has_leaf_permission(area.flags)
+}
+
+fn is_shared_mapping(area: &MapArea) -> bool {
+    matches!(
+        area.backing,
+        MapAreaBacking::SharedMemory { .. } | MapAreaBacking::File { shared: true, .. }
+    )
 }
 
 fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
@@ -527,8 +538,10 @@ impl MemorySet {
         }
 
         let old_flags = self.areas[index].flags;
-        if !matches!(self.areas[index].backing, MapAreaBacking::Anonymous)
-            || !old_flags.contains(PTEFlags::COW)
+        if !matches!(
+            self.areas[index].backing,
+            MapAreaBacking::Anonymous | MapAreaBacking::File { shared: false, .. }
+        ) || !old_flags.contains(PTEFlags::COW)
             || !old_flags.contains(PTEFlags::W)
         {
             return Err(SysErrNo::EFAULT);
@@ -846,14 +859,14 @@ impl MemorySet {
             let mut new_area =
                 MapArea::with_backing(area.start_va, area.end_va, area.flags, area.backing.clone());
 
-            if matches!(area.backing, MapAreaBacking::SharedMemory { .. }) {
+            if is_shared_mapping(area) {
                 new_area.frames = area.frames.clone();
                 map_area_pages(&new_ms.page_table, &new_area);
                 new_ms.areas.push(new_area);
                 continue;
             }
 
-            if is_anonymous_cow_candidate(area) {
+            if is_private_cow_candidate(area) {
                 let old_flags = area.flags;
                 area.flags |= PTEFlags::COW;
                 if old_flags.bits() != area.flags.bits() {
@@ -866,7 +879,7 @@ impl MemorySet {
                 continue;
             }
 
-            if is_anonymous_readonly_share_candidate(area) {
+            if is_readonly_share_candidate(area) {
                 new_area.frames = area.frames.clone();
                 map_area_pages(&new_ms.page_table, &new_area);
                 new_ms.areas.push(new_area);
