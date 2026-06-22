@@ -1,7 +1,7 @@
 use buddy_system_allocator::LockedHeap;
 
-/// 内核堆大小: 64MB（预加载的测试用例文件可能占数十 MB）
-const KERNEL_HEAP_SIZE: usize = 0x400_0000;
+/// 内核堆大小: 128MB（预加载的测试用例和大 ELF exec 缓冲可能占数十 MB）
+const KERNEL_HEAP_SIZE: usize = 0x800_0000;
 
 /// 内核堆空间
 static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];

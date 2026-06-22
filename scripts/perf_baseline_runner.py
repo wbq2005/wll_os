@@ -14,6 +14,7 @@ import hashlib
 import json
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -57,9 +58,9 @@ ARCHES = {
 
 SUITE_PROFILES = {
     "all": {
-        "judge_suites": ("iozone", "libcbench"),
+        "judge_suites": ("iozone", "libcbench", "lmbench"),
         "iozone": "1",
-        "lmbench": "0",
+        "lmbench": "1",
         "ltp": "0",
         "harness_groups": "",
         "ltp_cases": "",
@@ -192,11 +193,42 @@ def run_docker_capture(
     script: str,
     out_path: Path,
     results_root: Path | None = None,
+    timestamp_path: Path | None = None,
 ) -> int:
     cmd = docker_cmd(repo, image, script, results_root)
     with out_path.open("w", encoding="utf-8", errors="replace", newline="") as out:
-        proc = subprocess.run(cmd, cwd=repo, text=True, stdout=out, stderr=subprocess.STDOUT)
-    return proc.returncode
+        if timestamp_path is None:
+            proc = subprocess.run(cmd, cwd=repo, text=True, stdout=out, stderr=subprocess.STDOUT)
+            return proc.returncode
+
+        start = time.monotonic()
+        with timestamp_path.open("w", encoding="utf-8", errors="replace", newline="") as ts:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=repo,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                out.write(line)
+                out.flush()
+                ts.write(
+                    json.dumps(
+                        {
+                            "elapsed_seconds": time.monotonic() - start,
+                            "line": line.rstrip("\n"),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                ts.flush()
+            return proc.wait()
 
 
 def sha256_file(path: Path) -> str:
@@ -229,18 +261,25 @@ def build_kernel(
     image: str,
     dry_run: bool,
     results_root: Path,
+    trace_test_commands: bool,
+    trace_test_groups: str,
+    harness_groups_override: str | None,
 ) -> tuple[Path, str]:
     cfg = ARCHES[arch]
     profile = SUITE_PROFILES[suite]
     kernel = summary_dir / f"kernel-{arch}-{suite}"
-    harness_prefix = (
-        f"WLL_HARNESS_GROUPS={profile['harness_groups']} "
-        if profile["harness_groups"]
-        else ""
+    harness_groups = (
+        profile["harness_groups"] if harness_groups_override is None else harness_groups_override
     )
+    harness_prefix = f"WLL_HARNESS_GROUPS={shlex.quote(harness_groups)} " if harness_groups else ""
     ltp_cases_prefix = f"LTP_CASES={profile['ltp_cases']} " if profile["ltp_cases"] else ""
+    trace_prefix = ""
+    if trace_test_commands:
+        trace_prefix = "WLL_TRACE_TEST_COMMANDS=1 "
+        if trace_test_groups:
+            trace_prefix += f"WLL_TRACE_TEST_GROUPS={shlex.quote(trace_test_groups)} "
     script = (
-        f"{harness_prefix}{ltp_cases_prefix}make ARCH={cfg['make_arch']} build "
+        f"{harness_prefix}{ltp_cases_prefix}{trace_prefix}make ARCH={cfg['make_arch']} build "
         f"IOZONE={profile['iozone']} LMBENCH={profile['lmbench']} LTP={profile['ltp']} && "
         f"cp {cfg['target']} {container_path(repo, kernel, results_root)}"
     )
@@ -436,9 +475,14 @@ def run_one(
     dry_run: bool,
     results_root: Path,
     delete_sdcard_copy: bool,
+    timestamp_serial: bool,
+    harness_groups_override: str | None,
 ) -> dict[str, Any]:
     cfg = ARCHES[arch]
     profile = SUITE_PROFILES[suite]
+    harness_groups = (
+        profile["harness_groups"] if harness_groups_override is None else harness_groups_override
+    )
     sdcard_src = repo / cfg["sdcard"]
     if not sdcard_src.exists() and not dry_run:
         raise FileNotFoundError(f"missing sdcard image: {sdcard_src}")
@@ -465,12 +509,13 @@ def run_one(
         "qemu_timeout_seconds": timeout,
         "qemu_mem": mem,
         "qemu_smp": smp,
+        "timestamp_serial": timestamp_serial,
         "make": {
             "ARCH": cfg["make_arch"],
             "IOZONE": profile["iozone"],
             "LMBENCH": profile["lmbench"],
             "LTP": profile["ltp"],
-            "WLL_HARNESS_GROUPS": profile["harness_groups"],
+            "WLL_HARNESS_GROUPS": harness_groups,
             "LTP_CASES": profile["ltp_cases"],
         },
         "paths": {
@@ -488,11 +533,21 @@ def run_one(
 
     start = time.monotonic()
     serial_log = run_dir / "serial.log"
+    timestamp_path = run_dir / "serial-timestamps.jsonl" if timestamp_serial else None
     if dry_run:
         write_text(serial_log, "[dry-run] qemu skipped\n")
+        if timestamp_path is not None:
+            write_text(timestamp_path, "")
         exit_code = 0
     else:
-        exit_code = run_docker_capture(repo, image, qemu_script, serial_log, results_root)
+        exit_code = run_docker_capture(
+            repo,
+            image,
+            qemu_script,
+            serial_log,
+            results_root,
+            timestamp_path=timestamp_path,
+        )
     elapsed = time.monotonic() - start
     write_text(run_dir / "exit-code.txt", f"{exit_code}\n")
     write_json(run_dir / "timing.json", {"elapsed_seconds": elapsed, "qemu_exit_code": exit_code})
@@ -533,6 +588,25 @@ def main() -> int:
         help="delete each run's copied sdcard.img after serial/judge-summary files are written",
     )
     parser.add_argument("--dry-run", action="store_true", help="create metadata without building, copying, or running")
+    parser.add_argument(
+        "--timestamp-serial",
+        action="store_true",
+        help="write serial-timestamps.jsonl next to serial.log without changing serial.log",
+    )
+    parser.add_argument(
+        "--harness-groups",
+        help="override WLL_HARNESS_GROUPS for diagnostic subset runs",
+    )
+    parser.add_argument(
+        "--trace-test-commands",
+        action="store_true",
+        help="build the harness with shell command tracing for test scripts",
+    )
+    parser.add_argument(
+        "--trace-test-groups",
+        default="lmbench",
+        help="comma-separated test groups to trace when --trace-test-commands is set; use 'all' for every script",
+    )
     args = parser.parse_args()
 
     if args.runs is not None and args.runs <= 0:
@@ -561,6 +635,10 @@ def main() -> int:
             "dry_run": args.dry_run,
             "docker_image": args.image,
             "delete_sdcard_copy": args.delete_sdcard_copy,
+            "timestamp_serial": args.timestamp_serial,
+            "harness_groups_override": args.harness_groups,
+            "trace_test_commands": args.trace_test_commands,
+            "trace_test_groups": args.trace_test_groups if args.trace_test_commands else "",
         },
     )
 
@@ -572,6 +650,9 @@ def main() -> int:
         args.image,
         args.dry_run,
         results_root,
+        args.trace_test_commands,
+        args.trace_test_groups,
+        args.harness_groups,
     )
     run_results = []
     for run_index in range(1, runs + 1):
@@ -593,6 +674,8 @@ def main() -> int:
                 args.dry_run,
                 results_root,
                 args.delete_sdcard_copy,
+                args.timestamp_serial,
+                args.harness_groups,
             )
         )
 

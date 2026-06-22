@@ -173,6 +173,40 @@ fn console_write(msg: &str) {
     }
 }
 
+fn trace_test_commands_enabled() -> bool {
+    option_env!("WLL_TRACE_TEST_COMMANDS")
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty()
+                && value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(false)
+}
+
+fn trace_test_group_enabled(logical_script: &str) -> bool {
+    let Some(filter) = option_env!("WLL_TRACE_TEST_GROUPS") else {
+        return true;
+    };
+    if !filter.split(',').any(|part| !part.trim().is_empty()) {
+        return true;
+    }
+
+    let group = testcode_stem(logical_script).and_then(TestGroup::from_stem);
+    filter.split(',').any(|part| {
+        let part = part.trim();
+        part == "all"
+            || group
+                .map(|group| group.aliases().iter().any(|alias| *alias == part))
+                .unwrap_or(false)
+    })
+}
+
+fn trace_test_commands_enabled_for(logical_script: &str) -> bool {
+    trace_test_commands_enabled() && trace_test_group_enabled(logical_script)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ScriptLaunchError {
     InvalidPath,
@@ -1187,17 +1221,23 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
         String::from("LD_LIBRARY_PATH=/lib"),
         alloc::format!("SHELL={}", busybox_path),
     ];
+    let trace_commands = trace_test_commands_enabled_for(&logical_script);
+    if trace_commands {
+        envp.push(String::from("PS4=[harness] CMD "));
+    }
     if testcode_stem(&logical_script).and_then(TestGroup::from_stem) == Some(TestGroup::Lmbench) {
         envp.push(String::from("ENOUGH=5000"));
     }
 
+    let mut argv = alloc::vec![busybox_path.clone(), String::from("sh")];
+    if trace_commands {
+        argv.push(String::from("-x"));
+    }
+    argv.push(logical_script.clone());
+
     Ok(UserProgramSpec {
         path: busybox_path.clone(),
-        argv: alloc::vec![
-            busybox_path.clone(),
-            String::from("sh"),
-            logical_script.clone(),
-        ],
+        argv,
         envp,
         cwd: dirname(&logical_script),
         root,

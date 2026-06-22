@@ -6,7 +6,7 @@ LOG ?= OFF
 DEV_PRELOAD ?= 0
 LIBCTEST ?= 0
 IOZONE ?= 1
-LMBENCH ?= 0
+LMBENCH ?= 1
 LTP ?= 0
 RUSTUP_TOOLCHAIN ?= $(shell sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null | head -n 1)
 ifeq ($(strip $(RUSTUP_TOOLCHAIN)),)
