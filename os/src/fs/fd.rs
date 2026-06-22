@@ -35,6 +35,7 @@ const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
 const PIPE_WAIT_READABLE: usize = 1;
 const PIPE_WAIT_WRITABLE: usize = 2;
+const PIPE_SMALL_COPY: usize = 64;
 
 fn pipe_wait_key(state: &Arc<Mutex<PipeState>>, event: usize) -> WaitKey {
     WaitKey::new(Arc::as_ptr(state) as usize, event)
@@ -44,16 +45,8 @@ fn wake_pipe_readers(state: &Arc<Mutex<PipeState>>) {
     crate::task::wait_queue::wake_io_keyed_waiters(pipe_wait_key(state, PIPE_WAIT_READABLE));
 }
 
-fn wake_one_pipe_reader(state: &Arc<Mutex<PipeState>>) {
-    crate::task::wait_queue::wake_io_keyed_waiter(pipe_wait_key(state, PIPE_WAIT_READABLE));
-}
-
 fn wake_pipe_writers(state: &Arc<Mutex<PipeState>>) {
     crate::task::wait_queue::wake_io_keyed_waiters(pipe_wait_key(state, PIPE_WAIT_WRITABLE));
-}
-
-fn wake_one_pipe_writer(state: &Arc<Mutex<PipeState>>) {
-    crate::task::wait_queue::wake_io_keyed_waiter(pipe_wait_key(state, PIPE_WAIT_WRITABLE));
 }
 
 fn is_dev_null_path(path: &str) -> bool {
@@ -367,6 +360,40 @@ impl PipeState {
             writers: 1,
         }
     }
+}
+
+fn pipe_read_buffer(pipe: &mut PipeState, buf: &mut [u8]) -> usize {
+    let n = buf.len().min(pipe.buf.len());
+    if n <= PIPE_SMALL_COPY {
+        for dst in &mut buf[..n] {
+            *dst = pipe.buf.pop_front().unwrap_or(0);
+        }
+        return n;
+    }
+
+    {
+        let (front, back) = pipe.buf.as_slices();
+        let front_len = n.min(front.len());
+        buf[..front_len].copy_from_slice(&front[..front_len]);
+        let back_len = n - front_len;
+        if back_len != 0 {
+            buf[front_len..n].copy_from_slice(&back[..back_len]);
+        }
+    }
+    pipe.buf.drain(..n);
+    n
+}
+
+fn pipe_write_buffer(pipe: &mut PipeState, buf: &[u8], available: usize) -> usize {
+    let n = buf.len().min(available);
+    if n <= PIPE_SMALL_COPY {
+        for &byte in &buf[..n] {
+            pipe.buf.push_back(byte);
+        }
+    } else {
+        pipe.buf.extend(buf[..n].iter().copied());
+    }
+    n
 }
 
 #[derive(Debug)]
@@ -731,7 +758,7 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                let (n, wake_readers, wake_writers) = {
+                let (n, wake_writers) = {
                     let mut pipe = state.lock();
                     if pipe.buf.is_empty() {
                         if pipe.writers == 0 {
@@ -739,17 +766,12 @@ impl FileDescriptor {
                         }
                         return Err(SysErrNo::EAGAIN);
                     }
-                    let contiguous = pipe.buf.make_contiguous();
-                    let n = buf.len().min(contiguous.len());
-                    buf[..n].copy_from_slice(&contiguous[..n]);
-                    pipe.buf.drain(..n);
-                    (n, !pipe.buf.is_empty(), pipe.buf.len() < PIPE_CAPACITY)
+                    let was_full = pipe.buf.len() == PIPE_CAPACITY;
+                    let n = pipe_read_buffer(&mut pipe, buf);
+                    (n, was_full && pipe.buf.len() < PIPE_CAPACITY)
                 };
-                if wake_readers {
-                    wake_one_pipe_reader(state);
-                }
                 if wake_writers {
-                    wake_one_pipe_writer(state);
+                    wake_pipe_writers(state);
                 }
                 Ok(n)
             }
@@ -953,7 +975,7 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                let (written, wake_readers, wake_writers) = {
+                let (written, wake_readers) = {
                     let mut pipe = state.lock();
                     if pipe.readers == 0 {
                         return Err(SysErrNo::EPIPE);
@@ -962,19 +984,12 @@ impl FileDescriptor {
                     if available == 0 {
                         return Err(SysErrNo::EAGAIN);
                     }
-                    let written = buf.len().min(available);
-                    pipe.buf.extend(buf[..written].iter().copied());
-                    (
-                        written,
-                        !pipe.buf.is_empty(),
-                        pipe.buf.len() < PIPE_CAPACITY,
-                    )
+                    let was_empty = pipe.buf.is_empty();
+                    let written = pipe_write_buffer(&mut pipe, buf, available);
+                    (written, was_empty && written != 0)
                 };
                 if wake_readers {
-                    wake_one_pipe_reader(state);
-                }
-                if wake_writers {
-                    wake_one_pipe_writer(state);
+                    wake_pipe_readers(state);
                 }
                 Ok(written)
             }

@@ -310,6 +310,22 @@ fn write_fixed_at_from_kernel(
     super::with_kernel_page_table(|| file_desc.write_at(offset, buf))
 }
 
+fn read_fd_into_kernel(file_desc: &mut FileDescriptor, buf: &mut [u8]) -> SyscallRet {
+    if file_desc.is_pipe_read() {
+        file_desc.read(buf)
+    } else {
+        super::with_kernel_page_table(|| file_desc.read(buf))
+    }
+}
+
+fn write_fd_from_kernel(file_desc: &mut FileDescriptor, buf: &[u8]) -> SyscallRet {
+    if file_desc.is_pipe_write() {
+        file_desc.write(buf)
+    } else {
+        super::with_kernel_page_table(|| file_desc.write(buf))
+    }
+}
+
 fn wait_pipe_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
     let wait_key = {
         let fds = fd_table.lock();
@@ -503,7 +519,7 @@ fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
             let mut fds = fd_table.lock();
             match fds.get_mut(fd) {
                 Some(file_desc) => {
-                    super::with_kernel_page_table(|| file_desc.read(&mut kbuf[..want]))
+                    read_fd_into_kernel(file_desc, &mut kbuf[..want])
                 }
                 None => Err(SysErrNo::EBADF),
             }
@@ -604,7 +620,7 @@ fn vectored_write_from_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
             let res = {
                 let mut fds = fd_table.lock();
                 match fds.get_mut(fd) {
-                    Some(file_desc) => super::with_kernel_page_table(|| file_desc.write(write_buf)),
+                    Some(file_desc) => write_fd_from_kernel(file_desc, write_buf),
                     None => Err(SysErrNo::EBADF),
                 }
             };
@@ -1475,7 +1491,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
         let mut fds = fd_table.lock();
         let mut empty: [u8; 0] = [];
         return match fds.get_mut(fd) {
-            Some(file_desc) => super::with_kernel_page_table(|| file_desc.read(&mut empty)),
+            Some(file_desc) => read_fd_into_kernel(file_desc, &mut empty),
             None => Err(SysErrNo::EBADF),
         };
     }
@@ -1500,7 +1516,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
                 let mut fds = fd_table.lock();
                 match fds.get_mut(fd) {
                     Some(file_desc) => {
-                        super::with_kernel_page_table(|| file_desc.read(&mut kbuf[..count]))
+                        read_fd_into_kernel(file_desc, &mut kbuf[..count])
                     }
                     None => Err(SysErrNo::EBADF),
                 }
@@ -1526,7 +1542,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
         let res = {
             let mut fds = fd_table.lock();
             match fds.get_mut(fd) {
-                Some(file_desc) => super::with_kernel_page_table(|| file_desc.read(&mut kbuf)),
+                Some(file_desc) => read_fd_into_kernel(file_desc, &mut kbuf),
                 None => Err(SysErrNo::EBADF),
             }
         };
@@ -1562,7 +1578,7 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
         let fd_table = task.inner.lock().fd_table.clone();
         let mut fds = fd_table.lock();
         return match fds.get_mut(fd) {
-            Some(file_desc) => super::with_kernel_page_table(|| file_desc.write(&[])),
+            Some(file_desc) => write_fd_from_kernel(file_desc, &[]),
             None => Err(SysErrNo::EBADF),
         };
     }
@@ -1583,7 +1599,7 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
                 let mut fds = fd_table.lock();
                 match fds.get_mut(fd) {
                     Some(file_desc) => {
-                        super::with_kernel_page_table(|| file_desc.write(&kbuf[written..]))
+                        write_fd_from_kernel(file_desc, &kbuf[written..])
                     }
                     None => Err(SysErrNo::EBADF),
                 }
