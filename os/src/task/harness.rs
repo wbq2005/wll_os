@@ -109,7 +109,12 @@ fn harness_filter_active() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(all(not(feature = "libctest"), not(feature = "ltp"), feature = "lmbench"))]
+#[cfg(all(
+    not(feature = "libctest"),
+    not(feature = "ltp"),
+    not(feature = "iozone"),
+    feature = "lmbench"
+))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Lmbench];
 
 #[cfg(all(
@@ -141,6 +146,22 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Iozone,
     TestGroup::LibcTest,
     TestGroup::LibcBench,
+];
+
+#[cfg(all(
+    not(feature = "libctest"),
+    not(feature = "ltp"),
+    feature = "iozone",
+    feature = "lmbench"
+))]
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
+    TestGroup::Basic,
+    TestGroup::Busybox,
+    TestGroup::Lua,
+    TestGroup::Iozone,
+    TestGroup::LibcTest,
+    TestGroup::LibcBench,
+    TestGroup::Lmbench,
 ];
 
 #[cfg(all(not(feature = "libctest"), feature = "ltp"))]

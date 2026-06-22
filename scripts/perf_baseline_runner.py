@@ -65,6 +65,15 @@ SUITE_PROFILES = {
         "ltp_cases": "",
         "recommended_runs": 7,
     },
+    "all-lmbench": {
+        "judge_suites": ("iozone", "libcbench", "lmbench"),
+        "iozone": "1",
+        "lmbench": "1",
+        "ltp": "0",
+        "harness_groups": "",
+        "ltp_cases": "",
+        "recommended_runs": 7,
+    },
     "iozone": {
         "judge_suites": ("iozone",),
         "iozone": "1",
