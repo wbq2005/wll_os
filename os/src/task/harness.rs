@@ -392,13 +392,15 @@ fn run_runtime_test_harness() -> ! {
             console_write("[harness] SCRIPT ");
             console_write(script);
             console_write("\n");
-            if group == Some(TestGroup::Ltp) && ltp_cases_filter() != "all" {
-                if !run_ltp_collection_harness(script) {
-                    console_write("[harness] failed to launch LTP collector: ");
-                    console_write(script);
-                    console_write("\n");
+            if group == Some(TestGroup::Ltp) {
+                if let Some(cases_filter) = ltp_cases_filter() {
+                    if !run_ltp_collection_harness(script, cases_filter) {
+                        console_write("[harness] failed to launch LTP collector: ");
+                        console_write(script);
+                        console_write("\n");
+                    }
+                    continue;
                 }
-                continue;
             }
             if let Err(err) = run_script_via_busybox(script) {
                 log_script_launch_error(script, err);
@@ -776,10 +778,19 @@ fn run_libctest_collection_harness(include_glibc: bool) {
     }
 }
 
-fn ltp_cases_filter() -> &'static str {
+// External diagnostic knob only. With no LTP_CASES value, the submission path
+// runs the real LTP script instead of a kernel-side focused collector.
+fn ltp_cases_filter() -> Option<&'static str> {
     match option_env!("LTP_CASES") {
-        Some(filter) if !filter.trim().is_empty() => filter,
-        _ => "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01",
+        Some(filter) => {
+            let filter = filter.trim();
+            if filter.is_empty() || filter.eq_ignore_ascii_case("all") {
+                None
+            } else {
+                Some(filter)
+            }
+        }
+        None => None,
     }
 }
 
@@ -791,7 +802,7 @@ fn ltp_group_name(root: &str) -> &'static str {
     }
 }
 
-fn run_ltp_collection_harness(script_path: &str) -> bool {
+fn run_ltp_collection_harness(script_path: &str, cases_filter: &str) -> bool {
     let Some((root, _logical_script)) = logical_path_for_script(script_path) else {
         return false;
     };
@@ -802,7 +813,7 @@ fn run_ltp_collection_harness(script_path: &str) -> bool {
     console_write(group_name);
     console_write(" ####\n");
 
-    for part in ltp_cases_filter().split(',') {
+    for part in cases_filter.split(',') {
         let case = part.trim();
         if case.is_empty() {
             continue;
@@ -815,23 +826,6 @@ fn run_ltp_collection_harness(script_path: &str) -> bool {
     console_write(group_name);
     console_write(" ####\n");
     launched
-}
-
-fn legacy_ltp_score_visible_passes(case: &str) -> &'static [&'static str] {
-    match case {
-        // These legacy LTP binaries emit "case N TPASS : ..." lines instead
-        // of the newer "case.c:line: TPASS: ..." form used by most cases.
-        // Keep the real binary output as truth, and only add parser-visible
-        // compatibility lines when the binary exits successfully.
-        "getgroups01" => &[
-            "getgroups01.c:0: TPASS: legacy getgroups01 subtest 1 passed\n",
-            "getgroups01.c:0: TPASS: legacy getgroups01 subtest 2 passed\n",
-            "getgroups01.c:0: TPASS: legacy getgroups01 subtest 3 passed\n",
-            "getgroups01.c:0: TPASS: legacy getgroups01 subtest 4 passed\n",
-        ],
-        "setgroups04" => &["setgroups04.c:0: TPASS: legacy setgroups04 subtest 1 passed\n"],
-        _ => &[],
-    }
 }
 
 fn run_ltp_case(root: &str, case: &str) {
@@ -856,19 +850,14 @@ fn run_ltp_case(root: &str, case: &str) {
     })
     .unwrap_or(-1);
 
-    if ret == 0 {
-        for line in legacy_ltp_score_visible_passes(case) {
-            console_write(line);
-        }
-    }
-
-    console_write("FAIL LTP CASE ");
+    console_write("END LTP CASE ");
     console_write(case);
     console_write(" : ");
     console_write(&format!("{}", ret));
     console_write("\n");
 }
 
+// External diagnostic knob only; default libc-test routing is not shortened.
 fn libctest_segment_enabled(name: &str) -> bool {
     match option_env!("LIBCTEST_FILTER") {
         Some(filter) => {
@@ -1293,9 +1282,6 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
     let trace_commands = trace_test_commands_enabled_for(&logical_script);
     if trace_commands {
         envp.push(String::from("PS4=[harness] CMD "));
-    }
-    if testcode_stem(&logical_script).and_then(TestGroup::from_stem) == Some(TestGroup::Lmbench) {
-        envp.push(String::from("ENOUGH=5000"));
     }
 
     let mut argv = alloc::vec![busybox_path.clone(), String::from("sh")];

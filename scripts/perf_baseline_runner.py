@@ -24,6 +24,10 @@ from typing import Any
 
 
 IMAGE = "zhouzhouyi/os-contest:20260510"
+FOCUSED_LTP_CASES = (
+    "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,"
+    "setgroups04,access01,open02,setfsuid01,setfsgid01"
+)
 
 ARCHES = {
     "riscv64": {
@@ -58,12 +62,12 @@ ARCHES = {
 
 SUITE_PROFILES = {
     "all": {
-        "judge_suites": ("iozone", "libcbench", "lmbench", "ltp"),
+        "judge_suites": ("iozone", "libcbench", "lmbench"),
         "iozone": "1",
         "lmbench": "1",
-        "ltp": "1",
+        "ltp": "0",
         "harness_groups": "",
-        "ltp_cases": "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01",
+        "ltp_cases": "",
         "recommended_runs": 7,
     },
     "all-lmbench": {
@@ -108,7 +112,7 @@ SUITE_PROFILES = {
         "lmbench": "0",
         "ltp": "1",
         "harness_groups": "ltp",
-        "ltp_cases": "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01",
+        "ltp_cases": FOCUSED_LTP_CASES,
         "recommended_runs": 1,
     },
 }

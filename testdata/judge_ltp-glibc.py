@@ -2,6 +2,8 @@ import sys
 import json
 import re
 
+LTP_STATUS_RE = re.compile(r"\b(TPASS|TFAIL|TBROK|TCONF|TWARN)\s*:")
+
 # This is for reference only and is unused below.
 # Note terminal control sequences (\x1b[...m) should be present in real output, which isn't shown here.
 template = '''
@@ -53,7 +55,7 @@ def parse_ltp_log(content: str):
         
         # Look at LTP logs (TPASS, TFAIL etc.) rather than summary.
         # Some LTP binaries don't produce summaries when run directly.
-        if line.startswith("FAIL LTP CASE"):
+        if line.startswith("END LTP CASE") or line.startswith("FAIL LTP CASE"):
             result[testcase] = {
                 "success": passed,
                 "failed": failed,
@@ -68,19 +70,24 @@ def parse_ltp_log(content: str):
 
         plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
 
-        if re.search(r"\bTPASS:", plain):
+        status_match = LTP_STATUS_RE.search(plain)
+        if not status_match:
+            continue
+
+        status = status_match.group(1)
+        if status == "TPASS":
             passed += 1
             continue
-        if re.search(r"\bTFAIL:", plain):
+        if status == "TFAIL":
             failed += 1
             continue
-        if re.search(r"\bTBROK:", plain):
+        if status == "TBROK":
             broken += 1
             continue
-        if re.search(r"\bTCONF:", plain):
+        if status == "TCONF":
             skipped += 1
             continue
-        if re.search(r"\bTWARN:", plain):
+        if status == "TWARN":
             warnings += 1
             continue
 

@@ -18,7 +18,7 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 - FD/VFS 与 IPC：常用文件、目录、pipe、poll/select、pseudo device、部分 socket loopback 与 ext4 写入路径。
 - 内存与同步：`brk`、匿名/文件 `mmap`、`munmap`、`mprotect`、SysV shm、futex、robust list 的可用子集。
 - 信号与身份：`rt_sig*`、`kill/tkill/tgkill`、UID/GID、supplementary groups、部分权限检查。
-- 评测路径：`basic`、`busybox`、`lua`、`libc-test`、`iozone`、`libcbench`、`lmbench`，以及 bounded LTP slice。
+- 评测路径：`basic`、`busybox`、`lua`、`libc-test`、`iozone`、`libcbench`、`lmbench`。bounded LTP slice 仅作为外部诊断探针，不进入默认提交路径。
 
 更细的 syscall 状态、剩余风险和 suite 边界见 [docs/syscall-matrix.md](docs/syscall-matrix.md)。
 
@@ -37,7 +37,7 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 | `LIBCTEST` | `0` | 完整 libc-test 收集器为 opt-in |
 | `DEV_PRELOAD` | `0` | 默认不把测试脚本预载进 kernel |
 
-`scripts/perf_baseline_runner.py --suite all` 会在构建时打开 `LTP=1`，并把当前 bounded LTP group 接到 iozone/libcbench/lmbench 后面。
+`scripts/perf_baseline_runner.py --suite all` 不打开 `LTP=1`，只覆盖默认提交路径中的 iozone/libcbench/lmbench。当前 bounded LTP group 只通过 `--suite ltp` 作为外部诊断探针运行。
 
 ### Bounded LTP slice
 
@@ -75,8 +75,8 @@ make ARCH=loongarch64 check
 # 窄 baseline，不打开 iozone/lmbench/LTP
 make ARCH=riscv64 check IOZONE=0 LMBENCH=0 LTP=0
 
-# 聚焦 LTP slice
-make ARCH=riscv64 check IOZONE=0 LMBENCH=0 LTP=1
+# 外部诊断：聚焦 LTP slice
+python scripts/perf_baseline_runner.py --arch riscv64 --suite ltp --runs 1 --delete-sdcard-copy
 ```
 
 默认构建不会因为缺少 `sdcard-rv.img` / `sdcard-la.img` 失败。若存在对应 `.img.xz` 且环境有 `xz`，可执行：
@@ -133,8 +133,8 @@ python scripts/perf_baseline_runner.py --arch loongarch64 --suite all --runs 1 -
 
 | Profile | 用途 |
 | --- | --- |
-| `all` | iozone + libcbench + lmbench + bounded LTP |
-| `all-lmbench` | iozone + libcbench + lmbench，不含 LTP |
+| `all` | iozone + libcbench + lmbench，不含 LTP |
+| `all-lmbench` | iozone + libcbench + lmbench 的兼容别名/聚焦路径，不含 LTP |
 | `iozone` | 仅跑 iozone group |
 | `libcbench` | 仅跑 libcbench group |
 | `lmbench` | 仅跑 lmbench group |

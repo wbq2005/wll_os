@@ -947,8 +947,12 @@ pub fn sys_getrusage(who: usize, usage: usize) -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_umask(_mask: usize) -> SyscallRet {
-    Ok(0o022)
+pub fn sys_umask(mask: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut fs = task.fs.lock();
+    let old = fs.umask & 0o777;
+    fs.umask = (mask as u32) & 0o777;
+    Ok(old as usize)
 }
 
 pub fn sys_getpgid(pid: usize) -> SyscallRet {
@@ -978,12 +982,21 @@ pub fn sys_setpgid(pid: usize, pgid: usize) -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_membarrier(_cmd: usize, _flags: usize) -> SyscallRet {
-    Ok(0)
+pub fn sys_membarrier(cmd: usize, flags: usize) -> SyscallRet {
+    const MEMBARRIER_CMD_QUERY: usize = 0;
+
+    if flags != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    match cmd {
+        MEMBARRIER_CMD_QUERY => Ok(0),
+        _ => Err(SysErrNo::EINVAL),
+    }
 }
 
-pub fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> SyscallRet {
+pub fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask: usize) -> SyscallRet {
     const KERNEL_CPUSET_BYTES: usize = 128;
+    let _ = sched_task_for_pid(pid)?;
     if mask == 0 {
         return Err(SysErrNo::EFAULT);
     }
@@ -997,14 +1010,19 @@ pub fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> Sys
     Ok(KERNEL_CPUSET_BYTES)
 }
 
-pub fn sys_sched_setaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> SyscallRet {
-    if cpusetsize != 0 && mask == 0 {
+pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask: usize) -> SyscallRet {
+    let _ = sched_task_for_pid(pid)?;
+    if cpusetsize == 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if mask == 0 {
         return Err(SysErrNo::EFAULT);
     }
-    if cpusetsize != 0 {
-        let mut bytes = Vec::new();
-        bytes.resize(cpusetsize.min(128), 0);
-        super::user::copy_from_user(mask, &mut bytes)?;
+    let mut bytes = Vec::new();
+    bytes.resize(cpusetsize.min(128), 0);
+    super::user::copy_from_user(mask, &mut bytes)?;
+    if bytes.is_empty() || (bytes[0] & 1) == 0 {
+        return Err(SysErrNo::EINVAL);
     }
     Ok(0)
 }

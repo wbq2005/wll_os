@@ -1046,11 +1046,16 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
 
     // 获取当前任务的文件描述符表
     if let Some(task) = current_task() {
+        let create_mode = if (open_flags & fd::open_flags::O_CREAT) != 0 {
+            mode & !task.fs.lock().umask
+        } else {
+            mode
+        };
         let inner = task.inner.lock();
         let nofile_limit = inner.rlimit_nofile;
 
         let opened = super::with_kernel_page_table(|| {
-            crate::fs::open_path(&host_path, &logical_path, open_flags, mode)
+            crate::fs::open_path(&host_path, &logical_path, open_flags, create_mode)
         });
         match opened {
             Ok(fd_desc) => {
@@ -1113,6 +1118,8 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallRet {
 
 pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mode = mode & !task.fs.lock().umask;
     super::with_kernel_page_table(|| crate::fs::create_dir_with_mode(&host_path, mode))?;
     Ok(0)
 }
@@ -1440,7 +1447,7 @@ pub fn sys_mount(
     let norm = crate::fs::normalize_path(&tgt);
     if norm != "/" {
         log::info!("[syscall] mount: unsupported target '{}'", tgt);
-        return Ok(0);
+        return Err(SysErrNo::ENODEV);
     }
 
     match fst.as_str() {
@@ -1452,8 +1459,8 @@ pub fn sys_mount(
             }
         }
         _ => {
-            log::debug!("[syscall] mount fstype '{}' — ignored (MemFS / no-op)", fst);
-            Ok(0)
+            log::debug!("[syscall] mount fstype '{}' unsupported", fst);
+            Err(SysErrNo::ENODEV)
         }
     }
 }

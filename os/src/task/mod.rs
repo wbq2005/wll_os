@@ -191,6 +191,7 @@ impl Credentials {
 pub struct FsContext {
     pub cwd: String,
     pub root: String,
+    pub umask: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -279,7 +280,11 @@ pub fn new_shared_fd_table() -> SharedFdTable {
 
 #[inline]
 pub fn new_shared_fs_context(cwd: String, root: String) -> SharedFsContext {
-    Arc::new(Mutex::new(FsContext { cwd, root }))
+    Arc::new(Mutex::new(FsContext {
+        cwd,
+        root,
+        umask: 0o022,
+    }))
 }
 
 #[inline]

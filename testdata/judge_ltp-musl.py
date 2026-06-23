@@ -2,6 +2,8 @@ import sys
 import json
 import re
 
+LTP_STATUS_RE = re.compile(r"\b(TPASS|TFAIL|TBROK|TCONF|TWARN)\s*:")
+
 template = '''
 RUN LTP CASE writev01
 tst_tmpdir.c:316: TINFO: Using /tmp/LTP_wriRnYU84 as tmpdir (ext2/ext3/ext4 filesystem)
@@ -56,7 +58,10 @@ def parse_ltp_log(content):
             in_summary = False
             saw_test_line = False
 
-        elif current_case and stripped_line.startswith(f'FAIL LTP CASE {current_case}'):
+        elif current_case and (
+            stripped_line.startswith(f'END LTP CASE {current_case}')
+            or stripped_line.startswith(f'FAIL LTP CASE {current_case}')
+        ):
             parts = stripped_line.split()
             return_code = int(parts[-1])
             success = summary_data.get('passed', 0)
@@ -73,27 +78,30 @@ def parse_ltp_log(content):
             current_case = None
 
         elif current_case:
-            if re.search(r"\bTPASS:", plain):
+            status_match = LTP_STATUS_RE.search(plain)
+            status = status_match.group(1) if status_match else None
+
+            if status == "TPASS":
                 summary_data['passed'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True
                 continue
-            if re.search(r"\bTFAIL:", plain):
+            if status == "TFAIL":
                 summary_data['failed'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True
                 continue
-            if re.search(r"\bTBROK:", plain):
+            if status == "TBROK":
                 summary_data['broken'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True
                 continue
-            if re.search(r"\bTCONF:", plain):
+            if status == "TCONF":
                 summary_data['skipped'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True
                 continue
-            if re.search(r"\bTWARN:", plain):
+            if status == "TWARN":
                 summary_data['warnings'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True

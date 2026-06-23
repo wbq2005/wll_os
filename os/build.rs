@@ -42,6 +42,7 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DEV_PRELOAD");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LIBCTEST");
     println!("cargo:rerun-if-env-changed=LIBCTEST_FILTER");
+    println!("cargo:rerun-if-env-changed=LTP_CASES");
     println!("cargo:rerun-if-env-changed=WLL_HARNESS_GROUPS");
     println!("cargo:rerun-if-env-changed=WLL_TRACE_TEST_COMMANDS");
     println!("cargo:rerun-if-env-changed=WLL_TRACE_TEST_GROUPS");
