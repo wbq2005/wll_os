@@ -1273,6 +1273,7 @@ pub fn sys_faccessat(dirfd: isize, pathname: *const u8, mode: usize, flags: usiz
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
         return Err(SysErrNo::EINVAL);
     }
+    let use_effective = (flags & AT_EACCESS) != 0;
     let path = read_user_cstr(pathname)?;
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
@@ -1285,20 +1286,26 @@ pub fn sys_faccessat(dirfd: isize, pathname: *const u8, mode: usize, flags: usiz
                 (fs.root.clone(), fs.cwd.clone())
             };
             let host_path = crate::fs::apply_root(&root, &cwd);
-            super::with_kernel_page_table(|| crate::fs::check_access(&host_path, true, mode))?;
+            super::with_kernel_page_table(|| {
+                crate::fs::check_access_with_effective(&host_path, true, mode, use_effective)
+            })?;
         } else {
             let fd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
             let task = current_task().ok_or(SysErrNo::ESRCH)?;
             let inner = task.inner.lock();
             let fds = inner.fd_table.lock();
             let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-            super::with_kernel_page_table(|| crate::fs::check_fd_access(file_desc, mode))?;
+            super::with_kernel_page_table(|| {
+                crate::fs::check_fd_access_with_effective(file_desc, mode, use_effective)
+            })?;
         }
         return Ok(0);
     }
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
     let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    super::with_kernel_page_table(|| crate::fs::check_access(&host_path, follow, mode))?;
+    super::with_kernel_page_table(|| {
+        crate::fs::check_access_with_effective(&host_path, follow, mode, use_effective)
+    })?;
     Ok(0)
 }
 

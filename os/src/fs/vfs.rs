@@ -10,7 +10,7 @@ use crate::utils::error::SysErrNo;
 
 use super::ext4_vol;
 use super::fd;
-use super::{normalize_path, MEM_FS};
+use super::{normalize_path, MemNodeMetadata, MEM_FS};
 
 const S_IFDIR: u32 = 0o040000;
 const S_IFIFO: u32 = 0o010000;
@@ -190,20 +190,45 @@ fn metadata_for_char_device(path: &str, major: u32, minor: u32) -> VfsMetadata {
     meta
 }
 
-fn metadata_for_mem_file(name: &str, len: usize, is_elf: bool) -> VfsMetadata {
+fn default_mem_metadata(mode: u32) -> MemNodeMetadata {
+    MemNodeMetadata {
+        mode,
+        uid: 0,
+        gid: 0,
+    }
+}
+
+fn metadata_for_mem_file(
+    name: &str,
+    len: usize,
+    _is_elf: bool,
+    node: MemNodeMetadata,
+) -> VfsMetadata {
     if is_dev_null_path(name) {
         return metadata_for_char_device(name, DEV_NULL_MAJOR, DEV_NULL_MINOR);
     }
     if is_dev_zero_path(name) {
         return metadata_for_char_device(name, DEV_ZERO_MAJOR, DEV_ZERO_MINOR);
     }
-    let perm = if is_elf { 0o777 } else { 0o666 };
-    synthetic_metadata(name, VfsNodeKind::Regular, S_IFREG | perm, len as u64, 1)
+    let mut meta = synthetic_metadata(
+        name,
+        VfsNodeKind::Regular,
+        S_IFREG | (node.mode & 0o7777),
+        len as u64,
+        1,
+    );
+    meta.uid = node.uid;
+    meta.gid = node.gid;
+    meta
 }
 
-fn metadata_from_mem_file(file: &super::MemFile) -> VfsMetadata {
-    let mut meta =
-        metadata_for_mem_file(&file.name, file.content.len(), is_elf_image(&file.content));
+fn metadata_from_mem_file(file: &super::MemFile, node: MemNodeMetadata) -> VfsMetadata {
+    let mut meta = metadata_for_mem_file(
+        &file.name,
+        file.content.len(),
+        is_elf_image(&file.content),
+        node,
+    );
     meta.atime_sec = file.times.atime_sec;
     meta.atime_nsec = file.times.atime_nsec;
     meta.mtime_sec = file.times.mtime_sec;
@@ -218,7 +243,11 @@ fn metadata_from_mem_fd(
     content: &fd::MemFileContent,
     times: super::FileTimes,
 ) -> VfsMetadata {
-    let mut meta = metadata_for_mem_file(name, content.len(), content.is_elf_image());
+    let node = MEM_FS
+        .lock()
+        .metadata(name)
+        .unwrap_or_else(|| default_mem_metadata(if content.is_elf_image() { 0o777 } else { 0o666 }));
+    let mut meta = metadata_for_mem_file(name, content.len(), content.is_elf_image(), node);
     meta.atime_sec = times.atime_sec;
     meta.atime_nsec = times.atime_nsec;
     meta.mtime_sec = times.mtime_sec;
@@ -239,13 +268,16 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
         if mem.is_dir(&norm) {
             let entries = mem.list_dir(&norm)?;
             let (sec, nsec) = current_times();
+            let node = mem
+                .metadata(&norm)
+                .unwrap_or_else(|| default_mem_metadata(0o755));
             return Ok(VfsMetadata {
                 ino: pseudo_inode(&norm),
                 kind: VfsNodeKind::Directory,
-                mode: S_IFDIR | 0o755,
+                mode: S_IFDIR | (node.mode & 0o7777),
                 nlink: 1,
-                uid: 0,
-                gid: 0,
+                uid: node.uid,
+                gid: node.gid,
                 rdev_major: 0,
                 rdev_minor: 0,
                 size: entries.len() as u64,
@@ -259,7 +291,14 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
             });
         }
         if let Some(file) = mem.get_file(&norm) {
-            return Ok(metadata_from_mem_file(file));
+            let node = mem.metadata(&norm).unwrap_or_else(|| {
+                default_mem_metadata(if is_elf_image(&file.content) {
+                    0o777
+                } else {
+                    0o666
+                })
+            });
+            return Ok(metadata_from_mem_file(file, node));
         }
     }
 
@@ -312,21 +351,38 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
             if *linked {
                 let mem = MEM_FS.lock();
                 if let Some(file) = mem.get_file(name) {
-                    Ok(metadata_from_mem_file(file))
+                    let node = mem.metadata(name).unwrap_or_else(|| {
+                        default_mem_metadata(if is_elf_image(&file.content) {
+                            0o777
+                        } else {
+                            0o666
+                        })
+                    });
+                    Ok(metadata_from_mem_file(file, node))
                 } else {
+                    drop(mem);
                     Ok(metadata_from_mem_fd(name, content, *times))
                 }
             } else {
                 Ok(metadata_from_mem_fd(name, content, *times))
             }
         }
-        fd::FileDescriptor::MemDir { path, entries, .. } => Ok(synthetic_metadata(
-            path,
-            VfsNodeKind::Directory,
-            S_IFDIR | 0o755,
-            entries.len() as u64,
-            1,
-        )),
+        fd::FileDescriptor::MemDir { path, entries, .. } => {
+            let node = MEM_FS
+                .lock()
+                .metadata(path)
+                .unwrap_or_else(|| default_mem_metadata(0o755));
+            let mut meta = synthetic_metadata(
+                path,
+                VfsNodeKind::Directory,
+                S_IFDIR | (node.mode & 0o7777),
+                entries.len() as u64,
+                1,
+            );
+            meta.uid = node.uid;
+            meta.gid = node.gid;
+            Ok(meta)
+        }
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::metadata_by_ino(*ino).map(metadata_from_ext4)
         }
@@ -355,30 +411,116 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
 }
 
 pub fn check_metadata_access(meta: &VfsMetadata, access_mode: usize) -> Result<(), SysErrNo> {
+    check_metadata_access_with_effective(meta, access_mode, false)
+}
+
+pub fn check_metadata_access_with_effective(
+    meta: &VfsMetadata,
+    access_mode: usize,
+    effective: bool,
+) -> Result<(), SysErrNo> {
     const R_OK: usize = 4;
     const W_OK: usize = 2;
     const X_OK: usize = 1;
-    let perm = meta.mode & 0o777;
-    if (access_mode & R_OK) != 0 && (perm & 0o444) == 0 {
-        return Err(SysErrNo::EACCES);
+    let credentials = crate::task::current_task()
+        .map(|task| task.credentials.lock().clone())
+        .unwrap_or_else(crate::task::Credentials::root);
+    let uid = if effective {
+        credentials.effective_uid
+    } else {
+        credentials.real_uid
+    };
+
+    if uid == 0 {
+        if (access_mode & X_OK) != 0
+            && meta.kind == VfsNodeKind::Regular
+            && (meta.mode & 0o111) == 0
+        {
+            return Err(SysErrNo::EACCES);
+        }
+        return Ok(());
     }
-    if (access_mode & W_OK) != 0 && (perm & 0o222) == 0 {
-        return Err(SysErrNo::EACCES);
+
+    let class_shift = if uid == meta.uid {
+        6
+    } else if credentials.is_in_group(meta.gid, effective) {
+        3
+    } else {
+        0
+    };
+    let perm = (meta.mode >> class_shift) & 0o7;
+    let mut required = 0;
+    if (access_mode & R_OK) != 0 {
+        required |= 0o4;
     }
-    if (access_mode & X_OK) != 0 && (perm & 0o111) == 0 {
+    if (access_mode & W_OK) != 0 {
+        required |= 0o2;
+    }
+    if (access_mode & X_OK) != 0 {
+        required |= 0o1;
+    }
+    if (perm & required) != required {
         return Err(SysErrNo::EACCES);
     }
     Ok(())
 }
 
 pub fn check_access(path: &str, follow_symlink: bool, access_mode: usize) -> Result<(), SysErrNo> {
+    check_access_with_effective(path, follow_symlink, access_mode, false)
+}
+
+pub fn check_access_with_effective(
+    path: &str,
+    follow_symlink: bool,
+    access_mode: usize,
+    effective: bool,
+) -> Result<(), SysErrNo> {
+    check_search_access(path, effective)?;
     let meta = metadata(path, follow_symlink)?;
-    check_metadata_access(&meta, access_mode)
+    check_metadata_access_with_effective(&meta, access_mode, effective)
 }
 
 pub fn check_fd_access(file: &fd::FileDescriptor, access_mode: usize) -> Result<(), SysErrNo> {
+    check_fd_access_with_effective(file, access_mode, false)
+}
+
+pub fn check_fd_access_with_effective(
+    file: &fd::FileDescriptor,
+    access_mode: usize,
+    effective: bool,
+) -> Result<(), SysErrNo> {
     let meta = metadata_for_fd(file)?;
-    check_metadata_access(&meta, access_mode)
+    check_metadata_access_with_effective(&meta, access_mode, effective)
+}
+
+fn check_noatime_permission(meta: &VfsMetadata) -> Result<(), SysErrNo> {
+    let credentials = crate::task::current_task()
+        .map(|task| task.credentials.lock().clone())
+        .unwrap_or_else(crate::task::Credentials::root);
+    if credentials.effective_uid == 0 || credentials.effective_uid == meta.uid {
+        Ok(())
+    } else {
+        Err(SysErrNo::EPERM)
+    }
+}
+
+fn check_search_access(path: &str, effective: bool) -> Result<(), SysErrNo> {
+    const X_OK: usize = 1;
+    let norm = normalize_path(path);
+    let components: Vec<&str> = norm.split('/').filter(|part| !part.is_empty()).collect();
+    if components.len() <= 1 {
+        return Ok(());
+    }
+    let mut current = String::from("/");
+    for component in components.iter().take(components.len() - 1) {
+        if current != "/" {
+            current.push('/');
+        }
+        current.push_str(component);
+        let meta = metadata(&current, true)?;
+        check_metadata_access_with_effective(&meta, X_OK, effective)?;
+    }
+    Ok(())
 }
 
 pub fn read_file(name: &str) -> Option<Vec<u8>> {
@@ -764,9 +906,9 @@ pub fn truncate_fd(file: &mut fd::FileDescriptor, size: u64) -> Result<(), SysEr
 pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
     {
-        let mem = MEM_FS.lock();
+        let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) || mem.get_file(&norm).is_some() {
-            return Ok(());
+            return mem.set_mode(&norm, mode);
         }
     }
     let ext_path = match ext4_vol::lookup_kind(&norm) {
@@ -781,7 +923,8 @@ pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), 
 
 pub fn set_mode_fd(file: &mut fd::FileDescriptor, mode: u32) -> Result<(), SysErrNo> {
     match file {
-        fd::FileDescriptor::MemFile { .. } | fd::FileDescriptor::MemDir { .. } => Ok(()),
+        fd::FileDescriptor::MemFile { name, .. } => MEM_FS.lock().set_mode(name, mode),
+        fd::FileDescriptor::MemDir { path, .. } => MEM_FS.lock().set_mode(path, mode),
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::set_mode_ino(*ino, mode)
         }
@@ -797,9 +940,9 @@ pub fn set_owner_path(
 ) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
     {
-        let mem = MEM_FS.lock();
+        let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) || mem.get_file(&norm).is_some() {
-            return Ok(());
+            return mem.set_owner(&norm, uid, gid);
         }
     }
     let ext_path = match ext4_vol::lookup_kind(&norm) {
@@ -818,7 +961,8 @@ pub fn set_owner_fd(
     gid: Option<u32>,
 ) -> Result<(), SysErrNo> {
     match file {
-        fd::FileDescriptor::MemFile { .. } | fd::FileDescriptor::MemDir { .. } => Ok(()),
+        fd::FileDescriptor::MemFile { name, .. } => MEM_FS.lock().set_owner(name, uid, gid),
+        fd::FileDescriptor::MemDir { path, .. } => MEM_FS.lock().set_owner(path, uid, gid),
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::set_owner_ino(*ino, uid, gid)
         }
@@ -881,7 +1025,7 @@ pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
-        MEM_FS.lock().add_dir(&norm);
+        MEM_FS.lock().add_dir_with_mode(&norm, mode);
         return Ok(());
     }
     if ext_parent {
@@ -889,7 +1033,7 @@ pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
         return Ok(());
     }
     if mem_parent {
-        MEM_FS.lock().add_dir(&norm);
+        MEM_FS.lock().add_dir_with_mode(&norm, mode);
         return Ok(());
     }
     Err(SysErrNo::ENOENT)
@@ -909,14 +1053,14 @@ pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
-        MEM_FS.lock().add_file(&norm, Vec::new());
+        MEM_FS.lock().add_file_with_mode(&norm, Vec::new(), mode);
         return Ok(pseudo_inode(&norm) as u32);
     }
     if ext_parent {
         return ext4_vol::create_regular_ext4_with_mode(&norm, mode);
     }
     if mem_parent {
-        MEM_FS.lock().add_file(&norm, Vec::new());
+        MEM_FS.lock().add_file_with_mode(&norm, Vec::new(), mode);
         return Ok(pseudo_inode(&norm) as u32);
     }
     Err(SysErrNo::ENOENT)
@@ -1003,7 +1147,15 @@ pub fn open_path(
     let want_excl = (flags & O_EXCL) != 0;
     let want_trunc = (flags & O_TRUNC) != 0;
     let nofollow = (flags & O_NOFOLLOW) != 0;
+    let noatime = (flags & O_NOATIME) != 0;
     let append = (flags & O_APPEND) != 0;
+    let mut open_access = 0usize;
+    if read_ok {
+        open_access |= 4;
+    }
+    if write_ok {
+        open_access |= 2;
+    }
 
     if want_dir && want_create {
         return Err(SysErrNo::EINVAL);
@@ -1035,6 +1187,11 @@ pub fn open_path(
         }
         if want_excl && want_create {
             return Err(SysErrNo::EEXIST);
+        }
+        check_access_with_effective(&path_norm, true, open_access, true)?;
+        if noatime {
+            let meta = metadata(&path_norm, true)?;
+            check_noatime_permission(&meta)?;
         }
         let source = MEM_FS
             .lock()
@@ -1071,6 +1228,7 @@ pub fn open_path(
         } else {
             ext_path_norm.clone()
         };
+        check_access_with_effective(&open_path, true, open_access, true)?;
         return open_dir_descriptor(&open_path, &logical_norm);
     }
 
@@ -1090,6 +1248,11 @@ pub fn open_path(
         };
         if is_dir {
             return Err(SysErrNo::EISDIR);
+        }
+        check_access_with_effective(&ext_path_norm, true, open_access, true)?;
+        if noatime {
+            let meta = metadata(&ext_path_norm, true)?;
+            check_noatime_permission(&meta)?;
         }
         if want_trunc && write_ok {
             ext4_vol::truncate_regular_ext4(&ext_path_norm, 0)?;
@@ -1114,7 +1277,9 @@ pub fn open_path(
         let mem_parent = MEM_FS.lock().is_dir(&parent);
         let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
         if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
-            MEM_FS.lock().add_file(&path_norm, Vec::new());
+            MEM_FS
+                .lock()
+                .add_file_with_mode(&path_norm, Vec::new(), mode);
             clear_whiteout(&path_norm);
             let times = MEM_FS
                 .lock()
@@ -1145,7 +1310,9 @@ pub fn open_path(
             });
         }
         if mem_parent {
-            MEM_FS.lock().add_file(&path_norm, Vec::new());
+            MEM_FS
+                .lock()
+                .add_file_with_mode(&path_norm, Vec::new(), mode);
             clear_whiteout(&path_norm);
             let times = MEM_FS
                 .lock()

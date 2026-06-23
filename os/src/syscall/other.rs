@@ -444,7 +444,7 @@ pub fn sys_setreuid(ruid: usize, euid: usize) -> SyscallRet {
     let new_euid = parse_id_arg(euid)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let mut credentials = task.credentials.lock();
-    let old = *credentials;
+    let old = credentials.clone();
     if !old.is_root_capable() {
         if new_ruid
             .map(|uid| uid != old.real_uid && uid != old.effective_uid)
@@ -473,7 +473,7 @@ pub fn sys_setregid(rgid: usize, egid: usize) -> SyscallRet {
     let new_egid = parse_id_arg(egid)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let mut credentials = task.credentials.lock();
-    let old = *credentials;
+    let old = credentials.clone();
     if !old.is_root_capable() {
         if new_rgid
             .map(|gid| gid != old.real_gid && gid != old.effective_gid)
@@ -503,7 +503,7 @@ pub fn sys_setresuid(ruid: usize, euid: usize, suid: usize) -> SyscallRet {
     let new_suid = parse_id_arg(suid)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let mut credentials = task.credentials.lock();
-    let old = *credentials;
+    let old = credentials.clone();
     if !old.is_root_capable()
         && [new_ruid, new_euid, new_suid]
             .iter()
@@ -531,7 +531,7 @@ pub fn sys_setresgid(rgid: usize, egid: usize, sgid: usize) -> SyscallRet {
     let new_sgid = parse_id_arg(sgid)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let mut credentials = task.credentials.lock();
-    let old = *credentials;
+    let old = credentials.clone();
     if !old.is_root_capable()
         && [new_rgid, new_egid, new_sgid]
             .iter()
@@ -555,7 +555,7 @@ pub fn sys_setresgid(rgid: usize, egid: usize, sgid: usize) -> SyscallRet {
 
 pub fn sys_getresuid(ruid: usize, euid: usize, suid: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let credentials = *task.credentials.lock();
+    let credentials = task.credentials.lock().clone();
     copy_object_to_user(ruid, &credentials.real_uid)?;
     copy_object_to_user(euid, &credentials.effective_uid)?;
     copy_object_to_user(suid, &credentials.saved_uid)?;
@@ -564,7 +564,7 @@ pub fn sys_getresuid(ruid: usize, euid: usize, suid: usize) -> SyscallRet {
 
 pub fn sys_getresgid(rgid: usize, egid: usize, sgid: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let credentials = *task.credentials.lock();
+    let credentials = task.credentials.lock().clone();
     copy_object_to_user(rgid, &credentials.real_gid)?;
     copy_object_to_user(egid, &credentials.effective_gid)?;
     copy_object_to_user(sgid, &credentials.saved_gid)?;
@@ -582,7 +582,7 @@ fn parse_group_count(raw: usize) -> Result<usize, SysErrNo> {
 pub fn sys_getgroups(size: usize, list: usize) -> SyscallRet {
     let size = parse_group_count(size)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let credentials = *task.credentials.lock();
+    let credentials = task.credentials.lock().clone();
     let groups = credentials.supplementary_groups();
     let count = groups.len();
     if size == 0 {
@@ -602,7 +602,7 @@ pub fn sys_getgroups(size: usize, list: usize) -> SyscallRet {
 
 pub fn sys_setgroups(size: usize, list: usize) -> SyscallRet {
     let size = parse_group_count(size)?;
-    if size > crate::task::MAX_SUPPLEMENTARY_GROUPS {
+    if size > crate::task::LINUX_NGROUPS_MAX {
         return Err(SysErrNo::EINVAL);
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
@@ -614,6 +614,16 @@ pub fn sys_setgroups(size: usize, list: usize) -> SyscallRet {
     }
     if size != 0 && list == 0 {
         return Err(SysErrNo::EFAULT);
+    }
+    if size > crate::task::MAX_SUPPLEMENTARY_GROUPS {
+        // Keep the modeled credential set bounded, but still fault a bad user
+        // array within Linux's ABI limit before reporting the unsupported count.
+        for index in 0..size {
+            let _ = copy_object_from_user::<u32>(
+                list + index * core::mem::size_of::<u32>(),
+            )?;
+        }
+        return Err(SysErrNo::EINVAL);
     }
     let mut groups = Vec::new();
     for index in 0..size {

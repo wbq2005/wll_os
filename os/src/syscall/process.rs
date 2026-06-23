@@ -250,7 +250,7 @@ pub(crate) fn setup_user_stack(
     interp_base: usize,
 ) -> usize {
     let credentials = current_task()
-        .map(|task| *task.credentials.lock())
+        .map(|task| task.credentials.lock().clone())
         .unwrap_or_else(Credentials::root);
     setup_user_stack_with_credentials(
         memory_set,
@@ -947,7 +947,7 @@ pub fn sys_clone(
     } else {
         crate::syscall::signal::dup_signal_actions(&parent.signal_actions)
     };
-    let credentials = *parent.credentials.lock();
+    let credentials = parent.credentials.lock().clone();
     let signal_blocked = parent.signal_state.lock().blocked;
     let child_pid_obj = crate::task::pid::Pid::alloc();
     let child_pid = child_pid_obj.0;

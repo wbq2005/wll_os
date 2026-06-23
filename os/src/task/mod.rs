@@ -105,9 +105,10 @@ pub type SharedFdTable = Arc<Mutex<FileDescriptorTable>>;
 pub type SharedFsContext = Arc<Mutex<FsContext>>;
 pub type SharedMmContext = Arc<Mutex<MmContext>>;
 
+pub const LINUX_NGROUPS_MAX: usize = 65_536;
 pub const MAX_SUPPLEMENTARY_GROUPS: usize = 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credentials {
     pub real_uid: u32,
     pub effective_uid: u32,
@@ -115,12 +116,11 @@ pub struct Credentials {
     pub real_gid: u32,
     pub effective_gid: u32,
     pub saved_gid: u32,
-    supplementary_groups: [u32; MAX_SUPPLEMENTARY_GROUPS],
-    supplementary_group_count: usize,
+    supplementary_groups: Vec<u32>,
 }
 
 impl Credentials {
-    pub const fn root() -> Self {
+    pub fn root() -> Self {
         Self {
             real_uid: 0,
             effective_uid: 0,
@@ -128,8 +128,7 @@ impl Credentials {
             real_gid: 0,
             effective_gid: 0,
             saved_gid: 0,
-            supplementary_groups: [0; MAX_SUPPLEMENTARY_GROUPS],
-            supplementary_group_count: 1,
+            supplementary_groups: vec![0],
         }
     }
 
@@ -146,13 +145,21 @@ impl Credentials {
     }
 
     pub fn supplementary_groups(&self) -> &[u32] {
-        &self.supplementary_groups[..self.supplementary_group_count]
+        self.supplementary_groups.as_slice()
+    }
+
+    pub fn is_in_group(&self, gid: u32, effective: bool) -> bool {
+        let primary = if effective {
+            self.effective_gid
+        } else {
+            self.real_gid
+        };
+        primary == gid || self.supplementary_groups.iter().any(|group| *group == gid)
     }
 
     pub fn set_supplementary_groups(&mut self, groups: &[u32]) {
-        self.supplementary_groups = [0; MAX_SUPPLEMENTARY_GROUPS];
-        self.supplementary_groups[..groups.len()].copy_from_slice(groups);
-        self.supplementary_group_count = groups.len();
+        self.supplementary_groups.clear();
+        self.supplementary_groups.extend_from_slice(groups);
     }
 }
 

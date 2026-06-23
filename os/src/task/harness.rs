@@ -164,8 +164,54 @@ const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
     TestGroup::Lmbench,
 ];
 
-#[cfg(all(not(feature = "libctest"), feature = "ltp"))]
+#[cfg(all(
+    not(feature = "libctest"),
+    feature = "ltp",
+    not(feature = "iozone"),
+    not(feature = "lmbench")
+))]
 const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Ltp];
+
+#[cfg(all(
+    not(feature = "libctest"),
+    feature = "ltp",
+    not(feature = "iozone"),
+    feature = "lmbench"
+))]
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[TestGroup::Lmbench, TestGroup::Ltp];
+
+#[cfg(all(
+    not(feature = "libctest"),
+    feature = "ltp",
+    feature = "iozone",
+    not(feature = "lmbench")
+))]
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
+    TestGroup::Basic,
+    TestGroup::Busybox,
+    TestGroup::Lua,
+    TestGroup::Iozone,
+    TestGroup::LibcTest,
+    TestGroup::LibcBench,
+    TestGroup::Ltp,
+];
+
+#[cfg(all(
+    not(feature = "libctest"),
+    feature = "ltp",
+    feature = "iozone",
+    feature = "lmbench"
+))]
+const DEFAULT_ENABLED_GROUPS: &[TestGroup] = &[
+    TestGroup::Basic,
+    TestGroup::Busybox,
+    TestGroup::Lua,
+    TestGroup::Iozone,
+    TestGroup::LibcTest,
+    TestGroup::LibcBench,
+    TestGroup::Lmbench,
+    TestGroup::Ltp,
+];
 
 fn console_write(msg: &str) {
     for b in msg.bytes() {
@@ -733,7 +779,7 @@ fn run_libctest_collection_harness(include_glibc: bool) {
 fn ltp_cases_filter() -> &'static str {
     match option_env!("LTP_CASES") {
         Some(filter) if !filter.trim().is_empty() => filter,
-        _ => "writev01,setegid02,getgroups01",
+        _ => "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02",
     }
 }
 

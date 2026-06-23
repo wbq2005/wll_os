@@ -281,6 +281,7 @@ pub mod open_flags {
     pub const O_APPEND: u32 = 0o00002000;
     pub const O_DIRECTORY: u32 = 0o00200000;
     pub const O_NOFOLLOW: u32 = 0o00400000;
+    pub const O_NOATIME: u32 = 0o01000000;
     pub const O_CLOEXEC: u32 = 0o2000000;
 }
 

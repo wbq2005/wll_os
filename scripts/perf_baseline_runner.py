@@ -58,12 +58,12 @@ ARCHES = {
 
 SUITE_PROFILES = {
     "all": {
-        "judge_suites": ("iozone", "libcbench", "lmbench"),
+        "judge_suites": ("iozone", "libcbench", "lmbench", "ltp"),
         "iozone": "1",
         "lmbench": "1",
-        "ltp": "0",
+        "ltp": "1",
         "harness_groups": "",
-        "ltp_cases": "",
+        "ltp_cases": "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02",
         "recommended_runs": 7,
     },
     "all-lmbench": {
@@ -108,7 +108,7 @@ SUITE_PROFILES = {
         "lmbench": "0",
         "ltp": "1",
         "harness_groups": "ltp",
-        "ltp_cases": "writev01,setegid02,getgroups01",
+        "ltp_cases": "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02",
         "recommended_runs": 1,
     },
 }
