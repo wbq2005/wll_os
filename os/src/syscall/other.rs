@@ -571,6 +571,62 @@ pub fn sys_getresgid(rgid: usize, egid: usize, sgid: usize) -> SyscallRet {
     Ok(0)
 }
 
+fn parse_group_count(raw: usize) -> Result<usize, SysErrNo> {
+    if raw > i32::MAX as usize {
+        Err(SysErrNo::EINVAL)
+    } else {
+        Ok(raw)
+    }
+}
+
+pub fn sys_getgroups(size: usize, list: usize) -> SyscallRet {
+    let size = parse_group_count(size)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let credentials = *task.credentials.lock();
+    let groups = credentials.supplementary_groups();
+    let count = groups.len();
+    if size == 0 {
+        return Ok(count);
+    }
+    if size < count {
+        return Err(SysErrNo::EINVAL);
+    }
+    if list == 0 && count != 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    for (index, group) in groups.iter().enumerate() {
+        copy_object_to_user(list + index * core::mem::size_of::<u32>(), group)?;
+    }
+    Ok(count)
+}
+
+pub fn sys_setgroups(size: usize, list: usize) -> SyscallRet {
+    let size = parse_group_count(size)?;
+    if size > crate::task::MAX_SUPPLEMENTARY_GROUPS {
+        return Err(SysErrNo::EINVAL);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    {
+        let credentials = task.credentials.lock();
+        if !credentials.is_root_capable() {
+            return Err(SysErrNo::EPERM);
+        }
+    }
+    if size != 0 && list == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let mut groups = Vec::new();
+    for index in 0..size {
+        groups.push(copy_object_from_user::<u32>(
+            list + index * core::mem::size_of::<u32>(),
+        )?);
+    }
+    task.credentials
+        .lock()
+        .set_supplementary_groups(&groups);
+    Ok(0)
+}
+
 pub fn sys_setfsuid(_uid: usize) -> SyscallRet {
     Ok(0)
 }

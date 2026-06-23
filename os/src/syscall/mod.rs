@@ -117,6 +117,7 @@ pub const SYSCALL_SETPGID: usize = 154;
 pub const SYSCALL_GETPGID: usize = 155;
 pub const SYSCALL_SETSID: usize = 157;
 pub const SYSCALL_GETGROUPS: usize = 158;
+pub const SYSCALL_SETGROUPS: usize = 159;
 pub const SYSCALL_UNAME: usize = 160;
 pub const SYSCALL_GETRLIMIT: usize = 163;
 pub const SYSCALL_SETRLIMIT: usize = 164;
@@ -371,6 +372,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_SETRESGID => other::sys_setresgid(args[0], args[1], args[2]),
         SYSCALL_GETRESUID => other::sys_getresuid(args[0], args[1], args[2]),
         SYSCALL_GETRESGID => other::sys_getresgid(args[0], args[1], args[2]),
+        SYSCALL_GETGROUPS => other::sys_getgroups(args[0], args[1]),
+        SYSCALL_SETGROUPS => other::sys_setgroups(args[0], args[1]),
         SYSCALL_SETFSUID => other::sys_setfsuid(args[0]),
         SYSCALL_SETFSGID => other::sys_setfsgid(args[0]),
         SYSCALL_GETTID => other::sys_gettid(),

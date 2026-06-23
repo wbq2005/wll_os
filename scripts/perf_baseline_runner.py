@@ -108,7 +108,7 @@ SUITE_PROFILES = {
         "lmbench": "0",
         "ltp": "1",
         "harness_groups": "ltp",
-        "ltp_cases": "writev01,setegid02",
+        "ltp_cases": "writev01,setegid02,getgroups01",
         "recommended_runs": 1,
     },
 }

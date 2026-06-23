@@ -68,19 +68,19 @@ def parse_ltp_log(content: str):
 
         plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
 
-        if "TPASS:" in plain:
+        if re.search(r"\bTPASS\b", plain):
             passed += 1
             continue
-        if "TFAIL:" in plain:
+        if re.search(r"\bTFAIL\b", plain):
             failed += 1
             continue
-        if "TBROK:" in plain:
+        if re.search(r"\bTBROK\b", plain):
             broken += 1
             continue
-        if "TCONF:" in plain:
+        if re.search(r"\bTCONF\b", plain):
             skipped += 1
             continue
-        if "TWARN:" in plain:
+        if re.search(r"\bTWARN\b", plain):
             warnings += 1
             continue
 

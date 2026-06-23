@@ -105,6 +105,8 @@ pub type SharedFdTable = Arc<Mutex<FileDescriptorTable>>;
 pub type SharedFsContext = Arc<Mutex<FsContext>>;
 pub type SharedMmContext = Arc<Mutex<MmContext>>;
 
+pub const MAX_SUPPLEMENTARY_GROUPS: usize = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Credentials {
     pub real_uid: u32,
@@ -113,6 +115,8 @@ pub struct Credentials {
     pub real_gid: u32,
     pub effective_gid: u32,
     pub saved_gid: u32,
+    supplementary_groups: [u32; MAX_SUPPLEMENTARY_GROUPS],
+    supplementary_group_count: usize,
 }
 
 impl Credentials {
@@ -124,6 +128,8 @@ impl Credentials {
             real_gid: 0,
             effective_gid: 0,
             saved_gid: 0,
+            supplementary_groups: [0; MAX_SUPPLEMENTARY_GROUPS],
+            supplementary_group_count: 1,
         }
     }
 
@@ -137,6 +143,16 @@ impl Credentials {
 
     pub fn is_root_capable(&self) -> bool {
         self.effective_uid == 0
+    }
+
+    pub fn supplementary_groups(&self) -> &[u32] {
+        &self.supplementary_groups[..self.supplementary_group_count]
+    }
+
+    pub fn set_supplementary_groups(&mut self, groups: &[u32]) {
+        self.supplementary_groups = [0; MAX_SUPPLEMENTARY_GROUPS];
+        self.supplementary_groups[..groups.len()].copy_from_slice(groups);
+        self.supplementary_group_count = groups.len();
     }
 }
 
