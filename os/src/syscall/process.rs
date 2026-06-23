@@ -21,6 +21,7 @@ const ALLOWED_CLONE_FLAGS: usize = CLONE_VM
     | CLONE_FS
     | CLONE_FILES
     | CLONE_SIGHAND
+    | CLONE_VFORK
     | CLONE_THREAD
     | CLONE_SYSVSEM
     | CLONE_SETTLS
@@ -36,6 +37,8 @@ const CLONE_FS: usize = 0x00000200;
 const CLONE_FILES: usize = 0x00000400;
 
 const CLONE_SIGHAND: usize = 0x00000800;
+
+const CLONE_VFORK: usize = 0x00004000;
 
 const CLONE_THREAD: usize = 0x00010000;
 
@@ -903,7 +906,10 @@ pub fn sys_clone(
     }
     crate::trap::prepare_user_trapframe(&mut child_tf);
 
-    let share_vm = (clone_bits & CLONE_VM) != 0;
+    let is_vfork = (clone_bits & CLONE_VFORK) != 0;
+    // vfork children exec in-place in this kernel.  Give them their own COW
+    // address space so execve cannot replace the parent's shared MemorySet.
+    let share_vm = (clone_bits & CLONE_VM) != 0 && !is_vfork;
     let is_thread = (clone_bits & CLONE_THREAD) != 0;
     let memory_set = if share_vm {
         parent.memory_set.clone()
@@ -1026,8 +1032,12 @@ pub fn sys_clone(
     if !is_thread {
         parent.inner.lock().children.push(child.clone());
     }
-    crate::task::manager::add_task(child);
-    if crate::trap::foreground_driver_active() {
+    if is_vfork {
+        crate::task::manager::add_task_front(child);
+    } else {
+        crate::task::manager::add_task(child);
+    }
+    if crate::trap::foreground_driver_active() && !is_vfork {
         crate::task::request_foreground_requeue_front(parent.pid.0);
     }
 

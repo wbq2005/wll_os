@@ -136,6 +136,7 @@ impl MemFile {
 pub struct MemFileSystem {
     files: Vec<MemFile>,
     dirs: Vec<String>,
+    symlinks: BTreeMap<String, String>,
     metadata: BTreeMap<String, MemNodeMetadata>,
 }
 
@@ -146,6 +147,7 @@ impl MemFileSystem {
         Self {
             files: Vec::new(),
             dirs: vec!["/".to_string()],
+            symlinks: BTreeMap::new(),
             metadata,
         }
     }
@@ -155,6 +157,7 @@ impl MemFileSystem {
         let name = normalize_path(name);
         self.ensure_parent_dirs(&name);
         let mode = if is_elf_content(&content) { 0o777 } else { 0o666 };
+        self.symlinks.remove(&name);
 
         // 如果文件已存在，先删除
         self.files.retain(|f| f.name != name);
@@ -185,6 +188,7 @@ impl MemFileSystem {
     pub fn add_dir(&mut self, name: &str) {
         let name = normalize_path(name);
         self.ensure_parent_dirs(&name);
+        self.symlinks.remove(&name);
         if !self.dirs.iter().any(|dir| dir == &name) {
             self.dirs.push(name.clone());
             log::info!("[fs] Added directory '{}'", name);
@@ -199,16 +203,38 @@ impl MemFileSystem {
         let _ = self.set_mode(name, mode);
     }
 
+    pub fn add_symlink(&mut self, name: &str, target: &str) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        let parent = parent_path(&name);
+        if !self.is_dir(&parent) {
+            return Err(SysErrNo::ENOENT);
+        }
+        if self.exists(&name) {
+            return Err(SysErrNo::EEXIST);
+        }
+        self.symlinks.insert(name.clone(), String::from(target));
+        self.metadata
+            .insert(name, MemNodeMetadata::new(0o777));
+        Ok(())
+    }
+
     /// 获取文件
     pub fn get_file(&self, name: &str) -> Option<&MemFile> {
         let name = normalize_path(name);
         self.files.iter().find(|f| f.name == name)
     }
 
+    pub fn get_symlink(&self, name: &str) -> Option<String> {
+        let name = normalize_path(name);
+        self.symlinks.get(&name).cloned()
+    }
+
     /// 检查文件是否存在
     pub fn exists(&self, name: &str) -> bool {
         let name = normalize_path(name);
-        self.files.iter().any(|f| f.name == name) || self.dirs.iter().any(|dir| dir == &name)
+        self.files.iter().any(|f| f.name == name)
+            || self.dirs.iter().any(|dir| dir == &name)
+            || self.symlinks.contains_key(&name)
     }
 
     pub fn is_dir(&self, name: &str) -> bool {
@@ -231,11 +257,15 @@ impl MemFileSystem {
     }
 
     pub fn entry_count(&self) -> usize {
-        self.files.len().saturating_add(self.dirs.len())
+        self.files
+            .len()
+            .saturating_add(self.dirs.len())
+            .saturating_add(self.symlinks.len())
     }
 
     pub fn total_file_bytes(&self) -> usize {
-        self.files.iter().map(|f| f.content.len()).sum()
+        self.files.iter().map(|f| f.content.len()).sum::<usize>()
+            + self.symlinks.values().map(|target| target.len()).sum::<usize>()
     }
 
     pub fn list_dir(&self, dir: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
@@ -261,6 +291,15 @@ impl MemFileSystem {
             }
         }
 
+        for link in self.symlinks.keys() {
+            if let Some(name) = child_name(&dir, link) {
+                entries.push(fd::DirEntryRecord {
+                    name,
+                    is_dir: false,
+                });
+            }
+        }
+
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
@@ -269,7 +308,9 @@ impl MemFileSystem {
         let name = normalize_path(name);
         let before = self.files.len();
         self.files.retain(|file| file.name != name);
-        if before == self.files.len() {
+        let removed_file = before != self.files.len();
+        let removed_link = self.symlinks.remove(&name).is_some();
+        if !removed_file && !removed_link {
             return Err(SysErrNo::ENOENT);
         }
         self.metadata.remove(&name);
@@ -288,6 +329,10 @@ impl MemFileSystem {
             .files
             .iter()
             .any(|file| is_descendant(&name, &file.name))
+            || self
+                .symlinks
+                .keys()
+                .any(|link| is_descendant(&name, link))
             || self
                 .dirs
                 .iter()
@@ -331,7 +376,41 @@ impl MemFileSystem {
                     file.name = alloc::format!("{}{}", new, suffix);
                 }
             }
+            let link_updates: Vec<(String, String, String)> = self
+                .symlinks
+                .iter()
+                .filter_map(|(path, target)| {
+                    if is_descendant(&old, path) {
+                        let suffix = path.strip_prefix(&old).unwrap_or("");
+                        Some((path.clone(), alloc::format!("{}{}", new, suffix), target.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (old_path, new_path, target) in link_updates {
+                self.symlinks.remove(&old_path);
+                self.symlinks.insert(new_path, target);
+            }
             self.rename_metadata_tree(&old, &new);
+            return Ok(());
+        }
+
+        if let Some(target) = self.symlinks.remove(&old) {
+            if self.is_dir(&new) {
+                self.symlinks.insert(old, target);
+                return Err(SysErrNo::EISDIR);
+            }
+            self.files.retain(|file| file.name != new);
+            self.symlinks.remove(&new);
+            let metadata = self
+                .metadata
+                .get(&old)
+                .copied()
+                .unwrap_or_else(|| MemNodeMetadata::new(0o777));
+            self.metadata.remove(&old);
+            self.symlinks.insert(new.clone(), target);
+            self.metadata.insert(new, metadata);
             return Ok(());
         }
 
@@ -357,6 +436,7 @@ impl MemFileSystem {
             .unwrap_or_else(|| MemNodeMetadata::new(0o666));
         self.files
             .retain(|file| file.name != old && file.name != new);
+        self.symlinks.remove(&new);
         self.files.push(MemFile::with_times(&new, content, times));
         self.metadata.remove(&old);
         self.metadata.insert(new, metadata);
@@ -499,6 +579,7 @@ pub fn init() {
     log::info!("[fs] Initializing memory filesystem...");
     preload_generated_programs();
     init_pseudo_files();
+    install_busybox_shell_aliases();
 }
 
 fn init_pseudo_files() {
@@ -602,6 +683,24 @@ fn init_pseudo_files() {
 /// 在内核初始化时调用，将编译进内核的用户程序 ELF 数据添加到文件系统
 pub fn add_user_program(name: &str, data: &[u8]) {
     MEM_FS.lock().add_file(name, data.to_vec());
+}
+
+fn install_busybox_shell_aliases() {
+    for root in ["", "/musl", "/glibc"] {
+        let busybox_path = alloc::format!("{}/busybox", root);
+        if read_executable_file(&busybox_path).is_none() {
+            continue;
+        }
+
+        let shell_path = alloc::format!("{}/bin/sh", root);
+        if file_exists(&shell_path) {
+            continue;
+        }
+
+        let mut fs = MEM_FS.lock();
+        fs.add_dir(&alloc::format!("{}/bin", root));
+        let _ = fs.add_symlink(&shell_path, "../busybox");
+    }
 }
 
 pub fn normalize_path(path: &str) -> String {

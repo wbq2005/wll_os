@@ -26,7 +26,8 @@ from typing import Any
 IMAGE = "zhouzhouyi/os-contest:20260510"
 FOCUSED_LTP_CASES = (
     "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,"
-    "setgroups04,access01,open02,setfsuid01,setfsgid01"
+    "setgroups04,access01,open02,setfsuid01,setfsgid01,"
+    "faccessat01,access02,open03"
 )
 
 ARCHES = {
@@ -268,6 +269,7 @@ def build_kernel(
     trace_test_commands: bool,
     trace_test_groups: str,
     harness_groups_override: str | None,
+    ltp_cases_override: str | None,
 ) -> tuple[Path, str]:
     cfg = ARCHES[arch]
     profile = SUITE_PROFILES[suite]
@@ -275,8 +277,9 @@ def build_kernel(
     harness_groups = (
         profile["harness_groups"] if harness_groups_override is None else harness_groups_override
     )
+    ltp_cases = profile["ltp_cases"] if ltp_cases_override is None else ltp_cases_override
     harness_prefix = f"WLL_HARNESS_GROUPS={shlex.quote(harness_groups)} " if harness_groups else ""
-    ltp_cases_prefix = f"LTP_CASES={profile['ltp_cases']} " if profile["ltp_cases"] else ""
+    ltp_cases_prefix = f"LTP_CASES={shlex.quote(ltp_cases)} " if ltp_cases else ""
     trace_prefix = ""
     if trace_test_commands:
         trace_prefix = "WLL_TRACE_TEST_COMMANDS=1 "
@@ -481,12 +484,14 @@ def run_one(
     delete_sdcard_copy: bool,
     timestamp_serial: bool,
     harness_groups_override: str | None,
+    ltp_cases_override: str | None,
 ) -> dict[str, Any]:
     cfg = ARCHES[arch]
     profile = SUITE_PROFILES[suite]
     harness_groups = (
         profile["harness_groups"] if harness_groups_override is None else harness_groups_override
     )
+    ltp_cases = profile["ltp_cases"] if ltp_cases_override is None else ltp_cases_override
     sdcard_src = repo / cfg["sdcard"]
     if not sdcard_src.exists() and not dry_run:
         raise FileNotFoundError(f"missing sdcard image: {sdcard_src}")
@@ -520,7 +525,7 @@ def run_one(
             "LMBENCH": profile["lmbench"],
             "LTP": profile["ltp"],
             "WLL_HARNESS_GROUPS": harness_groups,
-            "LTP_CASES": profile["ltp_cases"],
+            "LTP_CASES": ltp_cases,
         },
         "paths": {
             "kernel": str(kernel),
@@ -602,6 +607,10 @@ def main() -> int:
         help="override WLL_HARNESS_GROUPS for diagnostic subset runs",
     )
     parser.add_argument(
+        "--ltp-cases",
+        help="override LTP_CASES for external diagnostic LTP subset runs",
+    )
+    parser.add_argument(
         "--trace-test-commands",
         action="store_true",
         help="build the harness with shell command tracing for test scripts",
@@ -615,6 +624,8 @@ def main() -> int:
 
     if args.runs is not None and args.runs <= 0:
         parser.error("--runs must be positive")
+    if args.ltp_cases and args.suite != "ltp":
+        parser.error("--ltp-cases is only supported with --suite ltp")
 
     repo = repo_root()
     profile = SUITE_PROFILES[args.suite]
@@ -641,6 +652,7 @@ def main() -> int:
             "delete_sdcard_copy": args.delete_sdcard_copy,
             "timestamp_serial": args.timestamp_serial,
             "harness_groups_override": args.harness_groups,
+            "ltp_cases": args.ltp_cases if args.ltp_cases is not None else profile["ltp_cases"],
             "trace_test_commands": args.trace_test_commands,
             "trace_test_groups": args.trace_test_groups if args.trace_test_commands else "",
         },
@@ -657,6 +669,7 @@ def main() -> int:
         args.trace_test_commands,
         args.trace_test_groups,
         args.harness_groups,
+        args.ltp_cases,
     )
     run_results = []
     for run_index in range(1, runs + 1):
@@ -680,6 +693,7 @@ def main() -> int:
                 args.delete_sdcard_copy,
                 args.timestamp_serial,
                 args.harness_groups,
+                args.ltp_cases,
             )
         )
 
