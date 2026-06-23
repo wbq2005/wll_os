@@ -779,7 +779,7 @@ fn run_libctest_collection_harness(include_glibc: bool) {
 fn ltp_cases_filter() -> &'static str {
     match option_env!("LTP_CASES") {
         Some(filter) if !filter.trim().is_empty() => filter,
-        _ => "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02",
+        _ => "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01",
     }
 }
 

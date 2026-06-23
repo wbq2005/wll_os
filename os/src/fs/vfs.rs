@@ -48,6 +48,39 @@ pub enum VfsNodeKind {
     Other,
 }
 
+#[derive(Clone, Copy)]
+enum CredentialIdentity {
+    Real,
+    Effective,
+    Filesystem,
+}
+
+impl CredentialIdentity {
+    fn from_effective_flag(effective: bool) -> Self {
+        if effective {
+            Self::Effective
+        } else {
+            Self::Real
+        }
+    }
+
+    fn uid(self, credentials: &crate::task::Credentials) -> u32 {
+        match self {
+            Self::Real => credentials.real_uid,
+            Self::Effective => credentials.effective_uid,
+            Self::Filesystem => credentials.fsuid,
+        }
+    }
+
+    fn is_in_group(self, credentials: &crate::task::Credentials, gid: u32) -> bool {
+        match self {
+            Self::Real => credentials.is_in_group(gid, false),
+            Self::Effective => credentials.is_in_group(gid, true),
+            Self::Filesystem => credentials.is_in_filesystem_group(gid),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct VfsMetadata {
     pub ino: u64,
@@ -411,7 +444,7 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
 }
 
 pub fn check_metadata_access(meta: &VfsMetadata, access_mode: usize) -> Result<(), SysErrNo> {
-    check_metadata_access_with_effective(meta, access_mode, false)
+    check_metadata_access_with_identity(meta, access_mode, CredentialIdentity::Real)
 }
 
 pub fn check_metadata_access_with_effective(
@@ -419,17 +452,25 @@ pub fn check_metadata_access_with_effective(
     access_mode: usize,
     effective: bool,
 ) -> Result<(), SysErrNo> {
+    check_metadata_access_with_identity(
+        meta,
+        access_mode,
+        CredentialIdentity::from_effective_flag(effective),
+    )
+}
+
+fn check_metadata_access_with_identity(
+    meta: &VfsMetadata,
+    access_mode: usize,
+    identity: CredentialIdentity,
+) -> Result<(), SysErrNo> {
     const R_OK: usize = 4;
     const W_OK: usize = 2;
     const X_OK: usize = 1;
     let credentials = crate::task::current_task()
         .map(|task| task.credentials.lock().clone())
         .unwrap_or_else(crate::task::Credentials::root);
-    let uid = if effective {
-        credentials.effective_uid
-    } else {
-        credentials.real_uid
-    };
+    let uid = identity.uid(&credentials);
 
     if uid == 0 {
         if (access_mode & X_OK) != 0
@@ -443,7 +484,7 @@ pub fn check_metadata_access_with_effective(
 
     let class_shift = if uid == meta.uid {
         6
-    } else if credentials.is_in_group(meta.gid, effective) {
+    } else if identity.is_in_group(&credentials, meta.gid) {
         3
     } else {
         0
@@ -466,7 +507,12 @@ pub fn check_metadata_access_with_effective(
 }
 
 pub fn check_access(path: &str, follow_symlink: bool, access_mode: usize) -> Result<(), SysErrNo> {
-    check_access_with_effective(path, follow_symlink, access_mode, false)
+    check_access_with_identity(
+        path,
+        follow_symlink,
+        access_mode,
+        CredentialIdentity::Real,
+    )
 }
 
 pub fn check_access_with_effective(
@@ -475,13 +521,41 @@ pub fn check_access_with_effective(
     access_mode: usize,
     effective: bool,
 ) -> Result<(), SysErrNo> {
-    check_search_access(path, effective)?;
+    check_access_with_identity(
+        path,
+        follow_symlink,
+        access_mode,
+        CredentialIdentity::from_effective_flag(effective),
+    )
+}
+
+fn check_access_with_filesystem(
+    path: &str,
+    follow_symlink: bool,
+    access_mode: usize,
+) -> Result<(), SysErrNo> {
+    check_access_with_identity(
+        path,
+        follow_symlink,
+        access_mode,
+        CredentialIdentity::Filesystem,
+    )
+}
+
+fn check_access_with_identity(
+    path: &str,
+    follow_symlink: bool,
+    access_mode: usize,
+    identity: CredentialIdentity,
+) -> Result<(), SysErrNo> {
+    check_search_access(path, identity)?;
     let meta = metadata(path, follow_symlink)?;
-    check_metadata_access_with_effective(&meta, access_mode, effective)
+    check_metadata_access_with_identity(&meta, access_mode, identity)
 }
 
 pub fn check_fd_access(file: &fd::FileDescriptor, access_mode: usize) -> Result<(), SysErrNo> {
-    check_fd_access_with_effective(file, access_mode, false)
+    let meta = metadata_for_fd(file)?;
+    check_metadata_access_with_identity(&meta, access_mode, CredentialIdentity::Real)
 }
 
 pub fn check_fd_access_with_effective(
@@ -490,21 +564,25 @@ pub fn check_fd_access_with_effective(
     effective: bool,
 ) -> Result<(), SysErrNo> {
     let meta = metadata_for_fd(file)?;
-    check_metadata_access_with_effective(&meta, access_mode, effective)
+    check_metadata_access_with_identity(
+        &meta,
+        access_mode,
+        CredentialIdentity::from_effective_flag(effective),
+    )
 }
 
 fn check_noatime_permission(meta: &VfsMetadata) -> Result<(), SysErrNo> {
     let credentials = crate::task::current_task()
         .map(|task| task.credentials.lock().clone())
         .unwrap_or_else(crate::task::Credentials::root);
-    if credentials.effective_uid == 0 || credentials.effective_uid == meta.uid {
+    if credentials.fsuid == 0 || credentials.fsuid == meta.uid {
         Ok(())
     } else {
         Err(SysErrNo::EPERM)
     }
 }
 
-fn check_search_access(path: &str, effective: bool) -> Result<(), SysErrNo> {
+fn check_search_access(path: &str, identity: CredentialIdentity) -> Result<(), SysErrNo> {
     const X_OK: usize = 1;
     let norm = normalize_path(path);
     let components: Vec<&str> = norm.split('/').filter(|part| !part.is_empty()).collect();
@@ -518,7 +596,7 @@ fn check_search_access(path: &str, effective: bool) -> Result<(), SysErrNo> {
         }
         current.push_str(component);
         let meta = metadata(&current, true)?;
-        check_metadata_access_with_effective(&meta, X_OK, effective)?;
+        check_metadata_access_with_identity(&meta, X_OK, identity)?;
     }
     Ok(())
 }
@@ -1188,7 +1266,7 @@ pub fn open_path(
         if want_excl && want_create {
             return Err(SysErrNo::EEXIST);
         }
-        check_access_with_effective(&path_norm, true, open_access, true)?;
+        check_access_with_filesystem(&path_norm, true, open_access)?;
         if noatime {
             let meta = metadata(&path_norm, true)?;
             check_noatime_permission(&meta)?;
@@ -1228,7 +1306,7 @@ pub fn open_path(
         } else {
             ext_path_norm.clone()
         };
-        check_access_with_effective(&open_path, true, open_access, true)?;
+        check_access_with_filesystem(&open_path, true, open_access)?;
         return open_dir_descriptor(&open_path, &logical_norm);
     }
 
@@ -1249,7 +1327,7 @@ pub fn open_path(
         if is_dir {
             return Err(SysErrNo::EISDIR);
         }
-        check_access_with_effective(&ext_path_norm, true, open_access, true)?;
+        check_access_with_filesystem(&ext_path_norm, true, open_access)?;
         if noatime {
             let meta = metadata(&ext_path_norm, true)?;
             check_noatime_permission(&meta)?;

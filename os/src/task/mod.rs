@@ -113,9 +113,11 @@ pub struct Credentials {
     pub real_uid: u32,
     pub effective_uid: u32,
     pub saved_uid: u32,
+    pub fsuid: u32,
     pub real_gid: u32,
     pub effective_gid: u32,
     pub saved_gid: u32,
+    pub fsgid: u32,
     supplementary_groups: Vec<u32>,
 }
 
@@ -125,9 +127,11 @@ impl Credentials {
             real_uid: 0,
             effective_uid: 0,
             saved_uid: 0,
+            fsuid: 0,
             real_gid: 0,
             effective_gid: 0,
             saved_gid: 0,
+            fsgid: 0,
             supplementary_groups: vec![0],
         }
     }
@@ -138,6 +142,14 @@ impl Credentials {
 
     pub fn has_gid(&self, gid: u32) -> bool {
         gid == self.real_gid || gid == self.effective_gid || gid == self.saved_gid
+    }
+
+    pub fn has_uid_or_fsuid(&self, uid: u32) -> bool {
+        self.has_uid(uid) || uid == self.fsuid
+    }
+
+    pub fn has_gid_or_fsgid(&self, gid: u32) -> bool {
+        self.has_gid(gid) || gid == self.fsgid
     }
 
     pub fn is_root_capable(&self) -> bool {
@@ -155,6 +167,18 @@ impl Credentials {
             self.real_gid
         };
         primary == gid || self.supplementary_groups.iter().any(|group| *group == gid)
+    }
+
+    pub fn is_in_filesystem_group(&self, gid: u32) -> bool {
+        self.fsgid == gid || self.supplementary_groups.iter().any(|group| *group == gid)
+    }
+
+    pub fn sync_fsuid_to_effective(&mut self) {
+        self.fsuid = self.effective_uid;
+    }
+
+    pub fn sync_fsgid_to_effective(&mut self) {
+        self.fsgid = self.effective_gid;
     }
 
     pub fn set_supplementary_groups(&mut self, groups: &[u32]) {

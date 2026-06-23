@@ -403,6 +403,14 @@ fn parse_required_id(raw: usize) -> Result<u32, SysErrNo> {
     }
 }
 
+fn parse_filesystem_id_arg(raw: usize) -> Option<u32> {
+    if raw == usize::MAX || raw == u32::MAX as usize || raw > u32::MAX as usize {
+        None
+    } else {
+        Some(raw as u32)
+    }
+}
+
 pub fn sys_setuid(uid: usize) -> SyscallRet {
     let uid = parse_required_id(uid)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
@@ -411,10 +419,12 @@ pub fn sys_setuid(uid: usize) -> SyscallRet {
         credentials.real_uid = uid;
         credentials.effective_uid = uid;
         credentials.saved_uid = uid;
+        credentials.sync_fsuid_to_effective();
         return Ok(0);
     }
     if credentials.has_uid(uid) {
         credentials.effective_uid = uid;
+        credentials.sync_fsuid_to_effective();
         Ok(0)
     } else {
         Err(SysErrNo::EPERM)
@@ -429,10 +439,12 @@ pub fn sys_setgid(gid: usize) -> SyscallRet {
         credentials.real_gid = gid;
         credentials.effective_gid = gid;
         credentials.saved_gid = gid;
+        credentials.sync_fsgid_to_effective();
         return Ok(0);
     }
     if credentials.has_gid(gid) {
         credentials.effective_gid = gid;
+        credentials.sync_fsgid_to_effective();
         Ok(0)
     } else {
         Err(SysErrNo::EPERM)
@@ -461,6 +473,7 @@ pub fn sys_setreuid(ruid: usize, euid: usize) -> SyscallRet {
     }
     if let Some(uid) = new_euid {
         credentials.effective_uid = uid;
+        credentials.sync_fsuid_to_effective();
     }
     if new_ruid.is_some() || new_euid.map(|uid| uid != old.real_uid).unwrap_or(false) {
         credentials.saved_uid = credentials.effective_uid;
@@ -490,6 +503,7 @@ pub fn sys_setregid(rgid: usize, egid: usize) -> SyscallRet {
     }
     if let Some(gid) = new_egid {
         credentials.effective_gid = gid;
+        credentials.sync_fsgid_to_effective();
     }
     if new_rgid.is_some() || new_egid.map(|gid| gid != old.real_gid).unwrap_or(false) {
         credentials.saved_gid = credentials.effective_gid;
@@ -518,6 +532,7 @@ pub fn sys_setresuid(ruid: usize, euid: usize, suid: usize) -> SyscallRet {
     }
     if let Some(uid) = new_euid {
         credentials.effective_uid = uid;
+        credentials.sync_fsuid_to_effective();
     }
     if let Some(uid) = new_suid {
         credentials.saved_uid = uid;
@@ -546,6 +561,7 @@ pub fn sys_setresgid(rgid: usize, egid: usize, sgid: usize) -> SyscallRet {
     }
     if let Some(gid) = new_egid {
         credentials.effective_gid = gid;
+        credentials.sync_fsgid_to_effective();
     }
     if let Some(gid) = new_sgid {
         credentials.saved_gid = gid;
@@ -637,12 +653,30 @@ pub fn sys_setgroups(size: usize, list: usize) -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_setfsuid(_uid: usize) -> SyscallRet {
-    Ok(0)
+pub fn sys_setfsuid(uid: usize) -> SyscallRet {
+    let new_fsuid = parse_filesystem_id_arg(uid);
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut credentials = task.credentials.lock();
+    let old_fsuid = credentials.fsuid;
+    if let Some(uid) = new_fsuid {
+        if credentials.is_root_capable() || credentials.has_uid_or_fsuid(uid) {
+            credentials.fsuid = uid;
+        }
+    }
+    Ok(old_fsuid as usize)
 }
 
-pub fn sys_setfsgid(_gid: usize) -> SyscallRet {
-    Ok(0)
+pub fn sys_setfsgid(gid: usize) -> SyscallRet {
+    let new_fsgid = parse_filesystem_id_arg(gid);
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut credentials = task.credentials.lock();
+    let old_fsgid = credentials.fsgid;
+    if let Some(gid) = new_fsgid {
+        if credentials.is_root_capable() || credentials.has_gid_or_fsgid(gid) {
+            credentials.fsgid = gid;
+        }
+    }
+    Ok(old_fsgid as usize)
 }
 
 fn resource_limit_snapshot(resource: usize) -> Result<RLimit, SysErrNo> {
