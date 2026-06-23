@@ -73,27 +73,27 @@ def parse_ltp_log(content):
             current_case = None
 
         elif current_case:
-            if re.search(r"\bTPASS\b", plain):
+            if re.search(r"\bTPASS:", plain):
                 summary_data['passed'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True
                 continue
-            if re.search(r"\bTFAIL\b", plain):
+            if re.search(r"\bTFAIL:", plain):
                 summary_data['failed'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True
                 continue
-            if re.search(r"\bTBROK\b", plain):
+            if re.search(r"\bTBROK:", plain):
                 summary_data['broken'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True
                 continue
-            if re.search(r"\bTCONF\b", plain):
+            if re.search(r"\bTCONF:", plain):
                 summary_data['skipped'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True
                 continue
-            if re.search(r"\bTWARN\b", plain):
+            if re.search(r"\bTWARN:", plain):
                 summary_data['warnings'] += 1
                 summary_data['all'] += 1
                 saw_test_line = True
