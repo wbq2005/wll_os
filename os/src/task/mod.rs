@@ -903,6 +903,7 @@ fn release_process_runtime_resources(members: &[Arc<TaskControlBlock>]) {
         inner.clear_child_tid = 0;
         inner.robust_list_head = 0;
         inner.robust_list_len = 0;
+        inner.interval_timers = crate::syscall::other::EMPTY_INTERVAL_TIMERS;
     }
 }
 
@@ -1306,6 +1307,7 @@ pub struct TaskControlBlockInner {
     pub clear_child_tid: usize,
     pub robust_list_head: usize,
     pub robust_list_len: usize,
+    pub interval_timers: [crate::syscall::other::IntervalTimer; 3],
 }
 
 /// 任务状态

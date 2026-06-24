@@ -435,6 +435,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_FUTEX => {
             other::sys_futex_stub(args[0], args[1], args[2], args[3], args[4], args[5])
         }
+        SYSCALL_SETITIMER => other::sys_setitimer(args[0] as isize, args[1], args[2]),
         SYSCALL_CLOCK_NANOSLEEP => other::sys_clock_nanosleep(args[0], args[1], args[2], args[3]),
         SYSCALL_MLOCK | SYSCALL_MUNLOCK | SYSCALL_MLOCKALL | SYSCALL_MUNLOCKALL => {
             other::sys_memory_lock_noop()

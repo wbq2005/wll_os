@@ -999,6 +999,7 @@ pub fn sys_clone(
             },
             robust_list_head: 0,
             robust_list_len: 0,
+            interval_timers: crate::syscall::other::EMPTY_INTERVAL_TIMERS,
         }),
         task_ctx: crate::task::KernelCtx::new(crate::task::context::TaskContext::zero_init()),
         memory_set,

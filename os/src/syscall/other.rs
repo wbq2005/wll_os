@@ -56,6 +56,59 @@ struct TimeVal {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct ITimerTimeVal {
+    tv_sec: isize,
+    tv_usec: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ITimerVal {
+    it_interval: ITimerTimeVal,
+    it_value: ITimerTimeVal,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IntervalTimer {
+    interval_us: usize,
+    deadline_us: Option<usize>,
+}
+
+impl IntervalTimer {
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            interval_us: 0,
+            deadline_us: None,
+        }
+    }
+
+    fn from_value(interval_us: usize, value_us: usize) -> Self {
+        Self {
+            interval_us,
+            deadline_us: if value_us == 0 {
+                None
+            } else {
+                Some(timer::deadline_after_us(value_us))
+            },
+        }
+    }
+
+    fn to_user_value(self, now_us: usize) -> ITimerVal {
+        ITimerVal {
+            it_interval: us_to_itimer_timeval(self.interval_us),
+            it_value: us_to_itimer_timeval(
+                self.deadline_us
+                    .map(|deadline| deadline.saturating_sub(now_us))
+                    .unwrap_or(0),
+            ),
+        }
+    }
+}
+
+pub(crate) const EMPTY_INTERVAL_TIMERS: [IntervalTimer; 3] = [IntervalTimer::disabled(); 3];
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct RUsage {
     ru_utime: TimeVal,
     ru_stime: TimeVal,
@@ -149,6 +202,24 @@ fn duration_us_from_timespec(ts: TimeSpec) -> Result<usize, SysErrNo> {
     Ok(tv_sec
         .saturating_mul(1_000_000)
         .saturating_add(tv_nsec.div_ceil(1000)))
+}
+
+fn duration_us_from_itimer_timeval(tv: ITimerTimeVal) -> Result<usize, SysErrNo> {
+    if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let sec = usize::try_from(tv.tv_sec).map_err(|_| SysErrNo::EINVAL)?;
+    let usec = usize::try_from(tv.tv_usec).map_err(|_| SysErrNo::EINVAL)?;
+    sec.checked_mul(1_000_000)
+        .and_then(|base| base.checked_add(usec))
+        .ok_or(SysErrNo::EINVAL)
+}
+
+fn us_to_itimer_timeval(us: usize) -> ITimerTimeVal {
+    ITimerTimeVal {
+        tv_sec: (us / 1_000_000).min(isize::MAX as usize) as isize,
+        tv_usec: (us % 1_000_000) as isize,
+    }
 }
 
 fn timespec_to_us(ts: TimeSpec) -> Result<usize, SysErrNo> {
@@ -264,6 +335,33 @@ pub fn sys_clock_nanosleep(_clock_id: usize, flags: usize, req: usize, rem: usiz
             },
         )?;
     }
+    Ok(0)
+}
+
+pub fn sys_setitimer(which: isize, new_value: usize, old_value: usize) -> SyscallRet {
+    let index = match which {
+        0..=2 => which as usize,
+        _ => return Err(SysErrNo::EINVAL),
+    };
+    if new_value == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+
+    let new_timer = copy_object_from_user::<ITimerVal>(new_value)?;
+    let interval_us = duration_us_from_itimer_timeval(new_timer.it_interval)?;
+    let value_us = duration_us_from_itimer_timeval(new_timer.it_value)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let now_us = timer::get_time_us();
+    let old_timer = {
+        let inner = task.inner.lock();
+        inner.interval_timers[index]
+    };
+
+    if old_value != 0 {
+        copy_object_to_user(old_value, &old_timer.to_user_value(now_us))?;
+    }
+
+    task.inner.lock().interval_timers[index] = IntervalTimer::from_value(interval_us, value_us);
     Ok(0)
 }
 
