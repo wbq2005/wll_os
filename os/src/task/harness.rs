@@ -843,6 +843,7 @@ fn run_ltp_case(root: &str, case: &str) {
             String::from("LD_LIBRARY_PATH=/lib"),
             String::from("LTPROOT=/ltp"),
             String::from("TMPDIR=/tmp"),
+            String::from("LTP_COLORIZE_OUTPUT=y"),
         ],
         cwd: String::from("/"),
         root: String::from(root),
@@ -850,7 +851,7 @@ fn run_ltp_case(root: &str, case: &str) {
     })
     .unwrap_or(-1);
 
-    console_write("END LTP CASE ");
+    console_write("FAIL LTP CASE ");
     console_write(case);
     console_write(" : ");
     console_write(&format!("{}", ret));
