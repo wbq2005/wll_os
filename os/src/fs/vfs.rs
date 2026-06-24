@@ -253,6 +253,73 @@ fn resolve_final_symlink(path: &str, nofollow: bool) -> Result<String, SysErrNo>
     Err(SysErrNo::ELOOP)
 }
 
+fn lookup_symlink_target(path: &str) -> Result<Option<String>, SysErrNo> {
+    let norm = normalize_path(path);
+    if is_removed(&norm) {
+        return Err(SysErrNo::ENOENT);
+    }
+    if mounted_ext4_backend_path(&norm).is_none() {
+        if let Some(target) = MEM_FS.lock().get_symlink(&norm) {
+            return Ok(Some(target));
+        }
+    }
+    match ext4_vol::lookup_kind(&ext4_lookup_path(&norm)) {
+        Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => {
+            ext4_vol::readlink_ext4(&ext4_lookup_path(&norm)).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn resolve_parent_symlinks_for_lookup(path: &str) -> Result<String, SysErrNo> {
+    let norm = normalize_path(path);
+    let tail = norm.trim_matches('/');
+    if tail.is_empty() {
+        return Ok(norm);
+    }
+
+    let parts: Vec<&str> = tail.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() <= 1 {
+        return Ok(norm);
+    }
+
+    let final_name = parts[parts.len() - 1];
+    let mut current = String::from("/");
+    let mut index = 0usize;
+    let mut followed = 0usize;
+    while index + 1 < parts.len() {
+        if current != "/" {
+            current.push('/');
+        }
+        current.push_str(parts[index]);
+
+        loop {
+            match lookup_symlink_target(&current)? {
+                Some(target) => {
+                    followed += 1;
+                    if followed > 40 {
+                        return Err(SysErrNo::ELOOP);
+                    }
+                    current = symlink_target_path(&current, &target);
+                }
+                None => break,
+            }
+        }
+
+        let meta = metadata(&current, false)?;
+        if meta.kind != VfsNodeKind::Directory {
+            return Err(SysErrNo::ENOTDIR);
+        }
+        index += 1;
+    }
+
+    if current == "/" {
+        Ok(normalize_path(&alloc::format!("/{}", final_name)))
+    } else {
+        Ok(normalize_path(&alloc::format!("{}/{}", current, final_name)))
+    }
+}
+
 fn pseudo_inode(path: &str) -> u64 {
     let mut hash = 1469598103934665603u64;
     for &b in path.as_bytes() {
@@ -555,6 +622,12 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
     };
 
     ext4_vol::metadata(&ext_path).map(metadata_from_ext4)
+}
+
+pub fn metadata_for_lookup(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrNo> {
+    let norm = resolve_parent_symlinks_for_lookup(path)?;
+    check_search_access(&norm, CredentialIdentity::Filesystem)?;
+    metadata(&norm, follow_symlink)
 }
 
 fn mount_record_line(entry: &MountEntry) -> String {
@@ -1508,10 +1581,11 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
 }
 
 pub fn read_link(path: &str) -> Result<String, SysErrNo> {
-    let norm = normalize_path(path);
+    let norm = resolve_parent_symlinks_for_lookup(path)?;
     if is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
     }
+    check_search_access(&norm, CredentialIdentity::Filesystem)?;
     if let Some(meta) = vfat_metadata_for_path(&norm) {
         meta?;
         return Err(SysErrNo::EINVAL);

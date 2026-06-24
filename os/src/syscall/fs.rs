@@ -843,7 +843,7 @@ fn stat_for_fd(file_desc: &FileDescriptor) -> Result<KStat, SysErrNo> {
 }
 
 fn stat_for_path(path: &str, follow_symlink: bool) -> Result<KStat, SysErrNo> {
-    crate::fs::metadata(path, follow_symlink).map(kstat_from_vfs)
+    crate::fs::metadata_for_lookup(path, follow_symlink).map(kstat_from_vfs)
 }
 
 fn stat_empty_path(dirfd: isize) -> Result<KStat, SysErrNo> {
