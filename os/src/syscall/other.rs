@@ -103,6 +103,29 @@ impl IntervalTimer {
             ),
         }
     }
+
+    fn next_deadline_us(self) -> Option<usize> {
+        self.deadline_us
+    }
+
+    fn expire_at(&mut self, now_us: usize) -> bool {
+        let Some(deadline_us) = self.deadline_us else {
+            return false;
+        };
+        if deadline_us > now_us {
+            return false;
+        }
+        if self.interval_us == 0 {
+            self.deadline_us = None;
+        } else {
+            let missed = now_us.saturating_sub(deadline_us) / self.interval_us;
+            let step = missed.saturating_add(1);
+            self.deadline_us = Some(
+                deadline_us.saturating_add(self.interval_us.saturating_mul(step)),
+            );
+        }
+        true
+    }
 }
 
 pub(crate) const EMPTY_INTERVAL_TIMERS: [IntervalTimer; 3] = [IntervalTimer::disabled(); 3];
@@ -362,7 +385,44 @@ pub fn sys_setitimer(which: isize, new_value: usize, old_value: usize) -> Syscal
     }
 
     task.inner.lock().interval_timers[index] = IntervalTimer::from_value(interval_us, value_us);
+    timer::set_next_trigger();
     Ok(0)
+}
+
+pub(crate) fn next_interval_timer_deadline_us() -> Option<usize> {
+    crate::task::manager::all_user_tasks()
+        .into_iter()
+        .filter(|task| task.status() != crate::task::TaskStatus::Zombie)
+        .filter_map(|task| {
+            task.inner
+                .lock()
+                .interval_timers
+                .iter()
+                .filter_map(|timer| timer.next_deadline_us())
+                .min()
+        })
+        .min()
+}
+
+pub(crate) fn wake_expired_interval_timers() {
+    let now_us = timer::get_time_us();
+    let mut expired = alloc::vec::Vec::new();
+    for task in crate::task::manager::all_user_tasks() {
+        if task.status() == crate::task::TaskStatus::Zombie {
+            continue;
+        }
+        {
+            let mut inner = task.inner.lock();
+            for which in 0..inner.interval_timers.len() {
+                if inner.interval_timers[which].expire_at(now_us) {
+                    expired.push((task.clone(), which));
+                }
+            }
+        }
+    }
+    for (task, which) in expired {
+        crate::syscall::signal::send_interval_timer_signal(&task, which);
+    }
 }
 
 /// gettimeofday 系统调用
@@ -407,7 +467,7 @@ pub fn sys_clock_getres(_clock_id: usize, tp: usize) -> SyscallRet {
         tp,
         &TimeSpec {
             tv_sec: 0,
-            tv_nsec: 1_000,
+            tv_nsec: crate::timer::TIME_SLICE_MS as isize * 1_000_000,
         },
     )?;
     Ok(0)

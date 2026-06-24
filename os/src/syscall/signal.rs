@@ -20,15 +20,18 @@ const SIG_DFL: usize = 0;
 const SIG_IGN: usize = 1;
 
 const SIGKILL: i32 = 9;
+const SIGALRM: i32 = 14;
 const SIGPIPE: i32 = 13;
 const SIGSEGV: i32 = 11;
 const SIGCHLD: i32 = 17;
+const SIGPROF: i32 = 27;
 const SIGCONT: i32 = 18;
 const SIGSTOP: i32 = 19;
 const SIGTSTP: i32 = 20;
 const SIGTTIN: i32 = 21;
 const SIGTTOU: i32 = 22;
 const SIGURG: i32 = 23;
+const SIGVTALRM: i32 = 26;
 const SIGWINCH: i32 = 28;
 const SIGCANCEL: i32 = 32;
 const SIGSETXID: i32 = 33;
@@ -653,6 +656,16 @@ pub(crate) fn send_sigpipe_to_current() {
     if let Some(task) = current_task() {
         queue_signal(&task, SIGPIPE, PendingSignalInfo::from_current(SI_USER));
     }
+}
+
+pub(crate) fn send_interval_timer_signal(task: &Arc<TaskControlBlock>, which: usize) {
+    let signum = match which {
+        0 => SIGALRM,
+        1 => SIGVTALRM,
+        2 => SIGPROF,
+        _ => return,
+    };
+    queue_signal(task, signum, PendingSignalInfo::from_current(SI_USER));
 }
 
 pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {

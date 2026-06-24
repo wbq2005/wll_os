@@ -28,7 +28,7 @@ FOCUSED_LTP_CASES = (
     "writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,"
     "setgroups04,access01,open02,setfsuid01,setfsgid01,"
     "faccessat01,access02,open03,symlink01,readlink01,lstat01,lstat02,"
-    "symlink02,symlink03,symlink04,symlinkat01,readlinkat01,setitimer02"
+    "symlink02,symlink03,symlink04,symlinkat01,readlinkat01,setitimer02,setitimer01"
 )
 
 ARCHES = {

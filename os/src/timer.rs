@@ -41,8 +41,15 @@ pub fn get_time_us() -> usize {
 }
 
 fn next_timer_delay_us(now_us: usize, default_us: usize) -> usize {
-    let waiters = TIMER_WAITERS.lock();
-    let next_deadline = waiters.iter().map(|waiter| waiter.deadline_us).min();
+    let waiter_deadline = TIMER_WAITERS
+        .lock()
+        .iter()
+        .map(|waiter| waiter.deadline_us)
+        .min();
+    let next_deadline = waiter_deadline
+        .into_iter()
+        .chain(crate::syscall::other::next_interval_timer_deadline_us())
+        .min();
     match next_deadline {
         Some(deadline) if deadline <= now_us => 1,
         Some(deadline) => default_us.min(deadline.saturating_sub(now_us)).max(1),
@@ -125,6 +132,7 @@ pub fn wake_expired_timers() {
     for waiter in expired {
         crate::task::wake_task_token_with(&waiter.task, waiter.token, WaitOutcome::TimedOut);
     }
+    crate::syscall::other::wake_expired_interval_timers();
 }
 
 pub fn deadline_after_us(duration_us: usize) -> usize {

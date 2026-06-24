@@ -248,6 +248,7 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 suspend_current_and_run_next();
             } else {
                 crate::timer::set_next_foreground_trigger();
+                let _ = crate::syscall::signal::handle_pending_for_user(ctx);
             }
         }
         trap @ (TrapType::StorePageFault(vaddr)
@@ -349,6 +350,7 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     {
         return;
     }
+    crate::timer::wake_expired_timers();
     match result {
         Ok(ret) => {
             ctx[TrapFrameArgs::RET] = ret;
@@ -360,6 +362,13 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     }
     // 普通系统调用：PC 需要前进（跳过 ecall 指令）
     ctx.syscall_ok();
+    let should_return = syscall_task
+        .as_ref()
+        .map(|task| task.status() != TaskStatus::Zombie)
+        .unwrap_or(true);
+    if should_return {
+        let _ = crate::syscall::signal::handle_pending_for_user(ctx);
+    }
 }
 
 /// 处理进程退出系统调用
