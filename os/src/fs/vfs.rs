@@ -975,6 +975,17 @@ fn check_search_access(path: &str, identity: CredentialIdentity) -> Result<(), S
     Ok(())
 }
 
+fn check_create_access(parent: &str) -> Result<(), SysErrNo> {
+    const W_OK: usize = 2;
+    const X_OK: usize = 1;
+    let meta = metadata(parent, true)?;
+    if meta.kind != VfsNodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    check_search_access(parent, CredentialIdentity::Filesystem)?;
+    check_metadata_access_with_identity(&meta, W_OK | X_OK, CredentialIdentity::Filesystem)
+}
+
 pub fn read_file(name: &str) -> Option<Vec<u8>> {
     let original = normalize_path(name);
     if is_removed(&original) {
@@ -1470,6 +1481,9 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
     }
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+    if mem_parent || ext_parent {
+        check_create_access(&parent)?;
+    }
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_symlink(&norm, target)?;
         clear_whiteout(&norm);

@@ -581,6 +581,15 @@ fn current_ext4_time() -> u32 {
     sec.min(u32::MAX as usize) as u32
 }
 
+fn current_fs_ids() -> (u16, u16) {
+    let credentials = crate::task::current_task()
+        .map(|task| task.credentials.lock().clone())
+        .unwrap_or_else(crate::task::Credentials::root);
+    let uid = credentials.fsuid.min(u16::MAX as u32) as u16;
+    let gid = credentials.fsgid.min(u16::MAX as u32) as u16;
+    (uid, gid)
+}
+
 fn ext4_extra_nsec(extra: u32) -> isize {
     (extra >> 2) as isize
 }
@@ -1695,9 +1704,12 @@ pub fn mkdir_ext4_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
         .create(parent_ino, &name, InodeFileType::S_IFDIR.bits() | perm)
         .map_err(map_ext4_err)?;
     let now = current_ext4_time();
+    let (uid, gid) = current_fs_ids();
     child_ref
         .inode
         .set_mode(InodeFileType::S_IFDIR.bits() | perm);
+    child_ref.inode.set_uid(uid);
+    child_ref.inode.set_gid(gid);
     child_ref.inode.set_atime(now);
     child_ref.inode.set_mtime(now);
     child_ref.inode.set_ctime(now);
@@ -1775,7 +1787,10 @@ pub fn create_regular_ext4_with_mode(path: &str, mode: u32) -> Result<u32, SysEr
         .create(parent_ino, &name, InodeFileType::S_IFREG.bits() | perm)
         .map_err(map_ext4_err)?;
     let now = current_ext4_time();
+    let (uid, gid) = current_fs_ids();
     iref.inode.set_mode(InodeFileType::S_IFREG.bits() | perm);
+    iref.inode.set_uid(uid);
+    iref.inode.set_gid(gid);
     iref.inode.set_atime(now);
     iref.inode.set_mtime(now);
     iref.inode.set_ctime(now);
@@ -2138,7 +2153,10 @@ pub fn create_symlink_ext4(target: &str, link_path: &str) -> Result<(), SysErrNo
         .create(parent_ino, &name, InodeFileType::S_IFLNK.bits() | 0o777)
         .map_err(map_ext4_err)?;
     let now = current_ext4_time();
+    let (uid, gid) = current_fs_ids();
     iref.inode.set_mode(InodeFileType::S_IFLNK.bits() | 0o777);
+    iref.inode.set_uid(uid);
+    iref.inode.set_gid(gid);
     iref.inode.set_atime(now);
     iref.inode.set_mtime(now);
     iref.inode.set_ctime(now);

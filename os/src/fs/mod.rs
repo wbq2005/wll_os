@@ -47,6 +47,17 @@ impl MemNodeMetadata {
             gid: 0,
         }
     }
+
+    fn new_for_current(mode: u32) -> Self {
+        let credentials = crate::task::current_task()
+            .map(|task| task.credentials.lock().clone())
+            .unwrap_or_else(crate::task::Credentials::root);
+        Self {
+            mode: mode & 0o7777,
+            uid: credentials.fsuid,
+            gid: credentials.fsgid,
+        }
+    }
 }
 
 fn is_elf_content(content: &[u8]) -> bool {
@@ -166,7 +177,7 @@ impl MemFileSystem {
         let len = content.len();
         self.files.push(MemFile::new(&name, content));
         self.metadata
-            .insert(name.clone(), MemNodeMetadata::new(mode));
+            .insert(name.clone(), MemNodeMetadata::new_for_current(mode));
         log::info!("[fs] Added file '{}' ({} bytes)", name, len);
     }
 
@@ -197,7 +208,7 @@ impl MemFileSystem {
         }
         self.metadata
             .entry(name)
-            .or_insert_with(|| MemNodeMetadata::new(0o755));
+            .or_insert_with(|| MemNodeMetadata::new_for_current(0o755));
     }
 
     pub fn add_dir_with_mode(&mut self, name: &str, mode: u32) {
@@ -216,7 +227,7 @@ impl MemFileSystem {
         }
         self.symlinks.insert(name.clone(), String::from(target));
         self.metadata
-            .insert(name, MemNodeMetadata::new(0o777));
+            .insert(name, MemNodeMetadata::new_for_current(0o777));
         Ok(())
     }
 
