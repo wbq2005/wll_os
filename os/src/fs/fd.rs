@@ -9,6 +9,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::fs::ext4_vol;
+use crate::fs::vfs::VfsNodeKind;
 use crate::fs::FileTimes;
 use crate::fs::MEM_FS;
 use crate::task::wait_queue::WaitKey;
@@ -282,6 +283,7 @@ pub mod open_flags {
     pub const O_DIRECTORY: u32 = 0o00200000;
     pub const O_NOFOLLOW: u32 = 0o00400000;
     pub const O_NOATIME: u32 = 0o01000000;
+    pub const O_PATH: u32 = 0o10000000;
     pub const O_CLOEXEC: u32 = 0o2000000;
 }
 
@@ -330,6 +332,12 @@ pub enum FileDescriptor {
         path: String,
         ino: u32,
         offset: usize,
+    },
+    Path {
+        logical_path: String,
+        host_path: String,
+        kind: VfsNodeKind,
+        flags: u32,
     },
     /// 管道读端
     PipeRead {
@@ -528,6 +536,14 @@ impl FileDescriptor {
                 FileDescriptor::Ext4Regular { ino: left, .. },
                 FileDescriptor::Ext4Regular { ino: right, .. },
             ) => left == right,
+            (
+                FileDescriptor::Path {
+                    host_path: left, ..
+                },
+                FileDescriptor::Path {
+                    host_path: right, ..
+                },
+            ) => left == right,
             _ => false,
         }
     }
@@ -672,6 +688,7 @@ impl FileDescriptor {
             FileDescriptor::MemDir { .. } => false,
             FileDescriptor::Ext4Regular { readable, .. } => *readable,
             FileDescriptor::Ext4Dir { .. } => false,
+            FileDescriptor::Path { .. } => false,
             FileDescriptor::PipeRead { .. } => true,
             FileDescriptor::PipeWrite { .. } => false,
             FileDescriptor::Socket { .. } => true,
@@ -688,6 +705,7 @@ impl FileDescriptor {
             FileDescriptor::MemDir { .. } => false,
             FileDescriptor::Ext4Regular { writable, .. } => *writable,
             FileDescriptor::Ext4Dir { .. } => false,
+            FileDescriptor::Path { .. } => false,
             FileDescriptor::PipeRead { .. } => false,
             FileDescriptor::PipeWrite { .. } => true,
             FileDescriptor::Socket { .. } => true,
@@ -755,6 +773,7 @@ impl FileDescriptor {
                 Ok(n)
             }
             FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
+            FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
             FileDescriptor::PipeRead { state, .. } => {
                 if buf.is_empty() {
                     return Ok(0);
@@ -855,6 +874,7 @@ impl FileDescriptor {
                 ext4_vol::ext4_read_at(*ino, offset, buf)
             }
             FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
+            FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
             FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
                 Err(SysErrNo::ESPIPE)
             }
@@ -901,6 +921,7 @@ impl FileDescriptor {
                 ext4_vol::ext4_write_at(*ino, offset, buf)
             }
             FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
+            FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
             FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
                 Err(SysErrNo::ESPIPE)
             }
@@ -972,6 +993,7 @@ impl FileDescriptor {
                 Ok(n)
             }
             FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
+            FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
             FileDescriptor::PipeWrite { state, .. } => {
                 if buf.is_empty() {
                     return Ok(0);
@@ -1075,6 +1097,7 @@ impl FileDescriptor {
                 Ok(*current_offset)
             }
             FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::ESPIPE),
+            FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
             _ => Err(SysErrNo::ESPIPE),
         }
     }
@@ -1113,6 +1136,7 @@ impl FileDescriptor {
                 ext4_vol::regular_file_size(*ino).unwrap_or(0)
             }
             FileDescriptor::Ext4Dir { .. } => 0,
+            FileDescriptor::Path { .. } => 0,
             FileDescriptor::PipeRead { state, .. } | FileDescriptor::PipeWrite { state, .. } => {
                 state.lock().buf.len()
             }
@@ -1156,6 +1180,7 @@ impl FileDescriptor {
                 ext4_vol::truncate_regular_ino(*ino, new_len as u64)
             }
             FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
+            FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
             _ => Err(SysErrNo::EINVAL),
         }
     }
@@ -1240,6 +1265,7 @@ impl FileDescriptor {
 
                 Ok(written)
             }
+            FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
             _ => Err(SysErrNo::ENOTDIR),
         }
     }
@@ -1299,6 +1325,17 @@ impl Clone for FileDescriptor {
                 path: path.clone(),
                 ino: *ino,
                 offset: *offset,
+            },
+            FileDescriptor::Path {
+                logical_path,
+                host_path,
+                kind,
+                flags,
+            } => FileDescriptor::Path {
+                logical_path: logical_path.clone(),
+                host_path: host_path.clone(),
+                kind: *kind,
+                flags: *flags,
             },
             FileDescriptor::PipeRead { state, nonblock } => {
                 state.lock().readers += 1;

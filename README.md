@@ -44,10 +44,10 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 当前 LTP 不是完整 suite 启用，而是一个明确收口的 case 列表：
 
 ```text
-writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03,symlink01,readlink01,lstat01,symlink02,symlink03,symlink04,symlinkat01
+writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03,symlink01,readlink01,lstat01,symlink02,symlink03,symlink04,symlinkat01,readlinkat01
 ```
 
-该 slice 覆盖真实 `writev`、UID/GID 与 supplementary groups、fsuid/fsgid 状态、`access(2)` 权限检查、`open(O_NOATIME)` 的所有者/权限路径、基础 symlink/readlink/lstat 路径元数据语义，以及 symlink 创建错误路径和 `symlinkat(2)` 的目录 fd 语义。后续扩展应继续按子系统逐步增加，不应把 full LTP script 当作已经可用的整体能力。
+该 slice 覆盖真实 `writev`、UID/GID 与 supplementary groups、fsuid/fsgid 状态、`access(2)` 权限检查、`open(O_NOATIME)` 的所有者/权限路径、基础 symlink/readlink/lstat 路径元数据语义、symlink 创建错误路径、`symlinkat(2)` 的目录 fd 语义，以及 `readlinkat(2)` 的 `O_PATH|O_NOFOLLOW` 空路径 symlink 读取语义。后续扩展应继续按子系统逐步增加，不应把 full LTP script 当作已经可用的整体能力。
 
 ## 快速构建
 

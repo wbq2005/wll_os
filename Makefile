@@ -8,7 +8,7 @@ LIBCTEST ?= 0
 IOZONE ?= 1
 LMBENCH ?= 1
 LTP ?= 0
-FOCUSED_LTP_CASES ?= writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03,symlink01,readlink01,lstat01,symlink02,symlink03,symlink04,symlinkat01
+FOCUSED_LTP_CASES ?= writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03,symlink01,readlink01,lstat01,symlink02,symlink03,symlink04,symlinkat01,readlinkat01
 RUSTUP_TOOLCHAIN ?= $(shell sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null | head -n 1)
 ifeq ($(strip $(RUSTUP_TOOLCHAIN)),)
     # Keep judge builds on the repository-pinned compiler. Falling back to the

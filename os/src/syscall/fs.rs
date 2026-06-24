@@ -795,6 +795,11 @@ fn resolve_base_dir(dirfd: isize) -> Result<String, SysErrNo> {
     let result = match inner.fd_table.lock().get(dirfd) {
         Some(FileDescriptor::MemDir { path, .. }) => Ok(path.clone()),
         Some(FileDescriptor::Ext4Dir { path, .. }) => Ok(path.clone()),
+        Some(FileDescriptor::Path {
+            logical_path,
+            kind: crate::fs::VfsNodeKind::Directory,
+            ..
+        }) => Ok(logical_path.clone()),
         Some(_) => Err(SysErrNo::ENOTDIR),
         None => Err(SysErrNo::EBADF),
     };
@@ -1003,6 +1008,9 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
         }
         FileDescriptor::Ext4Dir { .. } => {
             fd::open_flags::O_RDONLY as usize | fd::open_flags::O_DIRECTORY as usize
+        }
+        FileDescriptor::Path { flags, .. } => {
+            (flags & !fd::open_flags::O_CLOEXEC) as usize
         }
         FileDescriptor::PipeRead { nonblock, .. } => {
             let mut flags = fd::open_flags::O_RDONLY as usize;
@@ -1331,6 +1339,27 @@ pub fn sys_access(pathname: *const u8, mode: usize) -> SyscallRet {
 }
 
 fn readlink_target_at(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
+    if path.is_empty() {
+        if dirfd == AT_FDCWD {
+            return Err(SysErrNo::ENOENT);
+        }
+        let fd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let fds = inner.fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        return match file_desc {
+            FileDescriptor::Path {
+                host_path,
+                flags,
+                ..
+            } if (flags & fd::open_flags::O_NOFOLLOW) != 0 => {
+                super::with_kernel_page_table(|| crate::fs::read_link(host_path))
+            }
+            _ => Err(SysErrNo::ENOENT),
+        };
+    }
+
     // glibc asks /proc/self/exe during startup to name the executable used for
     // diagnostics and pointer-guard setup. Model this as a procfs symlink
     // backed by task metadata rather than a BusyBox-specific string.
@@ -1358,9 +1387,6 @@ pub fn sys_readlinkat(
     }
 
     let path = read_user_path(pathname)?;
-    if path.is_empty() {
-        return Err(SysErrNo::ENOENT);
-    }
     let target = readlink_target_at(dirfd, &path)?;
     let bytes = target.as_bytes();
     let n = bytes.len().min(bufsiz);

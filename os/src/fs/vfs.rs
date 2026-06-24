@@ -793,6 +793,7 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::metadata_by_ino(*ino).map(metadata_from_ext4)
         }
+        fd::FileDescriptor::Path { host_path, .. } => metadata(host_path, false),
         fd::FileDescriptor::PipeRead { .. } => Ok(synthetic_metadata(
             "pipe-read",
             VfsNodeKind::Other,
@@ -1253,11 +1254,13 @@ pub fn statfs_for_fd(file: &fd::FileDescriptor) -> Result<VfsStatFs, SysErrNo> {
     ) || match file {
         fd::FileDescriptor::MemFile { name, .. } => path_uses_ext4(name),
         fd::FileDescriptor::MemDir { path, .. } => path_uses_ext4(path),
+        fd::FileDescriptor::Path { host_path, .. } => path_uses_ext4(host_path),
         _ => false,
     };
     let use_vfat = match file {
         fd::FileDescriptor::MemFile { name, .. } => mounted_vfat_backend(name).is_some(),
         fd::FileDescriptor::MemDir { path, .. } => mounted_vfat_backend(path).is_some(),
+        fd::FileDescriptor::Path { host_path, .. } => mounted_vfat_backend(host_path).is_some(),
         _ => false,
     };
     if use_vfat {
@@ -1785,6 +1788,21 @@ fn open_dir_descriptor(
     })
 }
 
+fn open_path_descriptor(
+    host_path: &str,
+    logical_path: &str,
+    flags: u32,
+    follow_symlink: bool,
+) -> Result<fd::FileDescriptor, SysErrNo> {
+    let meta = metadata(host_path, follow_symlink)?;
+    Ok(fd::FileDescriptor::Path {
+        logical_path: normalize_path(logical_path),
+        host_path: normalize_path(host_path),
+        kind: meta.kind,
+        flags,
+    })
+}
+
 fn path_exists_non_dir(path: &str) -> bool {
     let norm = normalize_path(path);
     if is_removed(&norm) {
@@ -1849,6 +1867,7 @@ pub fn open_path(
     let want_trunc = (flags & O_TRUNC) != 0;
     let nofollow = (flags & O_NOFOLLOW) != 0;
     let noatime = (flags & O_NOATIME) != 0;
+    let path_only = (flags & O_PATH) != 0;
     let append = (flags & O_APPEND) != 0;
     let mut open_access = 0usize;
     if read_ok {
@@ -1865,6 +1884,13 @@ pub fn open_path(
     let removed = is_removed(&path_norm);
     if removed && !want_create {
         return Err(SysErrNo::ENOENT);
+    }
+
+    if path_only {
+        if want_create || want_trunc {
+            return Err(SysErrNo::EINVAL);
+        }
+        return open_path_descriptor(&path_norm, &logical_norm, flags, !nofollow);
     }
 
     let open_norm = if !removed {
