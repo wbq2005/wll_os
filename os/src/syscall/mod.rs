@@ -78,6 +78,7 @@ pub const SYSCALL_FUTEX: usize = 98;
 pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 pub const SYSCALL_NANOSLEEP: usize = 101;
+pub const SYSCALL_GETITIMER: usize = 102;
 pub const SYSCALL_SETITIMER: usize = 103;
 pub const SYSCALL_CLOCK_SETTIME: usize = 112;
 pub const SYSCALL_CLOCK_GETTIME: usize = 113;
@@ -435,6 +436,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_FUTEX => {
             other::sys_futex_stub(args[0], args[1], args[2], args[3], args[4], args[5])
         }
+        SYSCALL_GETITIMER => other::sys_getitimer(args[0] as isize, args[1]),
         SYSCALL_SETITIMER => other::sys_setitimer(args[0] as isize, args[1], args[2]),
         SYSCALL_CLOCK_NANOSLEEP => other::sys_clock_nanosleep(args[0], args[1], args[2], args[3]),
         SYSCALL_MLOCK | SYSCALL_MUNLOCK | SYSCALL_MLOCKALL | SYSCALL_MUNLOCKALL => {

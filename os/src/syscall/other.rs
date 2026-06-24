@@ -389,6 +389,25 @@ pub fn sys_setitimer(which: isize, new_value: usize, old_value: usize) -> Syscal
     Ok(0)
 }
 
+pub fn sys_getitimer(which: isize, current_value: usize) -> SyscallRet {
+    let index = match which {
+        0..=2 => which as usize,
+        _ => return Err(SysErrNo::EINVAL),
+    };
+    if current_value == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let now_us = timer::get_time_us();
+    let timer = {
+        let inner = task.inner.lock();
+        inner.interval_timers[index]
+    };
+    copy_object_to_user(current_value, &timer.to_user_value(now_us))?;
+    Ok(0)
+}
+
 pub(crate) fn next_interval_timer_deadline_us() -> Option<usize> {
     crate::task::manager::all_user_tasks()
         .into_iter()
