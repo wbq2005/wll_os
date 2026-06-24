@@ -108,6 +108,13 @@ pub fn read_cstr(addr: usize) -> Result<String, SysErrNo> {
     read_cstr_inner(addr, false, SysErrNo::EFAULT)
 }
 
+pub fn read_path_cstr(addr: usize) -> Result<String, SysErrNo> {
+    if addr == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    read_cstr_inner(addr, false, SysErrNo::ENAMETOOLONG)
+}
+
 pub fn read_cstr_null_empty(addr: usize) -> Result<String, SysErrNo> {
     read_cstr_inner(addr, true, SysErrNo::EINVAL)
 }

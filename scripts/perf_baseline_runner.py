@@ -63,12 +63,12 @@ ARCHES = {
 
 SUITE_PROFILES = {
     "all": {
-        "judge_suites": ("iozone", "libcbench", "lmbench"),
+        "judge_suites": ("iozone", "libcbench", "lmbench", "ltp"),
         "iozone": "1",
         "lmbench": "1",
-        "ltp": "0",
+        "ltp": "1",
         "harness_groups": "",
-        "ltp_cases": "",
+        "ltp_cases": FOCUSED_LTP_CASES,
         "recommended_runs": 7,
     },
     "all-lmbench": {

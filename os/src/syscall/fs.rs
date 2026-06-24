@@ -149,6 +149,10 @@ fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
     super::user::read_cstr(ptr as usize)
 }
 
+fn read_user_path(ptr: *const u8) -> Result<String, SysErrNo> {
+    super::user::read_path_cstr(ptr as usize)
+}
+
 fn copy_to_user(dst: *mut u8, src: &[u8]) -> Result<(), SysErrNo> {
     super::user::copy_to_user(dst as usize, src)
 }
@@ -751,7 +755,7 @@ fn resolve_path_str(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
 }
 
 fn resolve_path(dirfd: isize, pathname: *const u8) -> Result<String, SysErrNo> {
-    let path = read_user_cstr(pathname)?;
+    let path = read_user_path(pathname)?;
     resolve_path_str(dirfd, &path)
 }
 
@@ -759,6 +763,12 @@ fn current_root() -> Result<String, SysErrNo> {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let root = task.fs.lock().root.clone();
     Ok(root)
+}
+
+fn current_cwd() -> Result<String, SysErrNo> {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let cwd = task.fs.lock().cwd.clone();
+    Ok(cwd)
 }
 
 fn resolve_host_path_str(dirfd: isize, path: &str) -> Result<(String, String), SysErrNo> {
@@ -1257,7 +1267,7 @@ pub fn sys_link(oldpath: *const u8, newpath: *const u8) -> SyscallRet {
 }
 
 pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) -> SyscallRet {
-    let target = read_user_cstr(target)?;
+    let target = read_user_path(target)?;
     if target.is_empty() {
         return Err(SysErrNo::ENOENT);
     }
@@ -1281,7 +1291,7 @@ pub fn sys_faccessat(dirfd: isize, pathname: *const u8, mode: usize, flags: usiz
         return Err(SysErrNo::EINVAL);
     }
     let use_effective = (flags & AT_EACCESS) != 0;
-    let path = read_user_cstr(pathname)?;
+    let path = read_user_path(pathname)?;
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(SysErrNo::ENOENT);
@@ -1347,7 +1357,7 @@ pub fn sys_readlinkat(
         return Err(SysErrNo::EINVAL);
     }
 
-    let path = read_user_cstr(pathname)?;
+    let path = read_user_path(pathname)?;
     if path.is_empty() {
         return Err(SysErrNo::ENOENT);
     }
@@ -1434,40 +1444,47 @@ pub fn sys_mount(
     flags: usize,
     data: usize,
 ) -> SyscallRet {
-    let _ = flags;
     let _ = data;
+    if target.is_null() || fstype.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
     let fst = read_user_cstr(fstype)?;
-    let tgt = read_user_cstr(target)?;
-    let _src = if source.is_null() {
+    let target_path = read_user_path(target)?;
+    let source_path = if source.is_null() {
         String::new()
     } else {
-        read_user_cstr(source)?
+        read_user_path(source)?
     };
-
-    let norm = crate::fs::normalize_path(&tgt);
-    if norm != "/" {
-        log::info!("[syscall] mount: unsupported target '{}'", tgt);
+    if target_path.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+    if source_path.is_empty() {
         return Err(SysErrNo::ENODEV);
     }
 
-    match fst.as_str() {
-        "ext4" => {
-            if crate::fs::ext4_vol::is_ext4_mounted() {
-                Ok(0)
-            } else {
-                Err(SysErrNo::ENODEV)
-            }
-        }
-        _ => {
-            log::debug!("[syscall] mount fstype '{}' unsupported", fst);
-            Err(SysErrNo::ENODEV)
-        }
-    }
+    let target_logical = crate::fs::resolve_path(&current_cwd()?, &target_path);
+    let root = current_root()?;
+    let target_host = crate::fs::apply_root(&root, &target_logical);
+    let source_logical = crate::fs::resolve_path("/", &source_path);
+
+    super::with_kernel_page_table(|| {
+        crate::fs::mount_fs(&source_logical, &target_logical, &target_host, &fst, flags)
+    })?;
+    Ok(0)
 }
 
 pub fn sys_umount2(target: *const u8, flags: usize) -> SyscallRet {
-    let _ = flags;
-    let _tgt = read_user_cstr(target)?;
+    if target.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+    let target_path = read_user_path(target)?;
+    if target_path.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+    let target_logical = crate::fs::resolve_path(&current_cwd()?, &target_path);
+    let root = current_root()?;
+    let target_host = crate::fs::apply_root(&root, &target_logical);
+    super::with_kernel_page_table(|| crate::fs::umount_fs(&target_logical, &target_host, flags))?;
     Ok(0)
 }
 
@@ -1887,7 +1904,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SyscallRet {
             }
             _ => Err(SysErrNo::ENOTTY),
         },
-        _ => Ok(0),
+        _ => Err(SysErrNo::ENOTTY),
     }
 }
 
@@ -2399,7 +2416,7 @@ pub fn sys_statx(
     }
     check_statx_flags(flags)?;
 
-    let path = read_user_cstr(pathname)?;
+    let path = read_user_path(pathname)?;
     let st = if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(SysErrNo::ENOENT);
@@ -2427,7 +2444,7 @@ pub fn sys_newfstatat(
     }
     check_fstatat_flags(flags)?;
 
-    let path = read_user_cstr(pathname)?;
+    let path = read_user_path(pathname)?;
     let st = if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(SysErrNo::ENOENT);
@@ -2466,7 +2483,7 @@ pub fn sys_utimensat(
             .map(|_| 0);
     }
 
-    let path = read_user_cstr(pathname)?;
+    let path = read_user_path(pathname)?;
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(SysErrNo::ENOENT);

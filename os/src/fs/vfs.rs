@@ -2,19 +2,21 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::utils::error::SysErrNo;
 
-use super::ext4_vol;
+use super::{block_dev, ext4_vol, vfat};
 use super::fd;
 use super::{normalize_path, MemNodeMetadata, MEM_FS};
 
 const S_IFDIR: u32 = 0o040000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFCHR: u32 = 0o020000;
+const S_IFBLK: u32 = 0o060000;
 const S_IFREG: u32 = 0o100000;
 const S_IFLNK: u32 = 0o120000;
 const S_IFSOCK: u32 = 0o140000;
@@ -25,6 +27,23 @@ const DEV_ZERO_MINOR: u32 = 5;
 
 lazy_static! {
     static ref WHITEOUTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    static ref MOUNT_TABLE: Mutex<Vec<MountEntry>> = Mutex::new(Vec::new());
+}
+
+#[derive(Clone)]
+struct MountEntry {
+    source: String,
+    logical_target: String,
+    host_target: String,
+    fstype: String,
+    backend: MountBackend,
+}
+
+#[derive(Clone)]
+enum MountBackend {
+    Root,
+    Ext4Root,
+    Vfat(Arc<vfat::VfatVolume>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,6 +146,78 @@ fn parent_path(path: &str) -> String {
     }
 }
 
+fn path_is_under(path: &str, parent: &str) -> bool {
+    let path = normalize_path(path);
+    let parent = normalize_path(parent);
+    path == parent
+        || (parent != "/"
+            && path
+                .strip_prefix(parent.as_str())
+                .is_some_and(|tail| tail.starts_with('/')))
+}
+
+fn mounted_ext4_backend_path(path: &str) -> Option<String> {
+    let norm = normalize_path(path);
+    let mounts = MOUNT_TABLE.lock();
+    let entry = mounts
+        .iter()
+        .filter(|entry| {
+            matches!(entry.backend, MountBackend::Ext4Root)
+                && entry.host_target != "/"
+                && path_is_under(&norm, &entry.host_target)
+        })
+        .max_by_key(|entry| entry.host_target.len())?;
+    let suffix = if norm == entry.host_target {
+        ""
+    } else {
+        norm.strip_prefix(entry.host_target.as_str())
+            .and_then(|tail| tail.strip_prefix('/'))
+            .unwrap_or("")
+    };
+    if suffix.is_empty() {
+        Some(String::from("/"))
+    } else {
+        Some(normalize_path(&alloc::format!("/{}", suffix)))
+    }
+}
+
+fn mounted_vfat_backend(path: &str) -> Option<(Arc<vfat::VfatVolume>, String)> {
+    let norm = normalize_path(path);
+    let mounts = MOUNT_TABLE.lock();
+    let entry = mounts
+        .iter()
+        .filter(|entry| matches!(entry.backend, MountBackend::Vfat(_)) && path_is_under(&norm, &entry.host_target))
+        .max_by_key(|entry| entry.host_target.len())?;
+    let MountBackend::Vfat(volume) = &entry.backend else {
+        return None;
+    };
+    let suffix = if norm == entry.host_target {
+        ""
+    } else {
+        norm.strip_prefix(entry.host_target.as_str())
+            .and_then(|tail| tail.strip_prefix('/'))
+            .unwrap_or("")
+    };
+    let backend_path = if suffix.is_empty() {
+        String::from("/")
+    } else {
+        normalize_path(&alloc::format!("/{}", suffix))
+    };
+    Some((volume.clone(), backend_path))
+}
+
+fn vfat_metadata_for_path(path: &str) -> Option<Result<vfat::VfatMetadata, SysErrNo>> {
+    mounted_vfat_backend(path).map(|(volume, backend_path)| volume.metadata(&backend_path))
+}
+
+fn parent_vfat_metadata_for_path(path: &str) -> Option<Result<vfat::VfatMetadata, SysErrNo>> {
+    vfat_metadata_for_path(&parent_path(path))
+}
+
+fn ext4_lookup_path(path: &str) -> String {
+    mounted_ext4_backend_path(path).unwrap_or_else(|| normalize_path(path))
+}
+
 fn symlink_target_path(link_path: &str, target: &str) -> String {
     if target.starts_with('/') {
         normalize_path(target)
@@ -138,19 +229,22 @@ fn symlink_target_path(link_path: &str, target: &str) -> String {
 fn resolve_final_symlink(path: &str, nofollow: bool) -> Result<String, SysErrNo> {
     let mut current = normalize_path(path);
     for _ in 0..40 {
-        if let Some(target) = MEM_FS.lock().get_symlink(&current) {
-            if nofollow {
-                return Err(SysErrNo::ELOOP);
+        let ext_current = ext4_lookup_path(&current);
+        if mounted_ext4_backend_path(&current).is_none() {
+            if let Some(target) = MEM_FS.lock().get_symlink(&current) {
+                if nofollow {
+                    return Err(SysErrNo::ELOOP);
+                }
+                current = symlink_target_path(&current, &target);
+                continue;
             }
-            current = symlink_target_path(&current, &target);
-            continue;
         }
-        match ext4_vol::lookup_kind(&current) {
+        match ext4_vol::lookup_kind(&ext_current) {
             Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if nofollow => {
                 return Err(SysErrNo::ELOOP);
             }
             Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => {
-                current = ext4_vol::resolve_symlinks(&current)?;
+                current = ext4_vol::resolve_symlinks(&ext_current)?;
                 continue;
             }
             _ => return Ok(current),
@@ -249,11 +343,56 @@ fn is_dev_zero_path(path: &str) -> bool {
     matches!(path, "/dev/zero" | "/glibc/dev/zero" | "/musl/dev/zero")
 }
 
+fn local_device_path(path: &str) -> &str {
+    for root in ["/glibc", "/musl"] {
+        if let Some(tail) = path.strip_prefix(root) {
+            if tail.is_empty() {
+                return "/";
+            }
+            if tail.starts_with('/') {
+                return tail;
+            }
+        }
+    }
+    path
+}
+
+fn block_device_minor(path: &str) -> Option<u32> {
+    block_dev::minor_for_path(local_device_path(path))
+}
+
 fn metadata_for_char_device(path: &str, major: u32, minor: u32) -> VfsMetadata {
     let mut meta = synthetic_metadata(path, VfsNodeKind::Other, S_IFCHR | 0o666, 0, 1);
     meta.rdev_major = major;
     meta.rdev_minor = minor;
     meta
+}
+
+fn metadata_for_block_device(path: &str, minor: u32) -> VfsMetadata {
+    let mut meta = synthetic_metadata(path, VfsNodeKind::Other, S_IFBLK | 0o600, 0, 1);
+    meta.rdev_major = block_dev::DEV_VIRTIO_BLK_MAJOR;
+    meta.rdev_minor = minor;
+    meta
+}
+
+fn metadata_from_vfat(path: &str, meta: vfat::VfatMetadata) -> VfsMetadata {
+    synthetic_metadata(
+        path,
+        if meta.is_dir {
+            VfsNodeKind::Directory
+        } else {
+            VfsNodeKind::Regular
+        },
+        if meta.is_dir {
+            S_IFDIR | 0o755
+        } else if meta.readonly {
+            S_IFREG | 0o444
+        } else {
+            S_IFREG | 0o644
+        },
+        meta.size as u64,
+        1,
+    )
 }
 
 fn default_mem_metadata(mode: u32) -> MemNodeMetadata {
@@ -275,6 +414,9 @@ fn metadata_for_mem_file(
     }
     if is_dev_zero_path(name) {
         return metadata_for_char_device(name, DEV_ZERO_MAJOR, DEV_ZERO_MINOR);
+    }
+    if let Some(minor) = block_device_minor(name) {
+        return metadata_for_block_device(name, minor);
     }
     let mut meta = synthetic_metadata(
         name,
@@ -341,8 +483,15 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
     if is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
     }
+    if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
+        return volume
+            .metadata(&backend_path)
+            .map(|meta| metadata_from_vfat(&norm, meta));
+    }
+    let ext_norm = ext4_lookup_path(&norm);
+    let mounted_ext4 = mounted_ext4_backend_path(&norm).is_some();
 
-    {
+    if !mounted_ext4 {
         let mem = MEM_FS.lock();
         if mem.is_dir(&norm) {
             let entries = mem.list_dir(&norm)?;
@@ -392,12 +541,12 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
         }
     }
 
-    let ext_path = match ext4_vol::lookup_kind(&norm) {
+    let ext_path = match ext4_vol::lookup_kind(&ext_norm) {
         Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
-            ext4_vol::resolve_symlinks(&norm)?
+            ext4_vol::resolve_symlinks(&ext_norm)?
         }
         Some((_ino, kind)) => {
-            let meta = ext4_vol::metadata(&norm)?;
+            let meta = ext4_vol::metadata(&ext_norm)?;
             let mut out = metadata_from_ext4(meta);
             out.kind = kind_from_ext4(kind);
             return Ok(out);
@@ -406,6 +555,174 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
     };
 
     ext4_vol::metadata(&ext_path).map(metadata_from_ext4)
+}
+
+fn mount_record_line(entry: &MountEntry) -> String {
+    alloc::format!(
+        "{} {} {} rw 0 0\n",
+        entry.source,
+        entry.logical_target,
+        entry.fstype
+    )
+}
+
+fn mount_table_text() -> Vec<u8> {
+    let mounts = MOUNT_TABLE.lock();
+    let mut text = String::new();
+    for entry in mounts.iter() {
+        text.push_str(&mount_record_line(entry));
+    }
+    text.into_bytes()
+}
+
+fn refresh_mount_pseudo_files() {
+    let data = mount_table_text();
+    let now = super::FileTimes::now();
+    let mut fs = MEM_FS.lock();
+    for root in ["", "/musl", "/glibc"] {
+        let proc_mounts = alloc::format!("{}/proc/mounts", root);
+        if !fs.write_file_content(&proc_mounts, data.clone(), now) {
+            fs.add_file(&proc_mounts, data.clone());
+        }
+        let etc_mtab = alloc::format!("{}/etc/mtab", root);
+        if !fs.write_file_content(&etc_mtab, data.clone(), now) {
+            fs.add_file(&etc_mtab, data.clone());
+        }
+    }
+}
+
+pub fn refresh_block_device_nodes() {
+    let devices = block_dev::list_device_paths();
+    if devices.is_empty() {
+        return;
+    }
+    let mut fs = MEM_FS.lock();
+    for dev in devices {
+        for root in ["", "/musl", "/glibc"] {
+            let path = alloc::format!("{}{}", root, dev);
+            fs.add_file(&path, Vec::new());
+        }
+    }
+}
+
+fn validate_mount_source(source: &str) -> Result<(), SysErrNo> {
+    let meta = metadata(source, true)?;
+    if meta.kind != VfsNodeKind::Other
+        || meta.rdev_major != block_dev::DEV_VIRTIO_BLK_MAJOR
+        || block_device_minor(source) != Some(meta.rdev_minor)
+    {
+        return Err(SysErrNo::ENOTBLK);
+    }
+    if block_dev::range_for_path(local_device_path(source)).is_none() {
+        return Err(SysErrNo::ENODEV);
+    }
+    if block_dev::is_root_source(local_device_path(source)) {
+        return Err(SysErrNo::EBUSY);
+    }
+    Ok(())
+}
+
+fn resolve_mount_backend(
+    source: &str,
+    fstype: &str,
+) -> Result<(String, MountBackend), SysErrNo> {
+    match fstype {
+        "vfat" | "fat" | "msdos" => {
+            let range = block_dev::range_for_path(local_device_path(source))
+                .ok_or(SysErrNo::ENODEV)?;
+            let volume = vfat::VfatVolume::open(range)?;
+            Ok((String::from("vfat"), MountBackend::Vfat(Arc::new(volume))))
+        }
+        // Non-root ext4 mounts need an independent ext4 volume object. Until
+        // that exists, accepting ext4 here would alias the root filesystem.
+        "ext4" => Err(SysErrNo::ENODEV),
+        _ => Err(SysErrNo::ENODEV),
+    }
+}
+
+pub fn init_mount_table() {
+    let mut mounts = MOUNT_TABLE.lock();
+    mounts.clear();
+    let fstype = if ext4_vol::is_ext4_mounted() {
+        "ext4"
+    } else {
+        "tmpfs"
+    };
+    mounts.push(MountEntry {
+        source: String::from("rootfs"),
+        logical_target: String::from("/"),
+        host_target: String::from("/"),
+        fstype: String::from(fstype),
+        backend: MountBackend::Root,
+    });
+    drop(mounts);
+    refresh_mount_pseudo_files();
+}
+
+pub fn mount_fs(
+    source: &str,
+    logical_target: &str,
+    host_target: &str,
+    fstype: &str,
+    flags: usize,
+) -> Result<(), SysErrNo> {
+    let source = normalize_path(source);
+    let logical_target = normalize_path(logical_target);
+    let host_target = normalize_path(host_target);
+    if flags != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if !ext4_vol::is_ext4_mounted() {
+        return Err(SysErrNo::ENODEV);
+    }
+    validate_mount_source(&source)?;
+    let (backend_fstype, backend) = resolve_mount_backend(&source, fstype)?;
+    let target_meta = metadata(&host_target, true)?;
+    if target_meta.kind != VfsNodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    ext4_vol::metadata("/")?;
+
+    let mut mounts = MOUNT_TABLE.lock();
+    if mounts.iter().any(|entry| entry.host_target == host_target) {
+        return Err(SysErrNo::EBUSY);
+    }
+    mounts.push(MountEntry {
+        source,
+        logical_target,
+        host_target,
+        fstype: backend_fstype,
+        backend,
+    });
+    drop(mounts);
+    refresh_mount_pseudo_files();
+    Ok(())
+}
+
+pub fn umount_fs(logical_target: &str, host_target: &str, flags: usize) -> Result<(), SysErrNo> {
+    const MNT_FORCE: usize = 1;
+    const MNT_DETACH: usize = 2;
+    const MNT_EXPIRE: usize = 4;
+    const UMOUNT_NOFOLLOW: usize = 8;
+    if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let logical_target = normalize_path(logical_target);
+    let host_target = normalize_path(host_target);
+    let mut mounts = MOUNT_TABLE.lock();
+    let Some(index) = mounts.iter().rposition(|entry| {
+        entry.logical_target == logical_target && entry.host_target == host_target
+    }) else {
+        return Err(SysErrNo::EINVAL);
+    };
+    if mounts[index].logical_target == "/" {
+        return Err(SysErrNo::EBUSY);
+    }
+    mounts.remove(index);
+    drop(mounts);
+    refresh_mount_pseudo_files();
+    Ok(())
 }
 
 pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrNo> {
@@ -667,12 +984,17 @@ pub fn read_file(name: &str) -> Option<Vec<u8>> {
     if is_removed(&norm) {
         return None;
     }
-    let m = MEM_FS.lock();
-    if let Some(f) = m.get_file(&norm) {
-        return Some(f.content.clone());
+    if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
+        return volume.read_file(&backend_path).ok();
     }
-    drop(m);
-    ext4_vol::slurp_regular_file(&norm)
+    if mounted_ext4_backend_path(&norm).is_none() {
+        let m = MEM_FS.lock();
+        if let Some(f) = m.get_file(&norm) {
+            return Some(f.content.clone());
+        }
+        drop(m);
+    }
+    ext4_vol::slurp_regular_file(&ext4_lookup_path(&norm))
 }
 
 fn is_elf_image(data: &[u8]) -> bool {
@@ -689,12 +1011,23 @@ pub fn read_executable_file(name: &str) -> Option<Vec<u8>> {
         return None;
     }
 
-    let mem_data = MEM_FS.lock().get_file(&norm).map(|f| f.content.clone());
+    if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
+        return volume
+            .read_file(&backend_path)
+            .ok()
+            .filter(|data| is_elf_image(data));
+    }
+
+    let mem_data = if mounted_ext4_backend_path(&norm).is_none() {
+        MEM_FS.lock().get_file(&norm).map(|f| f.content.clone())
+    } else {
+        None
+    };
     if mem_data.as_ref().is_some_and(|data| is_elf_image(data)) {
         return mem_data;
     }
 
-    let ext4_data = ext4_vol::slurp_regular_file(&norm);
+    let ext4_data = ext4_vol::slurp_regular_file(&ext4_lookup_path(&norm));
     if let Some(data) = ext4_data {
         if is_elf_image(&data) {
             if mem_data.is_some() {
@@ -761,14 +1094,19 @@ pub fn file_exists(name: &str) -> bool {
     if is_removed(&norm) {
         return false;
     }
-    {
+    if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
+        return volume
+            .metadata(&backend_path)
+            .is_ok_and(|meta| !meta.is_dir);
+    }
+    if mounted_ext4_backend_path(&norm).is_none() {
         let mem = MEM_FS.lock();
         if mem.get_file(&norm).is_some() || mem.get_symlink(&norm).is_some() {
             return true;
         }
     }
     matches!(
-        ext4_vol::lookup_kind(&norm),
+        ext4_vol::lookup_kind(&ext4_lookup_path(&norm)),
         Some((
             _,
             ext4_vol::Ext4NodeKind::Regular
@@ -783,11 +1121,32 @@ pub fn dir_exists(name: &str) -> bool {
     if is_removed(&norm) {
         return false;
     }
-    MEM_FS.lock().is_dir(&norm) || ext4_vol::ext4_dir_path_exists(&norm)
+    if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
+        return volume
+            .metadata(&backend_path)
+            .is_ok_and(|meta| meta.is_dir);
+    }
+    mounted_ext4_backend_path(&norm).is_some()
+        || MEM_FS.lock().is_dir(&norm)
+        || ext4_vol::ext4_dir_path_exists(&ext4_lookup_path(&norm))
+}
+
+fn path_uses_ext4(path: &str) -> bool {
+    let norm = normalize_path(path);
+    if !ext4_vol::is_ext4_mounted() {
+        return false;
+    }
+    if mounted_ext4_backend_path(&norm).is_some() || ext4_vol::lookup_kind(&norm).is_some() {
+        return true;
+    }
+    MOUNT_TABLE
+        .lock()
+        .iter()
+        .any(|entry| entry.fstype == "ext4" && path_is_under(&norm, &entry.host_target))
 }
 
 pub fn filesystem_magic() -> usize {
-    if ext4_vol::is_ext4_mounted() {
+    if path_uses_ext4("/") {
         0xef53
     } else {
         0x0102_1994
@@ -813,7 +1172,43 @@ fn mem_statfs() -> VfsStatFs {
     }
 }
 
-fn current_statfs() -> VfsStatFs {
+fn vfat_statfs() -> VfsStatFs {
+    VfsStatFs {
+        f_type: 0x4d44,
+        f_bsize: 512,
+        f_blocks: 0,
+        f_bfree: 0,
+        f_bavail: 0,
+        f_files: 0,
+        f_ffree: 0,
+        f_namelen: 255,
+        f_frsize: 512,
+        f_flags: 1,
+    }
+}
+
+fn current_statfs(use_ext4: bool) -> VfsStatFs {
+    if use_ext4 {
+        if let Some(info) = ext4_vol::statfs_info() {
+            return VfsStatFs {
+                f_type: 0xef53,
+                f_bsize: info.block_size,
+                f_blocks: info.blocks,
+                f_bfree: info.free_blocks,
+                f_bavail: info.free_blocks,
+                f_files: info.files,
+                f_ffree: info.free_files,
+                f_namelen: info.max_name_len,
+                f_frsize: info.block_size,
+                f_flags: 0,
+            };
+        }
+    }
+    mem_statfs()
+}
+
+#[cfg(any())]
+fn old_current_statfs_unused() -> VfsStatFs {
     if let Some(info) = ext4_vol::statfs_info() {
         return VfsStatFs {
             f_type: 0xef53,
@@ -833,12 +1228,31 @@ fn current_statfs() -> VfsStatFs {
 
 pub fn statfs_for_path(path: &str) -> Result<VfsStatFs, SysErrNo> {
     metadata(path, true)?;
-    Ok(current_statfs())
+    if mounted_vfat_backend(path).is_some() {
+        return Ok(vfat_statfs());
+    }
+    Ok(current_statfs(path_uses_ext4(path)))
 }
 
 pub fn statfs_for_fd(file: &fd::FileDescriptor) -> Result<VfsStatFs, SysErrNo> {
     metadata_for_fd(file)?;
-    Ok(current_statfs())
+    let use_ext4 = matches!(
+        file,
+        fd::FileDescriptor::Ext4Regular { .. } | fd::FileDescriptor::Ext4Dir { .. }
+    ) || match file {
+        fd::FileDescriptor::MemFile { name, .. } => path_uses_ext4(name),
+        fd::FileDescriptor::MemDir { path, .. } => path_uses_ext4(path),
+        _ => false,
+    };
+    let use_vfat = match file {
+        fd::FileDescriptor::MemFile { name, .. } => mounted_vfat_backend(name).is_some(),
+        fd::FileDescriptor::MemDir { path, .. } => mounted_vfat_backend(path).is_some(),
+        _ => false,
+    };
+    if use_vfat {
+        return Ok(vfat_statfs());
+    }
+    Ok(current_statfs(use_ext4))
 }
 
 pub fn sync_fd(file: &fd::FileDescriptor, data_only: bool) -> Result<(), SysErrNo> {
@@ -857,6 +1271,14 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
     }
     if norm == "/" {
         return Err(SysErrNo::EISDIR);
+    }
+    if let Some(meta) = vfat_metadata_for_path(&norm) {
+        let meta = meta?;
+        return if meta.is_dir {
+            Err(SysErrNo::EISDIR)
+        } else {
+            Err(SysErrNo::EROFS)
+        };
     }
     {
         let mut m = MEM_FS.lock();
@@ -888,6 +1310,14 @@ pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
     if norm == "/" {
         return Err(SysErrNo::EBUSY);
     }
+    if let Some(meta) = vfat_metadata_for_path(&norm) {
+        let meta = meta?;
+        return if meta.is_dir {
+            Err(SysErrNo::EROFS)
+        } else {
+            Err(SysErrNo::ENOTDIR)
+        };
+    }
     {
         let mut m = MEM_FS.lock();
         if m.get_file(&norm).is_some() || m.get_symlink(&norm).is_some() {
@@ -918,6 +1348,18 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
     let new = normalize_path(new);
     if is_removed(&old) {
         return Err(SysErrNo::ENOENT);
+    }
+    if let Some(meta) = vfat_metadata_for_path(&old) {
+        meta?;
+        return Err(SysErrNo::EROFS);
+    }
+    if let Some(parent_meta) = parent_vfat_metadata_for_path(&new) {
+        let parent_meta = parent_meta?;
+        return if parent_meta.is_dir {
+            Err(SysErrNo::EROFS)
+        } else {
+            Err(SysErrNo::ENOTDIR)
+        };
     }
     if no_replace && (file_exists(&new) || dir_exists(&new)) {
         return Err(SysErrNo::EEXIST);
@@ -976,6 +1418,18 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
     if is_removed(&old) {
         return Err(SysErrNo::ENOENT);
     }
+    if let Some(meta) = vfat_metadata_for_path(&old) {
+        meta?;
+        return Err(SysErrNo::EXDEV);
+    }
+    if let Some(parent_meta) = parent_vfat_metadata_for_path(&new) {
+        let parent_meta = parent_meta?;
+        return if parent_meta.is_dir {
+            Err(SysErrNo::EROFS)
+        } else {
+            Err(SysErrNo::ENOTDIR)
+        };
+    }
     if file_exists(&new) || dir_exists(&new) {
         return Err(SysErrNo::EEXIST);
     }
@@ -1006,6 +1460,14 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EEXIST);
     }
     let parent = parent_path(&norm);
+    if let Some(parent_meta) = vfat_metadata_for_path(&parent) {
+        let parent_meta = parent_meta?;
+        return if parent_meta.is_dir {
+            Err(SysErrNo::EROFS)
+        } else {
+            Err(SysErrNo::ENOTDIR)
+        };
+    }
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
@@ -1033,6 +1495,10 @@ pub fn read_link(path: &str) -> Result<String, SysErrNo> {
     if is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
     }
+    if let Some(meta) = vfat_metadata_for_path(&norm) {
+        meta?;
+        return Err(SysErrNo::EINVAL);
+    }
     if MEM_FS.lock().exists(&norm) {
         if let Some(target) = MEM_FS.lock().get_symlink(&norm) {
             return Ok(target);
@@ -1048,6 +1514,14 @@ pub fn read_link(path: &str) -> Result<String, SysErrNo> {
 
 pub fn truncate_path(path: &str, size: u64) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
+    if let Some(meta) = vfat_metadata_for_path(&norm) {
+        let meta = meta?;
+        return if meta.is_dir {
+            Err(SysErrNo::EISDIR)
+        } else {
+            Err(SysErrNo::EROFS)
+        };
+    }
     {
         let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) {
@@ -1074,6 +1548,10 @@ pub fn truncate_fd(file: &mut fd::FileDescriptor, size: u64) -> Result<(), SysEr
 
 pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
+    if let Some(meta) = vfat_metadata_for_path(&norm) {
+        meta?;
+        return Err(SysErrNo::EROFS);
+    }
     {
         let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) || mem.get_file(&norm).is_some() {
@@ -1108,6 +1586,10 @@ pub fn set_owner_path(
     gid: Option<u32>,
 ) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
+    if let Some(meta) = vfat_metadata_for_path(&norm) {
+        meta?;
+        return Err(SysErrNo::EROFS);
+    }
     {
         let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) || mem.get_file(&norm).is_some() {
@@ -1146,6 +1628,10 @@ pub fn set_times_path(
     mtime: Option<(isize, isize)>,
 ) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
+    if let Some(meta) = vfat_metadata_for_path(&norm) {
+        meta?;
+        return Err(SysErrNo::EROFS);
+    }
     {
         let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) {
@@ -1191,6 +1677,14 @@ pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
     }
     clear_whiteout(&norm);
     let parent = parent_path(&norm);
+    if let Some(parent_meta) = vfat_metadata_for_path(&parent) {
+        let parent_meta = parent_meta?;
+        return if parent_meta.is_dir {
+            Err(SysErrNo::EROFS)
+        } else {
+            Err(SysErrNo::ENOTDIR)
+        };
+    }
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
@@ -1219,6 +1713,14 @@ pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
     }
     clear_whiteout(&norm);
     let parent = parent_path(&norm);
+    if let Some(parent_meta) = vfat_metadata_for_path(&parent) {
+        let parent_meta = parent_meta?;
+        return if parent_meta.is_dir {
+            Err(SysErrNo::EROFS)
+        } else {
+            Err(SysErrNo::ENOTDIR)
+        };
+    }
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
@@ -1239,6 +1741,14 @@ fn open_dir_descriptor(
     host_path: &str,
     logical_path: &str,
 ) -> Result<fd::FileDescriptor, SysErrNo> {
+    if let Some((volume, backend_path)) = mounted_vfat_backend(host_path) {
+        let entries = volume.list_dir(&backend_path)?;
+        return Ok(fd::FileDescriptor::MemDir {
+            path: logical_path.into(),
+            entries,
+            offset: 0,
+        });
+    }
     if MEM_FS.lock().is_dir(host_path) {
         let entries = list_dir(host_path)?;
         return Ok(fd::FileDescriptor::MemDir {
@@ -1266,20 +1776,25 @@ fn path_exists_non_dir(path: &str) -> bool {
     if is_removed(&norm) {
         return false;
     }
+    if let Some(meta) = vfat_metadata_for_path(&norm) {
+        return meta.is_ok_and(|meta| !meta.is_dir);
+    }
+    let ext_norm = ext4_lookup_path(&norm);
+    let mounted = mounted_ext4_backend_path(&norm).is_some();
     {
         let mem = MEM_FS.lock();
-        if mem.get_file(&norm).is_some() {
+        if !mounted && mem.get_file(&norm).is_some() {
             return true;
         }
-        if mem.get_symlink(&norm).is_some() {
+        if !mounted && mem.get_symlink(&norm).is_some() {
             return true;
         }
-        if mem.is_dir(&norm) {
+        if !mounted && mem.is_dir(&norm) {
             return false;
         }
     }
     matches!(
-        ext4_vol::lookup_kind(&norm),
+        ext4_vol::lookup_kind(&ext_norm),
         Some((
             _,
             ext4_vol::Ext4NodeKind::Regular
@@ -1343,8 +1858,37 @@ pub fn open_path(
     } else {
         path_norm.clone()
     };
-    let mem_has_file = MEM_FS.lock().get_file(&open_norm).is_some();
-    let ext_path_norm = open_norm.clone();
+    if let Some((volume, backend_path)) = mounted_vfat_backend(&open_norm) {
+        if want_create || want_trunc || write_ok {
+            return Err(SysErrNo::EROFS);
+        }
+        let meta = volume.metadata(&backend_path)?;
+        if want_dir && !meta.is_dir {
+            return Err(SysErrNo::ENOTDIR);
+        }
+        if meta.is_dir {
+            let entries = volume.list_dir(&backend_path)?;
+            return Ok(fd::FileDescriptor::MemDir {
+                path: logical_norm,
+                entries,
+                offset: 0,
+            });
+        }
+        let data = volume.read_file(&backend_path)?;
+        return Ok(fd::FileDescriptor::MemFile {
+            name: open_norm,
+            content: fd::MemFileContent::from_slice(&data),
+            times: super::FileTimes::now(),
+            offset: 0,
+            readable: read_ok,
+            writable: false,
+            append: false,
+            linked: false,
+        });
+    }
+    let mounted_ext4 = mounted_ext4_backend_path(&open_norm).is_some();
+    let mem_has_file = !mounted_ext4 && MEM_FS.lock().get_file(&open_norm).is_some();
+    let ext_path_norm = ext4_lookup_path(&open_norm);
 
     if mem_has_file {
         if want_dir {
@@ -1384,11 +1928,13 @@ pub fn open_path(
         });
     }
 
-    if MEM_FS.lock().is_dir(&open_norm) || ext4_vol::ext4_dir_path_exists(&ext_path_norm) {
+    if (!mounted_ext4 && MEM_FS.lock().is_dir(&open_norm))
+        || ext4_vol::ext4_dir_path_exists(&ext_path_norm)
+    {
         if write_ok || want_trunc || want_create {
             return Err(SysErrNo::EISDIR);
         }
-        let open_path = if MEM_FS.lock().is_dir(&open_norm) {
+        let open_path = if !mounted_ext4 && MEM_FS.lock().is_dir(&open_norm) {
             open_norm.clone()
         } else {
             ext_path_norm.clone()
@@ -1439,8 +1985,9 @@ pub fn open_path(
 
     if want_create {
         let parent = parent_path(&open_norm);
-        let mem_parent = MEM_FS.lock().is_dir(&parent);
-        let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+        let parent_mounted_ext4 = mounted_ext4_backend_path(&parent).is_some();
+        let mem_parent = !parent_mounted_ext4 && MEM_FS.lock().is_dir(&parent);
+        let ext_parent = ext4_vol::ext4_dir_path_exists(&ext4_lookup_path(&parent));
         if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
             MEM_FS
                 .lock()
@@ -1463,7 +2010,8 @@ pub fn open_path(
             });
         }
         if ext_parent {
-            let ino = ext4_vol::create_regular_ext4_with_mode(&open_norm, mode)?;
+            let create_path = ext4_lookup_path(&open_norm);
+            let ino = ext4_vol::create_regular_ext4_with_mode(&create_path, mode)?;
             clear_whiteout(&open_norm);
             ext4_vol::open_regular_ino(ino);
             return Ok(fd::FileDescriptor::Ext4Regular {
@@ -1503,15 +2051,20 @@ pub fn open_path(
 
 pub fn list_dir(path: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
     let norm = normalize_path(path);
+    if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
+        return volume.list_dir(&backend_path);
+    }
+    let ext_norm = ext4_lookup_path(&norm);
+    let mounted_ext4 = mounted_ext4_backend_path(&norm).is_some();
 
-    let mem_dir = MEM_FS.lock().is_dir(&norm);
+    let mem_dir = !mounted_ext4 && MEM_FS.lock().is_dir(&norm);
     let mem_entries: Vec<fd::DirEntryRecord> = if mem_dir {
         MEM_FS.lock().list_dir(&norm)?
     } else {
         Vec::new()
     };
 
-    let ext_dir = ext4_vol::is_ext4_mounted() && ext4_vol::ext4_dir_path_exists(&norm);
+    let ext_dir = ext4_vol::is_ext4_mounted() && ext4_vol::ext4_dir_path_exists(&ext_norm);
 
     if !mem_dir && !ext_dir {
         let m = MEM_FS.lock();
@@ -1519,7 +2072,7 @@ pub fn list_dir(path: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
             return Err(SysErrNo::ENOTDIR);
         }
         drop(m);
-        if ext4_vol::is_ext4_mounted() && ext4_vol::ext4_file_path_exists(&norm) {
+        if ext4_vol::is_ext4_mounted() && ext4_vol::ext4_file_path_exists(&ext_norm) {
             return Err(SysErrNo::ENOTDIR);
         }
         return Err(SysErrNo::ENOENT);
@@ -1530,11 +2083,11 @@ pub fn list_dir(path: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
         map.insert(e.name.clone(), e);
     }
     if ext_dir {
-        for (name, is_dir) in ext4_vol::ext4_list_dir(&norm)? {
-            let child = if norm == "/" {
+        for (name, is_dir) in ext4_vol::ext4_list_dir(&ext_norm)? {
+            let child = if ext_norm == "/" {
                 alloc::format!("/{}", name)
             } else {
-                alloc::format!("{}/{}", norm, name)
+                alloc::format!("{}/{}", ext_norm, name)
             };
             if is_removed(&child) {
                 continue;

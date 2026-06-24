@@ -8,6 +8,7 @@ LIBCTEST ?= 0
 IOZONE ?= 1
 LMBENCH ?= 1
 LTP ?= 0
+FOCUSED_LTP_CASES ?= writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03
 RUSTUP_TOOLCHAIN ?= $(shell sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null | head -n 1)
 ifeq ($(strip $(RUSTUP_TOOLCHAIN)),)
     # Keep judge builds on the repository-pinned compiler. Falling back to the
@@ -53,17 +54,22 @@ ifeq ($(LTP),1)
 else
     LTP_EXTRA :=
 endif
+ifneq ($(strip $(LTP_CASES)),)
+    LTP_CASES_ENV := LTP_CASES="$(LTP_CASES)"
+else
+    LTP_CASES_ENV :=
+endif
 NO_PRELOAD_PATTERN := _testcode\.sh|busybox_cmd\.txt|testcase busybox
 
 .PHONY: all build clean check check-sdcard check-kernel-no-preload prepare-cargo-config unpack-sdcard print-phase2-gate
 all:
 	@echo "Building for RISC-V..."
-	$(MAKE) ARCH=riscv64 build INIT=$(INIT) LOG=$(LOG)
+	$(MAKE) ARCH=riscv64 build INIT=$(INIT) LOG=$(LOG) LTP=1 LTP_CASES=$(FOCUSED_LTP_CASES)
 	cp target/riscv64gc-unknown-none-elf/release/wll_OS kernel-rv
 	$(MAKE) check-kernel-no-preload
 	@echo "RISC-V build done: kernel-rv"
 	@echo "Building for LoongArch..."
-	$(MAKE) ARCH=loongarch64 build INIT=$(INIT) LOG=$(LOG)
+	$(MAKE) ARCH=loongarch64 build INIT=$(INIT) LOG=$(LOG) LTP=1 LTP_CASES=$(FOCUSED_LTP_CASES)
 	cp target/loongarch64-unknown-none/release/wll_OS kernel-la
 	@echo "LoongArch build done: kernel-la"
 
@@ -141,13 +147,13 @@ build:
 	@echo "Building kernel for $(ARCH)..."
 	$(MAKE) prepare-cargo-config
 	@if [ "$(DEV_PRELOAD)" = "1" ]; then $(MAKE) check-sdcard ARCH=$(ARCH); fi
-	cd os && cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
+	cd os && $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
 
 # 快速检查（不做链接，更快，适合开发阶段验证代码）
 check:
 	@echo "Checking kernel for $(ARCH)..."
 	$(MAKE) prepare-cargo-config
-	cd os && cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
+	cd os && $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
 
 check-kernel-no-preload:
 	@if [ ! -f kernel-rv ]; then \

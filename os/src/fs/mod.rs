@@ -1,20 +1,22 @@
 /// 内存文件系统实现
 ///
 /// 提供一个简单的基于内存的文件系统，用于支持用户程序加载和基本文件操作
+pub mod block_dev;
 pub mod ext4_vol;
 pub mod fd;
 pub mod vfs;
+pub mod vfat;
 
 #[allow(unused_imports)]
 pub use vfs::{
     check_access, check_access_with_effective, check_fd_access, check_fd_access_with_effective,
     check_metadata_access, check_metadata_access_with_effective, create_dir, create_dir_with_mode,
     create_regular_file, create_symlink, dir_exists, file_exists, filesystem_magic, is_removed,
-    link_path, list_dir, list_files, metadata, metadata_for_fd, open_path, read_executable_file,
-    read_file, read_interpreter, read_link, remove_dir, remove_file, rename_path, set_mode_fd,
-    set_mode_path, set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd,
-    statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path, VfsMetadata, VfsNodeKind,
-    VfsStatFs,
+    link_path, list_dir, list_files, metadata, metadata_for_fd, mount_fs, open_path,
+    read_executable_file, read_file, read_interpreter, read_link, refresh_block_device_nodes,
+    remove_dir, remove_file, rename_path, set_mode_fd, set_mode_path, set_owner_fd,
+    set_owner_path, set_times_fd, set_times_path, statfs_for_fd, statfs_for_path, sync_all,
+    sync_fd, truncate_fd, truncate_path, umount_fs, VfsMetadata, VfsNodeKind, VfsStatFs,
 };
 
 use alloc::collections::BTreeMap;
@@ -579,6 +581,8 @@ pub fn init() {
     log::info!("[fs] Initializing memory filesystem...");
     preload_generated_programs();
     init_pseudo_files();
+    vfs::refresh_block_device_nodes();
+    vfs::init_mount_table();
     install_busybox_shell_aliases();
 }
 

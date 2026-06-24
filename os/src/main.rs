@@ -304,7 +304,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     #[cfg(target_arch = "riscv64")]
     {
         use crate::drivers::virtio_mmio_blk;
-        use crate::fs::ext4_vol;
+        use crate::fs::{block_dev, ext4_vol};
         putchar(b'[');
         putchar(b'V');
         putchar(b'I');
@@ -350,7 +350,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             putchar(b'.');
             putchar(b'.');
             putchar(b'\n');
-            ext4_vol::mount_block_device(device);
+            let root_device = block_dev::register_virtio_disk(device);
+            ext4_vol::mount_block_device(root_device);
             putchar(b'[');
             putchar(b'E');
             putchar(b'X');
@@ -408,7 +409,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         early_la_line(b"[VIRTIO] Probing...\n");
         if let Some(dev) = crate::drivers::virtio_pci_blk::probe_pci_virtio_blk() {
             early_la_line(b"[VIRTIO] found\n");
-            crate::fs::ext4_vol::mount_block_device(dev);
+            let root_device = crate::fs::block_dev::register_virtio_disk(dev);
+            crate::fs::ext4_vol::mount_block_device(root_device);
             early_la_line(b"[EXT4] mounted successfully\n");
         } else {
             early_la_line(b"[VIRTIO] not found\n");

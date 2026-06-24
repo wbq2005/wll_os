@@ -1251,6 +1251,18 @@ fn ensure_busybox_applet_alias(root: &str, busybox_data: &[u8], applet: &str) ->
     Some(())
 }
 
+fn prepare_lmbench_helpers(root: &str) {
+    let lmbench_host = crate::fs::apply_root(root, "/lmbench_all");
+    if !crate::fs::file_exists(&lmbench_host) {
+        return;
+    }
+
+    let helper_host = crate::fs::apply_root(root, "/code/lmbench_src/bin/build/lmbench_all");
+    let mut fs = crate::fs::MEM_FS.lock();
+    fs.add_dir(&crate::fs::apply_root(root, "/code/lmbench_src/bin/build"));
+    let _ = fs.add_symlink(&helper_host, "../../../../lmbench_all");
+}
+
 fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunchError> {
     let (root, logical_script) =
         logical_path_for_script(script_path).ok_or(ScriptLaunchError::InvalidPath)?;
@@ -1272,6 +1284,9 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
     for applet in applets {
         ensure_busybox_applet_alias(&root, &busybox_data, applet)
             .ok_or(ScriptLaunchError::MissingApplet(applet))?;
+    }
+    if testcode_stem(&logical_script).and_then(TestGroup::from_stem) == Some(TestGroup::Lmbench) {
+        prepare_lmbench_helpers(&root);
     }
 
     let mut envp = alloc::vec![

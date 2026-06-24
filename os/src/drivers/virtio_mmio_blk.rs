@@ -3,16 +3,15 @@
 
 use alloc::sync::Arc;
 use alloc::vec;
-use alloc::vec::Vec;
 use core::ptr::NonNull;
 
-use ext4_rs::BlockDevice;
-use ext4_rs::BLOCK_SIZE as EXT4_BLOCK_SIZE;
 use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 use virtio_drivers::transport::{DeviceType, Transport};
 
 use crate::drivers::hal::VirtHal;
+use crate::fs::block_dev::RawBlockDevice;
+use crate::utils::error::SysErrNo;
 
 unsafe fn dtb_totalsize(dtb: usize) -> Option<usize> {
     let mag = unsafe { *(dtb as *const u32) };
@@ -100,28 +99,23 @@ impl VirtioMmioBlock {
     }
 }
 
-impl BlockDevice for VirtioMmioBlock {
-    fn read_offset(&self, offset: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; EXT4_BLOCK_SIZE];
-        if self.read_phys(offset, &mut buf).is_err() {
-            log::warn!("[virtio] read_offset failed @{:#x}", offset);
-        }
-        buf
+impl RawBlockDevice for VirtioMmioBlock {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), SysErrNo> {
+        self.read_phys(offset, buf).map_err(|_| SysErrNo::EIO)
     }
 
-    fn write_offset(&self, offset: usize, data: &[u8]) {
-        if self.write_phys(offset, data).is_err() {
-            log::warn!(
-                "[virtio] write_offset failed @{:#x}, len {}",
-                offset,
-                data.len()
-            );
-        }
+    fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), SysErrNo> {
+        self.write_phys(offset, data).map_err(|_| SysErrNo::EIO)
+    }
+
+    fn size_bytes(&self) -> Option<usize> {
+        let sectors = self.blk.lock().capacity();
+        (sectors as usize).checked_mul(SECTOR_SIZE)
     }
 }
 
 /// 枚举 DTB 中兼容 `virtio,mmio` 的节点并附着第一块 virtio-blk。
-pub unsafe fn probe_first_virtio_disk_from_dt(dtb_ptr: usize) -> Option<Arc<dyn BlockDevice>> {
+pub unsafe fn probe_first_virtio_disk_from_dt(dtb_ptr: usize) -> Option<Arc<dyn RawBlockDevice>> {
     let tot = dtb_totalsize(dtb_ptr)?;
     let blob = unsafe { core::slice::from_raw_parts(dtb_ptr as *const u8, tot) };
     let Ok(fdt) = flat_device_tree::Fdt::new(blob) else {
@@ -152,7 +146,7 @@ pub unsafe fn probe_first_virtio_disk_from_dt(dtb_ptr: usize) -> Option<Arc<dyn 
         log::info!("[virtio] Trying virtio,mmio @ {:#x}", mmio_pa);
         unsafe {
             if let Some(dev) = VirtioMmioBlock::attach(mmio_pa) {
-                let arc: Arc<dyn BlockDevice> = Arc::new(dev);
+                let arc: Arc<dyn RawBlockDevice> = Arc::new(dev);
                 log::info!("[virtio] Successfully attached virtio blk @ {:#x}", mmio_pa);
                 return Some(arc);
             }

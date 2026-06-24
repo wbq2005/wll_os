@@ -219,6 +219,10 @@ fn read_user_cstr(ptr: *const u8) -> Result<String, SysErrNo> {
     super::user::read_cstr_null_empty(ptr as usize)
 }
 
+fn read_user_path(ptr: *const u8) -> Result<String, SysErrNo> {
+    super::user::read_path_cstr(ptr as usize)
+}
+
 pub(crate) fn proc_self_exe_target(path: &str) -> Result<Option<String>, SysErrNo> {
     if path != "/proc/self/exe" && path != "/proc/thread-self/exe" {
         return Ok(None);
@@ -452,7 +456,7 @@ fn setup_user_stack_with_credentials(
 ///
 /// 加载并执行新程序
 pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallRet {
-    let path_str = read_user_cstr(path)?;
+    let path_str = read_user_path(path)?;
     log::info!("[syscall] execve(path='{}')", path_str);
 
     // 在替换地址空间之前，从旧地址空间读取 argv/envp

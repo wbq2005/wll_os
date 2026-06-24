@@ -6,16 +6,15 @@
 
 use alloc::sync::Arc;
 use alloc::vec;
-use alloc::vec::Vec;
 
-use ext4_rs::BlockDevice;
-use ext4_rs::BLOCK_SIZE as EXT4_BLOCK_SIZE;
 use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
 use virtio_drivers::transport::pci::bus::{BarInfo, Cam, Command, MemoryBarType, PciRoot};
 use virtio_drivers::transport::pci::{virtio_device_type, PciTransport};
 use virtio_drivers::transport::{DeviceType, Transport};
 
 use crate::drivers::hal::{phys_to_virt_mmio, VirtHal};
+use crate::fs::block_dev::RawBlockDevice;
+use crate::utils::error::SysErrNo;
 
 /// QEMU LoongArch virt: PCI ECAM 物理基址
 /// 参考: 2331 loongarch64-qemu-virt.toml  pci-ecam-base = 0x2000_0000
@@ -100,30 +99,25 @@ impl VirtioPciBlock {
 
 /// BlockDevice impl 与 riscv64 的 VirtioMmioBlock 保持同构
 /// 参考: os_contest/os/src/drivers/virtio_mmio_blk.rs (riscv64 接口形状)
-impl BlockDevice for VirtioPciBlock {
-    fn read_offset(&self, offset: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; EXT4_BLOCK_SIZE];
-        if self.read_phys(offset, &mut buf).is_err() {
-            log::warn!("[virtio-pci] read_offset failed @{:#x}", offset);
-        }
-        buf
+impl RawBlockDevice for VirtioPciBlock {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), SysErrNo> {
+        self.read_phys(offset, buf).map_err(|_| SysErrNo::EIO)
     }
 
-    fn write_offset(&self, offset: usize, data: &[u8]) {
-        if self.write_phys(offset, data).is_err() {
-            log::warn!(
-                "[virtio-pci] write_offset failed @{:#x}, len {}",
-                offset,
-                data.len()
-            );
-        }
+    fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), SysErrNo> {
+        self.write_phys(offset, data).map_err(|_| SysErrNo::EIO)
+    }
+
+    fn size_bytes(&self) -> Option<usize> {
+        let sectors = self.blk.lock().capacity();
+        (sectors as usize).checked_mul(SECTOR_SIZE)
     }
 }
 
 /// 枚举 PCI 总线 0，找到第一个 VirtIO Block 设备并返回。
 ///
 /// 参考: T202510008995695-2720-master/os/src/drivers/virtio/blk.rs (enumerate_pci)
-pub fn probe_pci_virtio_blk() -> Option<Arc<dyn BlockDevice>> {
+pub fn probe_pci_virtio_blk() -> Option<Arc<dyn RawBlockDevice>> {
     let ecam_virt = phys_to_virt_mmio(PCI_ECAM_PHYS);
     log::info!(
         "[virtio-pci] Enumerating PCI bus, ECAM phys {:#x} virt {:p}",
