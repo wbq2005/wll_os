@@ -18,7 +18,7 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 - FD/VFS 与 IPC：常用文件、目录、pipe、poll/select、pseudo device、部分 socket loopback 与 ext4 写入路径。
 - 内存与同步：`brk`、匿名/文件 `mmap`、`munmap`、`mprotect`、SysV shm、futex、robust list 的可用子集。
 - 信号与身份：`rt_sig*`、`kill/tkill/tgkill`、UID/GID、supplementary groups、部分权限检查。
-- 评测路径：`basic`、`busybox`、`lua`、`libc-test`、`iozone`、`libcbench`、`lmbench`。bounded LTP slice 仅作为外部诊断探针，不进入默认提交路径。
+- 评测路径：`basic`、`busybox`、`lua`、`libc-test`、`iozone`、`libcbench`、`lmbench`，以及 `all` profile 中的 bounded LTP slice。
 
 更细的 syscall 状态、剩余风险和 suite 边界见 [docs/syscall-matrix.md](docs/syscall-matrix.md)。
 
@@ -37,14 +37,14 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 | `LIBCTEST` | `0` | 完整 libc-test 收集器为 opt-in |
 | `DEV_PRELOAD` | `0` | 默认不把测试脚本预载进 kernel |
 
-`scripts/perf_baseline_runner.py --suite all` 不打开 `LTP=1`，只覆盖默认提交路径中的 iozone/libcbench/lmbench。当前 bounded LTP group 只通过 `--suite ltp` 作为外部诊断探针运行。
+`scripts/perf_baseline_runner.py --suite all` 会打开 `LTP=1`，在 iozone/libcbench/lmbench 后追加当前 bounded LTP slice。`--suite ltp` 仍可作为只跑 LTP slice 的聚焦诊断入口。
 
 ### Bounded LTP slice
 
 当前 LTP 不是完整 suite 启用，而是一个明确收口的 case 列表：
 
 ```text
-writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01
+writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03
 ```
 
 该 slice 覆盖真实 `writev`、UID/GID 与 supplementary groups、fsuid/fsgid 状态、`access(2)` 权限检查、以及 `open(O_NOATIME)` 的所有者/权限路径。后续扩展应继续按子系统逐步增加，不应把 full LTP script 当作已经可用的整体能力。
@@ -133,7 +133,7 @@ python scripts/perf_baseline_runner.py --arch loongarch64 --suite all --runs 1 -
 
 | Profile | 用途 |
 | --- | --- |
-| `all` | iozone + libcbench + lmbench，不含 LTP |
+| `all` | iozone + libcbench + lmbench + 当前 bounded LTP case list |
 | `all-lmbench` | iozone + libcbench + lmbench 的兼容别名/聚焦路径，不含 LTP |
 | `iozone` | 仅跑 iozone group |
 | `libcbench` | 仅跑 libcbench group |
