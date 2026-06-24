@@ -1298,6 +1298,9 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
     if trace_commands {
         envp.push(String::from("PS4=[harness] CMD "));
     }
+    if testcode_stem(&logical_script).and_then(TestGroup::from_stem) == Some(TestGroup::Lmbench) {
+        envp.push(String::from("ENOUGH=5000"));
+    }
 
     let mut argv = alloc::vec![busybox_path.clone(), String::from("sh")];
     if trace_commands {
