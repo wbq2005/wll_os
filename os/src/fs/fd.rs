@@ -1185,6 +1185,31 @@ impl FileDescriptor {
         }
     }
 
+    pub fn allocate(&mut self, offset: usize, len: usize, keep_size: bool) -> Result<(), SysErrNo> {
+        if len == 0 {
+            return Err(SysErrNo::EINVAL);
+        }
+        let end = Self::checked_file_end(offset, len)?;
+        match self {
+            FileDescriptor::MemFile { .. } | FileDescriptor::Ext4Regular { .. } => {
+                let current_size = self.size();
+                let target_size = if keep_size {
+                    current_size
+                } else {
+                    end.max(current_size)
+                };
+                self.truncate(target_size)?;
+                Ok(())
+            }
+            FileDescriptor::MemDir { .. } | FileDescriptor::Ext4Dir { .. } => Err(SysErrNo::EISDIR),
+            FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
+            FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
+                Err(SysErrNo::ESPIPE)
+            }
+            _ => Err(SysErrNo::EINVAL),
+        }
+    }
+
     pub fn sync(&self, _data_only: bool) -> Result<(), SysErrNo> {
         match self {
             FileDescriptor::Ext4Regular { ino, .. } => ext4_vol::flush_cached_ino(*ino),

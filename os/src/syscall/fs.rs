@@ -31,6 +31,8 @@ const F_DUPFD_CLOEXEC: usize = 1030;
 const FIONREAD: usize = 0x541B;
 const FIONBIO: usize = 0x5421;
 
+const FALLOC_FL_KEEP_SIZE: usize = 0x01;
+
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EACCESS: usize = 0x200;
 const UTIME_NOW: isize = 0x3fffffff;
@@ -2569,4 +2571,22 @@ pub fn sys_write_kernel(fd: usize, buf: &[u8]) -> SyscallRet {
         }
         _ => Err(SysErrNo::EBADF),
     }
+}
+
+pub fn sys_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> SyscallRet {
+    if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+        return Err(SysErrNo::EOPNOTSUPP);
+    }
+    if offset > isize::MAX as usize || len > isize::MAX as usize {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let mut fds = inner.fd_table.lock();
+    let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+    super::with_kernel_page_table(|| {
+        file_desc.allocate(offset, len, mode & FALLOC_FL_KEEP_SIZE != 0)
+    })?;
+    Ok(0)
 }

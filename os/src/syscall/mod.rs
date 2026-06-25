@@ -63,6 +63,7 @@ pub const SYSCALL_LSEEK: usize = 62;
 pub const SYSCALL_SENDFILE: usize = 71;
 pub const SYSCALL_TRUNCATE: usize = 45;
 pub const SYSCALL_FTRUNCATE: usize = 46;
+pub const SYSCALL_FALLOCATE: usize = 47;
 pub const SYSCALL_PSELECT6: usize = 72;
 pub const SYSCALL_PPOLL: usize = 73;
 pub const SYSCALL_READLINKAT: usize = 78;
@@ -231,6 +232,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_SENDFILE => fs::sys_sendfile(args[0], args[1], args[2], args[3]),
         SYSCALL_TRUNCATE => fs::sys_truncate(args[0] as *const u8, args[1]),
         SYSCALL_FTRUNCATE => fs::sys_ftruncate(args[0], args[1]),
+        SYSCALL_FALLOCATE => fs::sys_fallocate(args[0], args[1], args[2], args[3]),
         SYSCALL_FCHMOD => fs::sys_fchmod(args[0], args[1] as u32),
         SYSCALL_FCHMODAT => {
             fs::sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32)
