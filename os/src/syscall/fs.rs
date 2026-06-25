@@ -15,6 +15,12 @@ const AT_FDCWD: isize = -100;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_NO_AUTOMOUNT: usize = 0x800;
 const AT_STATX_SYNC_TYPE: usize = 0x6000;
+const S_IFMT: u32 = 0o170000;
+const S_IFIFO: u32 = 0o010000;
+const S_IFCHR: u32 = 0o020000;
+const S_IFBLK: u32 = 0o060000;
+const S_IFREG: u32 = 0o100000;
+const S_IFSOCK: u32 = 0o140000;
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -522,9 +528,7 @@ fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
         let res = {
             let mut fds = fd_table.lock();
             match fds.get_mut(fd) {
-                Some(file_desc) => {
-                    read_fd_into_kernel(file_desc, &mut kbuf[..want])
-                }
+                Some(file_desc) => read_fd_into_kernel(file_desc, &mut kbuf[..want]),
                 None => Err(SysErrNo::EBADF),
             }
         };
@@ -1009,9 +1013,7 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
         FileDescriptor::Ext4Dir { .. } => {
             fd::open_flags::O_RDONLY as usize | fd::open_flags::O_DIRECTORY as usize
         }
-        FileDescriptor::Path { flags, .. } => {
-            (flags & !fd::open_flags::O_CLOEXEC) as usize
-        }
+        FileDescriptor::Path { flags, .. } => (flags & !fd::open_flags::O_CLOEXEC) as usize,
         FileDescriptor::PipeRead { nonblock, .. } => {
             let mut flags = fd::open_flags::O_RDONLY as usize;
             if *nonblock {
@@ -1139,6 +1141,40 @@ pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let mode = mode & !task.fs.lock().umask;
     super::with_kernel_page_table(|| crate::fs::create_dir_with_mode(&host_path, mode))?;
+    Ok(0)
+}
+
+pub fn sys_mknodat(dirfd: isize, pathname: *const u8, mode: u32, _dev: usize) -> SyscallRet {
+    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let permissions = mode & 0o7777 & !task.fs.lock().umask;
+    match mode & S_IFMT {
+        0 | S_IFREG => {
+            super::with_kernel_page_table(|| {
+                crate::fs::create_regular_file(&host_path, permissions)
+            })?;
+        }
+        S_IFIFO => {
+            super::with_kernel_page_table(|| {
+                crate::fs::create_special_node(
+                    &host_path,
+                    crate::fs::MemSpecialKind::Fifo,
+                    permissions,
+                )
+            })?;
+        }
+        S_IFSOCK => {
+            super::with_kernel_page_table(|| {
+                crate::fs::create_special_node(
+                    &host_path,
+                    crate::fs::MemSpecialKind::Socket,
+                    permissions,
+                )
+            })?;
+        }
+        S_IFCHR | S_IFBLK => return Err(SysErrNo::EPERM),
+        _ => return Err(SysErrNo::EINVAL),
+    }
     Ok(0)
 }
 
@@ -1350,9 +1386,7 @@ fn readlink_target_at(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
         return match file_desc {
             FileDescriptor::Path {
-                host_path,
-                flags,
-                ..
+                host_path, flags, ..
             } if (flags & fd::open_flags::O_NOFOLLOW) != 0 => {
                 super::with_kernel_page_table(|| crate::fs::read_link(host_path))
             }
@@ -1572,9 +1606,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
             let res = {
                 let mut fds = fd_table.lock();
                 match fds.get_mut(fd) {
-                    Some(file_desc) => {
-                        read_fd_into_kernel(file_desc, &mut kbuf[..count])
-                    }
+                    Some(file_desc) => read_fd_into_kernel(file_desc, &mut kbuf[..count]),
                     None => Err(SysErrNo::EBADF),
                 }
             };
@@ -1655,9 +1687,7 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
             let res = {
                 let mut fds = fd_table.lock();
                 match fds.get_mut(fd) {
-                    Some(file_desc) => {
-                        write_fd_from_kernel(file_desc, &kbuf[written..])
-                    }
+                    Some(file_desc) => write_fd_from_kernel(file_desc, &kbuf[written..]),
                     None => Err(SysErrNo::EBADF),
                 }
             };

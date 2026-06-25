@@ -4,19 +4,20 @@
 pub mod block_dev;
 pub mod ext4_vol;
 pub mod fd;
-pub mod vfs;
 pub mod vfat;
+pub mod vfs;
 
 #[allow(unused_imports)]
 pub use vfs::{
     check_access, check_access_with_effective, check_fd_access, check_fd_access_with_effective,
     check_metadata_access, check_metadata_access_with_effective, create_dir, create_dir_with_mode,
-    create_regular_file, create_symlink, dir_exists, file_exists, filesystem_magic, is_removed,
-    link_path, list_dir, list_files, metadata, metadata_for_fd, metadata_for_lookup, mount_fs,
-    open_path, read_executable_file, read_file, read_interpreter, read_link,
-    refresh_block_device_nodes, remove_dir, remove_file, rename_path, set_mode_fd, set_mode_path,
-    set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd, statfs_for_path,
-    sync_all, sync_fd, truncate_fd, truncate_path, umount_fs, VfsMetadata, VfsNodeKind, VfsStatFs,
+    create_regular_file, create_special_node, create_symlink, dir_exists, file_exists,
+    filesystem_magic, is_removed, link_path, list_dir, list_files, metadata, metadata_for_fd,
+    metadata_for_lookup, mount_fs, open_path, read_executable_file, read_file, read_interpreter,
+    read_link, refresh_block_device_nodes, remove_dir, remove_file, rename_path, set_mode_fd,
+    set_mode_path, set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd,
+    statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path, umount_fs, VfsMetadata,
+    VfsNodeKind, VfsStatFs,
 };
 
 use alloc::collections::BTreeMap;
@@ -58,6 +59,12 @@ impl MemNodeMetadata {
             gid: credentials.fsgid,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemSpecialKind {
+    Fifo,
+    Socket,
 }
 
 fn is_elf_content(content: &[u8]) -> bool {
@@ -121,6 +128,7 @@ pub struct MemFile {
     pub name: String,
     pub content: FileContent,
     pub times: FileTimes,
+    link_key: String,
 }
 
 impl MemFile {
@@ -129,14 +137,20 @@ impl MemFile {
             name: String::from(name),
             content,
             times: FileTimes::now(),
+            link_key: String::from(name),
         }
     }
 
     pub fn with_times(name: &str, content: Vec<u8>, times: FileTimes) -> Self {
+        Self::with_link_key(name, content, times, String::from(name))
+    }
+
+    fn with_link_key(name: &str, content: Vec<u8>, times: FileTimes, link_key: String) -> Self {
         Self {
             name: String::from(name),
             content,
             times,
+            link_key,
         }
     }
 
@@ -150,6 +164,7 @@ pub struct MemFileSystem {
     files: Vec<MemFile>,
     dirs: Vec<String>,
     symlinks: BTreeMap<String, String>,
+    specials: BTreeMap<String, MemSpecialKind>,
     metadata: BTreeMap<String, MemNodeMetadata>,
 }
 
@@ -161,6 +176,7 @@ impl MemFileSystem {
             files: Vec::new(),
             dirs: vec!["/".to_string()],
             symlinks: BTreeMap::new(),
+            specials: BTreeMap::new(),
             metadata,
         }
     }
@@ -169,8 +185,13 @@ impl MemFileSystem {
     pub fn add_file(&mut self, name: &str, content: Vec<u8>) {
         let name = normalize_path(name);
         self.ensure_parent_dirs(&name);
-        let mode = if is_elf_content(&content) { 0o777 } else { 0o666 };
+        let mode = if is_elf_content(&content) {
+            0o777
+        } else {
+            0o666
+        };
         self.symlinks.remove(&name);
+        self.specials.remove(&name);
 
         // 如果文件已存在，先删除
         self.files.retain(|f| f.name != name);
@@ -188,9 +209,20 @@ impl MemFileSystem {
 
     pub fn write_file_content(&mut self, name: &str, content: Vec<u8>, times: FileTimes) -> bool {
         let name = normalize_path(name);
-        if let Some(file) = self.files.iter_mut().find(|f| f.name == name) {
-            file.content = content;
-            file.times = times;
+        if let Some(link_key) = self
+            .files
+            .iter()
+            .find(|file| file.name == name)
+            .map(|file| file.link_key.clone())
+        {
+            for file in self
+                .files
+                .iter_mut()
+                .filter(|file| file.link_key == link_key)
+            {
+                file.content = content.clone();
+                file.times = times;
+            }
             true
         } else {
             false
@@ -202,6 +234,7 @@ impl MemFileSystem {
         let name = normalize_path(name);
         self.ensure_parent_dirs(&name);
         self.symlinks.remove(&name);
+        self.specials.remove(&name);
         if !self.dirs.iter().any(|dir| dir == &name) {
             self.dirs.push(name.clone());
             log::info!("[fs] Added directory '{}'", name);
@@ -231,6 +264,26 @@ impl MemFileSystem {
         Ok(())
     }
 
+    pub fn add_special_with_mode(
+        &mut self,
+        name: &str,
+        kind: MemSpecialKind,
+        mode: u32,
+    ) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        let parent = parent_path(&name);
+        if !self.is_dir(&parent) {
+            return Err(SysErrNo::ENOENT);
+        }
+        if self.exists(&name) {
+            return Err(SysErrNo::EEXIST);
+        }
+        self.specials.insert(name.clone(), kind);
+        self.metadata
+            .insert(name, MemNodeMetadata::new_for_current(mode));
+        Ok(())
+    }
+
     /// 获取文件
     pub fn get_file(&self, name: &str) -> Option<&MemFile> {
         let name = normalize_path(name);
@@ -242,12 +295,18 @@ impl MemFileSystem {
         self.symlinks.get(&name).cloned()
     }
 
+    pub fn get_special(&self, name: &str) -> Option<MemSpecialKind> {
+        let name = normalize_path(name);
+        self.specials.get(&name).copied()
+    }
+
     /// 检查文件是否存在
     pub fn exists(&self, name: &str) -> bool {
         let name = normalize_path(name);
         self.files.iter().any(|f| f.name == name)
             || self.dirs.iter().any(|dir| dir == &name)
             || self.symlinks.contains_key(&name)
+            || self.specials.contains_key(&name)
     }
 
     pub fn is_dir(&self, name: &str) -> bool {
@@ -258,6 +317,32 @@ impl MemFileSystem {
     pub fn metadata(&self, name: &str) -> Option<MemNodeMetadata> {
         let name = normalize_path(name);
         self.metadata.get(&name).copied()
+    }
+
+    pub fn file_link_count(&self, name: &str) -> u32 {
+        let name = normalize_path(name);
+        let Some(link_key) = self
+            .files
+            .iter()
+            .find(|file| file.name == name)
+            .map(|file| file.link_key.as_str())
+        else {
+            return 1;
+        };
+        self.files
+            .iter()
+            .filter(|file| file.link_key == link_key)
+            .count()
+            .max(1)
+            .min(u32::MAX as usize) as u32
+    }
+
+    pub fn file_link_key(&self, name: &str) -> Option<String> {
+        let name = normalize_path(name);
+        self.files
+            .iter()
+            .find(|file| file.name == name)
+            .map(|file| file.link_key.clone())
     }
 
     /// 列出所有文件
@@ -274,11 +359,16 @@ impl MemFileSystem {
             .len()
             .saturating_add(self.dirs.len())
             .saturating_add(self.symlinks.len())
+            .saturating_add(self.specials.len())
     }
 
     pub fn total_file_bytes(&self) -> usize {
         self.files.iter().map(|f| f.content.len()).sum::<usize>()
-            + self.symlinks.values().map(|target| target.len()).sum::<usize>()
+            + self
+                .symlinks
+                .values()
+                .map(|target| target.len())
+                .sum::<usize>()
     }
 
     pub fn list_dir(&self, dir: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
@@ -313,6 +403,15 @@ impl MemFileSystem {
             }
         }
 
+        for special in self.specials.keys() {
+            if let Some(name) = child_name(&dir, special) {
+                entries.push(fd::DirEntryRecord {
+                    name,
+                    is_dir: false,
+                });
+            }
+        }
+
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
@@ -323,7 +422,8 @@ impl MemFileSystem {
         self.files.retain(|file| file.name != name);
         let removed_file = before != self.files.len();
         let removed_link = self.symlinks.remove(&name).is_some();
-        if !removed_file && !removed_link {
+        let removed_special = self.specials.remove(&name).is_some();
+        if !removed_file && !removed_link && !removed_special {
             return Err(SysErrNo::ENOENT);
         }
         self.metadata.remove(&name);
@@ -342,10 +442,11 @@ impl MemFileSystem {
             .files
             .iter()
             .any(|file| is_descendant(&name, &file.name))
+            || self.symlinks.keys().any(|link| is_descendant(&name, link))
             || self
-                .symlinks
+                .specials
                 .keys()
-                .any(|link| is_descendant(&name, link))
+                .any(|special| is_descendant(&name, special))
             || self
                 .dirs
                 .iter()
@@ -389,13 +490,33 @@ impl MemFileSystem {
                     file.name = alloc::format!("{}{}", new, suffix);
                 }
             }
+            let special_updates: Vec<(String, String, MemSpecialKind)> = self
+                .specials
+                .iter()
+                .filter_map(|(path, kind)| {
+                    if is_descendant(&old, path) {
+                        let suffix = path.strip_prefix(&old).unwrap_or("");
+                        Some((path.clone(), alloc::format!("{}{}", new, suffix), *kind))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (old_path, new_path, kind) in special_updates {
+                self.specials.remove(&old_path);
+                self.specials.insert(new_path, kind);
+            }
             let link_updates: Vec<(String, String, String)> = self
                 .symlinks
                 .iter()
                 .filter_map(|(path, target)| {
                     if is_descendant(&old, path) {
                         let suffix = path.strip_prefix(&old).unwrap_or("");
-                        Some((path.clone(), alloc::format!("{}{}", new, suffix), target.clone()))
+                        Some((
+                            path.clone(),
+                            alloc::format!("{}{}", new, suffix),
+                            target.clone(),
+                        ))
                     } else {
                         None
                     }
@@ -406,6 +527,25 @@ impl MemFileSystem {
                 self.symlinks.insert(new_path, target);
             }
             self.rename_metadata_tree(&old, &new);
+            return Ok(());
+        }
+
+        if let Some(kind) = self.specials.remove(&old) {
+            if self.is_dir(&new) {
+                self.specials.insert(old, kind);
+                return Err(SysErrNo::EISDIR);
+            }
+            self.files.retain(|file| file.name != new);
+            self.symlinks.remove(&new);
+            self.specials.remove(&new);
+            let metadata = self
+                .metadata
+                .get(&old)
+                .copied()
+                .unwrap_or_else(|| MemNodeMetadata::new(0o666));
+            self.metadata.remove(&old);
+            self.specials.insert(new.clone(), kind);
+            self.metadata.insert(new, metadata);
             return Ok(());
         }
 
@@ -431,14 +571,9 @@ impl MemFileSystem {
             .files
             .iter()
             .find(|file| file.name == old)
-            .map(|file| file.content.clone())
+            .map(|file| (file.content.clone(), file.times, file.link_key.clone()))
             .ok_or(SysErrNo::ENOENT)?;
-        let times = self
-            .files
-            .iter()
-            .find(|file| file.name == old)
-            .map(|file| file.times)
-            .ok_or(SysErrNo::ENOENT)?;
+        let (content, times, link_key) = content;
         if self.is_dir(&new) {
             return Err(SysErrNo::EISDIR);
         }
@@ -450,25 +585,85 @@ impl MemFileSystem {
         self.files
             .retain(|file| file.name != old && file.name != new);
         self.symlinks.remove(&new);
-        self.files.push(MemFile::with_times(&new, content, times));
+        self.specials.remove(&new);
+        self.files
+            .push(MemFile::with_link_key(&new, content, times, link_key));
         self.metadata.remove(&old);
         self.metadata.insert(new, metadata);
         Ok(())
     }
 
+    pub fn link_path(&mut self, old: &str, new: &str) -> Result<(), SysErrNo> {
+        let old = normalize_path(old);
+        let new = normalize_path(new);
+        if self.is_dir(&old) {
+            return Err(SysErrNo::EPERM);
+        }
+        if self.exists(&new) {
+            return Err(SysErrNo::EEXIST);
+        }
+        let parent = parent_path(&new);
+        if !self.is_dir(&parent) {
+            return Err(SysErrNo::ENOENT);
+        }
+
+        if let Some(file) = self.files.iter().find(|file| file.name == old) {
+            let metadata = self
+                .metadata
+                .get(&old)
+                .copied()
+                .unwrap_or_else(|| MemNodeMetadata::new(0o666));
+            self.files.push(MemFile::with_link_key(
+                &new,
+                file.content.clone(),
+                file.times,
+                file.link_key.clone(),
+            ));
+            self.metadata.insert(new, metadata);
+            return Ok(());
+        }
+
+        if let Some(target) = self.symlinks.get(&old).cloned() {
+            let metadata = self
+                .metadata
+                .get(&old)
+                .copied()
+                .unwrap_or_else(|| MemNodeMetadata::new(0o777));
+            self.symlinks.insert(new.clone(), target);
+            self.metadata.insert(new, metadata);
+            return Ok(());
+        }
+
+        if let Some(kind) = self.specials.get(&old).copied() {
+            let metadata = self
+                .metadata
+                .get(&old)
+                .copied()
+                .unwrap_or_else(|| MemNodeMetadata::new(0o666));
+            self.specials.insert(new.clone(), kind);
+            self.metadata.insert(new, metadata);
+            return Ok(());
+        }
+
+        Err(SysErrNo::ENOENT)
+    }
+
     pub fn truncate_file(&mut self, name: &str, new_len: usize) -> Result<(), SysErrNo> {
         let name = normalize_path(name);
-        let file = self
+        let link_key = self
             .files
-            .iter_mut()
+            .iter()
             .find(|f| f.name == name)
+            .map(|f| f.link_key.clone())
             .ok_or(SysErrNo::ENOENT)?;
-        file.content.resize(new_len, 0);
         let now = FileTimes::now();
-        file.times.mtime_sec = now.mtime_sec;
-        file.times.mtime_nsec = now.mtime_nsec;
-        file.times.ctime_sec = now.ctime_sec;
-        file.times.ctime_nsec = now.ctime_nsec;
+        for file in self.files.iter_mut().filter(|f| f.link_key == link_key) {
+            file.content.resize(new_len, 0);
+            file.times.mtime_sec = now.mtime_sec;
+            file.times.mtime_nsec = now.mtime_nsec;
+            file.times.ctime_sec = now.ctime_sec;
+            file.times.ctime_nsec = now.ctime_nsec;
+        }
         Ok(())
     }
 
@@ -479,12 +674,15 @@ impl MemFileSystem {
         mtime: Option<(isize, isize)>,
     ) -> Result<(), SysErrNo> {
         let name = normalize_path(name);
-        let file = self
+        let link_key = self
             .files
-            .iter_mut()
+            .iter()
             .find(|f| f.name == name)
+            .map(|f| f.link_key.clone())
             .ok_or(SysErrNo::ENOENT)?;
-        file.times.set_access_modify(atime, mtime);
+        for file in self.files.iter_mut().filter(|f| f.link_key == link_key) {
+            file.times.set_access_modify(atime, mtime);
+        }
         Ok(())
     }
 
@@ -600,6 +798,7 @@ pub fn init() {
 fn init_pseudo_files() {
     let mounts = b"rootfs / ext4 rw 0 0\n";
     let meminfo = b"MemTotal:       131072 kB\nMemFree:         65536 kB\nMemAvailable:    65536 kB\nBuffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\nSwapFree:            0 kB\n";
+    let cpuinfo = b"processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imac\n";
     let proc_self_status = b"Name:\twll_OS\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nMems_allowed:\t1\nMems_allowed_list:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n";
     let passwd =
         b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n";
@@ -639,6 +838,7 @@ fn init_pseudo_files() {
             &alloc::format!("{}/proc/self/status", root),
             proc_self_status.to_vec(),
         );
+        fs.add_file(&alloc::format!("{}/proc/cpuinfo", root), cpuinfo.to_vec());
         fs.add_file(&alloc::format!("{}/etc/mtab", root), mounts.to_vec());
         fs.add_file(
             &alloc::format!("{}/etc/localtime", root),
