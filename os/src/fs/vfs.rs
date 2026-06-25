@@ -14,6 +14,7 @@ use super::{block_dev, ext4_vol, vfat};
 use super::{normalize_path, MemNodeMetadata, MemSpecialKind, MEM_FS};
 
 const S_IFDIR: u32 = 0o040000;
+const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFBLK: u32 = 0o060000;
@@ -429,8 +430,14 @@ fn local_device_path(path: &str) -> &str {
     path
 }
 
+fn device_numbers(path: &str) -> Option<(u32, u32)> {
+    block_dev::device_numbers_for_path(local_device_path(path))
+}
+
 fn block_device_minor(path: &str) -> Option<u32> {
-    block_dev::minor_for_path(local_device_path(path))
+    device_numbers(path)
+        .filter(|(major, _)| *major == block_dev::DEV_VIRTIO_BLK_MAJOR)
+        .map(|(_, minor)| minor)
 }
 
 fn procfs_link_source(path: &str) -> bool {
@@ -449,6 +456,13 @@ fn metadata_for_char_device(path: &str, major: u32, minor: u32) -> VfsMetadata {
 fn metadata_for_block_device(path: &str, minor: u32) -> VfsMetadata {
     let mut meta = synthetic_metadata(path, VfsNodeKind::Other, S_IFBLK | 0o600, 0, 1);
     meta.rdev_major = block_dev::DEV_VIRTIO_BLK_MAJOR;
+    meta.rdev_minor = minor;
+    meta
+}
+
+fn metadata_for_block_device_number(path: &str, major: u32, minor: u32) -> VfsMetadata {
+    let mut meta = synthetic_metadata(path, VfsNodeKind::Other, S_IFBLK | 0o600, 0, 1);
+    meta.rdev_major = major;
     meta.rdev_minor = minor;
     meta
 }
@@ -495,8 +509,11 @@ fn metadata_for_mem_file(
     if is_dev_zero_path(name) {
         return metadata_for_char_device(name, DEV_ZERO_MAJOR, DEV_ZERO_MINOR);
     }
-    if let Some(minor) = block_device_minor(name) {
-        return metadata_for_block_device(name, minor);
+    if let Some((major, minor)) = device_numbers(name) {
+        if major == block_dev::DEV_LOOP_CONTROL_MAJOR {
+            return metadata_for_char_device(name, major, minor);
+        }
+        return metadata_for_block_device_number(name, major, minor);
     }
     let mut meta = synthetic_metadata(
         ino_key,
@@ -731,6 +748,11 @@ pub fn refresh_block_device_nodes() {
         return;
     }
     let mut fs = MEM_FS.lock();
+    for root in ["", "/musl", "/glibc"] {
+        fs.add_dir(&alloc::format!("{}/dev", root));
+        fs.add_dir(&alloc::format!("{}/dev/loop", root));
+        fs.add_dir(&alloc::format!("{}/dev/block", root));
+    }
     for dev in devices {
         for root in ["", "/musl", "/glibc"] {
             let path = alloc::format!("{}{}", root, dev);
@@ -741,16 +763,17 @@ pub fn refresh_block_device_nodes() {
 
 fn validate_mount_source(source: &str) -> Result<(), SysErrNo> {
     let meta = metadata(source, true)?;
+    let local = local_device_path(source);
     if meta.kind != VfsNodeKind::Other
-        || meta.rdev_major != block_dev::DEV_VIRTIO_BLK_MAJOR
-        || block_device_minor(source) != Some(meta.rdev_minor)
+        || (meta.mode & S_IFMT) != S_IFBLK
+        || device_numbers(source) != Some((meta.rdev_major, meta.rdev_minor))
     {
         return Err(SysErrNo::ENOTBLK);
     }
-    if block_dev::range_for_path(local_device_path(source)).is_none() {
+    if block_dev::range_for_path(local).is_none() {
         return Err(SysErrNo::ENODEV);
     }
-    if block_dev::is_root_source(local_device_path(source)) {
+    if block_dev::is_root_source(local) {
         return Err(SysErrNo::EBUSY);
     }
     Ok(())
@@ -927,6 +950,16 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
             ext4_vol::metadata_by_ino(*ino).map(metadata_from_ext4)
         }
         fd::FileDescriptor::Path { host_path, .. } => metadata(host_path, false),
+        fd::FileDescriptor::LoopControl => Ok(metadata_for_char_device(
+            "/dev/loop-control",
+            block_dev::DEV_LOOP_CONTROL_MAJOR,
+            block_dev::DEV_LOOP_CONTROL_MINOR,
+        )),
+        fd::FileDescriptor::LoopDevice { index, .. } => Ok(metadata_for_block_device_number(
+            &block_dev::loop_device_path(*index),
+            block_dev::DEV_LOOP_MAJOR,
+            *index as u32,
+        )),
         fd::FileDescriptor::PipeRead { .. } => Ok(synthetic_metadata(
             "pipe-read",
             VfsNodeKind::Other,
@@ -1384,12 +1417,14 @@ pub fn statfs_for_fd(file: &fd::FileDescriptor) -> Result<VfsStatFs, SysErrNo> {
         fd::FileDescriptor::MemFile { name, .. } => path_uses_ext4(name),
         fd::FileDescriptor::MemDir { path, .. } => path_uses_ext4(path),
         fd::FileDescriptor::Path { host_path, .. } => path_uses_ext4(host_path),
+        fd::FileDescriptor::LoopControl | fd::FileDescriptor::LoopDevice { .. } => false,
         _ => false,
     };
     let use_vfat = match file {
         fd::FileDescriptor::MemFile { name, .. } => mounted_vfat_backend(name).is_some(),
         fd::FileDescriptor::MemDir { path, .. } => mounted_vfat_backend(path).is_some(),
         fd::FileDescriptor::Path { host_path, .. } => mounted_vfat_backend(host_path).is_some(),
+        fd::FileDescriptor::LoopControl | fd::FileDescriptor::LoopDevice { .. } => false,
         _ => false,
     };
     if use_vfat {
@@ -2050,6 +2085,25 @@ fn missing_path_errno(path: &str) -> SysErrNo {
     }
 }
 
+fn open_loop_device_descriptor(
+    local_path: &str,
+    read_ok: bool,
+    write_ok: bool,
+) -> Option<Result<fd::FileDescriptor, SysErrNo>> {
+    if block_dev::loop_control_path(local_path) {
+        let _ = (read_ok, write_ok);
+        return Some(Ok(fd::FileDescriptor::LoopControl));
+    }
+    block_dev::loop_index_for_path(local_path).map(|index| {
+        Ok(fd::FileDescriptor::LoopDevice {
+            index,
+            offset: 0,
+            readable: read_ok,
+            writable: write_ok,
+        })
+    })
+}
+
 pub fn open_path(
     host_path: &str,
     logical_path: &str,
@@ -2103,6 +2157,20 @@ pub fn open_path(
     } else {
         path_norm.clone()
     };
+    if let Some(opened) =
+        open_loop_device_descriptor(local_device_path(&open_norm), read_ok, write_ok)
+    {
+        if want_dir {
+            return Err(SysErrNo::ENOTDIR);
+        }
+        if want_create || want_trunc {
+            return Err(SysErrNo::EINVAL);
+        }
+        if want_create && want_excl {
+            return Err(SysErrNo::EEXIST);
+        }
+        return opened;
+    }
     if let Some((volume, backend_path)) = mounted_vfat_backend(&open_norm) {
         if want_create || want_trunc || write_ok {
             return Err(SysErrNo::EROFS);

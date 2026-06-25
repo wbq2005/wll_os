@@ -30,6 +30,15 @@ const F_SETFL: usize = 4;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const FIONREAD: usize = 0x541B;
 const FIONBIO: usize = 0x5421;
+const LOOP_SET_FD: usize = 0x4C00;
+const LOOP_CLR_FD: usize = 0x4C01;
+const LOOP_SET_STATUS: usize = 0x4C02;
+const LOOP_GET_STATUS: usize = 0x4C03;
+const LOOP_SET_STATUS64: usize = 0x4C04;
+const LOOP_GET_STATUS64: usize = 0x4C05;
+const LOOP_CTL_GET_FREE: usize = 0x4C82;
+const BLKSSZGET: usize = 0x1268;
+const BLKGETSIZE64: usize = 0x80081272;
 
 const FALLOC_FL_KEEP_SIZE: usize = 0x01;
 
@@ -1016,6 +1025,14 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
             fd::open_flags::O_RDONLY as usize | fd::open_flags::O_DIRECTORY as usize
         }
         FileDescriptor::Path { flags, .. } => (flags & !fd::open_flags::O_CLOEXEC) as usize,
+        FileDescriptor::LoopControl => fd::open_flags::O_RDWR as usize,
+        FileDescriptor::LoopDevice {
+            readable, writable, ..
+        } => match (*readable, *writable) {
+            (true, true) => fd::open_flags::O_RDWR as usize,
+            (false, true) => fd::open_flags::O_WRONLY as usize,
+            _ => fd::open_flags::O_RDONLY as usize,
+        },
         FileDescriptor::PipeRead { nonblock, .. } => {
             let mut flags = fd::open_flags::O_RDONLY as usize;
             if *nonblock {
@@ -1927,12 +1944,108 @@ pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> SyscallRet {
     Ok(0)
 }
 
+fn loop_backing_from_fd(
+    file_desc: &FileDescriptor,
+) -> Result<crate::fs::block_dev::LoopBacking, SysErrNo> {
+    match file_desc {
+        FileDescriptor::MemFile {
+            name,
+            writable,
+            linked,
+            ..
+        } => {
+            if !*writable {
+                return Err(SysErrNo::EBADF);
+            }
+            if !*linked || crate::fs::MEM_FS.lock().get_file(name).is_none() {
+                return Err(SysErrNo::ENOENT);
+            }
+            Ok(crate::fs::block_dev::LoopBacking::MemFile { path: name.clone() })
+        }
+        FileDescriptor::Ext4Regular { ino, writable, .. } => {
+            if !*writable {
+                return Err(SysErrNo::EBADF);
+            }
+            Ok(crate::fs::block_dev::LoopBacking::Ext4Regular { ino: *ino })
+        }
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+fn loop_set_fd(index: usize, backing_fd: usize, fd_table: &fd::FileDescriptorTable) -> SyscallRet {
+    let backing = {
+        let backing_desc = fd_table.get(backing_fd).ok_or(SysErrNo::EBADF)?;
+        loop_backing_from_fd(backing_desc)?
+    };
+    crate::fs::block_dev::attach_loop(index, backing)?;
+    Ok(0)
+}
+
+fn loop_status_ioctl(index: usize, argp: usize) -> SyscallRet {
+    if !crate::fs::block_dev::loop_is_attached(index)? {
+        return Err(SysErrNo::ENXIO);
+    }
+    if argp != 0 {
+        let zero = [0u8; 232];
+        let len = zero.len().min(232);
+        super::user::copy_to_user(argp, &zero[..len])?;
+    }
+    Ok(0)
+}
+
+fn loop_device_ioctl(
+    index: usize,
+    request: usize,
+    argp: usize,
+    fd_table: &fd::FileDescriptorTable,
+) -> SyscallRet {
+    match request {
+        LOOP_SET_FD => loop_set_fd(index, argp, fd_table),
+        LOOP_CLR_FD => {
+            crate::fs::block_dev::detach_loop(index)?;
+            Ok(0)
+        }
+        LOOP_GET_STATUS | LOOP_GET_STATUS64 => loop_status_ioctl(index, argp),
+        LOOP_SET_STATUS | LOOP_SET_STATUS64 => {
+            if !crate::fs::block_dev::loop_is_attached(index)? {
+                return Err(SysErrNo::ENXIO);
+            }
+            Ok(0)
+        }
+        BLKGETSIZE64 => {
+            if argp == 0 {
+                return Err(SysErrNo::EFAULT);
+            }
+            let size = crate::fs::block_dev::loop_size(index)? as u64;
+            super::user::copy_object_to_user(argp, &size)?;
+            Ok(0)
+        }
+        BLKSSZGET => {
+            if argp == 0 {
+                return Err(SysErrNo::EFAULT);
+            }
+            let sector_size: i32 = 512;
+            super::user::copy_object_to_user(argp, &sector_size)?;
+            Ok(0)
+        }
+        _ => Err(SysErrNo::ENOTTY),
+    }
+}
+
 pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SyscallRet {
+    let request = request as u32 as usize;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
-    let mut fds = inner.fd_table.lock();
-    let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
     match file_desc {
+        FileDescriptor::LoopControl => match request {
+            LOOP_CTL_GET_FREE => crate::fs::block_dev::first_free_loop()
+                .map(|index| Ok(index))
+                .unwrap_or(Err(SysErrNo::ENODEV)),
+            _ => Err(SysErrNo::ENOTTY),
+        },
+        FileDescriptor::LoopDevice { index, .. } => loop_device_ioctl(*index, request, argp, &fds),
         FileDescriptor::Socket { state } => match request {
             FIONBIO => {
                 if argp == 0 {

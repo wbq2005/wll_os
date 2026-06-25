@@ -9,8 +9,13 @@ use spin::Mutex;
 use crate::utils::error::SysErrNo;
 
 pub const DEV_VIRTIO_BLK_MAJOR: u32 = 254;
+pub const DEV_LOOP_MAJOR: u32 = 7;
+pub const DEV_LOOP_CONTROL_MAJOR: u32 = 10;
+pub const DEV_LOOP_CONTROL_MINOR: u32 = 237;
+pub const LOOP_DEVICE_COUNT: usize = 4;
 const SECTOR_SIZE: usize = 512;
 const ROOT_DISK: &str = "/dev/vda";
+const LOOP_CONTROL: &str = "/dev/loop-control";
 
 pub trait RawBlockDevice: Send + Sync {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), SysErrNo>;
@@ -62,7 +67,11 @@ impl BlockDevice for BlockRange {
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
         if self.write_at(offset, data).is_err() {
-            log::warn!("[block] write_offset failed @{:#x}, len {}", offset, data.len());
+            log::warn!(
+                "[block] write_offset failed @{:#x}, len {}",
+                offset,
+                data.len()
+            );
         }
     }
 }
@@ -70,6 +79,7 @@ impl BlockDevice for BlockRange {
 #[derive(Clone)]
 struct RegisteredBlockDevice {
     path: String,
+    major: u32,
     minor: u32,
     range: Arc<BlockRange>,
 }
@@ -77,6 +87,11 @@ struct RegisteredBlockDevice {
 lazy_static! {
     static ref DEVICES: Mutex<Vec<RegisteredBlockDevice>> = Mutex::new(Vec::new());
     static ref ROOT_SOURCE: Mutex<String> = Mutex::new(ROOT_DISK.to_string());
+    static ref LOOP_DEVICES: Mutex<Vec<LoopDeviceState>> = Mutex::new(
+        (0..LOOP_DEVICE_COUNT)
+            .map(|_| LoopDeviceState::new())
+            .collect()
+    );
 }
 
 fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
@@ -200,6 +215,7 @@ pub fn register_virtio_disk(raw: Arc<dyn RawBlockDevice>) -> Arc<dyn BlockDevice
     let mut devices = Vec::new();
     devices.push(RegisteredBlockDevice {
         path: ROOT_DISK.to_string(),
+        major: DEV_VIRTIO_BLK_MAJOR,
         minor: 0,
         range: whole.clone(),
     });
@@ -222,6 +238,7 @@ pub fn register_virtio_disk(raw: Arc<dyn RawBlockDevice>) -> Arc<dyn BlockDevice
         }
         devices.push(RegisteredBlockDevice {
             path,
+            major: DEV_VIRTIO_BLK_MAJOR,
             minor: part.index,
             range,
         });
@@ -243,19 +260,36 @@ pub fn register_virtio_disk(raw: Arc<dyn RawBlockDevice>) -> Arc<dyn BlockDevice
 }
 
 pub fn list_device_paths() -> Vec<String> {
-    DEVICES
+    let mut paths: Vec<String> = DEVICES
         .lock()
         .iter()
         .map(|entry| entry.path.clone())
-        .collect()
+        .collect();
+    paths.push(LOOP_CONTROL.to_string());
+    for index in 0..LOOP_DEVICE_COUNT {
+        paths.push(loop_device_path(index));
+        paths.push(loop_device_alt_path(index));
+        paths.push(loop_device_block_path(index));
+    }
+    paths
 }
 
-pub fn minor_for_path(path: &str) -> Option<u32> {
+pub fn device_numbers_for_path(path: &str) -> Option<(u32, u32)> {
+    if path == LOOP_CONTROL {
+        return Some((DEV_LOOP_CONTROL_MAJOR, DEV_LOOP_CONTROL_MINOR));
+    }
+    if let Some(index) = loop_index_for_path(path) {
+        return Some((DEV_LOOP_MAJOR, index as u32));
+    }
     DEVICES
         .lock()
         .iter()
         .find(|entry| entry.path == path)
-        .map(|entry| entry.minor)
+        .map(|entry| (entry.major, entry.minor))
+}
+
+pub fn minor_for_path(path: &str) -> Option<u32> {
+    device_numbers_for_path(path).map(|(_, minor)| minor)
 }
 
 pub fn range_for_path(path: &str) -> Option<Arc<BlockRange>> {
@@ -268,4 +302,144 @@ pub fn range_for_path(path: &str) -> Option<Arc<BlockRange>> {
 
 pub fn is_root_source(path: &str) -> bool {
     *ROOT_SOURCE.lock() == path
+}
+
+#[derive(Clone, Debug)]
+pub enum LoopBacking {
+    MemFile { path: String },
+    Ext4Regular { ino: u32 },
+}
+
+#[derive(Clone, Debug)]
+struct LoopDeviceState {
+    backing: Option<LoopBacking>,
+    offset: usize,
+}
+
+impl LoopDeviceState {
+    fn new() -> Self {
+        Self {
+            backing: None,
+            offset: 0,
+        }
+    }
+}
+
+pub fn loop_control_path(path: &str) -> bool {
+    path == LOOP_CONTROL
+}
+
+pub fn loop_device_path(index: usize) -> String {
+    alloc::format!("/dev/loop{}", index)
+}
+
+pub fn loop_device_alt_path(index: usize) -> String {
+    alloc::format!("/dev/loop/{}", index)
+}
+
+pub fn loop_device_block_path(index: usize) -> String {
+    alloc::format!("/dev/block/loop{}", index)
+}
+
+pub fn loop_index_for_path(path: &str) -> Option<usize> {
+    if let Some(tail) = path.strip_prefix("/dev/loop") {
+        if !tail.is_empty() && tail.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+            return tail
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index < LOOP_DEVICE_COUNT);
+        }
+    }
+    if let Some(tail) = path.strip_prefix("/dev/loop/") {
+        return tail
+            .parse::<usize>()
+            .ok()
+            .filter(|index| *index < LOOP_DEVICE_COUNT);
+    }
+    if let Some(tail) = path.strip_prefix("/dev/block/loop") {
+        return tail
+            .parse::<usize>()
+            .ok()
+            .filter(|index| *index < LOOP_DEVICE_COUNT);
+    }
+    None
+}
+
+pub fn first_free_loop() -> Option<usize> {
+    LOOP_DEVICES
+        .lock()
+        .iter()
+        .enumerate()
+        .find_map(|(index, state)| state.backing.is_none().then_some(index))
+}
+
+pub fn loop_is_attached(index: usize) -> Result<bool, SysErrNo> {
+    LOOP_DEVICES
+        .lock()
+        .get(index)
+        .map(|state| state.backing.is_some())
+        .ok_or(SysErrNo::ENODEV)
+}
+
+pub fn attach_loop(index: usize, backing: LoopBacking) -> Result<(), SysErrNo> {
+    let mut devices = LOOP_DEVICES.lock();
+    let state = devices.get_mut(index).ok_or(SysErrNo::ENODEV)?;
+    if state.backing.is_some() {
+        return Err(SysErrNo::EBUSY);
+    }
+    if let LoopBacking::Ext4Regular { ino } = backing {
+        crate::fs::ext4_vol::open_regular_ino(ino);
+    }
+    state.backing = Some(backing);
+    state.offset = 0;
+    Ok(())
+}
+
+pub fn detach_loop(index: usize) -> Result<(), SysErrNo> {
+    let mut devices = LOOP_DEVICES.lock();
+    let state = devices.get_mut(index).ok_or(SysErrNo::ENODEV)?;
+    if state.backing.is_none() {
+        return Err(SysErrNo::ENXIO);
+    }
+    if let Some(LoopBacking::Ext4Regular { ino }) = state.backing.as_ref() {
+        crate::fs::ext4_vol::close_regular_ino(*ino);
+    }
+    state.backing = None;
+    state.offset = 0;
+    Ok(())
+}
+
+fn loop_backing(index: usize) -> Result<LoopBacking, SysErrNo> {
+    LOOP_DEVICES
+        .lock()
+        .get(index)
+        .ok_or(SysErrNo::ENODEV)?
+        .backing
+        .clone()
+        .ok_or(SysErrNo::ENXIO)
+}
+
+pub fn loop_size(index: usize) -> Result<usize, SysErrNo> {
+    match loop_backing(index)? {
+        LoopBacking::MemFile { path } => crate::fs::MEM_FS
+            .lock()
+            .get_file(&path)
+            .map(|file| file.content.len())
+            .ok_or(SysErrNo::ENOENT),
+        LoopBacking::Ext4Regular { ino } => crate::fs::ext4_vol::regular_file_size(ino),
+    }
+}
+
+pub fn loop_read_at(index: usize, offset: usize, buf: &mut [u8]) -> Result<usize, SysErrNo> {
+    match loop_backing(index)? {
+        LoopBacking::MemFile { path } => crate::fs::MEM_FS.lock().read_file_at(&path, offset, buf),
+        LoopBacking::Ext4Regular { ino } => crate::fs::ext4_vol::ext4_read_at(ino, offset, buf),
+    }
+}
+
+pub fn loop_write_at(index: usize, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {
+    match loop_backing(index)? {
+        LoopBacking::MemFile { path } => crate::fs::MEM_FS.lock().write_file_at(&path, offset, buf),
+        LoopBacking::Ext4Regular { ino } => crate::fs::ext4_vol::ext4_write_at(ino, offset, buf),
+    }
 }

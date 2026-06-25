@@ -240,6 +240,58 @@ impl MemFileSystem {
     }
 
     /// 添加目录
+    pub fn read_file_at(
+        &self,
+        name: &str,
+        offset: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SysErrNo> {
+        let name = normalize_path(name);
+        let file = self
+            .files
+            .iter()
+            .find(|file| file.name == name)
+            .ok_or(SysErrNo::ENOENT)?;
+        if offset >= file.content.len() {
+            return Ok(0);
+        }
+        Ok(file.content.read_at(offset, buf))
+    }
+
+    pub fn write_file_at(
+        &mut self,
+        name: &str,
+        offset: usize,
+        buf: &[u8],
+    ) -> Result<usize, SysErrNo> {
+        let name = normalize_path(name);
+        let link_key = self
+            .files
+            .iter()
+            .find(|file| file.name == name)
+            .map(|file| file.link_key.clone())
+            .ok_or(SysErrNo::ENOENT)?;
+        if offset.checked_add(buf.len()).ok_or(SysErrNo::EFBIG)? > isize::MAX as usize {
+            return Err(SysErrNo::EFBIG);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let now = FileTimes::now();
+        for file in self
+            .files
+            .iter_mut()
+            .filter(|file| file.link_key == link_key)
+        {
+            file.content.write_at(offset, buf);
+            file.times.mtime_sec = now.mtime_sec;
+            file.times.mtime_nsec = now.mtime_nsec;
+            file.times.ctime_sec = now.ctime_sec;
+            file.times.ctime_nsec = now.ctime_nsec;
+        }
+        Ok(buf.len())
+    }
+
     pub fn add_dir(&mut self, name: &str) {
         let name = normalize_path(name);
         self.ensure_parent_dirs(&name);
