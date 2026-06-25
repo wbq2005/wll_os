@@ -27,6 +27,7 @@ pub(crate) fn with_kernel_page_table<T>(f: impl FnOnce() -> T) -> T {
 
 /// 系统调用号定义
 pub const SYSCALL_GETCWD: usize = 17;
+pub const SYSCALL_FGETXATTR: usize = 10;
 pub const SYSCALL_DUP: usize = 23;
 pub const SYSCALL_DUP3: usize = 24;
 pub const SYSCALL_FCNTL: usize = 25;
@@ -200,6 +201,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
 
     match syscall_id {
         // 文件操作
+        SYSCALL_FGETXATTR => {
+            fs::sys_fgetxattr(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
+        }
         SYSCALL_GETCWD => fs::sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_OPENAT => fs::sys_openat(
             args[0] as isize,

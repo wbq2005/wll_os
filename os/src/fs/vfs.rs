@@ -1891,6 +1891,7 @@ pub fn set_mode_fd(file: &mut fd::FileDescriptor, mode: u32) -> Result<(), SysEr
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::set_mode_ino(*ino, mode)
         }
+        fd::FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
         _ => Err(SysErrNo::EINVAL),
     }
 }
@@ -1936,6 +1937,7 @@ pub fn set_owner_fd(
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::set_owner_ino(*ino, uid, gid)
         }
+        fd::FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
         _ => Err(SysErrNo::EINVAL),
     }
 }

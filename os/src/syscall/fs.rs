@@ -800,6 +800,33 @@ fn resolve_host_path(dirfd: isize, pathname: *const u8) -> Result<(String, Strin
     Ok((logical, host))
 }
 
+fn parse_decimal_fd(text: &str) -> Result<usize, SysErrNo> {
+    if text.is_empty() || !text.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+        return Err(SysErrNo::ENOENT);
+    }
+
+    let mut value = 0usize;
+    for &byte in text.as_bytes() {
+        value = value
+            .checked_mul(10)
+            .and_then(|n| n.checked_add((byte - b'0') as usize))
+            .ok_or(SysErrNo::ENOENT)?;
+    }
+    Ok(value)
+}
+
+fn proc_self_fd_number(logical_path: &str) -> Result<Option<usize>, SysErrNo> {
+    for prefix in ["/proc/self/fd/", "/proc/thread-self/fd/"] {
+        if let Some(tail) = logical_path.strip_prefix(prefix) {
+            if tail.contains('/') {
+                return Ok(None);
+            }
+            return parse_decimal_fd(tail).map(Some);
+        }
+    }
+    Ok(None)
+}
+
 fn resolve_base_dir(dirfd: isize) -> Result<String, SysErrNo> {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     if dirfd == AT_FDCWD {
@@ -1198,8 +1225,20 @@ pub fn sys_mknodat(dirfd: isize, pathname: *const u8, mode: u32, _dev: usize) ->
 }
 
 pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
-    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-    super::with_kernel_page_table(|| crate::fs::set_mode_path(&host_path, true, mode))?;
+    let path = read_user_path(pathname)?;
+    if path.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+    let (logical_path, host_path) = resolve_host_path_str(dirfd, &path)?;
+    if let Some(fd) = proc_self_fd_number(&logical_path)? {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let mut fds = inner.fd_table.lock();
+        let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+        super::with_kernel_page_table(|| crate::fs::set_mode_fd(file_desc, mode))?;
+    } else {
+        super::with_kernel_page_table(|| crate::fs::set_mode_path(&host_path, true, mode))?;
+    }
     Ok(0)
 }
 
@@ -1232,11 +1271,24 @@ pub fn sys_fchownat(
     if flags & !AT_SYMLINK_NOFOLLOW != 0 {
         return Err(SysErrNo::EINVAL);
     }
-    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     let uid = chown_id(uid)?;
     let gid = chown_id(gid)?;
-    super::with_kernel_page_table(|| crate::fs::set_owner_path(&host_path, follow, uid, gid))?;
+    let path = read_user_path(pathname)?;
+    if path.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+
+    let (logical_path, host_path) = resolve_host_path_str(dirfd, &path)?;
+    if let Some(fd) = proc_self_fd_number(&logical_path)? {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let mut fds = inner.fd_table.lock();
+        let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+        super::with_kernel_page_table(|| crate::fs::set_owner_fd(file_desc, uid, gid))?;
+    } else {
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        super::with_kernel_page_table(|| crate::fs::set_owner_path(&host_path, follow, uid, gid))?;
+    }
     Ok(0)
 }
 
@@ -1249,6 +1301,21 @@ pub fn sys_fchown(fd: usize, uid: usize, gid: usize) -> SyscallRet {
     let gid = chown_id(gid)?;
     super::with_kernel_page_table(|| crate::fs::set_owner_fd(file_desc, uid, gid))?;
     Ok(0)
+}
+
+pub fn sys_fgetxattr(fd: usize, name: *const u8, _value: *mut u8, _size: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    {
+        let inner = task.inner.lock();
+        let fds = inner.fd_table.lock();
+        match fds.get(fd).ok_or(SysErrNo::EBADF)? {
+            FileDescriptor::Path { .. } => return Err(SysErrNo::EBADF),
+            _ => {}
+        }
+    }
+
+    let _name = read_user_cstr(name)?;
+    Err(SysErrNo::EOPNOTSUPP)
 }
 
 pub fn sys_unlinkat(dirfd: isize, pathname: *const u8, flags: usize) -> SyscallRet {
