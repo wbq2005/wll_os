@@ -1912,6 +1912,14 @@ pub fn set_owner_path(
         if mem.is_dir(&norm) || mem.get_file(&norm).is_some() || mem.get_special(&norm).is_some() {
             return mem.set_owner(&norm, uid, gid);
         }
+        if mem.get_symlink(&norm).is_some() {
+            if !follow_symlink {
+                return mem.set_owner(&norm, uid, gid);
+            }
+            drop(mem);
+            let resolved = resolve_final_symlink(&norm, false)?;
+            return set_owner_path(&resolved, true, uid, gid);
+        }
     }
     if is_tmpfs_path(&norm) {
         return Err(missing_path_errno(&norm));
