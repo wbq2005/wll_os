@@ -832,6 +832,22 @@ fn clean_page_read_metadata(fs: &Ext4, ino: u32) -> Result<CleanPageReadMetadata
     })
 }
 
+fn extent_pblock_for_read(fs: &Ext4, ino: u32, lblock: u32) -> Option<u64> {
+    let inode_ref = fs.get_inode_ref(ino);
+    if !inode_ref.inode.is_file() {
+        return None;
+    }
+    let path = fs.find_extent(&inode_ref, lblock).ok()?;
+    let node = path.path.last()?;
+    let extent = node.extent?;
+    let first = extent.get_first_block();
+    let len = extent.get_actual_len() as u32;
+    if len == 0 || lblock < first || lblock >= first.saturating_add(len) {
+        return None;
+    }
+    Some((lblock - first) as u64 + extent.get_pblock())
+}
+
 fn cached_pblock_for_clean_read(fs: &Ext4, ino: u32, lblock: u32, max_run_len: u32) -> Option<u64> {
     if max_run_len == 0 {
         return None;
@@ -840,18 +856,14 @@ fn cached_pblock_for_clean_read(fs: &Ext4, ino: u32, lblock: u32, max_run_len: u
         return Some(pblock);
     }
 
-    let inode_ref = fs.get_inode_ref(ino);
-    if !inode_ref.inode.is_file() {
-        return None;
-    }
-    let first_pblock = fs.get_pblock_idx(&inode_ref, lblock).ok()?;
+    let first_pblock = extent_pblock_for_read(fs, ino, lblock)?;
     let mut len = 1u32;
     let mut prev_pblock = first_pblock;
     while len < max_run_len {
         let Some(next_lblock) = lblock.checked_add(len) else {
             break;
         };
-        let Ok(next_pblock) = fs.get_pblock_idx(&inode_ref, next_lblock) else {
+        let Some(next_pblock) = extent_pblock_for_read(fs, ino, next_lblock) else {
             break;
         };
         if prev_pblock.checked_add(1) != Some(next_pblock) {
@@ -921,9 +933,7 @@ fn fill_clean_page_frame(
     }
     let mut copied = 0usize;
     while copied < read_len {
-        let n = fs
-            .read_at(ino, page_start + copied, &mut page[copied..read_len])
-            .map_err(map_ext4_err)?;
+        let n = extent_aware_read_at(ino, page_start + copied, &mut page[copied..read_len])?;
         if n == 0 {
             return Err(SysErrNo::EIO);
         }
@@ -993,6 +1003,43 @@ fn clean_page_cached_read(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usi
         copied += n;
     }
     Ok(copied)
+}
+
+fn extent_aware_read_at(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usize, SysErrNo> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let metadata = clean_page_read_metadata(&fs, ino)?;
+    let size = metadata.file_size;
+    if offset >= size {
+        return Ok(0);
+    }
+
+    let total = buf.len().min(size - offset);
+    buf[..total].fill(0);
+    let mut copied = 0usize;
+    while copied < total {
+        let current = offset + copied;
+        let block_off = current % BLOCK_SIZE;
+        let lblock = current / BLOCK_SIZE;
+        let n = (total - copied).min(BLOCK_SIZE - block_off);
+        if lblock > u32::MAX as usize {
+            return Err(SysErrNo::EFBIG);
+        }
+        if let Some(pblock) = extent_pblock_for_read(&fs, ino, lblock as u32) {
+            if pblock > (usize::MAX / BLOCK_SIZE) as u64 {
+                return Err(SysErrNo::EFBIG);
+            }
+            let data = fs.block_device.read_offset(pblock as usize * BLOCK_SIZE);
+            if data.len() < block_off + n {
+                return Err(SysErrNo::EIO);
+            }
+            buf[copied..copied + n].copy_from_slice(&data[block_off..block_off + n]);
+        }
+        copied += n;
+    }
+    Ok(total)
 }
 
 fn invalidate_clean_pages_ino(ino: u32) {
@@ -1838,17 +1885,8 @@ pub fn truncate_regular_ino(ino: u32, size: u64) -> Result<(), SysErrNo> {
             cache_empty_regular(ino, true);
         }
     } else if size > old_size {
-        let zeroes = alloc::vec![0u8; 4096];
-        let mut off = old_size as usize;
-        let target = size as usize;
-        while off < target {
-            let n = (target - off).min(zeroes.len());
-            let written = fs.write_at(ino, off, &zeroes[..n]).map_err(map_ext4_err)?;
-            if written == 0 {
-                return Err(SysErrNo::EIO);
-            }
-            off += written;
-        }
+        iref.inode.set_size(size);
+        fs.write_back_inode(&mut iref);
     }
     touch_inode(&fs, ino, false, true, true);
     if kind == Ext4NodeKind::Regular {
@@ -1878,8 +1916,7 @@ pub fn ext4_read_at(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usize, Sy
         Err(SysErrNo::ENOMEM | SysErrNo::EINVAL) => {}
         Err(err) => return Err(err),
     }
-    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    fs.read_at(ino, offset, buf).map_err(map_ext4_err)
+    extent_aware_read_at(ino, offset, buf)
 }
 
 pub fn ext4_write_at(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysErrNo> {

@@ -553,7 +553,7 @@ fn metadata_from_mem_file(
     let mut meta = metadata_for_mem_file(
         &file.name,
         file.content.len(),
-        is_elf_image(&file.content),
+        file.content.is_elf_image(),
         node,
         nlink,
         ino_key,
@@ -640,7 +640,7 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
         }
         if let Some(file) = mem.get_file(&norm) {
             let node = mem.metadata(&norm).unwrap_or_else(|| {
-                default_mem_metadata(if is_elf_image(&file.content) {
+                default_mem_metadata(if file.content.is_elf_image() {
                     0o777
                 } else {
                     0o666
@@ -715,11 +715,11 @@ fn refresh_mount_pseudo_files() {
     let mut fs = MEM_FS.lock();
     for root in ["", "/musl", "/glibc"] {
         let proc_mounts = alloc::format!("{}/proc/mounts", root);
-        if !fs.write_file_content(&proc_mounts, data.clone(), now) {
+        if !fs.write_file_content(&proc_mounts, fd::MemFileContent::from_slice(&data), now) {
             fs.add_file(&proc_mounts, data.clone());
         }
         let etc_mtab = alloc::format!("{}/etc/mtab", root);
-        if !fs.write_file_content(&etc_mtab, data.clone(), now) {
+        if !fs.write_file_content(&etc_mtab, fd::MemFileContent::from_slice(&data), now) {
             fs.add_file(&etc_mtab, data.clone());
         }
     }
@@ -890,7 +890,7 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
                 let mem = MEM_FS.lock();
                 if let Some(file) = mem.get_file(name) {
                     let node = mem.metadata(name).unwrap_or_else(|| {
-                        default_mem_metadata(if is_elf_image(&file.content) {
+                        default_mem_metadata(if file.content.is_elf_image() {
                             0o777
                         } else {
                             0o666
@@ -1130,7 +1130,7 @@ pub fn read_file(name: &str) -> Option<Vec<u8>> {
     if mounted_ext4_backend_path(&norm).is_none() {
         let m = MEM_FS.lock();
         if let Some(f) = m.get_file(&norm) {
-            return Some(f.content.clone());
+            return Some(f.content.to_vec());
         }
         drop(m);
     }
@@ -1159,7 +1159,7 @@ pub fn read_executable_file(name: &str) -> Option<Vec<u8>> {
     }
 
     let mem_data = if mounted_ext4_backend_path(&norm).is_none() {
-        MEM_FS.lock().get_file(&norm).map(|f| f.content.clone())
+        MEM_FS.lock().get_file(&norm).map(|f| f.content.to_vec())
     } else {
         None
     };
@@ -2151,7 +2151,7 @@ pub fn open_path(
         let source = MEM_FS
             .lock()
             .get_file(&open_norm)
-            .map(|file| (fd::MemFileContent::from_slice(&file.content), file.times));
+            .map(|file| (file.content.clone(), file.times));
         let (mut content, mut times) =
             source.unwrap_or_else(|| (fd::MemFileContent::new(), super::FileTimes::now()));
         if want_trunc && write_ok {

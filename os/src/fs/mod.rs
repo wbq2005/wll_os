@@ -31,7 +31,7 @@ use spin::Mutex;
 use crate::utils::error::SysErrNo;
 
 /// 文件内容
-pub type FileContent = Vec<u8>;
+pub type FileContent = fd::MemFileContent;
 
 #[derive(Clone, Copy, Debug)]
 pub struct MemNodeMetadata {
@@ -135,17 +135,22 @@ impl MemFile {
     pub fn new(name: &str, content: Vec<u8>) -> Self {
         Self {
             name: String::from(name),
-            content,
+            content: FileContent::from_slice(&content),
             times: FileTimes::now(),
             link_key: String::from(name),
         }
     }
 
     pub fn with_times(name: &str, content: Vec<u8>, times: FileTimes) -> Self {
-        Self::with_link_key(name, content, times, String::from(name))
+        Self::with_link_key(
+            name,
+            FileContent::from_slice(&content),
+            times,
+            String::from(name),
+        )
     }
 
-    fn with_link_key(name: &str, content: Vec<u8>, times: FileTimes, link_key: String) -> Self {
+    fn with_link_key(name: &str, content: FileContent, times: FileTimes, link_key: String) -> Self {
         Self {
             name: String::from(name),
             content,
@@ -207,7 +212,12 @@ impl MemFileSystem {
         let _ = self.set_mode(name, mode);
     }
 
-    pub fn write_file_content(&mut self, name: &str, content: Vec<u8>, times: FileTimes) -> bool {
+    pub fn write_file_content(
+        &mut self,
+        name: &str,
+        content: FileContent,
+        times: FileTimes,
+    ) -> bool {
         let name = normalize_path(name);
         if let Some(link_key) = self
             .files
@@ -658,7 +668,7 @@ impl MemFileSystem {
             .ok_or(SysErrNo::ENOENT)?;
         let now = FileTimes::now();
         for file in self.files.iter_mut().filter(|f| f.link_key == link_key) {
-            file.content.resize(new_len, 0);
+            file.content.resize(new_len);
             file.times.mtime_sec = now.mtime_sec;
             file.times.mtime_nsec = now.mtime_nsec;
             file.times.ctime_sec = now.ctime_sec;

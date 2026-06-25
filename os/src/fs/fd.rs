@@ -61,7 +61,10 @@ fn is_dev_zero_path(path: &str) -> bool {
 #[derive(Debug, Clone)]
 pub enum MemFileContent {
     Inline(Vec<u8>),
-    Chunked { len: usize, chunks: Vec<Vec<u8>> },
+    Chunked {
+        len: usize,
+        chunks: Vec<Option<Vec<u8>>>,
+    },
 }
 
 impl MemFileContent {
@@ -75,7 +78,11 @@ impl MemFileContent {
         }
         let mut chunks = Vec::new();
         for part in content.chunks(MEM_FILE_CHUNK_SIZE) {
-            chunks.push(part.to_vec());
+            if part.iter().all(|byte| *byte == 0) {
+                chunks.push(None);
+            } else {
+                chunks.push(Some(part.to_vec()));
+            }
         }
         Self::Chunked {
             len: content.len(),
@@ -110,14 +117,20 @@ impl MemFileContent {
                 buf[..to_read].copy_from_slice(&content[offset..offset + to_read]);
             }
             Self::Chunked { chunks, .. } => {
+                buf[..to_read].fill(0);
                 let mut copied = 0usize;
                 while copied < to_read {
                     let pos = offset + copied;
                     let chunk_idx = pos / MEM_FILE_CHUNK_SIZE;
                     let chunk_off = pos % MEM_FILE_CHUNK_SIZE;
-                    let n = (to_read - copied).min(chunks[chunk_idx].len() - chunk_off);
-                    buf[copied..copied + n]
-                        .copy_from_slice(&chunks[chunk_idx][chunk_off..chunk_off + n]);
+                    let n = (to_read - copied).min(MEM_FILE_CHUNK_SIZE - chunk_off);
+                    if let Some(Some(chunk)) = chunks.get(chunk_idx) {
+                        if chunk_off < chunk.len() {
+                            let copy_len = n.min(chunk.len() - chunk_off);
+                            buf[copied..copied + copy_len]
+                                .copy_from_slice(&chunk[chunk_off..chunk_off + copy_len]);
+                        }
+                    }
                     copied += n;
                 }
             }
@@ -139,8 +152,14 @@ impl MemFileContent {
                     let chunk_idx = pos / MEM_FILE_CHUNK_SIZE;
                     let chunk_off = pos % MEM_FILE_CHUNK_SIZE;
                     let n = (buf.len() - copied).min(MEM_FILE_CHUNK_SIZE - chunk_off);
-                    chunks[chunk_idx][chunk_off..chunk_off + n]
-                        .copy_from_slice(&buf[copied..copied + n]);
+                    while chunks.len() <= chunk_idx {
+                        chunks.push(None);
+                    }
+                    let chunk = chunks[chunk_idx].get_or_insert_with(Vec::new);
+                    if chunk.len() < chunk_off + n {
+                        chunk.resize(chunk_off + n, 0);
+                    }
+                    chunk[chunk_off..chunk_off + n].copy_from_slice(&buf[copied..copied + n]);
                     copied += n;
                 }
             }
@@ -157,7 +176,11 @@ impl MemFileContent {
                 let old = core::mem::take(content);
                 let mut chunks = Vec::new();
                 for part in old.chunks(MEM_FILE_CHUNK_SIZE) {
-                    chunks.push(part.to_vec());
+                    if part.iter().all(|byte| *byte == 0) {
+                        chunks.push(None);
+                    } else {
+                        chunks.push(Some(part.to_vec()));
+                    }
                 }
                 *self = Self::Chunked {
                     len: old.len(),
@@ -172,13 +195,13 @@ impl MemFileContent {
                     (new_len + MEM_FILE_CHUNK_SIZE - 1) / MEM_FILE_CHUNK_SIZE
                 };
                 while chunks.len() < needed {
-                    chunks.push(Vec::new());
+                    chunks.push(None);
                 }
                 chunks.truncate(needed);
-                for idx in 0..needed {
-                    let start = idx * MEM_FILE_CHUNK_SIZE;
+                if let Some(Some(last)) = chunks.last_mut() {
+                    let start = (needed - 1) * MEM_FILE_CHUNK_SIZE;
                     let target = (new_len - start).min(MEM_FILE_CHUNK_SIZE);
-                    chunks[idx].resize(target, 0);
+                    last.truncate(target);
                 }
                 *len = new_len;
                 if new_len <= MEM_FILE_INLINE_LIMIT {
@@ -192,12 +215,9 @@ impl MemFileContent {
     pub fn to_vec(&self) -> Vec<u8> {
         match self {
             Self::Inline(content) => content.clone(),
-            Self::Chunked { len, chunks } => {
-                let mut out = Vec::with_capacity(*len);
-                for chunk in chunks {
-                    out.extend_from_slice(chunk);
-                }
-                out.truncate(*len);
+            Self::Chunked { len, .. } => {
+                let mut out = alloc::vec![0u8; *len];
+                self.read_at(0, &mut out);
                 out
             }
         }
@@ -217,7 +237,7 @@ fn refresh_mem_file(
         return false;
     }
     if let Some(file) = MEM_FS.lock().get_file(name) {
-        *content = MemFileContent::from_slice(&file.content);
+        *content = file.content.clone();
         *times = file.times;
         true
     } else {
@@ -909,7 +929,7 @@ impl FileDescriptor {
                 if mem_live {
                     MEM_FS
                         .lock()
-                        .write_file_content(name, content.to_vec(), *times);
+                        .write_file_content(name, content.clone(), *times);
                 }
                 Ok(buf.len())
             }
@@ -969,7 +989,7 @@ impl FileDescriptor {
                 if mem_live {
                     MEM_FS
                         .lock()
-                        .write_file_content(name, content.to_vec(), *times);
+                        .write_file_content(name, content.clone(), *times);
                 }
 
                 Ok(buf.len())
@@ -1169,7 +1189,7 @@ impl FileDescriptor {
                 if mem_live {
                     MEM_FS
                         .lock()
-                        .write_file_content(name, content.to_vec(), *times);
+                        .write_file_content(name, content.clone(), *times);
                 }
                 Ok(())
             }
@@ -1759,7 +1779,7 @@ fn open_file_legacy_unused(
         let source = fs::MEM_FS
             .lock()
             .get_file(&path_norm)
-            .map(|file| (MemFileContent::from_slice(&file.content), file.times));
+            .map(|file| (file.content.clone(), file.times));
         let (mut content, mut times) =
             source.unwrap_or_else(|| (MemFileContent::new(), FileTimes::now()));
         if want_trunc && write_ok {
