@@ -2270,17 +2270,23 @@ pub fn open_path(
         return Err(SysErrNo::ENOENT);
     }
 
+    let lookup_norm = if !removed {
+        resolve_parent_symlinks_for_lookup(&path_norm)?
+    } else {
+        path_norm.clone()
+    };
+
     if path_only {
         if want_create || want_trunc {
             return Err(SysErrNo::EINVAL);
         }
-        return open_path_descriptor(&path_norm, &logical_norm, flags, !nofollow);
+        return open_path_descriptor(&lookup_norm, &logical_norm, flags, !nofollow);
     }
 
     let open_norm = if !removed {
-        resolve_final_symlink(&path_norm, nofollow)?
+        resolve_final_symlink(&lookup_norm, nofollow)?
     } else {
-        path_norm.clone()
+        lookup_norm
     };
     if let Some(opened) =
         open_loop_device_descriptor(local_device_path(&open_norm), read_ok, write_ok)
