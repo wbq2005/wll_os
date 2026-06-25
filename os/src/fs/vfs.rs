@@ -501,7 +501,24 @@ fn default_mem_metadata(mode: u32) -> MemNodeMetadata {
         mode,
         uid: 0,
         gid: 0,
+        ino: 0,
     }
+}
+
+fn mem_inode(node: MemNodeMetadata, fallback_key: &str) -> u64 {
+    if node.ino != 0 {
+        node.ino
+    } else {
+        pseudo_inode(fallback_key)
+    }
+}
+
+fn memfs_inode_u32(path: &str) -> u32 {
+    MEM_FS
+        .lock()
+        .inode(path)
+        .unwrap_or_else(|| pseudo_inode(path))
+        .min(u32::MAX as u64) as u32
 }
 
 fn metadata_for_mem_file(
@@ -531,6 +548,7 @@ fn metadata_for_mem_file(
         len as u64,
         nlink,
     );
+    meta.ino = mem_inode(node, ino_key);
     meta.uid = node.uid;
     meta.gid = node.gid;
     meta
@@ -544,6 +562,7 @@ fn metadata_for_mem_symlink(name: &str, target: &str, node: MemNodeMetadata) -> 
         target.len() as u64,
         1,
     );
+    meta.ino = mem_inode(node, name);
     meta.uid = node.uid;
     meta.gid = node.gid;
     meta
@@ -565,6 +584,7 @@ fn metadata_for_mem_special(
         0,
         1,
     );
+    meta.ino = mem_inode(node, name);
     meta.uid = node.uid;
     meta.gid = node.gid;
     meta
@@ -647,7 +667,7 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
                 .metadata(&norm)
                 .unwrap_or_else(|| default_mem_metadata(0o755));
             return Ok(VfsMetadata {
-                ino: pseudo_inode(&norm),
+                ino: mem_inode(node, &norm),
                 kind: VfsNodeKind::Directory,
                 mode: S_IFDIR | (node.mode & 0o7777),
                 nlink: 1,
@@ -968,6 +988,7 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
                 entries.len() as u64,
                 1,
             );
+            meta.ino = mem_inode(node, path);
             meta.uid = node.uid;
             meta.gid = node.gid;
             Ok(meta)
@@ -2031,14 +2052,14 @@ pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
     let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_file_with_mode(&norm, Vec::new(), mode);
-        return Ok(pseudo_inode(&norm) as u32);
+        return Ok(memfs_inode_u32(&norm));
     }
     if ext_parent {
         return ext4_vol::create_regular_ext4_with_mode(&norm, mode);
     }
     if mem_parent {
         MEM_FS.lock().add_file_with_mode(&norm, Vec::new(), mode);
-        return Ok(pseudo_inode(&norm) as u32);
+        return Ok(memfs_inode_u32(&norm));
     }
     Err(SysErrNo::ENOENT)
 }
@@ -2066,14 +2087,14 @@ pub fn create_special_node(path: &str, kind: MemSpecialKind, mode: u32) -> Resul
     }
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_special_with_mode(&norm, kind, mode)?;
-        return Ok(pseudo_inode(&norm) as u32);
+        return Ok(memfs_inode_u32(&norm));
     }
     if ext_parent {
         return Err(SysErrNo::EOPNOTSUPP);
     }
     if mem_parent {
         MEM_FS.lock().add_special_with_mode(&norm, kind, mode)?;
-        return Ok(pseudo_inode(&norm) as u32);
+        return Ok(memfs_inode_u32(&norm));
     }
     if path_exists_non_dir(&parent) {
         return Err(SysErrNo::ENOTDIR);

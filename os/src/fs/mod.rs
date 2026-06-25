@@ -38,6 +38,7 @@ pub struct MemNodeMetadata {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
+    pub ino: u64,
 }
 
 impl MemNodeMetadata {
@@ -46,6 +47,14 @@ impl MemNodeMetadata {
             mode: mode & 0o7777,
             uid: 0,
             gid: 0,
+            ino: 0,
+        }
+    }
+
+    fn new_with_ino(mode: u32, ino: u64) -> Self {
+        Self {
+            ino,
+            ..Self::new(mode)
         }
     }
 
@@ -57,6 +66,7 @@ impl MemNodeMetadata {
             mode: mode & 0o7777,
             uid: credentials.fsuid,
             gid: credentials.fsgid,
+            ino: 0,
         }
     }
 }
@@ -171,19 +181,52 @@ pub struct MemFileSystem {
     symlinks: BTreeMap<String, String>,
     specials: BTreeMap<String, MemSpecialKind>,
     metadata: BTreeMap<String, MemNodeMetadata>,
+    next_ino: u64,
 }
 
 impl MemFileSystem {
     pub fn new() -> Self {
         let mut metadata = BTreeMap::new();
-        metadata.insert(String::from("/"), MemNodeMetadata::new(0o755));
+        metadata.insert(String::from("/"), MemNodeMetadata::new_with_ino(0o755, 1));
         Self {
             files: Vec::new(),
             dirs: vec!["/".to_string()],
             symlinks: BTreeMap::new(),
             specials: BTreeMap::new(),
             metadata,
+            next_ino: 2,
         }
+    }
+
+    fn allocate_metadata(&mut self, mut metadata: MemNodeMetadata) -> MemNodeMetadata {
+        if metadata.ino == 0 {
+            metadata.ino = self.next_ino;
+            self.next_ino = self.next_ino.saturating_add(1).max(2);
+        }
+        metadata
+    }
+
+    fn insert_new_metadata(&mut self, name: String, metadata: MemNodeMetadata) {
+        let metadata = self.allocate_metadata(metadata);
+        self.metadata.insert(name, metadata);
+    }
+
+    fn ensure_metadata(&mut self, name: &str, mode: u32) {
+        let name = normalize_path(name);
+        if !self.metadata.contains_key(&name) {
+            let metadata = self.allocate_metadata(MemNodeMetadata::new_for_current(mode));
+            self.metadata.insert(name, metadata);
+        }
+    }
+
+    fn metadata_or_alloc(&mut self, name: &str, mode: u32) -> MemNodeMetadata {
+        let name = normalize_path(name);
+        if let Some(metadata) = self.metadata.get(&name).copied() {
+            return metadata;
+        }
+        let metadata = self.allocate_metadata(MemNodeMetadata::new(mode));
+        self.metadata.insert(name, metadata);
+        metadata
     }
 
     /// 添加文件
@@ -202,8 +245,7 @@ impl MemFileSystem {
         self.files.retain(|f| f.name != name);
         let len = content.len();
         self.files.push(MemFile::new(&name, content));
-        self.metadata
-            .insert(name.clone(), MemNodeMetadata::new_for_current(mode));
+        self.insert_new_metadata(name.clone(), MemNodeMetadata::new_for_current(mode));
         log::info!("[fs] Added file '{}' ({} bytes)", name, len);
     }
 
@@ -301,9 +343,7 @@ impl MemFileSystem {
             self.dirs.push(name.clone());
             log::info!("[fs] Added directory '{}'", name);
         }
-        self.metadata
-            .entry(name)
-            .or_insert_with(|| MemNodeMetadata::new_for_current(0o755));
+        self.ensure_metadata(&name, 0o755);
     }
 
     pub fn add_dir_with_mode(&mut self, name: &str, mode: u32) {
@@ -321,8 +361,7 @@ impl MemFileSystem {
             return Err(SysErrNo::EEXIST);
         }
         self.symlinks.insert(name.clone(), String::from(target));
-        self.metadata
-            .insert(name, MemNodeMetadata::new_for_current(0o777));
+        self.insert_new_metadata(name, MemNodeMetadata::new_for_current(0o777));
         Ok(())
     }
 
@@ -341,8 +380,7 @@ impl MemFileSystem {
             return Err(SysErrNo::EEXIST);
         }
         self.specials.insert(name.clone(), kind);
-        self.metadata
-            .insert(name, MemNodeMetadata::new_for_current(mode));
+        self.insert_new_metadata(name, MemNodeMetadata::new_for_current(mode));
         Ok(())
     }
 
@@ -379,6 +417,11 @@ impl MemFileSystem {
     pub fn metadata(&self, name: &str) -> Option<MemNodeMetadata> {
         let name = normalize_path(name);
         self.metadata.get(&name).copied()
+    }
+
+    pub fn inode(&self, name: &str) -> Option<u64> {
+        self.metadata(name)
+            .and_then(|meta| (meta.ino != 0).then_some(meta.ino))
     }
 
     pub fn file_link_count(&self, name: &str) -> u32 {
@@ -600,11 +643,7 @@ impl MemFileSystem {
             self.files.retain(|file| file.name != new);
             self.symlinks.remove(&new);
             self.specials.remove(&new);
-            let metadata = self
-                .metadata
-                .get(&old)
-                .copied()
-                .unwrap_or_else(|| MemNodeMetadata::new(0o666));
+            let metadata = self.metadata_or_alloc(&old, 0o666);
             self.metadata.remove(&old);
             self.specials.insert(new.clone(), kind);
             self.metadata.insert(new, metadata);
@@ -618,11 +657,7 @@ impl MemFileSystem {
             }
             self.files.retain(|file| file.name != new);
             self.symlinks.remove(&new);
-            let metadata = self
-                .metadata
-                .get(&old)
-                .copied()
-                .unwrap_or_else(|| MemNodeMetadata::new(0o777));
+            let metadata = self.metadata_or_alloc(&old, 0o777);
             self.metadata.remove(&old);
             self.symlinks.insert(new.clone(), target);
             self.metadata.insert(new, metadata);
@@ -639,11 +674,7 @@ impl MemFileSystem {
         if self.is_dir(&new) {
             return Err(SysErrNo::EISDIR);
         }
-        let metadata = self
-            .metadata
-            .get(&old)
-            .copied()
-            .unwrap_or_else(|| MemNodeMetadata::new(0o666));
+        let metadata = self.metadata_or_alloc(&old, 0o666);
         self.files
             .retain(|file| file.name != old && file.name != new);
         self.symlinks.remove(&new);
@@ -669,39 +700,28 @@ impl MemFileSystem {
             return Err(SysErrNo::ENOENT);
         }
 
-        if let Some(file) = self.files.iter().find(|file| file.name == old) {
-            let metadata = self
-                .metadata
-                .get(&old)
-                .copied()
-                .unwrap_or_else(|| MemNodeMetadata::new(0o666));
-            self.files.push(MemFile::with_link_key(
-                &new,
-                file.content.clone(),
-                file.times,
-                file.link_key.clone(),
-            ));
+        if let Some((content, times, link_key)) = self
+            .files
+            .iter()
+            .find(|file| file.name == old)
+            .map(|file| (file.content.clone(), file.times, file.link_key.clone()))
+        {
+            let metadata = self.metadata_or_alloc(&old, 0o666);
+            self.files
+                .push(MemFile::with_link_key(&new, content, times, link_key));
             self.metadata.insert(new, metadata);
             return Ok(());
         }
 
         if let Some(target) = self.symlinks.get(&old).cloned() {
-            let metadata = self
-                .metadata
-                .get(&old)
-                .copied()
-                .unwrap_or_else(|| MemNodeMetadata::new(0o777));
+            let metadata = self.metadata_or_alloc(&old, 0o777);
             self.symlinks.insert(new.clone(), target);
             self.metadata.insert(new, metadata);
             return Ok(());
         }
 
         if let Some(kind) = self.specials.get(&old).copied() {
-            let metadata = self
-                .metadata
-                .get(&old)
-                .copied()
-                .unwrap_or_else(|| MemNodeMetadata::new(0o666));
+            let metadata = self.metadata_or_alloc(&old, 0o666);
             self.specials.insert(new.clone(), kind);
             self.metadata.insert(new, metadata);
             return Ok(());
@@ -753,10 +773,11 @@ impl MemFileSystem {
         if !self.exists(&name) {
             return Err(SysErrNo::ENOENT);
         }
-        let entry = self
-            .metadata
-            .entry(name.clone())
-            .or_insert_with(|| MemNodeMetadata::new(0o666));
+        if !self.metadata.contains_key(&name) {
+            let metadata = self.allocate_metadata(MemNodeMetadata::new(0o666));
+            self.metadata.insert(name.clone(), metadata);
+        }
+        let entry = self.metadata.get_mut(&name).expect("metadata exists");
         entry.mode = mode & 0o7777;
         if let Some(file) = self.files.iter_mut().find(|f| f.name == name) {
             let now = FileTimes::now();
@@ -776,10 +797,11 @@ impl MemFileSystem {
         if !self.exists(&name) {
             return Err(SysErrNo::ENOENT);
         }
-        let entry = self
-            .metadata
-            .entry(name.clone())
-            .or_insert_with(|| MemNodeMetadata::new(0o666));
+        if !self.metadata.contains_key(&name) {
+            let metadata = self.allocate_metadata(MemNodeMetadata::new(0o666));
+            self.metadata.insert(name.clone(), metadata);
+        }
+        let entry = self.metadata.get_mut(&name).expect("metadata exists");
         if let Some(uid) = uid {
             entry.uid = uid;
         }
@@ -810,9 +832,10 @@ impl MemFileSystem {
             if !self.dirs.iter().any(|dir| dir == &current) {
                 self.dirs.push(current.clone());
             }
-            self.metadata
-                .entry(current.clone())
-                .or_insert_with(|| MemNodeMetadata::new(0o755));
+            if !self.metadata.contains_key(&current) {
+                let metadata = self.allocate_metadata(MemNodeMetadata::new(0o755));
+                self.metadata.insert(current.clone(), metadata);
+            }
         }
     }
 
