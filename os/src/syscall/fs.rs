@@ -1537,7 +1537,7 @@ pub fn sys_mount(
     if target_path.is_empty() {
         return Err(SysErrNo::ENOENT);
     }
-    if source_path.is_empty() {
+    if source_path.is_empty() && fst != "tmpfs" {
         return Err(SysErrNo::ENODEV);
     }
 

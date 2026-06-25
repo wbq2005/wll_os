@@ -44,6 +44,7 @@ struct MountEntry {
 enum MountBackend {
     Root,
     Ext4Root,
+    Tmpfs,
     Vfat(Arc<vfat::VfatVolume>),
 }
 
@@ -180,6 +181,14 @@ fn mounted_ext4_backend_path(path: &str) -> Option<String> {
     } else {
         Some(normalize_path(&alloc::format!("/{}", suffix)))
     }
+}
+
+fn is_tmpfs_path(path: &str) -> bool {
+    let norm = normalize_path(path);
+    let mounts = MOUNT_TABLE.lock();
+    mounts.iter().any(|entry| {
+        matches!(entry.backend, MountBackend::Tmpfs) && path_is_under(&norm, &entry.host_target)
+    })
 }
 
 fn mounted_vfat_backend(path: &str) -> Option<(Arc<vfat::VfatVolume>, String)> {
@@ -625,10 +634,11 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
             .metadata(&backend_path)
             .map(|meta| metadata_from_vfat(&norm, meta));
     }
+    let tmpfs_path = is_tmpfs_path(&norm);
     let ext_norm = ext4_lookup_path(&norm);
     let mounted_ext4 = mounted_ext4_backend_path(&norm).is_some();
 
-    if !mounted_ext4 {
+    if tmpfs_path || !mounted_ext4 {
         let mem = MEM_FS.lock();
         if mem.is_dir(&norm) {
             let entries = mem.list_dir(&norm)?;
@@ -684,6 +694,10 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
                 .unwrap_or_else(|| default_mem_metadata(0o666));
             return Ok(metadata_for_mem_special(&norm, kind, node));
         }
+    }
+
+    if tmpfs_path {
+        return Err(missing_path_errno(&norm));
     }
 
     let ext_path = match ext4_vol::lookup_kind(&ext_norm) {
@@ -781,6 +795,10 @@ fn validate_mount_source(source: &str) -> Result<(), SysErrNo> {
 
 fn resolve_mount_backend(source: &str, fstype: &str) -> Result<(String, MountBackend), SysErrNo> {
     match fstype {
+        "tmpfs" => {
+            let _ = source;
+            Ok((String::from("tmpfs"), MountBackend::Tmpfs))
+        }
         "vfat" | "fat" | "msdos" => {
             let range =
                 block_dev::range_for_path(local_device_path(source)).ok_or(SysErrNo::ENODEV)?;
@@ -826,16 +844,24 @@ pub fn mount_fs(
     if flags != 0 {
         return Err(SysErrNo::EINVAL);
     }
-    if !ext4_vol::is_ext4_mounted() {
+    let (backend_fstype, backend) = resolve_mount_backend(&source, fstype)?;
+    let tmpfs_backend = matches!(&backend, MountBackend::Tmpfs);
+    if !tmpfs_backend && !ext4_vol::is_ext4_mounted() {
         return Err(SysErrNo::ENODEV);
     }
-    validate_mount_source(&source)?;
-    let (backend_fstype, backend) = resolve_mount_backend(&source, fstype)?;
+    if !tmpfs_backend {
+        validate_mount_source(&source)?;
+    }
     let target_meta = metadata(&host_target, true)?;
     if target_meta.kind != VfsNodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    ext4_vol::metadata("/")?;
+    if !tmpfs_backend {
+        ext4_vol::metadata("/")?;
+    }
+    if tmpfs_backend {
+        MEM_FS.lock().add_dir_with_mode(&host_target, 0o1777);
+    }
 
     let mut mounts = MOUNT_TABLE.lock();
     if mounts.iter().any(|entry| entry.host_target == host_target) {
@@ -1160,12 +1186,15 @@ pub fn read_file(name: &str) -> Option<Vec<u8>> {
     if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
         return volume.read_file(&backend_path).ok();
     }
-    if mounted_ext4_backend_path(&norm).is_none() {
+    if is_tmpfs_path(&norm) || mounted_ext4_backend_path(&norm).is_none() {
         let m = MEM_FS.lock();
         if let Some(f) = m.get_file(&norm) {
             return Some(f.content.to_vec());
         }
         drop(m);
+    }
+    if is_tmpfs_path(&norm) {
+        return None;
     }
     ext4_vol::slurp_regular_file(&ext4_lookup_path(&norm))
 }
@@ -1191,12 +1220,17 @@ pub fn read_executable_file(name: &str) -> Option<Vec<u8>> {
             .filter(|data| is_elf_image(data));
     }
 
-    let mem_data = if mounted_ext4_backend_path(&norm).is_none() {
+    let tmpfs_path = is_tmpfs_path(&norm);
+    let mem_data = if tmpfs_path || mounted_ext4_backend_path(&norm).is_none() {
         MEM_FS.lock().get_file(&norm).map(|f| f.content.to_vec())
     } else {
         None
     };
     if mem_data.as_ref().is_some_and(|data| is_elf_image(data)) {
+        return mem_data;
+    }
+
+    if tmpfs_path {
         return mem_data;
     }
 
@@ -1272,7 +1306,7 @@ pub fn file_exists(name: &str) -> bool {
             .metadata(&backend_path)
             .is_ok_and(|meta| !meta.is_dir);
     }
-    if mounted_ext4_backend_path(&norm).is_none() {
+    if is_tmpfs_path(&norm) || mounted_ext4_backend_path(&norm).is_none() {
         let mem = MEM_FS.lock();
         if mem.get_file(&norm).is_some()
             || mem.get_symlink(&norm).is_some()
@@ -1280,6 +1314,9 @@ pub fn file_exists(name: &str) -> bool {
         {
             return true;
         }
+    }
+    if is_tmpfs_path(&norm) {
+        return false;
     }
     matches!(
         ext4_vol::lookup_kind(&ext4_lookup_path(&norm)),
@@ -1300,6 +1337,9 @@ pub fn dir_exists(name: &str) -> bool {
     if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
         return volume.metadata(&backend_path).is_ok_and(|meta| meta.is_dir);
     }
+    if is_tmpfs_path(&norm) {
+        return MEM_FS.lock().is_dir(&norm);
+    }
     mounted_ext4_backend_path(&norm).is_some()
         || MEM_FS.lock().is_dir(&norm)
         || ext4_vol::ext4_dir_path_exists(&ext4_lookup_path(&norm))
@@ -1307,7 +1347,7 @@ pub fn dir_exists(name: &str) -> bool {
 
 fn path_uses_ext4(path: &str) -> bool {
     let norm = normalize_path(path);
-    if !ext4_vol::is_ext4_mounted() {
+    if !ext4_vol::is_ext4_mounted() || is_tmpfs_path(&norm) {
         return false;
     }
     if mounted_ext4_backend_path(&norm).is_some() || ext4_vol::lookup_kind(&norm).is_some() {
@@ -1402,6 +1442,9 @@ fn old_current_statfs_unused() -> VfsStatFs {
 
 pub fn statfs_for_path(path: &str) -> Result<VfsStatFs, SysErrNo> {
     metadata(path, true)?;
+    if is_tmpfs_path(path) {
+        return Ok(mem_statfs());
+    }
     if mounted_vfat_backend(path).is_some() {
         return Ok(vfat_statfs());
     }
@@ -1458,6 +1501,7 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
             Err(SysErrNo::EROFS)
         };
     }
+    let tmpfs_path = is_tmpfs_path(&norm);
     {
         let mut m = MEM_FS.lock();
         if m.is_dir(&norm) {
@@ -1471,6 +1515,10 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
             mark_whiteout(&norm);
             return Ok(());
         }
+    }
+
+    if tmpfs_path {
+        return Err(missing_path_errno(&norm));
     }
 
     match ext4_vol::lookup_kind(&norm) {
@@ -1499,6 +1547,7 @@ pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
             Err(SysErrNo::ENOTDIR)
         };
     }
+    let tmpfs_path = is_tmpfs_path(&norm);
     {
         let mut m = MEM_FS.lock();
         if m.get_file(&norm).is_some()
@@ -1512,6 +1561,10 @@ pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
             mark_whiteout(&norm);
             return Ok(());
         }
+    }
+
+    if tmpfs_path {
+        return Err(missing_path_errno(&norm));
     }
 
     match ext4_vol::lookup_kind(&norm) {
@@ -1548,10 +1601,16 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
     if no_replace && (file_exists(&new) || dir_exists(&new)) {
         return Err(SysErrNo::EEXIST);
     }
+    let old_tmpfs = is_tmpfs_path(&old);
+    let new_tmpfs = is_tmpfs_path(&new);
+    if old_tmpfs != new_tmpfs {
+        return Err(SysErrNo::EXDEV);
+    }
 
     let mut m = MEM_FS.lock();
     if m.exists(&old) {
         if !no_replace
+            && !new_tmpfs
             && (ext4_vol::ext4_file_path_exists(&new) || ext4_vol::ext4_dir_path_exists(&new))
         {
             return Err(SysErrNo::EEXIST);
@@ -1559,7 +1618,7 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
         let new_parent = parent_path(&new);
         if !m.is_dir(&new_parent) {
             drop(m);
-            if ext4_vol::ext4_dir_path_exists(&new_parent) {
+            if !new_tmpfs && ext4_vol::ext4_dir_path_exists(&new_parent) {
                 return Err(SysErrNo::EXDEV);
             }
             return Err(missing_path_errno(&new));
@@ -1572,6 +1631,10 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
         return result;
     }
     drop(m);
+
+    if old_tmpfs {
+        return Err(missing_path_errno(&old));
+    }
 
     if ext4_vol::lookup_kind(&old).is_some() {
         let new_parent = parent_path(&new);
@@ -1617,13 +1680,18 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
     if file_exists(&new) || dir_exists(&new) {
         return Err(SysErrNo::EEXIST);
     }
+    let old_tmpfs = is_tmpfs_path(&old);
+    let new_tmpfs = is_tmpfs_path(&new);
+    if old_tmpfs != new_tmpfs {
+        return Err(SysErrNo::EXDEV);
+    }
     if MEM_FS.lock().exists(&old) {
         if procfs_link_source(&old) {
             return Err(SysErrNo::EXDEV);
         }
         let new_parent = parent_path(&new);
         let mem_new_parent = MEM_FS.lock().is_dir(&new_parent);
-        let ext_new_parent = ext4_vol::ext4_dir_path_exists(&new_parent);
+        let ext_new_parent = !new_tmpfs && ext4_vol::ext4_dir_path_exists(&new_parent);
         if !mem_new_parent {
             if ext_new_parent {
                 return Err(SysErrNo::EXDEV);
@@ -1639,6 +1707,9 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
         MEM_FS.lock().link_path(&old, &new)?;
         clear_whiteout(&new);
         return Ok(());
+    }
+    if old_tmpfs {
+        return Err(SysErrNo::ENOENT);
     }
     if ext4_vol::lookup_kind(&old).is_none() && path_exists_non_dir(&parent_path(&old)) {
         return Err(SysErrNo::ENOTDIR);
@@ -1675,8 +1746,9 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
             Err(SysErrNo::ENOTDIR)
         };
     }
+    let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
-    let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+    let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent || ext_parent {
         check_create_access(&parent)?;
     }
@@ -1685,7 +1757,7 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
         clear_whiteout(&norm);
         return Ok(());
     }
-    if ext4_vol::ext4_dir_path_exists(&parent) {
+    if ext_parent {
         clear_whiteout(&norm);
         return ext4_vol::create_symlink_ext4(target, &norm);
     }
@@ -1716,6 +1788,9 @@ pub fn read_link(path: &str) -> Result<String, SysErrNo> {
         }
         return Err(SysErrNo::EINVAL);
     }
+    if is_tmpfs_path(&norm) {
+        return Err(missing_path_errno(&norm));
+    }
     match ext4_vol::lookup_kind(&norm) {
         Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => ext4_vol::readlink_ext4(&norm),
         Some(_) => Err(SysErrNo::EINVAL),
@@ -1745,6 +1820,9 @@ pub fn truncate_path(path: &str, size: u64) -> Result<(), SysErrNo> {
             return Err(SysErrNo::EINVAL);
         }
     }
+    if is_tmpfs_path(&norm) {
+        return Err(missing_path_errno(&norm));
+    }
     let ext_path = match ext4_vol::lookup_kind(&norm) {
         Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => ext4_vol::resolve_symlinks(&norm)?,
         Some(_) => norm.clone(),
@@ -1771,6 +1849,9 @@ pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), 
         if mem.is_dir(&norm) || mem.get_file(&norm).is_some() || mem.get_special(&norm).is_some() {
             return mem.set_mode(&norm, mode);
         }
+    }
+    if is_tmpfs_path(&norm) {
+        return Err(missing_path_errno(&norm));
     }
     let ext_path = match ext4_vol::lookup_kind(&norm) {
         Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
@@ -1809,6 +1890,9 @@ pub fn set_owner_path(
         if mem.is_dir(&norm) || mem.get_file(&norm).is_some() || mem.get_special(&norm).is_some() {
             return mem.set_owner(&norm, uid, gid);
         }
+    }
+    if is_tmpfs_path(&norm) {
+        return Err(missing_path_errno(&norm));
     }
     let ext_path = match ext4_vol::lookup_kind(&norm) {
         Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
@@ -1858,6 +1942,9 @@ pub fn set_times_path(
             return Ok(());
         }
     }
+    if is_tmpfs_path(&norm) {
+        return Err(missing_path_errno(&norm));
+    }
     let ext_path = match ext4_vol::lookup_kind(&norm) {
         Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
             ext4_vol::resolve_symlinks(&norm)?
@@ -1902,8 +1989,9 @@ pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
             Err(SysErrNo::ENOTDIR)
         };
     }
+    let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
-    let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+    let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_dir_with_mode(&norm, mode);
         return Ok(());
@@ -1938,8 +2026,9 @@ pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
             Err(SysErrNo::ENOTDIR)
         };
     }
+    let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
-    let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+    let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_file_with_mode(&norm, Vec::new(), mode);
         return Ok(pseudo_inode(&norm) as u32);
@@ -1969,8 +2058,9 @@ pub fn create_special_node(path: &str, kind: MemSpecialKind, mode: u32) -> Resul
             Err(SysErrNo::ENOTDIR)
         };
     }
+    let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
-    let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
+    let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
     if mem_parent || ext_parent {
         check_create_access(&parent)?;
     }
@@ -2048,6 +2138,7 @@ fn path_exists_non_dir(path: &str) -> bool {
     if let Some(meta) = vfat_metadata_for_path(&norm) {
         return meta.is_ok_and(|meta| !meta.is_dir);
     }
+    let tmpfs_path = is_tmpfs_path(&norm);
     let ext_norm = ext4_lookup_path(&norm);
     let mounted = mounted_ext4_backend_path(&norm).is_some();
     {
@@ -2064,6 +2155,9 @@ fn path_exists_non_dir(path: &str) -> bool {
         if !mounted && mem.is_dir(&norm) {
             return false;
         }
+    }
+    if tmpfs_path {
+        return false;
     }
     matches!(
         ext4_vol::lookup_kind(&ext_norm),
@@ -2199,7 +2293,8 @@ pub fn open_path(
             linked: false,
         });
     }
-    let mounted_ext4 = mounted_ext4_backend_path(&open_norm).is_some();
+    let tmpfs_path = is_tmpfs_path(&open_norm);
+    let mounted_ext4 = !tmpfs_path && mounted_ext4_backend_path(&open_norm).is_some();
     let mem_has_file = !mounted_ext4 && MEM_FS.lock().get_file(&open_norm).is_some();
     let mem_has_special = !mounted_ext4 && MEM_FS.lock().get_special(&open_norm).is_some();
     let ext_path_norm = ext4_lookup_path(&open_norm);
@@ -2253,7 +2348,7 @@ pub fn open_path(
     }
 
     if (!mounted_ext4 && MEM_FS.lock().is_dir(&open_norm))
-        || ext4_vol::ext4_dir_path_exists(&ext_path_norm)
+        || (!tmpfs_path && ext4_vol::ext4_dir_path_exists(&ext_path_norm))
     {
         if write_ok || want_trunc || want_create {
             return Err(SysErrNo::EISDIR);
@@ -2268,13 +2363,15 @@ pub fn open_path(
     }
 
     if want_dir {
-        if ext4_vol::ext4_regular_file_exists(&ext_path_norm) || path_exists_non_dir(&open_norm) {
+        if (!tmpfs_path && ext4_vol::ext4_regular_file_exists(&ext_path_norm))
+            || path_exists_non_dir(&open_norm)
+        {
             return Err(SysErrNo::ENOTDIR);
         }
         return Err(missing_path_errno(&open_norm));
     }
 
-    if !removed && ext4_vol::ext4_regular_file_exists(&ext_path_norm) {
+    if !tmpfs_path && !removed && ext4_vol::ext4_regular_file_exists(&ext_path_norm) {
         if want_excl && want_create {
             return Err(SysErrNo::EEXIST);
         }
@@ -2309,9 +2406,11 @@ pub fn open_path(
 
     if want_create {
         let parent = parent_path(&open_norm);
-        let parent_mounted_ext4 = mounted_ext4_backend_path(&parent).is_some();
+        let parent_tmpfs = is_tmpfs_path(&parent);
+        let parent_mounted_ext4 = !parent_tmpfs && mounted_ext4_backend_path(&parent).is_some();
         let mem_parent = !parent_mounted_ext4 && MEM_FS.lock().is_dir(&parent);
-        let ext_parent = ext4_vol::ext4_dir_path_exists(&ext4_lookup_path(&parent));
+        let ext_parent =
+            !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&ext4_lookup_path(&parent));
         if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
             MEM_FS
                 .lock()
@@ -2378,8 +2477,9 @@ pub fn list_dir(path: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
     if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
         return volume.list_dir(&backend_path);
     }
+    let tmpfs_path = is_tmpfs_path(&norm);
     let ext_norm = ext4_lookup_path(&norm);
-    let mounted_ext4 = mounted_ext4_backend_path(&norm).is_some();
+    let mounted_ext4 = !tmpfs_path && mounted_ext4_backend_path(&norm).is_some();
 
     let mem_dir = !mounted_ext4 && MEM_FS.lock().is_dir(&norm);
     let mem_entries: Vec<fd::DirEntryRecord> = if mem_dir {
@@ -2388,7 +2488,8 @@ pub fn list_dir(path: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {
         Vec::new()
     };
 
-    let ext_dir = ext4_vol::is_ext4_mounted() && ext4_vol::ext4_dir_path_exists(&ext_norm);
+    let ext_dir =
+        !tmpfs_path && ext4_vol::is_ext4_mounted() && ext4_vol::ext4_dir_path_exists(&ext_norm);
 
     if !mem_dir && !ext_dir {
         let m = MEM_FS.lock();
