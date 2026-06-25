@@ -47,6 +47,7 @@ const AT_EACCESS: usize = 0x200;
 const UTIME_NOW: isize = 0x3fffffff;
 const UTIME_OMIT: isize = 0x3ffffffe;
 const IOV_MAX: usize = 1024;
+const NAME_MAX: usize = 255;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -761,12 +762,25 @@ fn resolve_path_str(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
     if path.is_empty() {
         return Err(SysErrNo::ENOENT);
     }
+    check_path_component_lengths(path)?;
     if path.starts_with('/') {
         return Ok(crate::fs::normalize_path(path));
     }
 
     let base = resolve_base_dir(dirfd)?;
     Ok(crate::fs::resolve_path(&base, path))
+}
+
+fn check_path_component_lengths(path: &str) -> Result<(), SysErrNo> {
+    for part in path.split('/') {
+        if matches!(part, "" | "." | "..") {
+            continue;
+        }
+        if part.as_bytes().len() > NAME_MAX {
+            return Err(SysErrNo::ENAMETOOLONG);
+        }
+    }
+    Ok(())
 }
 
 fn resolve_path(dirfd: isize, pathname: *const u8) -> Result<String, SysErrNo> {
