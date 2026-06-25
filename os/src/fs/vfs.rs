@@ -2278,9 +2278,6 @@ pub fn open_path(
         if want_dir {
             return Err(SysErrNo::ENOTDIR);
         }
-        if want_create || want_trunc {
-            return Err(SysErrNo::EINVAL);
-        }
         if want_create && want_excl {
             return Err(SysErrNo::EEXIST);
         }
