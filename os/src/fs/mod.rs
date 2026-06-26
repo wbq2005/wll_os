@@ -460,6 +460,22 @@ impl MemFileSystem {
         self.dirs.iter().any(|dir| dir == &name)
     }
 
+    fn dir_has_entries(&self, name: &str) -> bool {
+        let name = normalize_path(name);
+        self.files
+            .iter()
+            .any(|file| is_descendant(&name, &file.name))
+            || self.symlinks.keys().any(|link| is_descendant(&name, link))
+            || self
+                .specials
+                .keys()
+                .any(|special| is_descendant(&name, special))
+            || self
+                .dirs
+                .iter()
+                .any(|dir| dir != &name && is_descendant(&name, dir))
+    }
+
     pub fn metadata(&self, name: &str) -> Option<MemNodeMetadata> {
         let name = normalize_path(name);
         self.metadata.get(&name).copied()
@@ -589,20 +605,7 @@ impl MemFileSystem {
         if !self.is_dir(&name) {
             return Err(SysErrNo::ENOENT);
         }
-        if self
-            .files
-            .iter()
-            .any(|file| is_descendant(&name, &file.name))
-            || self.symlinks.keys().any(|link| is_descendant(&name, link))
-            || self
-                .specials
-                .keys()
-                .any(|special| is_descendant(&name, special))
-            || self
-                .dirs
-                .iter()
-                .any(|dir| dir != &name && is_descendant(&name, dir))
-        {
+        if self.dir_has_entries(&name) {
             return Err(SysErrNo::ENOTEMPTY);
         }
         self.dirs.retain(|dir| dir != &name);
@@ -624,8 +627,17 @@ impl MemFileSystem {
             return Err(SysErrNo::ENOENT);
         }
         if self.is_dir(&old) {
-            if self.exists(&new) {
+            if new == "/" {
                 return Err(SysErrNo::EEXIST);
+            }
+            if self.is_dir(&new) {
+                if self.dir_has_entries(&new) {
+                    return Err(SysErrNo::ENOTEMPTY);
+                }
+                self.dirs.retain(|dir| dir != &new);
+                self.metadata.remove(&new);
+            } else if self.exists(&new) {
+                return Err(SysErrNo::ENOTDIR);
             }
             for dir in &mut self.dirs {
                 if *dir == old {
