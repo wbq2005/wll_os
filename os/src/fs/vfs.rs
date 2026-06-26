@@ -1110,6 +1110,13 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
             0,
             1,
         )),
+        fd::FileDescriptor::Epoll { .. } => Ok(synthetic_metadata(
+            "eventpoll",
+            VfsNodeKind::Other,
+            S_IFIFO | 0o600,
+            0,
+            1,
+        )),
     }
 }
 

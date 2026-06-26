@@ -44,6 +44,19 @@ const BLKGETSIZE64: usize = 0x80081272;
 
 const FALLOC_FL_KEEP_SIZE: usize = 0x01;
 
+const EPOLL_CLOEXEC: usize = fd::open_flags::O_CLOEXEC as usize;
+const EPOLL_CTL_ADD: usize = 1;
+const EPOLL_CTL_DEL: usize = 2;
+const EPOLL_CTL_MOD: usize = 3;
+const EPOLLIN: u32 = 0x0001;
+const EPOLLOUT: u32 = 0x0004;
+const EPOLLERR: u32 = 0x0008;
+const EPOLLHUP: u32 = 0x0010;
+const EPOLLRDNORM: u32 = 0x0040;
+const EPOLLWRNORM: u32 = 0x0100;
+const EPOLL_READ_EVENTS: u32 = EPOLLIN | EPOLLRDNORM;
+const EPOLL_WRITE_EVENTS: u32 = EPOLLOUT | EPOLLWRNORM;
+
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EACCESS: usize = 0x200;
 const UTIME_NOW: isize = 0x3fffffff;
@@ -117,6 +130,27 @@ struct Statx {
 struct IoVec {
     iov_base: *mut u8,
     iov_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct EpollEvent {
+    events: u32,
+    data: u64,
+}
+
+impl EpollEvent {
+    fn new(events: u32, data: u64) -> Self {
+        Self { events, data }
+    }
+
+    fn events(&self) -> u32 {
+        self.events
+    }
+
+    fn data(&self) -> u64 {
+        self.data
+    }
 }
 
 #[repr(C)]
@@ -1108,6 +1142,7 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
             }
             flags
         }
+        FileDescriptor::Epoll { .. } => fd::open_flags::O_RDWR as usize,
     }
 }
 
@@ -2370,6 +2405,240 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> S
         }
     }
     Ok(total)
+}
+
+fn epoll_state_for_fd(epfd: usize) -> Result<alloc::sync::Arc<spin::Mutex<fd::EpollState>>, SysErrNo> {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    match fds.get(epfd) {
+        Some(FileDescriptor::Epoll { state }) => Ok(state.clone()),
+        Some(_) => Err(SysErrNo::EINVAL),
+        None => Err(SysErrNo::EBADF),
+    }
+}
+
+fn epoll_ready_events(file_desc: &FileDescriptor, interest_events: u32) -> u32 {
+    let mut revents = 0u32;
+    if (interest_events & EPOLL_READ_EVENTS) != 0
+        && super::with_kernel_page_table(|| file_desc.poll_read_ready())
+    {
+        revents |= interest_events & EPOLL_READ_EVENTS;
+    }
+    if (interest_events & EPOLL_WRITE_EVENTS) != 0
+        && super::with_kernel_page_table(|| file_desc.poll_write_ready())
+    {
+        revents |= interest_events & EPOLL_WRITE_EVENTS;
+    }
+    if super::with_kernel_page_table(|| file_desc.poll_error()) {
+        revents |= EPOLLERR;
+    }
+    if super::with_kernel_page_table(|| file_desc.poll_hup()) {
+        revents |= EPOLLHUP;
+    }
+    revents
+}
+
+fn fd_supports_epoll(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::Stdin
+            | FileDescriptor::Stdout
+            | FileDescriptor::Stderr
+            | FileDescriptor::PipeRead { .. }
+            | FileDescriptor::PipeWrite { .. }
+            | FileDescriptor::Socket { .. }
+    )
+}
+
+fn epoll_ready_count(state: &alloc::sync::Arc<spin::Mutex<fd::EpollState>>) -> usize {
+    let epoll = state.lock();
+    epoll
+        .interests
+        .iter()
+        .filter(|interest| epoll_ready_events(&interest.file, interest.events) != 0)
+        .count()
+}
+
+fn epoll_collect_ready(
+    state: &alloc::sync::Arc<spin::Mutex<fd::EpollState>>,
+    events: *mut EpollEvent,
+    maxevents: usize,
+) -> Result<usize, SysErrNo> {
+    let mut ready_events = Vec::new();
+    {
+        let epoll = state.lock();
+        for interest in epoll.interests.iter() {
+            let revents = epoll_ready_events(&interest.file, interest.events);
+            if revents == 0 {
+                continue;
+            }
+            ready_events.push(EpollEvent::new(revents, interest.data));
+            if ready_events.len() == maxevents {
+                break;
+            }
+        }
+    }
+
+    for (index, event) in ready_events.iter().enumerate() {
+        copy_object_to_user(unsafe { events.add(index) }, event)?;
+    }
+    Ok(ready_events.len())
+}
+
+fn sys_epoll_wait_deadline(
+    epfd: usize,
+    events: *mut EpollEvent,
+    maxevents: usize,
+    deadline: Option<usize>,
+) -> SyscallRet {
+    if maxevents == 0 || maxevents > fd::MAX_FD_NUM {
+        return Err(SysErrNo::EINVAL);
+    }
+    if events.is_null() {
+        return Err(SysErrNo::EFAULT);
+    }
+
+    let state = epoll_state_for_fd(epfd)?;
+    loop {
+        let ready = epoll_collect_ready(&state, events, maxevents)?;
+        if ready != 0 {
+            return Ok(ready);
+        }
+        if let Some(deadline) = deadline {
+            if crate::timer::get_time_us() >= deadline {
+                return Ok(0);
+            }
+            if sleep_on_io_if(Some(deadline), || Ok(epoll_ready_count(&state) == 0))?
+                == WaitOutcome::TimedOut
+            {
+                return epoll_collect_ready(&state, events, maxevents);
+            }
+        } else {
+            let _ = sleep_on_io_if(None, || Ok(epoll_ready_count(&state) == 0))?;
+        }
+    }
+}
+
+pub fn sys_epoll_create1(flags: usize) -> SyscallRet {
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let fd_flags = if flags & EPOLL_CLOEXEC != 0 {
+        fd::FD_CLOEXEC
+    } else {
+        0
+    };
+    let epoll = FileDescriptor::Epoll {
+        state: alloc::sync::Arc::new(spin::Mutex::new(fd::EpollState::new())),
+    };
+    let inner = task.inner.lock();
+    let mut fds = inner.fd_table.lock();
+    fds.alloc_with_flags(epoll, fd_flags).ok_or(SysErrNo::EMFILE)
+}
+
+pub fn sys_epoll_ctl(
+    epfd: usize,
+    op: usize,
+    target_fd: usize,
+    event: *const EpollEvent,
+) -> SyscallRet {
+    let epoll_state = epoll_state_for_fd(epfd)?;
+    if epfd == target_fd {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let event = match op {
+        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+            if event.is_null() {
+                return Err(SysErrNo::EFAULT);
+            }
+            Some(copy_object_from_user(event)?)
+        }
+        EPOLL_CTL_DEL => None,
+        _ => return Err(SysErrNo::EINVAL),
+    };
+
+    let target_file = {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let fds = inner.fd_table.lock();
+        let file = fds.get(target_fd).ok_or(SysErrNo::EBADF)?;
+        if matches!(file, FileDescriptor::Epoll { .. }) {
+            return Err(SysErrNo::EINVAL);
+        }
+        if !fd_supports_epoll(file) {
+            return Err(SysErrNo::EPERM);
+        }
+        if op == EPOLL_CTL_ADD {
+            Some(file.clone())
+        } else {
+            None
+        }
+    };
+
+    let mut epoll = epoll_state.lock();
+    let index = epoll
+        .interests
+        .iter()
+        .position(|interest| interest.fd == target_fd);
+    match op {
+        EPOLL_CTL_ADD => {
+            if index.is_some() {
+                return Err(SysErrNo::EEXIST);
+            }
+            let event = event.unwrap();
+            epoll.interests.push(fd::EpollInterest {
+                fd: target_fd,
+                file: target_file.unwrap(),
+                events: event.events(),
+                data: event.data(),
+            });
+            Ok(0)
+        }
+        EPOLL_CTL_MOD => {
+            let index = index.ok_or(SysErrNo::ENOENT)?;
+            let event = event.unwrap();
+            epoll.interests[index].events = event.events();
+            epoll.interests[index].data = event.data();
+            Ok(0)
+        }
+        EPOLL_CTL_DEL => {
+            let index = index.ok_or(SysErrNo::ENOENT)?;
+            epoll.interests.remove(index);
+            Ok(0)
+        }
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+pub fn sys_epoll_pwait(
+    epfd: usize,
+    events: *mut EpollEvent,
+    maxevents: usize,
+    timeout_ms: isize,
+    _sigmask: usize,
+    _sigsetsize: usize,
+) -> SyscallRet {
+    let deadline = if timeout_ms < 0 {
+        None
+    } else {
+        Some(crate::timer::deadline_after_us((timeout_ms as usize).saturating_mul(1000)))
+    };
+    sys_epoll_wait_deadline(epfd, events, maxevents, deadline)
+}
+
+pub fn sys_epoll_pwait2(
+    epfd: usize,
+    events: *mut EpollEvent,
+    maxevents: usize,
+    timeout: usize,
+    _sigmask: usize,
+    _sigsetsize: usize,
+) -> SyscallRet {
+    let deadline = deadline_from_timespec_ptr(timeout)?;
+    sys_epoll_wait_deadline(epfd, events, maxevents, deadline)
 }
 
 fn poll_once(fds: *mut PollFd, nfds: usize) -> Result<usize, SysErrNo> {

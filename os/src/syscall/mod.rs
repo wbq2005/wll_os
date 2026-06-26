@@ -27,6 +27,9 @@ pub(crate) fn with_kernel_page_table<T>(f: impl FnOnce() -> T) -> T {
 
 /// 系统调用号定义
 pub const SYSCALL_GETCWD: usize = 17;
+pub const SYSCALL_EPOLL_CREATE1: usize = 20;
+pub const SYSCALL_EPOLL_CTL: usize = 21;
+pub const SYSCALL_EPOLL_PWAIT: usize = 22;
 pub const SYSCALL_FGETXATTR: usize = 10;
 pub const SYSCALL_DUP: usize = 23;
 pub const SYSCALL_DUP3: usize = 24;
@@ -175,6 +178,7 @@ pub const SYSCALL_RENAMEAT2: usize = 276;
 pub const SYSCALL_MEMBARRIER: usize = 283;
 pub const SYSCALL_STATX: usize = 291;
 pub const SYSCALL_FACCESSAT2: usize = 439;
+pub const SYSCALL_EPOLL_PWAIT2: usize = 441;
 pub const SYSCALL_COPY_FILE_RANGE: usize = 326;
 pub const SYSCALL_GETRANDOM: usize = 278;
 
@@ -206,6 +210,29 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             fs::sys_fgetxattr(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
         }
         SYSCALL_GETCWD => fs::sys_getcwd(args[0] as *mut u8, args[1]),
+        SYSCALL_EPOLL_CREATE1 => fs::sys_epoll_create1(args[0]),
+        SYSCALL_EPOLL_CTL => fs::sys_epoll_ctl(
+            args[0],
+            args[1],
+            args[2],
+            args[3] as *const fs::EpollEvent,
+        ),
+        SYSCALL_EPOLL_PWAIT => fs::sys_epoll_pwait(
+            args[0],
+            args[1] as *mut fs::EpollEvent,
+            args[2],
+            args[3] as isize,
+            args[4],
+            args[5],
+        ),
+        SYSCALL_EPOLL_PWAIT2 => fs::sys_epoll_pwait2(
+            args[0],
+            args[1] as *mut fs::EpollEvent,
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+        ),
         SYSCALL_OPENAT => fs::sys_openat(
             args[0] as isize,
             args[1] as *const u8,

@@ -380,6 +380,9 @@ pub enum FileDescriptor {
     Socket {
         state: Arc<Mutex<SocketState>>,
     },
+    Epoll {
+        state: Arc<Mutex<EpollState>>,
+    },
 }
 
 #[derive(Debug)]
@@ -467,6 +470,27 @@ pub struct SocketState {
     pub send_timeout_us: Option<usize>,
     pub recv_timeout_us: Option<usize>,
     pub error: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct EpollInterest {
+    pub fd: usize,
+    pub file: FileDescriptor,
+    pub events: u32,
+    pub data: u64,
+}
+
+#[derive(Debug)]
+pub struct EpollState {
+    pub interests: Vec<EpollInterest>,
+}
+
+impl EpollState {
+    pub fn new() -> Self {
+        Self {
+            interests: Vec::new(),
+        }
+    }
 }
 
 impl SocketState {
@@ -724,6 +748,7 @@ impl FileDescriptor {
             FileDescriptor::PipeRead { .. } => true,
             FileDescriptor::PipeWrite { .. } => false,
             FileDescriptor::Socket { .. } => true,
+            FileDescriptor::Epoll { .. } => false,
         }
     }
 
@@ -743,6 +768,7 @@ impl FileDescriptor {
             FileDescriptor::PipeRead { .. } => false,
             FileDescriptor::PipeWrite { .. } => true,
             FileDescriptor::Socket { .. } => true,
+            FileDescriptor::Epoll { .. } => false,
         }
     }
 
@@ -1498,6 +1524,9 @@ impl Clone for FileDescriptor {
                 }
             }
             FileDescriptor::Socket { state } => FileDescriptor::Socket {
+                state: state.clone(),
+            },
+            FileDescriptor::Epoll { state } => FileDescriptor::Epoll {
                 state: state.clone(),
             },
         }
