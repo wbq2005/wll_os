@@ -81,6 +81,7 @@ pub const SYSCALL_FDATASYNC: usize = 83;
 pub const SYSCALL_UTIMENSAT: usize = 88;
 pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_EXIT_GROUP: usize = 94;
+pub const SYSCALL_WAITID: usize = 95;
 pub const SYSCALL_SET_TID_ADDRESS: usize = 96;
 pub const SYSCALL_FUTEX: usize = 98;
 pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
@@ -373,6 +374,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         // 进程管理
         SYSCALL_EXIT => process::sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => process::sys_exit_group(args[0] as i32),
+        SYSCALL_WAITID => process::sys_waitid(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_GETPID => process::sys_getpid(),
         SYSCALL_GETPPID => process::sys_getppid(),
         SYSCALL_SCHED_YIELD => process::sys_sched_yield(),

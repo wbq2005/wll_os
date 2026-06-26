@@ -55,11 +55,35 @@ const CLONE_DETACHED: usize = 0x00400000;
 const CLONE_CHILD_SETTID: usize = 0x01000000;
 
 const WNOHANG: usize = 0x0000_0001;
+const WNOWAIT: usize = 0x0100_0000;
+const WEXITED: usize = 0x0000_0004;
+
+const P_ALL: usize = 0;
+const P_PID: usize = 1;
+const P_PGID: usize = 2;
+
+const SIGCHLD: i32 = 17;
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
 
 #[derive(Clone, Copy)]
 enum WaitTarget {
     AnyChild,
     Tgid(usize),
+    Pgid(usize),
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserWaitSigInfo {
+    signo: i32,
+    errno: i32,
+    code: i32,
+    _align: i32,
+    pid: i32,
+    uid: u32,
+    status: i32,
+    _reserved: [u8; 100],
 }
 
 fn read_user_usize(addr: usize) -> Result<usize, SysErrNo> {
@@ -74,6 +98,7 @@ fn child_matches_wait_target(child: &Arc<TaskControlBlock>, target: WaitTarget) 
     match target {
         WaitTarget::AnyChild => true,
         WaitTarget::Tgid(tgid) => child.thread_group.tgid() == tgid,
+        WaitTarget::Pgid(pgid) => child.inner.lock().pgid == pgid,
     }
 }
 
@@ -84,6 +109,20 @@ fn reap_zombie_child(waiter: &Arc<TaskControlBlock>, target: WaitTarget) -> Opti
             child_matches_wait_target(child, target) && child.thread_group.is_process_zombie()
         }) {
             let child = inner.children.remove(index);
+            return Some((child.thread_group.tgid(), child.thread_group.exit_code()));
+        }
+    }
+    None
+}
+
+fn peek_zombie_child(waiter: &Arc<TaskControlBlock>, target: WaitTarget) -> Option<(usize, i32)> {
+    for owner in waiter.thread_group.user_members() {
+        let inner = owner.inner.lock();
+        if let Some(child) = inner
+            .children
+            .iter()
+            .find(|child| child_matches_wait_target(child, target) && child.thread_group.is_process_zombie())
+        {
             return Some((child.thread_group.tgid(), child.thread_group.exit_code()));
         }
     }
@@ -849,6 +888,99 @@ pub fn sys_sched_yield() -> SyscallRet {
 ///   - 父进程再次被调度时调用 wait4 可以成功回收。
 pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -> SyscallRet {
     sys_wait4_thread_group(pid, status, options)
+}
+
+fn waitid_target(idtype: usize, id: usize) -> Result<WaitTarget, SysErrNo> {
+    match idtype {
+        P_ALL => Ok(WaitTarget::AnyChild),
+        P_PID => Ok(WaitTarget::Tgid(id)),
+        P_PGID => {
+            if id == 0 {
+                let task = current_task().ok_or(SysErrNo::ESRCH)?;
+                let pgid = task.inner.lock().pgid;
+                Ok(WaitTarget::Pgid(pgid))
+            } else {
+                Ok(WaitTarget::Pgid(id))
+            }
+        }
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+fn waitid_siginfo(pid: usize, exit_code: i32) -> UserWaitSigInfo {
+    let (code, status) = if exit_code < crate::task::SIGNAL_EXIT_CODE_BASE {
+        let signum = crate::task::SIGNAL_EXIT_CODE_BASE - exit_code;
+        (CLD_KILLED, signum)
+    } else {
+        (CLD_EXITED, exit_code & 0xff)
+    };
+    UserWaitSigInfo {
+        signo: SIGCHLD,
+        errno: 0,
+        code,
+        _align: 0,
+        pid: pid as i32,
+        uid: 0,
+        status,
+        _reserved: [0; 100],
+    }
+}
+
+fn write_waitid_siginfo(infop: usize, pid: usize, exit_code: i32) -> Result<(), SysErrNo> {
+    if infop == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    super::user::copy_object_to_user(infop, &waitid_siginfo(pid, exit_code))
+}
+
+pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusage: usize) -> SyscallRet {
+    const SUPPORTED_OPTIONS: usize = WEXITED | WNOHANG | WNOWAIT;
+    if infop == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if (options & !SUPPORTED_OPTIONS) != 0 || (options & WEXITED) == 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let target = waitid_target(idtype, id)?;
+    let nohang = (options & WNOHANG) != 0;
+    let nowait = (options & WNOWAIT) != 0;
+
+    let take_child = |task: &Arc<TaskControlBlock>| {
+        if nowait {
+            peek_zombie_child(task, target)
+        } else {
+            reap_zombie_child(task, target)
+        }
+    };
+
+    if let Some((cpid, exit_code)) = take_child(&task) {
+        write_waitid_siginfo(infop, cpid, exit_code)?;
+        return Ok(0);
+    }
+
+    if !has_matching_child(&task, target) {
+        return Err(SysErrNo::ECHILD);
+    }
+
+    if nohang {
+        return Ok(0);
+    }
+
+    loop {
+        if let Some((cpid, exit_code)) = take_child(&task) {
+            write_waitid_siginfo(infop, cpid, exit_code)?;
+            return Ok(0);
+        }
+        if !has_matching_child(&task, target) {
+            return Err(SysErrNo::ECHILD);
+        }
+        match crate::task::wait_queue::sleep_on_child_exit() {
+            Ok(_) | Err(SysErrNo::EINTR) => continue,
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// clone: supports fork-style children plus the documented shared-resource and thread flags.

@@ -28,7 +28,7 @@ static mut SCHEDULER_CONTEXT: TaskContext = TaskContext {
     s: [0; 12],
 };
 static SCHEDULER_CONTEXT_PTR: AtomicUsize = AtomicUsize::new(0);
-const SIGNAL_EXIT_CODE_BASE: i32 = -0x1000;
+pub(crate) const SIGNAL_EXIT_CODE_BASE: i32 = -0x1000;
 pub const SCHED_OTHER: usize = 0;
 pub const SCHED_FIFO: usize = 1;
 pub const SCHED_RR: usize = 2;
