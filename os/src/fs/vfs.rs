@@ -21,6 +21,7 @@ const S_IFBLK: u32 = 0o060000;
 const S_IFREG: u32 = 0o100000;
 const S_IFLNK: u32 = 0o120000;
 const S_IFSOCK: u32 = 0o140000;
+const S_ISGID: u32 = 0o2000;
 const DEV_NULL_MAJOR: u32 = 1;
 const DEV_NULL_MINOR: u32 = 3;
 const DEV_ZERO_MAJOR: u32 = 1;
@@ -1300,14 +1301,40 @@ pub fn set_file_flags_for_fd(file: &fd::FileDescriptor, flags: u32) -> Result<()
 }
 
 fn check_noatime_permission(meta: &VfsMetadata) -> Result<(), SysErrNo> {
-    let credentials = crate::task::current_task()
-        .map(|task| task.credentials.lock().clone())
-        .unwrap_or_else(crate::task::Credentials::root);
+    let credentials = current_credentials();
     if credentials.fsuid == 0 || credentials.fsuid == meta.uid {
         Ok(())
     } else {
         Err(SysErrNo::EPERM)
     }
+}
+
+fn current_credentials() -> crate::task::Credentials {
+    crate::task::current_task()
+        .map(|task| task.credentials.lock().clone())
+        .unwrap_or_else(crate::task::Credentials::root)
+}
+
+fn check_chmod_permission(meta: &VfsMetadata) -> Result<(), SysErrNo> {
+    let credentials = current_credentials();
+    if credentials.is_root_capable() || credentials.fsuid == 0 || credentials.fsuid == meta.uid {
+        Ok(())
+    } else {
+        Err(SysErrNo::EPERM)
+    }
+}
+
+fn chmod_mode_after_permission(mode: u32, meta: &VfsMetadata) -> u32 {
+    let credentials = current_credentials();
+    let mut next = mode & 0o7777;
+    if (next & S_ISGID) != 0
+        && !credentials.is_root_capable()
+        && credentials.fsuid != 0
+        && !credentials.is_in_filesystem_group(meta.gid)
+    {
+        next &= !S_ISGID;
+    }
+    next
 }
 
 fn check_chown_permission(
@@ -1318,9 +1345,7 @@ fn check_chown_permission(
     if uid.is_none() && gid.is_none() {
         return Ok(());
     }
-    let credentials = crate::task::current_task()
-        .map(|task| task.credentials.lock().clone())
-        .unwrap_or_else(crate::task::Credentials::root);
+    let credentials = current_credentials();
     if credentials.effective_uid == 0 || credentials.effective_uid == meta.uid {
         Ok(())
     } else {
@@ -2077,10 +2102,32 @@ pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), 
         return Err(SysErrNo::EROFS);
     }
     ensure_mount_writable(&norm)?;
+    check_search_access(&norm, CredentialIdentity::Effective)?;
+    let (mem_node, mem_symlink) = {
+        let mem = MEM_FS.lock();
+        (
+            mem.is_dir(&norm) || mem.get_file(&norm).is_some() || mem.get_special(&norm).is_some(),
+            mem.get_symlink(&norm).is_some(),
+        )
+    };
+    if mem_node {
+        let meta = metadata(&norm, true)?;
+        check_chmod_permission(&meta)?;
+        return MEM_FS
+            .lock()
+            .set_mode(&norm, chmod_mode_after_permission(mode, &meta));
+    }
+    if mem_symlink && follow_symlink {
+        let resolved = resolve_final_symlink(&norm, false)?;
+        return set_mode_path(&resolved, true, mode);
+    }
     {
-        let mut mem = MEM_FS.lock();
-        if mem.is_dir(&norm) || mem.get_file(&norm).is_some() || mem.get_special(&norm).is_some() {
-            return mem.set_mode(&norm, mode);
+        if mem_symlink {
+            let meta = metadata(&norm, false)?;
+            check_chmod_permission(&meta)?;
+            return MEM_FS
+                .lock()
+                .set_mode(&norm, chmod_mode_after_permission(mode, &meta));
         }
     }
     if is_tmpfs_path(&norm) {
@@ -2093,18 +2140,33 @@ pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), 
         Some(_) => norm.clone(),
         None => return Err(missing_path_errno(&norm)),
     };
-    ext4_vol::set_mode_path(&ext_path, mode)
+    let meta = metadata(&ext_path, true)?;
+    check_chmod_permission(&meta)?;
+    ext4_vol::set_mode_path(&ext_path, chmod_mode_after_permission(mode, &meta))
 }
 
 pub fn set_mode_fd(file: &mut fd::FileDescriptor, mode: u32) -> Result<(), SysErrNo> {
+    match file {
+        fd::FileDescriptor::MemFile { .. }
+        | fd::FileDescriptor::MemDir { .. }
+        | fd::FileDescriptor::Ext4Regular { .. }
+        | fd::FileDescriptor::Ext4Dir { .. } => {}
+        fd::FileDescriptor::Path { .. } => return Err(SysErrNo::EBADF),
+        _ => return Err(SysErrNo::EINVAL),
+    }
+    if let Some(path) = mount_path_for_fd(file) {
+        ensure_mount_writable(path)?;
+    }
+    let meta = metadata_for_fd(file)?;
+    check_chmod_permission(&meta)?;
+    let mode = chmod_mode_after_permission(mode, &meta);
     match file {
         fd::FileDescriptor::MemFile { name, .. } => MEM_FS.lock().set_mode(name, mode),
         fd::FileDescriptor::MemDir { host_path, .. } => MEM_FS.lock().set_mode(host_path, mode),
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::set_mode_ino(*ino, mode)
         }
-        fd::FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
-        _ => Err(SysErrNo::EINVAL),
+        _ => unreachable!(),
     }
 }
 
