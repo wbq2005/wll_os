@@ -1580,8 +1580,10 @@ fn futex_wait_addr(
     private: bool,
 ) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    if let Some(ret) = finish_resumed_futex_wait(&task, uaddr, deadline, private) {
-        return ret;
+    if deadline.is_none() {
+        if let Some(ret) = finish_resumed_futex_wait(&task, uaddr, deadline, private) {
+            return ret;
+        }
     }
     if bitset == 0 {
         return Err(SysErrNo::EINVAL);
