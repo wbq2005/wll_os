@@ -69,6 +69,26 @@ impl MemNodeMetadata {
             ino: 0,
         }
     }
+
+    fn new_child_for_current(parent: Option<MemNodeMetadata>, mode: u32, is_dir: bool) -> Self {
+        let credentials = crate::task::current_task()
+            .map(|task| task.credentials.lock().clone())
+            .unwrap_or_else(crate::task::Credentials::root);
+        let parent_setgid = parent.is_some_and(|meta| (meta.mode & 0o2000) != 0);
+        let mut child_mode = mode & 0o7777;
+        if is_dir && parent_setgid {
+            child_mode |= 0o2000;
+        }
+        Self {
+            mode: child_mode,
+            uid: credentials.fsuid,
+            gid: parent
+                .filter(|_| parent_setgid)
+                .map(|meta| meta.gid)
+                .unwrap_or(credentials.fsgid),
+            ino: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +249,11 @@ impl MemFileSystem {
         metadata
     }
 
+    fn child_metadata_for_current(&self, name: &str, mode: u32, is_dir: bool) -> MemNodeMetadata {
+        let parent_meta = self.metadata(&parent_path(name));
+        MemNodeMetadata::new_child_for_current(parent_meta, mode, is_dir)
+    }
+
     /// 添加文件
     pub fn add_file(&mut self, name: &str, content: Vec<u8>) {
         let name = normalize_path(name);
@@ -250,8 +275,16 @@ impl MemFileSystem {
     }
 
     pub fn add_file_with_mode(&mut self, name: &str, content: Vec<u8>, mode: u32) {
-        self.add_file(name, content);
-        let _ = self.set_mode(name, mode);
+        let name = normalize_path(name);
+        self.ensure_parent_dirs(&name);
+        self.symlinks.remove(&name);
+        self.specials.remove(&name);
+        self.files.retain(|f| f.name != name);
+        let len = content.len();
+        self.files.push(MemFile::new(&name, content));
+        let metadata = self.child_metadata_for_current(&name, mode, false);
+        self.insert_new_metadata(name.clone(), metadata);
+        log::info!("[fs] Added file '{}' ({} bytes)", name, len);
     }
 
     pub fn write_file_content(
@@ -347,8 +380,19 @@ impl MemFileSystem {
     }
 
     pub fn add_dir_with_mode(&mut self, name: &str, mode: u32) {
-        self.add_dir(name);
-        let _ = self.set_mode(name, mode);
+        let name = normalize_path(name);
+        self.ensure_parent_dirs(&name);
+        self.symlinks.remove(&name);
+        self.specials.remove(&name);
+        if !self.dirs.iter().any(|dir| dir == &name) {
+            self.dirs.push(name.clone());
+            log::info!("[fs] Added directory '{}'", name);
+            let metadata = self.child_metadata_for_current(&name, mode, true);
+            self.insert_new_metadata(name, metadata);
+        } else {
+            self.ensure_metadata(&name, 0o755);
+            let _ = self.set_mode(&name, mode);
+        }
     }
 
     pub fn add_symlink(&mut self, name: &str, target: &str) -> Result<(), SysErrNo> {
@@ -361,7 +405,8 @@ impl MemFileSystem {
             return Err(SysErrNo::EEXIST);
         }
         self.symlinks.insert(name.clone(), String::from(target));
-        self.insert_new_metadata(name, MemNodeMetadata::new_for_current(0o777));
+        let metadata = self.child_metadata_for_current(&name, 0o777, false);
+        self.insert_new_metadata(name, metadata);
         Ok(())
     }
 
@@ -380,7 +425,8 @@ impl MemFileSystem {
             return Err(SysErrNo::EEXIST);
         }
         self.specials.insert(name.clone(), kind);
-        self.insert_new_metadata(name, MemNodeMetadata::new_for_current(mode));
+        let metadata = self.child_metadata_for_current(&name, mode, false);
+        self.insert_new_metadata(name, metadata);
         Ok(())
     }
 

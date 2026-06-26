@@ -590,6 +590,27 @@ fn current_fs_ids() -> (u16, u16) {
     (uid, gid)
 }
 
+fn new_child_ids_and_mode(
+    fs: &Ext4,
+    parent_ino: u32,
+    mode: u32,
+    is_dir: bool,
+) -> (u16, u16, u16) {
+    let (uid, fsgid) = current_fs_ids();
+    let parent_inode = fs.get_inode_ref(parent_ino).inode;
+    let parent_setgid = (parent_inode.mode() & 0o2000) != 0;
+    let mut perm = (mode as u16) & 0o7777;
+    if is_dir && parent_setgid {
+        perm |= 0o2000;
+    }
+    let gid = if parent_setgid {
+        parent_inode.gid()
+    } else {
+        fsgid
+    };
+    (uid, gid, perm)
+}
+
 fn ext4_extra_nsec(extra: u32) -> isize {
     (extra >> 2) as isize
 }
@@ -1746,12 +1767,11 @@ pub fn mkdir_ext4_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
     if resolve_existing(&fs, &norm).is_some() {
         return Err(SysErrNo::EEXIST);
     }
-    let perm = (mode as u16) & 0o777;
+    let (uid, gid, perm) = new_child_ids_and_mode(&fs, parent_ino, mode, true);
     let mut child_ref = fs
         .create(parent_ino, &name, InodeFileType::S_IFDIR.bits() | perm)
         .map_err(map_ext4_err)?;
     let now = current_ext4_time();
-    let (uid, gid) = current_fs_ids();
     child_ref
         .inode
         .set_mode(InodeFileType::S_IFDIR.bits() | perm);
@@ -1829,12 +1849,11 @@ pub fn create_regular_ext4_with_mode(path: &str, mode: u32) -> Result<u32, SysEr
     if resolve_existing(&fs, &norm).is_some() {
         return Err(SysErrNo::EEXIST);
     }
-    let perm = (mode as u16) & 0o777;
+    let (uid, gid, perm) = new_child_ids_and_mode(&fs, parent_ino, mode, false);
     let mut iref = fs
         .create(parent_ino, &name, InodeFileType::S_IFREG.bits() | perm)
         .map_err(map_ext4_err)?;
     let now = current_ext4_time();
-    let (uid, gid) = current_fs_ids();
     iref.inode.set_mode(InodeFileType::S_IFREG.bits() | perm);
     iref.inode.set_uid(uid);
     iref.inode.set_gid(gid);
@@ -2186,12 +2205,12 @@ pub fn create_symlink_ext4(target: &str, link_path: &str) -> Result<(), SysErrNo
     if resolve_existing(&fs, &norm).is_some() {
         return Err(SysErrNo::EEXIST);
     }
+    let (uid, gid, perm) = new_child_ids_and_mode(&fs, parent_ino, 0o777, false);
     let mut iref = fs
         .create(parent_ino, &name, InodeFileType::S_IFLNK.bits() | 0o777)
         .map_err(map_ext4_err)?;
     let now = current_ext4_time();
-    let (uid, gid) = current_fs_ids();
-    iref.inode.set_mode(InodeFileType::S_IFLNK.bits() | 0o777);
+    iref.inode.set_mode(InodeFileType::S_IFLNK.bits() | perm);
     iref.inode.set_uid(uid);
     iref.inode.set_gid(gid);
     iref.inode.set_atime(now);

@@ -1979,7 +1979,9 @@ fn open_file_legacy_unused(
         let mem_parent = fs::MEM_FS.lock().is_dir(&parent);
         let ext_parent = ext4_vol::ext4_dir_path_exists(&parent);
         if mem_parent && (fs::is_memfs_volatile_dir(&parent) || !ext_parent) {
-            fs::MEM_FS.lock().add_file(&path_norm, Vec::new());
+            fs::MEM_FS
+                .lock()
+                .add_file_with_mode(&path_norm, Vec::new(), mode);
             let times = fs::MEM_FS
                 .lock()
                 .get_file(&path_norm)
@@ -2009,7 +2011,9 @@ fn open_file_legacy_unused(
             });
         }
         if mem_parent {
-            fs::MEM_FS.lock().add_file(&path_norm, Vec::new());
+            fs::MEM_FS
+                .lock()
+                .add_file_with_mode(&path_norm, Vec::new(), mode);
             let times = fs::MEM_FS
                 .lock()
                 .get_file(&path_norm)
