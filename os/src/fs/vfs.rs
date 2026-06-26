@@ -1895,7 +1895,7 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
             }
             return Err(SysErrNo::ENOENT);
         }
-        if ext_new_parent && !super::is_memfs_volatile_dir(&new_parent) {
+        if ext_new_parent && !super::is_memfs_overlay_create_dir(&new_parent) {
             return Err(SysErrNo::EXDEV);
         }
         MEM_FS.lock().link_path(&old, &new)?;
@@ -1947,7 +1947,7 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
     if mem_parent || ext_parent {
         check_create_access(&parent)?;
     }
-    if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
+    if mem_parent && (super::is_memfs_overlay_create_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_symlink(&norm, target)?;
         clear_whiteout(&norm);
         return Ok(());
@@ -2205,7 +2205,7 @@ pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
     if mem_parent || ext_parent {
         check_create_access(&parent)?;
     }
-    if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
+    if mem_parent && (super::is_memfs_overlay_create_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_dir_with_mode(&norm, mode);
         return Ok(());
     }
@@ -2243,7 +2243,7 @@ pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
     let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
-    if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
+    if mem_parent && (super::is_memfs_overlay_create_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_file_with_mode(&norm, Vec::new(), mode);
         return Ok(memfs_inode_u32(&norm));
     }
@@ -2279,7 +2279,7 @@ pub fn create_special_node(path: &str, kind: MemSpecialKind, mode: u32) -> Resul
     if mem_parent || ext_parent {
         check_create_access(&parent)?;
     }
-    if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
+    if mem_parent && (super::is_memfs_overlay_create_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_special_with_mode(&norm, kind, mode)?;
         return Ok(memfs_inode_u32(&norm));
     }
@@ -2676,7 +2676,7 @@ pub fn open_path(
         let mem_parent = !parent_mounted_ext4 && MEM_FS.lock().is_dir(&parent);
         let ext_parent =
             !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&ext4_lookup_path(&parent));
-        if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
+        if mem_parent && (super::is_memfs_overlay_create_dir(&parent) || !ext_parent) {
             MEM_FS
                 .lock()
                 .add_file_with_mode(&open_norm, Vec::new(), mode);

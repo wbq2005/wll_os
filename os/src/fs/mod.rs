@@ -1002,6 +1002,8 @@ fn init_pseudo_files() {
     let meminfo = b"MemTotal:       131072 kB\nMemFree:         65536 kB\nMemAvailable:    65536 kB\nBuffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\nSwapFree:            0 kB\n";
     let cpuinfo = b"processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imac\n";
     let proc_self_status = b"Name:\twll_OS\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nMems_allowed:\t1\nMems_allowed_list:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n";
+    let proc_self_maps =
+        b"00010000-00020000 r-xp 00000000 00:00 0 /init\n00020000-00030000 rw-p 00000000 00:00 0 [heap]\n7fff0000-80000000 rw-p 00000000 00:00 0 [stack]\n";
     let passwd =
         b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n";
     let group = b"root:x:0:\nnogroup:x:65534:\n";
@@ -1039,6 +1041,10 @@ fn init_pseudo_files() {
         fs.add_file(
             &alloc::format!("{}/proc/self/status", root),
             proc_self_status.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/proc/self/maps", root),
+            proc_self_maps.to_vec(),
         );
         fs.add_file(&alloc::format!("{}/proc/cpuinfo", root), cpuinfo.to_vec());
         fs.add_file(&alloc::format!("{}/etc/mtab", root), mounts.to_vec());
@@ -1220,6 +1226,11 @@ pub fn is_memfs_volatile_dir(path: &str) -> bool {
         || local.starts_with("/var/tmp/")
         || local == "/dev/shm"
         || local.starts_with("/dev/shm/")
+}
+
+pub fn is_memfs_overlay_create_dir(path: &str) -> bool {
+    let norm = normalize_path(path);
+    norm == "/musl" || norm == "/glibc" || is_memfs_volatile_dir(&norm)
 }
 
 fn child_name(parent: &str, child: &str) -> Option<String> {

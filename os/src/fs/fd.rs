@@ -1621,23 +1621,26 @@ impl FileDescriptorTable {
         self.cloexec_count = self
             .cloexec_count
             .saturating_sub(Self::count_cloexec(self.fd_flags[index]));
+        let old = self.fds[index].take();
         self.fds[index] = Some(fd);
         self.fd_flags[index] = flags & FD_CLOEXEC;
         self.cloexec_count += Self::count_cloexec(self.fd_flags[index]);
         if self.next_fd_hint == MAX_FD_NUM || index <= self.next_fd_hint {
             self.next_fd_hint = index.saturating_add(1).min(MAX_FD_NUM);
         }
+        drop(old);
     }
 
-    fn clear_slot(&mut self, index: usize) {
+    fn clear_slot(&mut self, index: usize) -> Option<FileDescriptor> {
         self.cloexec_count = self
             .cloexec_count
             .saturating_sub(Self::count_cloexec(self.fd_flags[index]));
-        self.fds[index] = None;
+        let old = self.fds[index].take();
         self.fd_flags[index] = 0;
         if index < self.next_fd_hint {
             self.next_fd_hint = index;
         }
+        old
     }
 
     fn alloc_slot_from(
@@ -1746,14 +1749,24 @@ impl FileDescriptorTable {
     }
 
     pub fn free(&mut self, fd: usize) -> Result<(), SysErrNo> {
+        crate::trap::restore_kernel_page_table();
+        drop(self.remove(fd)?);
+        if let Some(task) = crate::task::current_task() {
+            if !task.is_kernel {
+                task.memory_set.lock().activate();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn remove(&mut self, fd: usize) -> Result<FileDescriptor, SysErrNo> {
         if fd >= MAX_FD_NUM {
             return Err(SysErrNo::EBADF);
         }
         if self.fds[fd].is_none() {
             return Err(SysErrNo::EBADF);
         }
-        self.clear_slot(fd);
-        Ok(())
+        self.clear_slot(fd).ok_or(SysErrNo::EBADF)
     }
 
     pub fn fd_flags(&self, fd: usize) -> Result<usize, SysErrNo> {

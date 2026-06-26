@@ -57,6 +57,13 @@ const EPOLLWRNORM: u32 = 0x0100;
 const EPOLL_READ_EVENTS: u32 = EPOLLIN | EPOLLRDNORM;
 const EPOLL_WRITE_EVENTS: u32 = EPOLLOUT | EPOLLWRNORM;
 
+const SPLICE_F_MOVE: usize = 0x01;
+const SPLICE_F_NONBLOCK: usize = 0x02;
+const SPLICE_F_MORE: usize = 0x04;
+const SPLICE_F_GIFT: usize = 0x08;
+const SPLICE_F_ALL: usize = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+const SPLICE_CHUNK: usize = 64 * 1024;
+
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EACCESS: usize = 0x200;
 const UTIME_NOW: isize = 0x3fffffff;
@@ -1725,8 +1732,14 @@ pub fn sys_close(fd: usize) -> SyscallRet {
 
     // 获取当前任务的文件描述符表
     if let Some(task) = current_task() {
-        let mut inner = task.inner.lock();
-        inner.fd_table.lock().free(fd)?;
+        let old = {
+            let inner = task.inner.lock();
+            let fd_table = inner.fd_table.clone();
+            drop(inner);
+            let mut fds = fd_table.lock();
+            fds.remove(fd)?
+        };
+        super::with_kernel_page_table(|| drop(old));
         Ok(0)
     } else {
         Err(SysErrNo::ESRCH)
@@ -2937,6 +2950,250 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize) ->
     if let Some(off) = file_offset {
         super::user::copy_object_to_user(offset, &off)?;
     }
+    Ok(copied)
+}
+
+fn fd_is_pipe(file_desc: &FileDescriptor) -> bool {
+    file_desc.is_pipe_read() || file_desc.is_pipe_write()
+}
+
+fn fd_has_append_mode(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::MemFile { append: true, .. }
+            | FileDescriptor::Ext4Regular { append: true, .. }
+    )
+}
+
+fn fd_is_splice_source(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::MemFile { readable: true, .. }
+            | FileDescriptor::Ext4Regular { readable: true, .. }
+            | FileDescriptor::PipeRead { .. }
+    )
+}
+
+fn fd_is_splice_target(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::MemFile {
+            writable: true,
+            append: false,
+            ..
+        } | FileDescriptor::Ext4Regular {
+            writable: true,
+            append: false,
+            ..
+        } | FileDescriptor::PipeWrite { .. }
+    )
+}
+
+fn fd_is_regular_without_read(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::MemFile {
+            readable: false, ..
+        } | FileDescriptor::Ext4Regular {
+            readable: false,
+            ..
+        }
+    )
+}
+
+fn fd_is_regular_without_write(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::MemFile {
+            writable: false, ..
+        } | FileDescriptor::Ext4Regular {
+            writable: false,
+            ..
+        }
+    )
+}
+
+fn load_splice_offset(ptr: usize) -> Result<Option<usize>, SysErrNo> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let offset = super::user::copy_object_from_user::<i64>(ptr)?;
+    usize::try_from(offset).map(Some).map_err(|_| SysErrNo::EINVAL)
+}
+
+fn store_splice_offset(ptr: usize, offset: usize) -> Result<(), SysErrNo> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    let offset = i64::try_from(offset).map_err(|_| SysErrNo::EINVAL)?;
+    super::user::copy_object_to_user(ptr, &offset)
+}
+
+pub fn sys_splice(
+    fd_in: usize,
+    off_in: usize,
+    fd_out: usize,
+    off_out: usize,
+    len: usize,
+    flags: usize,
+) -> SyscallRet {
+    if flags & !SPLICE_F_ALL != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    checked_io_count(len)?;
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let fd_table = task.inner.lock().fd_table.clone();
+
+    {
+        let fds = fd_table.lock();
+        let input = fds.get(fd_in).ok_or(SysErrNo::EBADF)?;
+        let output = fds.get(fd_out).ok_or(SysErrNo::EBADF)?;
+        let input_is_pipe = fd_is_pipe(input);
+        let output_is_pipe = fd_is_pipe(output);
+
+        if !input_is_pipe && !output_is_pipe {
+            return Err(SysErrNo::EINVAL);
+        }
+        if input_is_pipe && off_in != 0 {
+            return Err(SysErrNo::ESPIPE);
+        }
+        if output_is_pipe && off_out != 0 {
+            return Err(SysErrNo::ESPIPE);
+        }
+        if fd_has_append_mode(output) {
+            return Err(SysErrNo::EINVAL);
+        }
+        if matches!(input, FileDescriptor::PipeWrite { .. }) {
+            return Err(SysErrNo::EBADF);
+        }
+        if matches!(output, FileDescriptor::PipeRead { .. }) {
+            return Err(SysErrNo::EBADF);
+        }
+        if fd_is_regular_without_read(input) || fd_is_regular_without_write(output) {
+            return Err(SysErrNo::EBADF);
+        }
+        if !fd_is_splice_source(input) {
+            return Err(SysErrNo::EINVAL);
+        }
+        if !fd_is_splice_target(output) {
+            return Err(SysErrNo::EINVAL);
+        }
+    }
+
+    let mut input_offset = load_splice_offset(off_in)?;
+    let mut output_offset = load_splice_offset(off_out)?;
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
+    let mut copied = 0usize;
+    let mut kbuf = Vec::new();
+
+    while copied < len {
+        let want = (len - copied).min(SPLICE_CHUNK);
+        kbuf.resize(want, 0);
+
+        let nread = loop {
+            let res = {
+                let mut fds = fd_table.lock();
+                let input = fds.get_mut(fd_in).ok_or(SysErrNo::EBADF)?;
+                if let Some(offset) = input_offset {
+                    read_fixed_at_into_kernel(input, offset, &mut kbuf[..want])
+                } else {
+                    read_fd_into_kernel(input, &mut kbuf[..want])
+                }
+            };
+
+            match res {
+                Ok(n) => break n,
+                Err(SysErrNo::EAGAIN) => {
+                    if copied != 0 {
+                        store_splice_offset(off_in, input_offset.unwrap_or(0))?;
+                        store_splice_offset(off_out, output_offset.unwrap_or(0))?;
+                        return Ok(copied);
+                    }
+                    if nonblock {
+                        return Err(SysErrNo::EAGAIN);
+                    }
+                    let _ = wait_pipe_read_after_eagain(&fd_table, fd_in)?;
+                }
+                Err(err) => {
+                    if copied != 0 {
+                        store_splice_offset(off_in, input_offset.unwrap_or(0))?;
+                        store_splice_offset(off_out, output_offset.unwrap_or(0))?;
+                        return Ok(copied);
+                    }
+                    return Err(err);
+                }
+            }
+        };
+
+        if nread == 0 {
+            break;
+        }
+
+        let mut nwritten_total = 0usize;
+        while nwritten_total < nread {
+            let res = {
+                let mut fds = fd_table.lock();
+                let output = fds.get_mut(fd_out).ok_or(SysErrNo::EBADF)?;
+                let buf = &kbuf[nwritten_total..nread];
+                if let Some(offset) = output_offset {
+                    let fixed_offset = checked_fixed_offset(offset, nwritten_total)?;
+                    write_fixed_at_from_kernel(output, fixed_offset, buf)
+                } else {
+                    write_fd_from_kernel(output, buf)
+                }
+            };
+
+            match res {
+                Ok(0) => break,
+                Ok(n) => {
+                    nwritten_total += n;
+                    copied += n;
+                }
+                Err(SysErrNo::EAGAIN) => {
+                    if nonblock {
+                        store_splice_offset(off_in, input_offset.unwrap_or(0))?;
+                        store_splice_offset(off_out, output_offset.unwrap_or(0))?;
+                        return if copied != 0 {
+                            Ok(copied)
+                        } else {
+                            Err(SysErrNo::EAGAIN)
+                        };
+                    }
+                    let _ = wait_pipe_write_after_eagain(&fd_table, fd_out)?;
+                }
+                Err(SysErrNo::EPIPE) if copied == 0 => {
+                    crate::syscall::signal::send_sigpipe_to_current();
+                    return Err(SysErrNo::EPIPE);
+                }
+                Err(err) => {
+                    if copied != 0 {
+                        store_splice_offset(off_in, input_offset.unwrap_or(0))?;
+                        store_splice_offset(off_out, output_offset.unwrap_or(0))?;
+                        return Ok(copied);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        if let Some(offset) = input_offset.as_mut() {
+            *offset = checked_fixed_offset(*offset, nwritten_total)?;
+        }
+        if let Some(offset) = output_offset.as_mut() {
+            *offset = checked_fixed_offset(*offset, nwritten_total)?;
+        }
+        if nwritten_total == 0 || nwritten_total < nread {
+            break;
+        }
+    }
+
+    store_splice_offset(off_in, input_offset.unwrap_or(0))?;
+    store_splice_offset(off_out, output_offset.unwrap_or(0))?;
     Ok(copied)
 }
 

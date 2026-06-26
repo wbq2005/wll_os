@@ -70,6 +70,7 @@ pub const SYSCALL_FTRUNCATE: usize = 46;
 pub const SYSCALL_FALLOCATE: usize = 47;
 pub const SYSCALL_PSELECT6: usize = 72;
 pub const SYSCALL_PPOLL: usize = 73;
+pub const SYSCALL_SPLICE: usize = 76;
 pub const SYSCALL_READLINKAT: usize = 78;
 pub const SYSCALL_NEWFSTATAT: usize = 79;
 pub const SYSCALL_FSTAT: usize = 80;
@@ -284,6 +285,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[3],
             args[4],
         ),
+        SYSCALL_SPLICE => fs::sys_splice(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_PSELECT6 => fs::sys_pselect6(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_LSEEK => fs::sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_DUP => fs::sys_dup(args[0]),
