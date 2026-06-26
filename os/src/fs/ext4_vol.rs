@@ -2021,6 +2021,7 @@ pub fn set_mode_path(path: &str, mode: u32) -> Result<(), SysErrNo> {
 pub fn set_owner_ino(ino: u32, uid: Option<u32>, gid: Option<u32>) -> Result<(), SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let mut iref = fs.get_inode_ref(ino);
+    let is_regular = iref.inode.is_file();
     if let Some(uid) = uid {
         if uid > u16::MAX as u32 {
             return Err(SysErrNo::EINVAL);
@@ -2033,6 +2034,12 @@ pub fn set_owner_ino(ino: u32, uid: Option<u32>, gid: Option<u32>) -> Result<(),
         }
         iref.inode.set_gid(gid as u16);
     }
+    let mode = super::chown_mode_after_owner_update(
+        iref.inode.mode() as u32,
+        is_regular,
+        uid.is_some() || gid.is_some(),
+    );
+    iref.inode.set_mode(mode as u16);
     let now = current_ext4_time();
     iref.inode.set_ctime(now);
     iref.inode.set_i_ctime_extra(0);

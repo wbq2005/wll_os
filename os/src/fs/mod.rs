@@ -95,6 +95,21 @@ impl MemNodeMetadata {
     }
 }
 
+pub(crate) fn chown_mode_after_owner_update(
+    mode: u32,
+    is_regular: bool,
+    owner_update_requested: bool,
+) -> u32 {
+    if !is_regular || !owner_update_requested {
+        return mode;
+    }
+    let mut next = mode & !0o4000;
+    if (mode & 0o0010) != 0 {
+        next &= !0o2000;
+    }
+    next
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemSpecialKind {
     Fifo,
@@ -918,7 +933,13 @@ impl MemFileSystem {
             let metadata = self.allocate_metadata(MemNodeMetadata::new(0o666));
             self.metadata.insert(name.clone(), metadata);
         }
+        let is_regular = self.files.iter().any(|f| f.name == name);
         let entry = self.metadata.get_mut(&name).expect("metadata exists");
+        entry.mode = chown_mode_after_owner_update(
+            entry.mode,
+            is_regular,
+            uid.is_some() || gid.is_some(),
+        );
         if let Some(uid) = uid {
             entry.uid = uid;
         }
