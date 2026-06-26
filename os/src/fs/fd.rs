@@ -351,6 +351,7 @@ pub enum FileDescriptor {
     /// 内存目录
     MemDir {
         path: String,
+        host_path: String,
         entries: Vec<DirEntryRecord>,
         offset: usize,
     },
@@ -1589,10 +1590,12 @@ impl Clone for FileDescriptor {
             },
             FileDescriptor::MemDir {
                 path,
+                host_path,
                 entries,
                 offset,
             } => FileDescriptor::MemDir {
                 path: path.clone(),
+                host_path: host_path.clone(),
                 entries: entries.clone(),
                 offset: *offset,
             },
@@ -2107,6 +2110,7 @@ fn open_file_legacy_unused(
             let entries = fs::list_dir(&path_norm)?;
             return Ok(FileDescriptor::MemDir {
                 path: logical_norm,
+                host_path: path_norm,
                 entries,
                 offset: 0,
             });

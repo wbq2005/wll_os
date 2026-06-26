@@ -253,6 +253,15 @@ fn ensure_mount_writable(path: &str) -> Result<(), SysErrNo> {
     }
 }
 
+fn mount_path_for_fd(file: &fd::FileDescriptor) -> Option<&str> {
+    match file {
+        fd::FileDescriptor::MemFile { name, .. } => Some(name.as_str()),
+        fd::FileDescriptor::MemDir { host_path, .. } => Some(host_path.as_str()),
+        fd::FileDescriptor::Path { host_path, .. } => Some(host_path.as_str()),
+        _ => None,
+    }
+}
+
 fn is_mountpoint(path: &str) -> bool {
     let norm = normalize_path(path);
     MOUNT_TABLE
@@ -1058,19 +1067,21 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
                 Ok(metadata_from_mem_fd(name, content, *times))
             }
         }
-        fd::FileDescriptor::MemDir { path, entries, .. } => {
+        fd::FileDescriptor::MemDir {
+            host_path, entries, ..
+        } => {
             let node = MEM_FS
                 .lock()
-                .metadata(path)
+                .metadata(host_path)
                 .unwrap_or_else(|| default_mem_metadata(0o755));
             let mut meta = synthetic_metadata(
-                path,
+                host_path,
                 VfsNodeKind::Directory,
                 S_IFDIR | (node.mode & 0o7777),
                 entries.len() as u64,
                 1,
             );
-            meta.ino = mem_inode(node, path);
+            meta.ino = mem_inode(node, host_path);
             meta.uid = node.uid;
             meta.gid = node.gid;
             Ok(meta)
@@ -1293,6 +1304,24 @@ fn check_noatime_permission(meta: &VfsMetadata) -> Result<(), SysErrNo> {
         .map(|task| task.credentials.lock().clone())
         .unwrap_or_else(crate::task::Credentials::root);
     if credentials.fsuid == 0 || credentials.fsuid == meta.uid {
+        Ok(())
+    } else {
+        Err(SysErrNo::EPERM)
+    }
+}
+
+fn check_chown_permission(
+    meta: &VfsMetadata,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), SysErrNo> {
+    if uid.is_none() && gid.is_none() {
+        return Ok(());
+    }
+    let credentials = crate::task::current_task()
+        .map(|task| task.credentials.lock().clone())
+        .unwrap_or_else(crate::task::Credentials::root);
+    if credentials.effective_uid == 0 || credentials.effective_uid == meta.uid {
         Ok(())
     } else {
         Err(SysErrNo::EPERM)
@@ -1640,14 +1669,14 @@ pub fn statfs_for_fd(file: &fd::FileDescriptor) -> Result<VfsStatFs, SysErrNo> {
         fd::FileDescriptor::Ext4Regular { .. } | fd::FileDescriptor::Ext4Dir { .. }
     ) || match file {
         fd::FileDescriptor::MemFile { name, .. } => path_uses_ext4(name),
-        fd::FileDescriptor::MemDir { path, .. } => path_uses_ext4(path),
+        fd::FileDescriptor::MemDir { host_path, .. } => path_uses_ext4(host_path),
         fd::FileDescriptor::Path { host_path, .. } => path_uses_ext4(host_path),
         fd::FileDescriptor::LoopControl | fd::FileDescriptor::LoopDevice { .. } => false,
         _ => false,
     };
     let use_vfat = match file {
         fd::FileDescriptor::MemFile { name, .. } => mounted_vfat_backend(name).is_some(),
-        fd::FileDescriptor::MemDir { path, .. } => mounted_vfat_backend(path).is_some(),
+        fd::FileDescriptor::MemDir { host_path, .. } => mounted_vfat_backend(host_path).is_some(),
         fd::FileDescriptor::Path { host_path, .. } => mounted_vfat_backend(host_path).is_some(),
         fd::FileDescriptor::LoopControl | fd::FileDescriptor::LoopDevice { .. } => false,
         _ => false,
@@ -2070,7 +2099,7 @@ pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), 
 pub fn set_mode_fd(file: &mut fd::FileDescriptor, mode: u32) -> Result<(), SysErrNo> {
     match file {
         fd::FileDescriptor::MemFile { name, .. } => MEM_FS.lock().set_mode(name, mode),
-        fd::FileDescriptor::MemDir { path, .. } => MEM_FS.lock().set_mode(path, mode),
+        fd::FileDescriptor::MemDir { host_path, .. } => MEM_FS.lock().set_mode(host_path, mode),
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::set_mode_ino(*ino, mode)
         }
@@ -2091,19 +2120,27 @@ pub fn set_owner_path(
         return Err(SysErrNo::EROFS);
     }
     ensure_mount_writable(&norm)?;
-    {
-        let mut mem = MEM_FS.lock();
-        if mem.is_dir(&norm) || mem.get_file(&norm).is_some() || mem.get_special(&norm).is_some() {
-            return mem.set_owner(&norm, uid, gid);
+    check_search_access(&norm, CredentialIdentity::Effective)?;
+    let (mem_node, mem_symlink) = {
+        let mem = MEM_FS.lock();
+        (
+            mem.is_dir(&norm) || mem.get_file(&norm).is_some() || mem.get_special(&norm).is_some(),
+            mem.get_symlink(&norm).is_some(),
+        )
+    };
+    if mem_node {
+        let meta = metadata(&norm, true)?;
+        check_chown_permission(&meta, uid, gid)?;
+        return MEM_FS.lock().set_owner(&norm, uid, gid);
+    }
+    if mem_symlink {
+        if !follow_symlink {
+            let meta = metadata(&norm, false)?;
+            check_chown_permission(&meta, uid, gid)?;
+            return MEM_FS.lock().set_owner(&norm, uid, gid);
         }
-        if mem.get_symlink(&norm).is_some() {
-            if !follow_symlink {
-                return mem.set_owner(&norm, uid, gid);
-            }
-            drop(mem);
-            let resolved = resolve_final_symlink(&norm, false)?;
-            return set_owner_path(&resolved, true, uid, gid);
-        }
+        let resolved = resolve_final_symlink(&norm, false)?;
+        return set_owner_path(&resolved, true, uid, gid);
     }
     if is_tmpfs_path(&norm) {
         return Err(missing_path_errno(&norm));
@@ -2115,6 +2152,8 @@ pub fn set_owner_path(
         Some(_) => norm.clone(),
         None => return Err(missing_path_errno(&norm)),
     };
+    let meta = metadata(&ext_path, true)?;
+    check_chown_permission(&meta, uid, gid)?;
     ext4_vol::set_owner_path(&ext_path, uid, gid)
 }
 
@@ -2123,9 +2162,14 @@ pub fn set_owner_fd(
     uid: Option<u32>,
     gid: Option<u32>,
 ) -> Result<(), SysErrNo> {
+    if let Some(path) = mount_path_for_fd(file) {
+        ensure_mount_writable(path)?;
+    }
+    let meta = metadata_for_fd(file)?;
+    check_chown_permission(&meta, uid, gid)?;
     match file {
         fd::FileDescriptor::MemFile { name, .. } => MEM_FS.lock().set_owner(name, uid, gid),
-        fd::FileDescriptor::MemDir { path, .. } => MEM_FS.lock().set_owner(path, uid, gid),
+        fd::FileDescriptor::MemDir { host_path, .. } => MEM_FS.lock().set_owner(host_path, uid, gid),
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::set_owner_ino(*ino, uid, gid)
         }
@@ -2314,6 +2358,7 @@ fn open_dir_descriptor(
         let entries = volume.list_dir(&backend_path)?;
         return Ok(fd::FileDescriptor::MemDir {
             path: logical_path.into(),
+            host_path: normalize_path(host_path),
             entries,
             offset: 0,
         });
@@ -2322,6 +2367,7 @@ fn open_dir_descriptor(
         let entries = list_dir(host_path)?;
         return Ok(fd::FileDescriptor::MemDir {
             path: logical_path.into(),
+            host_path: normalize_path(host_path),
             entries,
             offset: 0,
         });
@@ -2532,6 +2578,7 @@ pub fn open_path(
             let entries = volume.list_dir(&backend_path)?;
             return Ok(fd::FileDescriptor::MemDir {
                 path: logical_norm,
+                host_path: open_norm,
                 entries,
                 offset: 0,
             });
