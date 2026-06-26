@@ -928,7 +928,15 @@ pub fn sys_clone(
     } else {
         dup_mm_context(&parent.mm)
     };
-    let (fd_table, exec_path, thread_parent, pgid, rlimit_nofile, rlimit_nofile_max) = {
+    let (
+        fd_table,
+        exec_path,
+        thread_parent,
+        pgid,
+        rlimit_nofile,
+        rlimit_nofile_max,
+        inherited_timer_slack_ns,
+    ) = {
         let inner = parent.inner.lock();
         let fd_table = if (clone_bits & CLONE_FILES) != 0 {
             inner.fd_table.clone()
@@ -943,6 +951,7 @@ pub fn sys_clone(
             inner.pgid,
             inner.rlimit_nofile,
             inner.rlimit_nofile_max,
+            inner.current_timer_slack_ns,
         )
     };
     let fs = if (clone_bits & CLONE_FS) != 0 {
@@ -1000,6 +1009,8 @@ pub fn sys_clone(
             robust_list_head: 0,
             robust_list_len: 0,
             interval_timers: crate::syscall::other::EMPTY_INTERVAL_TIMERS,
+            default_timer_slack_ns: inherited_timer_slack_ns,
+            current_timer_slack_ns: inherited_timer_slack_ns,
         }),
         task_ctx: crate::task::KernelCtx::new(crate::task::context::TaskContext::zero_init()),
         memory_set,

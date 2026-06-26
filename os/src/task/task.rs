@@ -13,6 +13,8 @@ use crate::task::context::TaskContext;
 use crate::task::pid::Pid;
 use crate::utils::error::SysErrNo;
 
+const DEFAULT_TIMER_SLACK_NS: usize = 50_000;
+
 #[cfg(target_arch = "riscv64")]
 fn init_user_trapframe(tf: &mut polyhal_trap::trapframe::TrapFrame) {
     crate::trap::prepare_user_trapframe(tf);
@@ -99,6 +101,8 @@ impl TaskControlBlock {
                 robust_list_head: 0,
                 robust_list_len: 0,
                 interval_timers: crate::syscall::other::EMPTY_INTERVAL_TIMERS,
+                default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                current_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             }),
             task_ctx: KernelCtx::new(TaskContext::zero_init()),
             memory_set: new_shared_memory_set(memory_set),
@@ -296,6 +300,8 @@ impl TaskControlBlock {
                 robust_list_head: 0,
                 robust_list_len: 0,
                 interval_timers: crate::syscall::other::EMPTY_INTERVAL_TIMERS,
+                default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                current_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             }),
             task_ctx: KernelCtx::new(TaskContext::zero_init()),
             memory_set: new_shared_memory_set(memory_set),
@@ -362,6 +368,8 @@ impl TaskControlBlock {
                 robust_list_head: 0,
                 robust_list_len: 0,
                 interval_timers: crate::syscall::other::EMPTY_INTERVAL_TIMERS,
+                default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                current_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             }),
             task_ctx: KernelCtx::new(TaskContext::zero_init()),
             memory_set: new_shared_memory_set(memory_set),
@@ -426,6 +434,8 @@ impl TaskControlBlock {
                 robust_list_head: 0,
                 robust_list_len: 0,
                 interval_timers: crate::syscall::other::EMPTY_INTERVAL_TIMERS,
+                default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                current_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             }),
             task_ctx: KernelCtx::new(task_ctx_val),
             memory_set: new_shared_memory_set(memory_set),

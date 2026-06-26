@@ -940,6 +940,32 @@ pub fn sys_prlimit64(
     Ok(0)
 }
 
+pub fn sys_prctl(
+    option: usize,
+    arg2: usize,
+    _arg3: usize,
+    _arg4: usize,
+    _arg5: usize,
+) -> SyscallRet {
+    const PR_SET_TIMERSLACK: usize = 29;
+    const PR_GET_TIMERSLACK: usize = 30;
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    match option {
+        PR_SET_TIMERSLACK => {
+            let mut inner = task.inner.lock();
+            inner.current_timer_slack_ns = if arg2 == 0 {
+                inner.default_timer_slack_ns
+            } else {
+                arg2
+            };
+            Ok(0)
+        }
+        PR_GET_TIMERSLACK => Ok(task.inner.lock().current_timer_slack_ns),
+        _ => Err(SysErrNo::ENOSYS),
+    }
+}
+
 pub fn sys_set_tid_address(tidptr: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     // set_tid_address only records the user word to clear on exit; it does not

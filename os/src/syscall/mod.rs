@@ -127,6 +127,7 @@ pub const SYSCALL_GETRLIMIT: usize = 163;
 pub const SYSCALL_SETRLIMIT: usize = 164;
 pub const SYSCALL_GETRUSAGE: usize = 165;
 pub const SYSCALL_UMASK: usize = 166;
+pub const SYSCALL_PRCTL: usize = 167;
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_GETPID: usize = 172;
 pub const SYSCALL_GETPPID: usize = 173;
@@ -402,6 +403,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_SYSLOG => other::sys_syslog(args[0], args[1], args[2]),
         SYSCALL_GETRUSAGE => other::sys_getrusage(args[0], args[1]),
         SYSCALL_UMASK => other::sys_umask(args[0]),
+        SYSCALL_PRCTL => other::sys_prctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_GETPGID => other::sys_getpgid(args[0]),
         SYSCALL_SETPGID => other::sys_setpgid(args[0], args[1]),
         SYSCALL_MEMBARRIER => other::sys_membarrier(args[0], args[1]),
