@@ -1025,7 +1025,7 @@ fn init_pseudo_files() {
         b"00010000-00020000 r-xp 00000000 00:00 0 /init\n00020000-00030000 rw-p 00000000 00:00 0 [heap]\n7fff0000-80000000 rw-p 00000000 00:00 0 [stack]\n";
     let passwd =
         b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n";
-    let group = b"root:x:0:\nnogroup:x:65534:\n";
+    let group = b"root:x:0:\ndaemon:x:1:\nusers:x:100:\nnogroup:x:65534:\n";
     let nsswitch = b"passwd: files\ngroup: files\nshadow: files\n";
     let localtime: &[u8] = &[
         0x54, 0x5a, 0x69, 0x66, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
