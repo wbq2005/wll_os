@@ -1022,11 +1022,13 @@ fn init_pseudo_files() {
     let cpu_list = b"0\n";
     let cpu_map = b"1\n";
     let node_meminfo = b"Node 0 MemTotal:       131072 kB\nNode 0 MemFree:         65536 kB\n";
+    let kernel_config = b"CONFIG_EVENTFD=y\n";
     let mut fs = MEM_FS.lock();
     for root in ["", "/musl", "/glibc"] {
         fs.add_dir_with_mode(&alloc::format!("{}/tmp", root), 0o1777);
         fs.add_dir_with_mode(&alloc::format!("{}/var/tmp", root), 0o1777);
         fs.add_dir(&alloc::format!("{}/etc", root));
+        fs.add_dir(&alloc::format!("{}/boot", root));
         fs.add_dir(&alloc::format!("{}/dev/shm", root));
         fs.add_dir(&alloc::format!("{}/proc", root));
         fs.add_dir(&alloc::format!("{}/proc/self", root));
@@ -1057,6 +1059,10 @@ fn init_pseudo_files() {
         fs.add_file(
             &alloc::format!("{}/etc/nsswitch.conf", root),
             nsswitch.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/boot/config-5.10.0", root),
+            kernel_config.to_vec(),
         );
         fs.add_file(&alloc::format!("{}/proc/meminfo", root), meminfo.to_vec());
         fs.add_file(
