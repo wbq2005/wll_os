@@ -835,6 +835,48 @@ fn parse_utimens_times(
     Ok((convert(atime)?, convert(mtime)?))
 }
 
+fn parse_utimens_times_with_permission(
+    times: *const TimeSpec,
+) -> Result<(
+    Option<(isize, isize)>,
+    Option<(isize, isize)>,
+    crate::fs::TimesUpdatePermission,
+), SysErrNo> {
+    if times.is_null() {
+        let now = current_time_pair();
+        return Ok((
+            Some(now),
+            Some(now),
+            crate::fs::TimesUpdatePermission::Current,
+        ));
+    }
+
+    let atime = copy_object_from_user(times)?;
+    let mtime = copy_object_from_user(unsafe { times.add(1) })?;
+
+    fn convert(ts: TimeSpec) -> Result<(Option<(isize, isize)>, bool), SysErrNo> {
+        match ts.tv_nsec {
+            UTIME_OMIT => Ok((None, false)),
+            UTIME_NOW => Ok((Some(current_time_pair()), false)),
+            nsec if (0..1_000_000_000).contains(&nsec) && ts.tv_sec >= 0 => {
+                Ok((Some((ts.tv_sec, nsec)), true))
+            }
+            _ => Err(SysErrNo::EINVAL),
+        }
+    }
+
+    let (atime, atime_explicit) = convert(atime)?;
+    let (mtime, mtime_explicit) = convert(mtime)?;
+    let permission = if atime.is_none() && mtime.is_none() {
+        crate::fs::TimesUpdatePermission::None
+    } else if atime_explicit || mtime_explicit {
+        crate::fs::TimesUpdatePermission::Explicit
+    } else {
+        crate::fs::TimesUpdatePermission::Current
+    };
+    Ok((atime, mtime, permission))
+}
+
 fn resolve_path_str(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
     if path.is_empty() {
         return Err(SysErrNo::ENOENT);
@@ -3376,16 +3418,21 @@ pub fn sys_utimensat(
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(SysErrNo::EINVAL);
     }
-    let (atime, mtime) = parse_utimens_times(times)?;
+    let (atime, mtime, permission) = parse_utimens_times_with_permission(times)?;
 
     if pathname.is_null() {
+        if dirfd == AT_FDCWD {
+            return Err(SysErrNo::EFAULT);
+        }
         let fd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
         let task = current_task().ok_or(SysErrNo::ESRCH)?;
         let inner = task.inner.lock();
         let mut fds = inner.fd_table.lock();
         let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
-        return super::with_kernel_page_table(|| crate::fs::set_times_fd(file_desc, atime, mtime))
-            .map(|_| 0);
+        return super::with_kernel_page_table(|| {
+            crate::fs::set_times_fd(file_desc, atime, mtime, permission)
+        })
+        .map(|_| 0);
     }
 
     let path = read_user_path(pathname)?;
@@ -3398,14 +3445,18 @@ pub fn sys_utimensat(
         let inner = task.inner.lock();
         let mut fds = inner.fd_table.lock();
         let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
-        return super::with_kernel_page_table(|| crate::fs::set_times_fd(file_desc, atime, mtime))
-            .map(|_| 0);
+        return super::with_kernel_page_table(|| {
+            crate::fs::set_times_fd(file_desc, atime, mtime, permission)
+        })
+        .map(|_| 0);
     }
 
     let (_logical_path, host_path) = resolve_host_path_str(dirfd, &path)?;
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-    super::with_kernel_page_table(|| crate::fs::set_times_path(&host_path, follow, atime, mtime))
-        .map(|_| 0)
+    super::with_kernel_page_table(|| {
+        crate::fs::set_times_path(&host_path, follow, atime, mtime, permission)
+    })
+    .map(|_| 0)
 }
 
 pub fn sys_write_kernel(fd: usize, buf: &[u8]) -> SyscallRet {

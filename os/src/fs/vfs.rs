@@ -130,6 +130,13 @@ pub struct VfsMetadata {
     pub file_flags: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimesUpdatePermission {
+    None,
+    Current,
+    Explicit,
+}
+
 pub fn is_removed(name: &str) -> bool {
     WHITEOUTS.lock().contains(&normalize_path(name))
 }
@@ -1337,6 +1344,32 @@ fn chmod_mode_after_permission(mode: u32, meta: &VfsMetadata) -> u32 {
     next
 }
 
+fn check_times_permission(
+    meta: &VfsMetadata,
+    permission: TimesUpdatePermission,
+) -> Result<(), SysErrNo> {
+    const W_OK: usize = 2;
+    match permission {
+        TimesUpdatePermission::None => Ok(()),
+        TimesUpdatePermission::Current => {
+            let credentials = current_credentials();
+            if credentials.effective_uid == 0 || credentials.effective_uid == meta.uid {
+                Ok(())
+            } else {
+                check_metadata_access_with_identity(meta, W_OK, CredentialIdentity::Effective)
+            }
+        }
+        TimesUpdatePermission::Explicit => {
+            let credentials = current_credentials();
+            if credentials.effective_uid == 0 || credentials.effective_uid == meta.uid {
+                Ok(())
+            } else {
+                Err(SysErrNo::EPERM)
+            }
+        }
+    }
+}
+
 fn check_chown_permission(
     meta: &VfsMetadata,
     uid: Option<u32>,
@@ -2245,6 +2278,7 @@ pub fn set_times_path(
     follow_symlink: bool,
     atime: Option<(isize, isize)>,
     mtime: Option<(isize, isize)>,
+    permission: TimesUpdatePermission,
 ) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
     if let Some(meta) = vfat_metadata_for_path(&norm) {
@@ -2252,17 +2286,42 @@ pub fn set_times_path(
         return Err(SysErrNo::EROFS);
     }
     ensure_mount_writable(&norm)?;
-    {
-        let mut mem = MEM_FS.lock();
-        if mem.is_dir(&norm) {
+    check_search_access(&norm, CredentialIdentity::Effective)?;
+    let (mem_dir, mem_file, mem_special, mem_symlink) = {
+        let mem = MEM_FS.lock();
+        (
+            mem.is_dir(&norm),
+            mem.get_file(&norm).is_some(),
+            mem.get_special(&norm).is_some(),
+            mem.get_symlink(&norm).is_some(),
+        )
+    };
+    if mem_dir {
+        let meta = metadata(&norm, true)?;
+        check_times_permission(&meta, permission)?;
+        return Ok(());
+    }
+    if mem_file {
+        let meta = metadata(&norm, true)?;
+        check_times_permission(&meta, permission)?;
+        if permission == TimesUpdatePermission::None {
             return Ok(());
         }
-        if mem.get_file(&norm).is_some() {
-            return mem.set_file_times(&norm, atime, mtime);
+        return MEM_FS.lock().set_file_times(&norm, atime, mtime);
+    }
+    if mem_special {
+        let meta = metadata(&norm, true)?;
+        check_times_permission(&meta, permission)?;
+        return Ok(());
+    }
+    if mem_symlink {
+        if follow_symlink {
+            let resolved = resolve_final_symlink(&norm, false)?;
+            return set_times_path(&resolved, true, atime, mtime, permission);
         }
-        if mem.get_special(&norm).is_some() {
-            return Ok(());
-        }
+        let meta = metadata(&norm, false)?;
+        check_times_permission(&meta, permission)?;
+        return Ok(());
     }
     if is_tmpfs_path(&norm) {
         return Err(missing_path_errno(&norm));
@@ -2274,6 +2333,11 @@ pub fn set_times_path(
         Some(_) => norm.clone(),
         None => return Err(missing_path_errno(&norm)),
     };
+    let meta = metadata(&ext_path, true)?;
+    check_times_permission(&meta, permission)?;
+    if permission == TimesUpdatePermission::None {
+        return Ok(());
+    }
     ext4_vol::set_times_path(&ext_path, atime, mtime)
 }
 
@@ -2281,7 +2345,16 @@ pub fn set_times_fd(
     file: &mut fd::FileDescriptor,
     atime: Option<(isize, isize)>,
     mtime: Option<(isize, isize)>,
+    permission: TimesUpdatePermission,
 ) -> Result<(), SysErrNo> {
+    if let Some(path) = mount_path_for_fd(file) {
+        ensure_mount_writable(path)?;
+    }
+    let meta = metadata_for_fd(file)?;
+    check_times_permission(&meta, permission)?;
+    if permission == TimesUpdatePermission::None {
+        return Ok(());
+    }
     match file {
         fd::FileDescriptor::MemFile { name, times, .. } => {
             let _ = MEM_FS.lock().set_file_times(name, atime, mtime);
