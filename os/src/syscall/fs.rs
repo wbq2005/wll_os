@@ -1334,10 +1334,17 @@ pub fn sys_fgetxattr(fd: usize, name: *const u8, _value: *mut u8, _size: usize) 
 
 pub fn sys_unlinkat(dirfd: isize, pathname: *const u8, flags: usize) -> SyscallRet {
     const AT_REMOVEDIR: usize = 0x200;
-    let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    let raw_path = read_user_path(pathname)?;
     if flags & !AT_REMOVEDIR != 0 {
         return Err(SysErrNo::EINVAL);
     }
+    if flags & AT_REMOVEDIR != 0 {
+        let trimmed = raw_path.trim_end_matches('/');
+        if trimmed == "." || trimmed.ends_with("/.") {
+            return Err(SysErrNo::EINVAL);
+        }
+    }
+    let (_logical_path, host_path) = resolve_host_path_str(dirfd, &raw_path)?;
     if flags & AT_REMOVEDIR != 0 {
         super::with_kernel_page_table(|| crate::fs::remove_dir(&host_path))?;
     } else {

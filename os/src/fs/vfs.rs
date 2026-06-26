@@ -25,6 +25,8 @@ const DEV_NULL_MAJOR: u32 = 1;
 const DEV_NULL_MINOR: u32 = 3;
 const DEV_ZERO_MAJOR: u32 = 1;
 const DEV_ZERO_MINOR: u32 = 5;
+const MS_RDONLY: usize = 1;
+const MS_REMOUNT: usize = 32;
 
 lazy_static! {
     static ref WHITEOUTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -38,6 +40,7 @@ struct MountEntry {
     host_target: String,
     fstype: String,
     backend: MountBackend,
+    readonly: bool,
 }
 
 #[derive(Clone)]
@@ -217,6 +220,42 @@ fn mounted_vfat_backend(path: &str) -> Option<(Arc<vfat::VfatVolume>, String)> {
         normalize_path(&alloc::format!("/{}", suffix))
     };
     Some((volume.clone(), backend_path))
+}
+
+fn mount_entry_index_for_target(path: &str) -> Option<usize> {
+    let norm = normalize_path(path);
+    let mounts = MOUNT_TABLE.lock();
+    mounts
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.host_target == norm)
+        .map(|(index, _)| index)
+}
+
+fn is_readonly_mount_path(path: &str) -> bool {
+    let norm = normalize_path(path);
+    let mounts = MOUNT_TABLE.lock();
+    mounts
+        .iter()
+        .filter(|entry| path_is_under(&norm, &entry.host_target))
+        .max_by_key(|entry| entry.host_target.len())
+        .is_some_and(|entry| entry.readonly)
+}
+
+fn ensure_mount_writable(path: &str) -> Result<(), SysErrNo> {
+    if is_readonly_mount_path(path) {
+        Err(SysErrNo::EROFS)
+    } else {
+        Ok(())
+    }
+}
+
+fn is_mountpoint(path: &str) -> bool {
+    let norm = normalize_path(path);
+    MOUNT_TABLE
+        .lock()
+        .iter()
+        .any(|entry| entry.host_target == norm && entry.host_target != "/")
 }
 
 fn vfat_metadata_for_path(path: &str) -> Option<Result<vfat::VfatMetadata, SysErrNo>> {
@@ -744,10 +783,11 @@ pub fn metadata_for_lookup(path: &str, follow_symlink: bool) -> Result<VfsMetada
 
 fn mount_record_line(entry: &MountEntry) -> String {
     alloc::format!(
-        "{} {} {} rw 0 0\n",
+        "{} {} {} {} 0 0\n",
         entry.source,
         entry.logical_target,
-        entry.fstype
+        entry.fstype,
+        if entry.readonly { "ro" } else { "rw" }
     )
 }
 
@@ -846,6 +886,7 @@ pub fn init_mount_table() {
         host_target: String::from("/"),
         fstype: String::from(fstype),
         backend: MountBackend::Root,
+        readonly: false,
     });
     drop(mounts);
     refresh_mount_pseudo_files();
@@ -861,8 +902,20 @@ pub fn mount_fs(
     let source = normalize_path(source);
     let logical_target = normalize_path(logical_target);
     let host_target = normalize_path(host_target);
-    if flags != 0 {
+    let allowed_flags = MS_RDONLY | MS_REMOUNT;
+    if flags & !allowed_flags != 0 {
         return Err(SysErrNo::EINVAL);
+    }
+    let readonly = (flags & MS_RDONLY) != 0;
+    if (flags & MS_REMOUNT) != 0 {
+        let Some(index) = mount_entry_index_for_target(&host_target) else {
+            return Err(SysErrNo::EINVAL);
+        };
+        let mut mounts = MOUNT_TABLE.lock();
+        mounts[index].readonly = readonly;
+        drop(mounts);
+        refresh_mount_pseudo_files();
+        return Ok(());
     }
     let (backend_fstype, backend) = resolve_mount_backend(&source, fstype)?;
     let tmpfs_backend = matches!(&backend, MountBackend::Tmpfs);
@@ -893,6 +946,7 @@ pub fn mount_fs(
         host_target,
         fstype: backend_fstype,
         backend,
+        readonly,
     });
     drop(mounts);
     refresh_mount_pseudo_files();
@@ -1522,6 +1576,7 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
             Err(SysErrNo::EROFS)
         };
     }
+    ensure_mount_writable(&norm)?;
     let tmpfs_path = is_tmpfs_path(&norm);
     {
         let mut m = MEM_FS.lock();
@@ -1553,11 +1608,14 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
 }
 
 pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
-    let norm = normalize_path(path);
+    let norm = resolve_parent_symlinks_for_lookup(path)?;
     if is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
     }
-    if norm == "/" {
+    if norm == "/" || norm.ends_with("/.") {
+        return Err(SysErrNo::EBUSY);
+    }
+    if is_mountpoint(&norm) {
         return Err(SysErrNo::EBUSY);
     }
     if let Some(meta) = vfat_metadata_for_path(&norm) {
@@ -1568,6 +1626,7 @@ pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
             Err(SysErrNo::ENOTDIR)
         };
     }
+    ensure_mount_writable(&norm)?;
     let tmpfs_path = is_tmpfs_path(&norm);
     {
         let mut m = MEM_FS.lock();
@@ -1622,6 +1681,8 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
     if no_replace && (file_exists(&new) || dir_exists(&new)) {
         return Err(SysErrNo::EEXIST);
     }
+    ensure_mount_writable(&old)?;
+    ensure_mount_writable(&new)?;
     let old_tmpfs = is_tmpfs_path(&old);
     let new_tmpfs = is_tmpfs_path(&new);
     if old_tmpfs != new_tmpfs {
@@ -1701,6 +1762,7 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
     if file_exists(&new) || dir_exists(&new) {
         return Err(SysErrNo::EEXIST);
     }
+    ensure_mount_writable(&new)?;
     let old_tmpfs = is_tmpfs_path(&old);
     let new_tmpfs = is_tmpfs_path(&new);
     if old_tmpfs != new_tmpfs {
@@ -1767,6 +1829,7 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
             Err(SysErrNo::ENOTDIR)
         };
     }
+    ensure_mount_writable(&norm)?;
     let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
@@ -1829,6 +1892,7 @@ pub fn truncate_path(path: &str, size: u64) -> Result<(), SysErrNo> {
             Err(SysErrNo::EROFS)
         };
     }
+    ensure_mount_writable(&norm)?;
     {
         let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) {
@@ -1865,6 +1929,7 @@ pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), 
         meta?;
         return Err(SysErrNo::EROFS);
     }
+    ensure_mount_writable(&norm)?;
     {
         let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) || mem.get_file(&norm).is_some() || mem.get_special(&norm).is_some() {
@@ -1907,6 +1972,7 @@ pub fn set_owner_path(
         meta?;
         return Err(SysErrNo::EROFS);
     }
+    ensure_mount_writable(&norm)?;
     {
         let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) || mem.get_file(&norm).is_some() || mem.get_special(&norm).is_some() {
@@ -1961,6 +2027,7 @@ pub fn set_times_path(
         meta?;
         return Err(SysErrNo::EROFS);
     }
+    ensure_mount_writable(&norm)?;
     {
         let mut mem = MEM_FS.lock();
         if mem.is_dir(&norm) {
@@ -2006,7 +2073,7 @@ pub fn set_times_fd(
 }
 
 pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
-    let norm = normalize_path(path);
+    let norm = resolve_parent_symlinks_for_lookup(path)?;
     if file_exists(&norm) || dir_exists(&norm) {
         return Err(SysErrNo::EEXIST);
     }
@@ -2020,6 +2087,7 @@ pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
             Err(SysErrNo::ENOTDIR)
         };
     }
+    ensure_mount_writable(&norm)?;
     let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
@@ -2060,6 +2128,7 @@ pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
             Err(SysErrNo::ENOTDIR)
         };
     }
+    ensure_mount_writable(&norm)?;
     let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
@@ -2092,6 +2161,7 @@ pub fn create_special_node(path: &str, kind: MemSpecialKind, mode: u32) -> Resul
             Err(SysErrNo::ENOTDIR)
         };
     }
+    ensure_mount_writable(&norm)?;
     let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
@@ -2291,6 +2361,9 @@ pub fn open_path(
     } else {
         lookup_norm
     };
+    if (want_create || want_trunc || write_ok) && is_readonly_mount_path(&open_norm) {
+        return Err(SysErrNo::EROFS);
+    }
     if let Some(opened) =
         open_loop_device_descriptor(local_device_path(&open_norm), read_ok, write_ok)
     {
