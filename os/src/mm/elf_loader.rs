@@ -24,7 +24,12 @@ fn align_up_to(value: usize, align: usize) -> Option<usize> {
         .map(|value| value / align * align)
 }
 
-fn ranges_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
     left_start < right_end && right_start < left_end
 }
 

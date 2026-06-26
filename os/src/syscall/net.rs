@@ -304,12 +304,7 @@ pub fn sys_socket(domain: usize, raw_type: usize, protocol: usize) -> SyscallRet
         .ok_or(SysErrNo::EMFILE)
 }
 
-pub fn sys_socketpair(
-    domain: usize,
-    raw_type: usize,
-    protocol: usize,
-    sv: usize,
-) -> SyscallRet {
+pub fn sys_socketpair(domain: usize, raw_type: usize, protocol: usize, sv: usize) -> SyscallRet {
     if sv == 0 {
         return Err(SysErrNo::EFAULT);
     }
@@ -354,7 +349,11 @@ pub fn sys_socketpair(
         0
     };
     let left_fd = fds
-        .alloc_with_flags_below(FileDescriptor::Socket { state: left }, fd_flags, nofile_limit)
+        .alloc_with_flags_below(
+            FileDescriptor::Socket { state: left },
+            fd_flags,
+            nofile_limit,
+        )
         .ok_or(SysErrNo::EMFILE)?;
     let right_fd = match fds.alloc_with_flags_below(
         FileDescriptor::Socket { state: right },

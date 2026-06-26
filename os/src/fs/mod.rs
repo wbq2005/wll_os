@@ -285,7 +285,6 @@ impl MemFileSystem {
             0o666
         };
         self.symlinks.remove(&name);
-        self.specials.remove(&name);
 
         // 如果文件已存在，先删除
         self.files.retain(|f| f.name != name);
@@ -392,7 +391,6 @@ impl MemFileSystem {
         let name = normalize_path(name);
         self.ensure_parent_dirs(&name);
         self.symlinks.remove(&name);
-        self.specials.remove(&name);
         if !self.dirs.iter().any(|dir| dir == &name) {
             self.dirs.push(name.clone());
             log::info!("[fs] Added directory '{}'", name);

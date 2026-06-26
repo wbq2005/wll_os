@@ -121,9 +121,8 @@ impl IntervalTimer {
         } else {
             let missed = now_us.saturating_sub(deadline_us) / self.interval_us;
             let step = missed.saturating_add(1);
-            self.deadline_us = Some(
-                deadline_us.saturating_add(self.interval_us.saturating_mul(step)),
-            );
+            self.deadline_us =
+                Some(deadline_us.saturating_add(self.interval_us.saturating_mul(step)));
         }
         true
     }
@@ -813,9 +812,7 @@ pub fn sys_setgroups(size: usize, list: usize) -> SyscallRet {
         // Keep the modeled credential set bounded, but still fault a bad user
         // array within Linux's ABI limit before reporting the unsupported count.
         for index in 0..size {
-            let _ = copy_object_from_user::<u32>(
-                list + index * core::mem::size_of::<u32>(),
-            )?;
+            let _ = copy_object_from_user::<u32>(list + index * core::mem::size_of::<u32>())?;
         }
         return Err(SysErrNo::EINVAL);
     }
@@ -825,9 +822,7 @@ pub fn sys_setgroups(size: usize, list: usize) -> SyscallRet {
             list + index * core::mem::size_of::<u32>(),
         )?);
     }
-    task.credentials
-        .lock()
-        .set_supplementary_groups(&groups);
+    task.credentials.lock().set_supplementary_groups(&groups);
     Ok(0)
 }
 
