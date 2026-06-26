@@ -2023,6 +2023,9 @@ pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
     let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
+    if mem_parent || ext_parent {
+        check_create_access(&parent)?;
+    }
     if mem_parent && (super::is_memfs_volatile_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_dir_with_mode(&norm, mode);
         return Ok(());
