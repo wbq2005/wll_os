@@ -44,6 +44,7 @@ struct RLimit {
 }
 
 const RLIMIT_NOFILE: usize = 7;
+const RLIMIT_FSIZE: usize = 1;
 const RLIMIT_STACK: usize = 3;
 const DEFAULT_STACK_LIMIT: usize = 256 * 1024;
 
@@ -870,6 +871,14 @@ fn resource_limit_snapshot(resource: usize) -> Result<RLimit, SysErrNo> {
                 rlim_max: inner.rlimit_nofile_max,
             })
         }
+        RLIMIT_FSIZE => {
+            let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            let inner = task.inner.lock();
+            Ok(RLimit {
+                rlim_cur: inner.rlimit_fsize,
+                rlim_max: inner.rlimit_fsize_max,
+            })
+        }
         _ => Ok(RLimit {
             rlim_cur: usize::MAX,
             rlim_max: usize::MAX,
@@ -886,6 +895,13 @@ fn apply_resource_limit(resource: usize, limit_ptr: usize) -> Result<(), SysErrN
         return Err(SysErrNo::EINVAL);
     }
     if resource == RLIMIT_STACK {
+        return Ok(());
+    }
+    if resource == RLIMIT_FSIZE {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let mut inner = task.inner.lock();
+        inner.rlimit_fsize = limit.rlim_cur;
+        inner.rlimit_fsize_max = limit.rlim_max;
         return Ok(());
     }
     if resource != RLIMIT_NOFILE {

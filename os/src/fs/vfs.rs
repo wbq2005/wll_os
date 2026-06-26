@@ -2088,7 +2088,7 @@ pub fn read_link(path: &str) -> Result<String, SysErrNo> {
 }
 
 pub fn truncate_path(path: &str, size: u64) -> Result<(), SysErrNo> {
-    let norm = normalize_path(path);
+    let norm = resolve_parent_symlinks_for_lookup(path)?;
     if let Some(meta) = vfat_metadata_for_path(&norm) {
         let meta = meta?;
         return if meta.is_dir {
@@ -2098,26 +2098,40 @@ pub fn truncate_path(path: &str, size: u64) -> Result<(), SysErrNo> {
         };
     }
     ensure_mount_writable(&norm)?;
-    {
-        let mut mem = MEM_FS.lock();
-        if mem.is_dir(&norm) {
-            return Err(SysErrNo::EISDIR);
-        }
-        if mem.get_file(&norm).is_some() {
-            return mem.truncate_file(&norm, size as usize);
-        }
-        if mem.get_special(&norm).is_some() {
-            return Err(SysErrNo::EINVAL);
-        }
+    check_search_access(&norm, CredentialIdentity::Effective)?;
+    let target = resolve_final_symlink(&norm, false)?;
+    if target != norm {
+        ensure_mount_writable(&target)?;
     }
-    if is_tmpfs_path(&norm) {
-        return Err(missing_path_errno(&norm));
-    }
-    let ext_path = match ext4_vol::lookup_kind(&norm) {
-        Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => ext4_vol::resolve_symlinks(&norm)?,
-        Some(_) => norm.clone(),
-        None => return Err(missing_path_errno(&norm)),
+    let (mem_dir, mem_file, mem_special) = {
+        let mem = MEM_FS.lock();
+        (
+            mem.is_dir(&target),
+            mem.get_file(&target).is_some(),
+            mem.get_special(&target).is_some(),
+        )
     };
+    if mem_dir {
+        return Err(SysErrNo::EISDIR);
+    }
+    if mem_file {
+        let meta = metadata(&target, true)?;
+        check_metadata_access_with_identity(&meta, 2, CredentialIdentity::Effective)?;
+        return MEM_FS.lock().truncate_file(&target, size as usize);
+    }
+    if mem_special {
+        return Err(SysErrNo::EINVAL);
+    }
+    if is_tmpfs_path(&target) {
+        return Err(missing_path_errno(&target));
+    }
+    let ext_path = match ext4_vol::lookup_kind(&target) {
+        Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => ext4_vol::resolve_symlinks(&target)?,
+        Some(_) => target.clone(),
+        None => return Err(missing_path_errno(&target)),
+    };
+    let meta = metadata(&ext_path, true)?;
+    check_metadata_access_with_identity(&meta, 2, CredentialIdentity::Effective)?;
     ext4_vol::truncate_regular_ext4(&ext_path, size)
 }
 

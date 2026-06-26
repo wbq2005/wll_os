@@ -1305,6 +1305,8 @@ pub struct TaskControlBlockInner {
     pub next_mmap: usize,
     pub rlimit_nofile: usize,
     pub rlimit_nofile_max: usize,
+    pub rlimit_fsize: usize,
+    pub rlimit_fsize_max: usize,
     pub clear_child_tid: usize,
     pub robust_list_head: usize,
     pub robust_list_len: usize,

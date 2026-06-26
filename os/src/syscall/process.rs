@@ -935,6 +935,8 @@ pub fn sys_clone(
         pgid,
         rlimit_nofile,
         rlimit_nofile_max,
+        rlimit_fsize,
+        rlimit_fsize_max,
         inherited_timer_slack_ns,
     ) = {
         let inner = parent.inner.lock();
@@ -951,6 +953,8 @@ pub fn sys_clone(
             inner.pgid,
             inner.rlimit_nofile,
             inner.rlimit_nofile_max,
+            inner.rlimit_fsize,
+            inner.rlimit_fsize_max,
             inner.current_timer_slack_ns,
         )
     };
@@ -1001,6 +1005,8 @@ pub fn sys_clone(
             next_mmap: mm_snapshot.next_mmap,
             rlimit_nofile,
             rlimit_nofile_max,
+            rlimit_fsize,
+            rlimit_fsize_max,
             clear_child_tid: if (clone_bits & CLONE_CHILD_CLEARTID) != 0 {
                 child_tid
             } else {

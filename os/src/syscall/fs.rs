@@ -3310,6 +3310,10 @@ pub fn sys_truncate(pathname: *const u8, length: usize) -> SyscallRet {
     if length > isize::MAX as usize {
         return Err(SysErrNo::EINVAL);
     }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    if length > task.inner.lock().rlimit_fsize {
+        return Err(SysErrNo::EFBIG);
+    }
     let (_logical_path, host_path) = resolve_host_path(AT_FDCWD, pathname)?;
     super::with_kernel_page_table(|| crate::fs::truncate_path(&host_path, length as u64))?;
     Ok(0)
@@ -3320,7 +3324,10 @@ pub fn sys_ftruncate(fd: usize, length: usize) -> SyscallRet {
         return Err(SysErrNo::EINVAL);
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let mut inner = task.inner.lock();
+    let inner = task.inner.lock();
+    if length > inner.rlimit_fsize {
+        return Err(SysErrNo::EFBIG);
+    }
     let mut fds = inner.fd_table.lock();
     let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
     super::with_kernel_page_table(|| crate::fs::truncate_fd(file_desc, length as u64))?;
