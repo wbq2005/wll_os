@@ -1249,6 +1249,33 @@ fn check_create_access(parent: &str) -> Result<(), SysErrNo> {
     check_metadata_access_with_identity(&meta, W_OK | X_OK, CredentialIdentity::Filesystem)
 }
 
+fn check_delete_access(path: &str, target: &VfsMetadata) -> Result<(), SysErrNo> {
+    const W_OK: usize = 2;
+    const X_OK: usize = 1;
+    const S_ISVTX: u32 = 0o1000;
+
+    let parent = parent_path(path);
+    let parent_meta = metadata(&parent, true)?;
+    if parent_meta.kind != VfsNodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    check_search_access(&parent, CredentialIdentity::Filesystem)?;
+    check_metadata_access_with_identity(&parent_meta, W_OK | X_OK, CredentialIdentity::Filesystem)?;
+
+    let credentials = crate::task::current_task()
+        .map(|task| task.credentials.lock().clone())
+        .unwrap_or_else(crate::task::Credentials::root);
+    let uid = credentials.fsuid;
+    if uid != 0
+        && (parent_meta.mode & S_ISVTX) != 0
+        && uid != parent_meta.uid
+        && uid != target.uid
+    {
+        return Err(SysErrNo::EPERM);
+    }
+    Ok(())
+}
+
 pub fn read_file(name: &str) -> Option<Vec<u8>> {
     let original = normalize_path(name);
     if is_removed(&original) {
@@ -1577,6 +1604,11 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
         };
     }
     ensure_mount_writable(&norm)?;
+    let target_meta = metadata(&norm, false)?;
+    if target_meta.kind == VfsNodeKind::Directory {
+        return Err(SysErrNo::EISDIR);
+    }
+    check_delete_access(&norm, &target_meta)?;
     let tmpfs_path = is_tmpfs_path(&norm);
     {
         let mut m = MEM_FS.lock();
@@ -1627,6 +1659,11 @@ pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
         };
     }
     ensure_mount_writable(&norm)?;
+    let target_meta = metadata(&norm, false)?;
+    if target_meta.kind != VfsNodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
+    check_delete_access(&norm, &target_meta)?;
     let tmpfs_path = is_tmpfs_path(&norm);
     {
         let mut m = MEM_FS.lock();
