@@ -870,6 +870,16 @@ fn encode_dev(major: u32, minor: u32) -> u64 {
     ((minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12)) as u64
 }
 
+fn decode_dev(dev: usize) -> Result<(u32, u32), SysErrNo> {
+    let dev = dev as u64;
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    if major > u32::MAX as u64 || minor > u32::MAX as u64 {
+        return Err(SysErrNo::EINVAL);
+    }
+    Ok((major as u32, minor as u32))
+}
+
 fn kstat_from_vfs(meta: crate::fs::VfsMetadata) -> KStat {
     KStat {
         st_dev: 0,
@@ -1204,9 +1214,10 @@ pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_mknodat(dirfd: isize, pathname: *const u8, mode: u32, _dev: usize) -> SyscallRet {
+pub fn sys_mknodat(dirfd: isize, pathname: *const u8, mode: u32, dev: usize) -> SyscallRet {
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let root_capable = task.credentials.lock().is_root_capable();
     let permissions = mode & 0o7777 & !task.fs.lock().umask;
     match mode & S_IFMT {
         0 | S_IFREG => {
@@ -1232,7 +1243,20 @@ pub fn sys_mknodat(dirfd: isize, pathname: *const u8, mode: u32, _dev: usize) ->
                 )
             })?;
         }
-        S_IFCHR | S_IFBLK => return Err(SysErrNo::EPERM),
+        S_IFCHR | S_IFBLK => {
+            if !root_capable {
+                return Err(SysErrNo::EPERM);
+            }
+            let (major, minor) = decode_dev(dev)?;
+            let kind = if mode & S_IFMT == S_IFCHR {
+                crate::fs::MemSpecialKind::CharDevice { major, minor }
+            } else {
+                crate::fs::MemSpecialKind::BlockDevice { major, minor }
+            };
+            super::with_kernel_page_table(|| {
+                crate::fs::create_special_node(&host_path, kind, permissions)
+            })?;
+        }
         _ => return Err(SysErrNo::EINVAL),
     }
     Ok(0)

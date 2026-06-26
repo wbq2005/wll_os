@@ -612,9 +612,11 @@ fn metadata_for_mem_special(
     kind: MemSpecialKind,
     node: MemNodeMetadata,
 ) -> VfsMetadata {
-    let file_type = match kind {
-        MemSpecialKind::Fifo => S_IFIFO,
-        MemSpecialKind::Socket => S_IFSOCK,
+    let (file_type, rdev) = match kind {
+        MemSpecialKind::Fifo => (S_IFIFO, None),
+        MemSpecialKind::Socket => (S_IFSOCK, None),
+        MemSpecialKind::CharDevice { major, minor } => (S_IFCHR, Some((major, minor))),
+        MemSpecialKind::BlockDevice { major, minor } => (S_IFBLK, Some((major, minor))),
     };
     let mut meta = synthetic_metadata(
         name,
@@ -626,6 +628,10 @@ fn metadata_for_mem_special(
     meta.ino = mem_inode(node, name);
     meta.uid = node.uid;
     meta.gid = node.gid;
+    if let Some((major, minor)) = rdev {
+        meta.rdev_major = major;
+        meta.rdev_minor = minor;
+    }
     meta
 }
 
@@ -2210,7 +2216,10 @@ pub fn create_special_node(path: &str, kind: MemSpecialKind, mode: u32) -> Resul
         return Ok(memfs_inode_u32(&norm));
     }
     if ext_parent {
-        return Err(SysErrNo::EOPNOTSUPP);
+        MEM_FS
+            .lock()
+            .add_overlay_special_with_mode(&norm, kind, mode)?;
+        return Ok(memfs_inode_u32(&norm));
     }
     if mem_parent {
         MEM_FS.lock().add_special_with_mode(&norm, kind, mode)?;
@@ -2337,6 +2346,30 @@ fn open_loop_device_descriptor(
             writable: write_ok,
         })
     })
+}
+
+fn open_char_device_descriptor(
+    major: u32,
+    minor: u32,
+    read_ok: bool,
+    write_ok: bool,
+    append: bool,
+) -> Option<Result<fd::FileDescriptor, SysErrNo>> {
+    let device_path = match (major, minor) {
+        (DEV_NULL_MAJOR, DEV_NULL_MINOR) => "/dev/null",
+        (DEV_ZERO_MAJOR, DEV_ZERO_MINOR) => "/dev/zero",
+        _ => return None,
+    };
+    Some(Ok(fd::FileDescriptor::MemFile {
+        name: String::from(device_path),
+        content: fd::MemFileContent::new(),
+        times: super::FileTimes::now(),
+        offset: 0,
+        readable: read_ok,
+        writable: write_ok,
+        append,
+        linked: false,
+    }))
 }
 
 pub fn open_path(
@@ -2490,6 +2523,23 @@ pub fn open_path(
         }
         if want_create && want_excl {
             return Err(SysErrNo::EEXIST);
+        }
+        let special = MEM_FS.lock().get_special(&open_norm).ok_or(SysErrNo::ENOENT)?;
+        let meta = metadata(&open_norm, false)?;
+        check_access_with_filesystem(&open_norm, false, open_access)?;
+        if let MemSpecialKind::CharDevice { major, minor } = special {
+            if let Some(opened) =
+                open_char_device_descriptor(major, minor, read_ok, write_ok, append)
+            {
+                return opened;
+            }
+        }
+        if (meta.mode & S_IFMT) == S_IFBLK {
+            if let Some(opened) =
+                open_loop_device_descriptor(local_device_path(&open_norm), read_ok, write_ok)
+            {
+                return opened;
+            }
         }
         return Err(SysErrNo::ENXIO);
     }

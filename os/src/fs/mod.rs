@@ -95,6 +95,8 @@ impl MemNodeMetadata {
 pub enum MemSpecialKind {
     Fifo,
     Socket,
+    CharDevice { major: u32, minor: u32 },
+    BlockDevice { major: u32, minor: u32 },
 }
 
 fn is_elf_content(content: &[u8]) -> bool {
@@ -428,6 +430,17 @@ impl MemFileSystem {
         let metadata = self.child_metadata_for_current(&name, mode, false);
         self.insert_new_metadata(name, metadata);
         Ok(())
+    }
+
+    pub fn add_overlay_special_with_mode(
+        &mut self,
+        name: &str,
+        kind: MemSpecialKind,
+        mode: u32,
+    ) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        self.ensure_parent_dirs(&name);
+        self.add_special_with_mode(&name, kind, mode)
     }
 
     /// 获取文件
