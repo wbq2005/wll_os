@@ -27,6 +27,7 @@ pub(crate) fn with_kernel_page_table<T>(f: impl FnOnce() -> T) -> T {
 
 /// 系统调用号定义
 pub const SYSCALL_GETCWD: usize = 17;
+pub const SYSCALL_EVENTFD2: usize = 19;
 pub const SYSCALL_EPOLL_CREATE1: usize = 20;
 pub const SYSCALL_EPOLL_CTL: usize = 21;
 pub const SYSCALL_EPOLL_PWAIT: usize = 22;
@@ -249,6 +250,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_ACCESS => fs::sys_access(args[0] as *const u8, args[1]),
         SYSCALL_CLOSE => fs::sys_close(args[0]),
         SYSCALL_PIPE2 => fs::sys_pipe2(args[0] as *mut i32, args[1]),
+        SYSCALL_EVENTFD2 => fs::sys_eventfd2(args[0], args[1]),
         SYSCALL_FACCESSAT => fs::sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], 0),
         SYSCALL_FACCESSAT2 => {
             fs::sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3])

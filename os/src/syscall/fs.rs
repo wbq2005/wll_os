@@ -44,6 +44,10 @@ const BLKGETSIZE64: usize = 0x80081272;
 
 const FALLOC_FL_KEEP_SIZE: usize = 0x01;
 
+const EFD_SEMAPHORE: usize = 0x01;
+const EFD_NONBLOCK: usize = fd::pipe_flags::O_NONBLOCK;
+const EFD_CLOEXEC: usize = fd::pipe_flags::O_CLOEXEC;
+
 const EPOLL_CLOEXEC: usize = fd::open_flags::O_CLOEXEC as usize;
 const EPOLL_CTL_ADD: usize = 1;
 const EPOLL_CTL_DEL: usize = 2;
@@ -391,54 +395,84 @@ fn write_fd_from_kernel(file_desc: &mut FileDescriptor, buf: &[u8]) -> SyscallRe
     }
 }
 
-fn wait_pipe_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
+fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
     let wait_key = {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-        if !file_desc.is_pipe_read() {
+        if file_desc.is_pipe_read() {
+            if file_desc.pipe_read_nonblocking() {
+                return Err(SysErrNo::EAGAIN);
+            }
+            if !file_desc.pipe_read_would_block() {
+                return Ok(false);
+            }
+            file_desc.pipe_read_wait_key().ok_or(SysErrNo::EBADF)?
+        } else if let Some(wait_key) = file_desc.eventfd_read_wait_key() {
+            if file_desc.eventfd_read_nonblocking() {
+                return Err(SysErrNo::EAGAIN);
+            }
+            if !file_desc.eventfd_read_would_block() {
+                return Ok(false);
+            }
+            wait_key
+        } else {
             return Err(SysErrNo::EAGAIN);
         }
-        if file_desc.pipe_read_nonblocking() {
-            return Err(SysErrNo::EAGAIN);
-        }
-        if !file_desc.pipe_read_would_block() {
-            return Ok(false);
-        }
-        file_desc.pipe_read_wait_key().ok_or(SysErrNo::EBADF)?
     };
     let _ = sleep_on_io_key_if(wait_key, None, || {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-        if file_desc.pipe_read_wait_key() != Some(wait_key) {
-            return Ok(false);
+        if file_desc.is_pipe_read() {
+            if file_desc.pipe_read_wait_key() != Some(wait_key) {
+                return Ok(false);
+            }
+            Ok(file_desc.pipe_read_would_block())
+        } else if file_desc.eventfd_read_wait_key() == Some(wait_key) {
+            Ok(file_desc.eventfd_read_would_block())
+        } else {
+            Ok(false)
         }
-        Ok(file_desc.pipe_read_would_block())
     })?;
     Ok(true)
 }
 
-fn wait_pipe_write_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
+fn wait_write_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
     let wait_key = {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-        if !file_desc.is_pipe_write() {
+        if file_desc.is_pipe_write() {
+            if file_desc.pipe_write_nonblocking() {
+                return Err(SysErrNo::EAGAIN);
+            }
+            if !file_desc.pipe_write_would_block() {
+                return Ok(false);
+            }
+            file_desc.pipe_write_wait_key().ok_or(SysErrNo::EBADF)?
+        } else if let Some(wait_key) = file_desc.eventfd_write_wait_key() {
+            if file_desc.eventfd_write_nonblocking() {
+                return Err(SysErrNo::EAGAIN);
+            }
+            if !file_desc.eventfd_write_would_block() {
+                return Ok(false);
+            }
+            wait_key
+        } else {
             return Err(SysErrNo::EAGAIN);
         }
-        if file_desc.pipe_write_nonblocking() {
-            return Err(SysErrNo::EAGAIN);
-        }
-        if !file_desc.pipe_write_would_block() {
-            return Ok(false);
-        }
-        file_desc.pipe_write_wait_key().ok_or(SysErrNo::EBADF)?
     };
     let _ = sleep_on_io_key_if(wait_key, None, || {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-        if file_desc.pipe_write_wait_key() != Some(wait_key) {
-            return Ok(false);
+        if file_desc.is_pipe_write() {
+            if file_desc.pipe_write_wait_key() != Some(wait_key) {
+                return Ok(false);
+            }
+            Ok(file_desc.pipe_write_would_block())
+        } else if file_desc.eventfd_write_wait_key() == Some(wait_key) {
+            Ok(file_desc.eventfd_write_would_block())
+        } else {
+            Ok(false)
         }
-        Ok(file_desc.pipe_write_would_block())
     })?;
     Ok(true)
 }
@@ -634,7 +668,7 @@ fn vectored_read_to_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
                 if total != 0 {
                     return Ok(total);
                 }
-                if !wait_pipe_read_after_eagain(&fd_table, fd)? {
+                if !wait_read_after_eagain(&fd_table, fd)? {
                     continue;
                 }
             }
@@ -700,7 +734,7 @@ fn vectored_write_from_user(fd: usize, iovecs: &[IoVec]) -> SyscallRet {
                     if total != 0 {
                         return Ok(total);
                     }
-                    match wait_pipe_write_after_eagain(&fd_table, fd) {
+                    match wait_write_after_eagain(&fd_table, fd) {
                         Ok(false) => continue,
                         Ok(_) => {}
                         Err(SysErrNo::EINTR) if total != 0 => return Ok(total),
@@ -1145,6 +1179,14 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
             let socket = state.lock();
             let mut flags = fd::open_flags::O_RDWR as usize;
             if socket.nonblock {
+                flags |= fd::pipe_flags::O_NONBLOCK;
+            }
+            flags
+        }
+        FileDescriptor::EventFd { state } => {
+            let eventfd = state.lock();
+            let mut flags = fd::open_flags::O_RDWR as usize;
+            if eventfd.nonblock {
                 flags |= fd::pipe_flags::O_NONBLOCK;
             }
             flags
@@ -1672,6 +1714,30 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: usize) -> SyscallRet {
     }
 }
 
+pub fn sys_eventfd2(initval: usize, flags: usize) -> SyscallRet {
+    let allowed = EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC;
+    if flags & !allowed != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let fd_flags = if flags & EFD_CLOEXEC != 0 {
+        fd::FD_CLOEXEC
+    } else {
+        0
+    };
+    let eventfd = crate::fs::fd::create_eventfd(
+        initval as u64,
+        flags & EFD_SEMAPHORE != 0,
+        flags & EFD_NONBLOCK != 0,
+    );
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let nofile_limit = inner.rlimit_nofile;
+    let mut fds = inner.fd_table.lock();
+    fds.alloc_with_flags_below(eventfd, fd_flags, nofile_limit)
+        .ok_or(SysErrNo::EMFILE)
+}
+
 pub fn sys_mount(
     source: *const u8,
     target: *const u8,
@@ -1798,7 +1864,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
                     return Ok(n);
                 }
                 Err(SysErrNo::EAGAIN) => {
-                    if !wait_pipe_read_after_eagain(&fd_table, fd)? {
+                    if !wait_read_after_eagain(&fd_table, fd)? {
                         continue;
                     }
                 }
@@ -1823,7 +1889,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
                 return Ok(n);
             }
             Err(SysErrNo::EAGAIN) => {
-                if !wait_pipe_read_after_eagain(&fd_table, fd)? {
+                if !wait_read_after_eagain(&fd_table, fd)? {
                     continue;
                 }
             }
@@ -1884,7 +1950,7 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
                     if written != 0 {
                         return Ok(written);
                     }
-                    match wait_pipe_write_after_eagain(&fd_table, fd) {
+                    match wait_write_after_eagain(&fd_table, fd) {
                         Ok(false) => continue,
                         Ok(_) => {}
                         Err(SysErrNo::EINTR) if written != 0 => return Ok(written),
@@ -2461,6 +2527,7 @@ fn fd_supports_epoll(file_desc: &FileDescriptor) -> bool {
             | FileDescriptor::PipeRead { .. }
             | FileDescriptor::PipeWrite { .. }
             | FileDescriptor::Socket { .. }
+            | FileDescriptor::EventFd { .. }
     )
 }
 
@@ -3117,7 +3184,7 @@ pub fn sys_splice(
                     if nonblock {
                         return Err(SysErrNo::EAGAIN);
                     }
-                    let _ = wait_pipe_read_after_eagain(&fd_table, fd_in)?;
+                    let _ = wait_read_after_eagain(&fd_table, fd_in)?;
                 }
                 Err(err) => {
                     if copied != 0 {
@@ -3164,7 +3231,7 @@ pub fn sys_splice(
                             Err(SysErrNo::EAGAIN)
                         };
                     }
-                    let _ = wait_pipe_write_after_eagain(&fd_table, fd_out)?;
+                    let _ = wait_write_after_eagain(&fd_table, fd_out)?;
                 }
                 Err(SysErrNo::EPIPE) if copied == 0 => {
                     crate::syscall::signal::send_sigpipe_to_current();

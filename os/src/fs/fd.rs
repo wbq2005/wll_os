@@ -37,6 +37,8 @@ const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
 const PIPE_WAIT_READABLE: usize = 1;
 const PIPE_WAIT_WRITABLE: usize = 2;
+const EVENTFD_WAIT_READABLE: usize = 1;
+const EVENTFD_WAIT_WRITABLE: usize = 2;
 const PIPE_SMALL_COPY: usize = 64;
 
 fn pipe_wait_key(state: &Arc<Mutex<PipeState>>, event: usize) -> WaitKey {
@@ -49,6 +51,18 @@ fn wake_pipe_readers(state: &Arc<Mutex<PipeState>>) {
 
 fn wake_pipe_writers(state: &Arc<Mutex<PipeState>>) {
     crate::task::wait_queue::wake_io_keyed_waiters(pipe_wait_key(state, PIPE_WAIT_WRITABLE));
+}
+
+fn eventfd_wait_key(state: &Arc<Mutex<EventFdState>>, event: usize) -> WaitKey {
+    WaitKey::new(Arc::as_ptr(state) as usize, event)
+}
+
+fn wake_eventfd_readers(state: &Arc<Mutex<EventFdState>>) {
+    crate::task::wait_queue::wake_io_keyed_waiters(eventfd_wait_key(state, EVENTFD_WAIT_READABLE));
+}
+
+fn wake_eventfd_writers(state: &Arc<Mutex<EventFdState>>) {
+    crate::task::wait_queue::wake_io_keyed_waiters(eventfd_wait_key(state, EVENTFD_WAIT_WRITABLE));
 }
 
 fn is_dev_null_path(path: &str) -> bool {
@@ -380,6 +394,9 @@ pub enum FileDescriptor {
     Socket {
         state: Arc<Mutex<SocketState>>,
     },
+    EventFd {
+        state: Arc<Mutex<EventFdState>>,
+    },
     Epoll {
         state: Arc<Mutex<EpollState>>,
     },
@@ -472,6 +489,13 @@ pub struct SocketState {
     pub error: i32,
 }
 
+#[derive(Debug)]
+pub struct EventFdState {
+    pub counter: u64,
+    pub semaphore: bool,
+    pub nonblock: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct EpollInterest {
     pub fd: usize,
@@ -531,6 +555,16 @@ impl SocketState {
 
     pub fn is_datagram(&self) -> bool {
         self.sock_type == SOCK_DGRAM
+    }
+}
+
+impl EventFdState {
+    pub fn new(counter: u64, semaphore: bool, nonblock: bool) -> Self {
+        Self {
+            counter,
+            semaphore,
+            nonblock,
+        }
     }
 }
 
@@ -645,6 +679,46 @@ impl FileDescriptor {
         }
     }
 
+    pub fn eventfd_read_nonblocking(&self) -> bool {
+        matches!(self, FileDescriptor::EventFd { state } if state.lock().nonblock)
+    }
+
+    pub fn eventfd_read_would_block(&self) -> bool {
+        match self {
+            FileDescriptor::EventFd { state } => state.lock().counter == 0,
+            _ => false,
+        }
+    }
+
+    pub fn eventfd_read_wait_key(&self) -> Option<WaitKey> {
+        match self {
+            FileDescriptor::EventFd { state } => {
+                Some(eventfd_wait_key(state, EVENTFD_WAIT_READABLE))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn eventfd_write_nonblocking(&self) -> bool {
+        matches!(self, FileDescriptor::EventFd { state } if state.lock().nonblock)
+    }
+
+    pub fn eventfd_write_would_block(&self) -> bool {
+        match self {
+            FileDescriptor::EventFd { state } => state.lock().counter != 0,
+            _ => false,
+        }
+    }
+
+    pub fn eventfd_write_wait_key(&self) -> Option<WaitKey> {
+        match self {
+            FileDescriptor::EventFd { state } => {
+                Some(eventfd_wait_key(state, EVENTFD_WAIT_WRITABLE))
+            }
+            _ => None,
+        }
+    }
+
     pub fn set_status_flags(&mut self, flags: usize) {
         let append = (flags & (open_flags::O_APPEND as usize)) != 0;
         let nonblock = (flags & pipe_flags::O_NONBLOCK) != 0;
@@ -666,6 +740,9 @@ impl FileDescriptor {
                 *current = nonblock;
             }
             FileDescriptor::Socket { state } => {
+                state.lock().nonblock = nonblock;
+            }
+            FileDescriptor::EventFd { state } => {
                 state.lock().nonblock = nonblock;
             }
             _ => {}
@@ -701,6 +778,7 @@ impl FileDescriptor {
                 let pipe = state.lock();
                 !pipe.buf.is_empty() || pipe.writers == 0
             }
+            FileDescriptor::EventFd { state } => state.lock().counter != 0,
             FileDescriptor::Socket { state } => {
                 let socket = state.lock();
                 socket.shutdown_read
@@ -722,6 +800,7 @@ impl FileDescriptor {
                 let pipe = state.lock();
                 pipe.readers > 0 && pipe.buf.len() < PIPE_CAPACITY
             }
+            FileDescriptor::EventFd { state } => state.lock().counter < u64::MAX - 1,
             FileDescriptor::Socket { state } => {
                 let socket = state.lock();
                 (socket.connected || socket.is_datagram())
@@ -748,6 +827,7 @@ impl FileDescriptor {
             FileDescriptor::PipeRead { .. } => true,
             FileDescriptor::PipeWrite { .. } => false,
             FileDescriptor::Socket { .. } => true,
+            FileDescriptor::EventFd { .. } => true,
             FileDescriptor::Epoll { .. } => false,
         }
     }
@@ -768,6 +848,7 @@ impl FileDescriptor {
             FileDescriptor::PipeRead { .. } => false,
             FileDescriptor::PipeWrite { .. } => true,
             FileDescriptor::Socket { .. } => true,
+            FileDescriptor::EventFd { .. } => true,
             FileDescriptor::Epoll { .. } => false,
         }
     }
@@ -870,6 +951,30 @@ impl FileDescriptor {
                 Ok(n)
             }
             FileDescriptor::PipeWrite { .. } => Err(SysErrNo::EBADF),
+            FileDescriptor::EventFd { state } => {
+                if buf.len() < core::mem::size_of::<u64>() {
+                    return Err(SysErrNo::EINVAL);
+                }
+                let (value, wake_writers) = {
+                    let mut eventfd = state.lock();
+                    if eventfd.counter == 0 {
+                        return Err(SysErrNo::EAGAIN);
+                    }
+                    if eventfd.semaphore {
+                        eventfd.counter -= 1;
+                        (1u64, true)
+                    } else {
+                        let value = eventfd.counter;
+                        eventfd.counter = 0;
+                        (value, true)
+                    }
+                };
+                buf[..core::mem::size_of::<u64>()].copy_from_slice(&value.to_ne_bytes());
+                if wake_writers {
+                    wake_eventfd_writers(state);
+                }
+                Ok(core::mem::size_of::<u64>())
+            }
             FileDescriptor::Socket { state } => {
                 if buf.is_empty() {
                     return Ok(0);
@@ -1128,6 +1233,31 @@ impl FileDescriptor {
                 Ok(written)
             }
             FileDescriptor::PipeRead { .. } => Err(SysErrNo::EBADF),
+            FileDescriptor::EventFd { state } => {
+                if buf.len() < core::mem::size_of::<u64>() {
+                    return Err(SysErrNo::EINVAL);
+                }
+                let mut raw = [0u8; core::mem::size_of::<u64>()];
+                raw.copy_from_slice(&buf[..core::mem::size_of::<u64>()]);
+                let value = u64::from_ne_bytes(raw);
+                if value == u64::MAX {
+                    return Err(SysErrNo::EINVAL);
+                }
+                let wake_readers = {
+                    let mut eventfd = state.lock();
+                    let available = (u64::MAX - 1).saturating_sub(eventfd.counter);
+                    if value > available {
+                        return Err(SysErrNo::EAGAIN);
+                    }
+                    let was_empty = eventfd.counter == 0;
+                    eventfd.counter += value;
+                    was_empty && value != 0
+                };
+                if wake_readers {
+                    wake_eventfd_readers(state);
+                }
+                Ok(core::mem::size_of::<u64>())
+            }
             FileDescriptor::Socket { state } => {
                 if buf.is_empty() {
                     return Ok(0);
@@ -1268,6 +1398,7 @@ impl FileDescriptor {
             FileDescriptor::PipeRead { state, .. } | FileDescriptor::PipeWrite { state, .. } => {
                 state.lock().buf.len()
             }
+            FileDescriptor::EventFd { .. } => core::mem::size_of::<u64>(),
             _ => 0,
         }
     }
@@ -1526,6 +1657,9 @@ impl Clone for FileDescriptor {
             FileDescriptor::Socket { state } => FileDescriptor::Socket {
                 state: state.clone(),
             },
+            FileDescriptor::EventFd { state } => FileDescriptor::EventFd {
+                state: state.clone(),
+            },
             FileDescriptor::Epoll { state } => FileDescriptor::Epoll {
                 state: state.clone(),
             },
@@ -1572,6 +1706,11 @@ impl Drop for FileDescriptor {
                 }
             }
             FileDescriptor::Socket { .. } => {
+                wake_io = true;
+            }
+            FileDescriptor::EventFd { state } => {
+                wake_eventfd_readers(state);
+                wake_eventfd_writers(state);
                 wake_io = true;
             }
             FileDescriptor::Ext4Regular { ino, .. } => {
@@ -2087,4 +2226,12 @@ pub fn create_pipe(nonblock: bool) -> (FileDescriptor, FileDescriptor) {
         },
         FileDescriptor::PipeWrite { state, nonblock },
     )
+}
+
+pub fn create_eventfd(counter: u64, semaphore: bool, nonblock: bool) -> FileDescriptor {
+    FileDescriptor::EventFd {
+        state: Arc::new(Mutex::new(EventFdState::new(
+            counter, semaphore, nonblock,
+        ))),
+    }
 }
