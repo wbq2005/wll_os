@@ -25,6 +25,8 @@ const DEV_NULL_MAJOR: u32 = 1;
 const DEV_NULL_MINOR: u32 = 3;
 const DEV_ZERO_MAJOR: u32 = 1;
 const DEV_ZERO_MINOR: u32 = 5;
+pub const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+pub const FS_APPEND_FL: u32 = 0x0000_0020;
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
 
@@ -124,6 +126,7 @@ pub struct VfsMetadata {
     pub mtime_nsec: isize,
     pub ctime_sec: isize,
     pub ctime_nsec: isize,
+    pub file_flags: u32,
 }
 
 pub fn is_removed(name: &str) -> bool {
@@ -425,6 +428,19 @@ fn metadata_from_ext4(meta: ext4_vol::Ext4Metadata) -> VfsMetadata {
         mtime_nsec: meta.mtime_nsec,
         ctime_sec: meta.ctime_sec,
         ctime_nsec: meta.ctime_nsec,
+        file_flags: meta.flags,
+    }
+}
+
+fn file_flags_block_unlink(flags: u32) -> bool {
+    (flags & (FS_IMMUTABLE_FL | FS_APPEND_FL)) != 0
+}
+
+fn check_file_flags_allow_unlink(meta: &VfsMetadata) -> Result<(), SysErrNo> {
+    if file_flags_block_unlink(meta.file_flags) {
+        Err(SysErrNo::EPERM)
+    } else {
+        Ok(())
     }
 }
 
@@ -453,6 +469,7 @@ fn synthetic_metadata(
         mtime_nsec: nsec,
         ctime_sec: sec,
         ctime_nsec: nsec,
+        file_flags: 0,
     }
 }
 
@@ -541,6 +558,7 @@ fn default_mem_metadata(mode: u32) -> MemNodeMetadata {
         uid: 0,
         gid: 0,
         ino: 0,
+        flags: 0,
     }
 }
 
@@ -590,6 +608,7 @@ fn metadata_for_mem_file(
     meta.ino = mem_inode(node, ino_key);
     meta.uid = node.uid;
     meta.gid = node.gid;
+    meta.file_flags = node.flags;
     meta
 }
 
@@ -604,6 +623,7 @@ fn metadata_for_mem_symlink(name: &str, target: &str, node: MemNodeMetadata) -> 
     meta.ino = mem_inode(node, name);
     meta.uid = node.uid;
     meta.gid = node.gid;
+    meta.file_flags = node.flags;
     meta
 }
 
@@ -628,6 +648,7 @@ fn metadata_for_mem_special(
     meta.ino = mem_inode(node, name);
     meta.uid = node.uid;
     meta.gid = node.gid;
+    meta.file_flags = node.flags;
     if let Some((major, minor)) = rdev {
         meta.rdev_major = major;
         meta.rdev_minor = minor;
@@ -728,6 +749,7 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
                 mtime_nsec: nsec,
                 ctime_sec: sec,
                 ctime_nsec: nsec,
+                file_flags: node.flags,
             });
         }
         if let Some(file) = mem.get_file(&norm) {
@@ -1214,6 +1236,44 @@ pub fn check_fd_access_with_effective(
     )
 }
 
+pub fn file_flags_for_fd(file: &fd::FileDescriptor) -> Result<u32, SysErrNo> {
+    match file {
+        fd::FileDescriptor::MemFile { name, linked, .. } if *linked => {
+            MEM_FS.lock().file_flags(name).ok_or(SysErrNo::ENOENT)
+        }
+        fd::FileDescriptor::MemFile { .. } => Ok(0),
+        fd::FileDescriptor::Ext4Regular { ino, .. } => ext4_vol::file_flags_by_ino(*ino),
+        fd::FileDescriptor::Path { host_path, kind, .. } if *kind != VfsNodeKind::Directory => {
+            Ok(metadata(host_path, false)?.file_flags)
+        }
+        _ => Err(SysErrNo::ENOTTY),
+    }
+}
+
+pub fn set_file_flags_for_fd(file: &fd::FileDescriptor, flags: u32) -> Result<(), SysErrNo> {
+    match file {
+        fd::FileDescriptor::MemFile { name, linked, .. } if *linked => {
+            MEM_FS.lock().set_file_flags(name, flags)
+        }
+        fd::FileDescriptor::MemFile { .. } => Err(SysErrNo::ENOENT),
+        fd::FileDescriptor::Ext4Regular { ino, .. } => ext4_vol::set_file_flags_ino(*ino, flags),
+        fd::FileDescriptor::Path { host_path, kind, .. } if *kind != VfsNodeKind::Directory => {
+            let norm = normalize_path(host_path);
+            if MEM_FS.lock().exists(&norm) {
+                return MEM_FS.lock().set_file_flags(&norm, flags);
+            }
+            let Some((ino, ext_kind)) = ext4_vol::lookup_kind(&norm) else {
+                return Err(SysErrNo::ENOENT);
+            };
+            if ext_kind == ext4_vol::Ext4NodeKind::Directory {
+                return Err(SysErrNo::ENOTTY);
+            }
+            ext4_vol::set_file_flags_ino(ino, flags)
+        }
+        _ => Err(SysErrNo::ENOTTY),
+    }
+}
+
 fn check_noatime_permission(meta: &VfsMetadata) -> Result<(), SysErrNo> {
     let credentials = crate::task::current_task()
         .map(|task| task.credentials.lock().clone())
@@ -1615,6 +1675,7 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EISDIR);
     }
     check_delete_access(&norm, &target_meta)?;
+    check_file_flags_allow_unlink(&target_meta)?;
     let tmpfs_path = is_tmpfs_path(&norm);
     {
         let mut m = MEM_FS.lock();

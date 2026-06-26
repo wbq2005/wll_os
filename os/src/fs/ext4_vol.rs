@@ -540,6 +540,7 @@ pub enum Ext4NodeKind {
 pub struct Ext4Metadata {
     pub ino: u32,
     pub mode: u32,
+    pub flags: u32,
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
@@ -1552,6 +1553,7 @@ fn metadata_for_ino(fs: &Ext4, ino: u32) -> Ext4Metadata {
     let mut meta = Ext4Metadata {
         ino,
         mode: inode.mode() as u32,
+        flags: inode.flags(),
         nlink: inode.links_count() as u32,
         uid: inode.uid() as u32,
         gid: inode.gid() as u32,
@@ -1978,6 +1980,22 @@ pub fn metadata(path: &str) -> Result<Ext4Metadata, SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let (ino, _) = resolve_existing(&fs, path).ok_or(SysErrNo::ENOENT)?;
     Ok(metadata_for_ino(&fs, ino))
+}
+
+pub fn file_flags_by_ino(ino: u32) -> Result<u32, SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    Ok(fs.get_inode_ref(ino).inode.flags())
+}
+
+pub fn set_file_flags_ino(ino: u32, flags: u32) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let mut iref = fs.get_inode_ref(ino);
+    iref.inode.set_flags(flags);
+    let now = current_ext4_time();
+    iref.inode.set_ctime(now);
+    iref.inode.set_i_ctime_extra(0);
+    fs.write_back_inode(&mut iref);
+    Ok(())
 }
 
 pub fn set_mode_ino(ino: u32, mode: u32) -> Result<(), SysErrNo> {

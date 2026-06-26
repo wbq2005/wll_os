@@ -12,12 +12,12 @@ pub use vfs::{
     check_access, check_access_with_effective, check_fd_access, check_fd_access_with_effective,
     check_metadata_access, check_metadata_access_with_effective, create_dir, create_dir_with_mode,
     create_regular_file, create_special_node, create_symlink, dir_exists, file_exists,
-    filesystem_magic, is_removed, link_path, list_dir, list_files, metadata, metadata_for_fd,
-    metadata_for_lookup, mount_fs, open_path, read_executable_file, read_file, read_interpreter,
-    read_link, refresh_block_device_nodes, remove_dir, remove_file, rename_path, set_mode_fd,
-    set_mode_path, set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd,
-    statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path, umount_fs, VfsMetadata,
-    VfsNodeKind, VfsStatFs,
+    file_flags_for_fd, filesystem_magic, is_removed, link_path, list_dir, list_files, metadata,
+    metadata_for_fd, metadata_for_lookup, mount_fs, open_path, read_executable_file, read_file,
+    read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file, rename_path,
+    set_file_flags_for_fd, set_mode_fd, set_mode_path, set_owner_fd, set_owner_path, set_times_fd,
+    set_times_path, statfs_for_fd, statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path,
+    umount_fs, VfsMetadata, VfsNodeKind, VfsStatFs,
 };
 
 use alloc::collections::BTreeMap;
@@ -39,6 +39,7 @@ pub struct MemNodeMetadata {
     pub uid: u32,
     pub gid: u32,
     pub ino: u64,
+    pub flags: u32,
 }
 
 impl MemNodeMetadata {
@@ -48,6 +49,7 @@ impl MemNodeMetadata {
             uid: 0,
             gid: 0,
             ino: 0,
+            flags: 0,
         }
     }
 
@@ -67,6 +69,7 @@ impl MemNodeMetadata {
             uid: credentials.fsuid,
             gid: credentials.fsgid,
             ino: 0,
+            flags: 0,
         }
     }
 
@@ -87,6 +90,7 @@ impl MemNodeMetadata {
                 .map(|meta| meta.gid)
                 .unwrap_or(credentials.fsgid),
             ino: 0,
+            flags: 0,
         }
     }
 }
@@ -607,6 +611,48 @@ impl MemFileSystem {
             return Err(SysErrNo::ENOENT);
         }
         self.metadata.remove(&name);
+        Ok(())
+    }
+
+    pub fn file_flags(&self, name: &str) -> Option<u32> {
+        let name = normalize_path(name);
+        self.metadata.get(&name).map(|meta| meta.flags)
+    }
+
+    pub fn set_file_flags(&mut self, name: &str, flags: u32) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        if !self.exists(&name) {
+            return Err(SysErrNo::ENOENT);
+        }
+
+        if let Some(link_key) = self
+            .files
+            .iter()
+            .find(|file| file.name == name)
+            .map(|file| file.link_key.clone())
+        {
+            let linked_names: Vec<String> = self
+                .files
+                .iter()
+                .filter(|file| file.link_key == link_key)
+                .map(|file| file.name.clone())
+                .collect();
+            for linked_name in linked_names {
+                let meta = self.metadata_or_alloc(&linked_name, 0o666);
+                self.metadata.insert(linked_name, MemNodeMetadata { flags, ..meta });
+            }
+            return Ok(());
+        }
+
+        let mode = if self.is_dir(&name) {
+            0o755
+        } else if self.symlinks.contains_key(&name) {
+            0o777
+        } else {
+            0o666
+        };
+        let meta = self.metadata_or_alloc(&name, mode);
+        self.metadata.insert(name, MemNodeMetadata { flags, ..meta });
         Ok(())
     }
 

@@ -30,6 +30,8 @@ const F_SETFL: usize = 4;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const FIONREAD: usize = 0x541B;
 const FIONBIO: usize = 0x5421;
+const FS_IOC_GETFLAGS: usize = 0x8008_6601;
+const FS_IOC_SETFLAGS: usize = 0x4008_6602;
 const LOOP_SET_FD: usize = 0x4C00;
 const LOOP_CLR_FD: usize = 0x4C01;
 const LOOP_SET_STATUS: usize = 0x4C02;
@@ -2158,6 +2160,33 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SyscallRet {
             _ => Err(SysErrNo::ENOTTY),
         },
         FileDescriptor::LoopDevice { index, .. } => loop_device_ioctl(*index, request, argp, &fds),
+        FileDescriptor::MemFile { .. }
+        | FileDescriptor::Ext4Regular { .. }
+        | FileDescriptor::Path { .. } => match request {
+            FS_IOC_GETFLAGS => {
+                if argp == 0 {
+                    return Err(SysErrNo::EFAULT);
+                }
+                let flags = super::with_kernel_page_table(|| crate::fs::file_flags_for_fd(file_desc))?;
+                let out = flags as i32;
+                super::user::copy_object_to_user(argp, &out)?;
+                Ok(0)
+            }
+            FS_IOC_SETFLAGS => {
+                if argp == 0 {
+                    return Err(SysErrNo::EFAULT);
+                }
+                let flags = super::user::copy_object_from_user::<i32>(argp)? as u32;
+                let meta = super::with_kernel_page_table(|| crate::fs::metadata_for_fd(file_desc))?;
+                let credentials = task.credentials.lock().clone();
+                if !credentials.is_root_capable() && credentials.fsuid != meta.uid {
+                    return Err(SysErrNo::EPERM);
+                }
+                super::with_kernel_page_table(|| crate::fs::set_file_flags_for_fd(file_desc, flags))?;
+                Ok(0)
+            }
+            _ => Err(SysErrNo::ENOTTY),
+        },
         FileDescriptor::Socket { state } => match request {
             FIONBIO => {
                 if argp == 0 {
