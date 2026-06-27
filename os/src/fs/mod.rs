@@ -1272,7 +1272,7 @@ pub fn is_memfs_volatile_dir(path: &str) -> bool {
 
 pub fn is_memfs_overlay_create_dir(path: &str) -> bool {
     let norm = normalize_path(path);
-    norm == "/musl" || norm == "/glibc" || is_memfs_volatile_dir(&norm)
+    is_memfs_volatile_dir(&norm)
 }
 
 fn child_name(parent: &str, child: &str) -> Option<String> {

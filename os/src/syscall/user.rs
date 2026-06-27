@@ -89,6 +89,38 @@ pub fn copy_from_user(src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
     copy_from_user_in_memory_set(&mut memory_set, src, dst)
 }
 
+pub fn check_user_readable(src: usize, len: usize) -> Result<(), SysErrNo> {
+    if src == 0 && len != 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut memory_set = task.memory_set.lock();
+    memory_set.prepare_read(src, len)
+}
+
+pub fn clear_user(dst: usize, len: usize) -> Result<(), SysErrNo> {
+    if dst == 0 && len != 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut memory_set = task.memory_set.lock();
+    memory_set.prepare_write(dst, len)?;
+    let mut copied = 0usize;
+    while copied < len {
+        let va = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
+        let pa = memory_set
+            .translate(VirtAddr::new(va))
+            .ok_or(SysErrNo::EFAULT)?;
+        let page_left = PAGE_SIZE - va % PAGE_SIZE;
+        let n = page_left.min(len - copied);
+        unsafe {
+            core::ptr::write_bytes(pa.raw() as *mut u8, 0, n);
+        }
+        copied += n;
+    }
+    Ok(())
+}
+
 pub fn copy_object_to_user<T>(dst: usize, obj: &T) -> Result<(), SysErrNo> {
     let bytes =
         unsafe { core::slice::from_raw_parts(obj as *const T as *const u8, mem::size_of::<T>()) };

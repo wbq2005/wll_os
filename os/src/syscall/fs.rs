@@ -395,6 +395,102 @@ fn write_fd_from_kernel(file_desc: &mut FileDescriptor, buf: &[u8]) -> SyscallRe
     }
 }
 
+fn is_dev_null_name(name: &str) -> bool {
+    matches!(name, "/dev/null" | "/glibc/dev/null" | "/musl/dev/null")
+}
+
+fn is_dev_zero_name(name: &str) -> bool {
+    matches!(name, "/dev/zero" | "/glibc/dev/zero" | "/musl/dev/zero")
+}
+
+fn direct_read_fd_to_user(
+    file_desc: &mut FileDescriptor,
+    dst: *mut u8,
+    count: usize,
+) -> Result<Option<usize>, SysErrNo> {
+    match file_desc {
+        FileDescriptor::MemFile {
+            name,
+            readable,
+            offset,
+            ..
+        } if is_dev_null_name(name) || is_dev_zero_name(name) => {
+            if !*readable {
+                return Err(SysErrNo::EBADF);
+            }
+            if is_dev_null_name(name) {
+                return Ok(Some(0));
+            }
+            super::user::clear_user(dst as usize, count)?;
+            *offset = offset.saturating_add(count);
+            return Ok(Some(count));
+        }
+        _ => return Ok(None),
+    }
+}
+
+fn direct_read_at_fd_to_user(
+    file_desc: &mut FileDescriptor,
+    dst: *mut u8,
+    count: usize,
+    _offset: usize,
+) -> Result<Option<usize>, SysErrNo> {
+    match file_desc {
+        FileDescriptor::MemFile { name, readable, .. }
+            if is_dev_null_name(name) || is_dev_zero_name(name) =>
+        {
+            if !*readable {
+                return Err(SysErrNo::EBADF);
+            }
+            if is_dev_null_name(name) {
+                return Ok(Some(0));
+            }
+            super::user::clear_user(dst as usize, count)?;
+            return Ok(Some(count));
+        }
+        _ => return Ok(None),
+    }
+}
+
+fn direct_write_fd_from_user(
+    file_desc: &mut FileDescriptor,
+    src: *const u8,
+    count: usize,
+) -> Result<Option<usize>, SysErrNo> {
+    match file_desc {
+        FileDescriptor::MemFile { name, writable, .. }
+            if is_dev_null_name(name) || is_dev_zero_name(name) =>
+        {
+            if !*writable {
+                return Err(SysErrNo::EBADF);
+            }
+            super::user::check_user_readable(src as usize, count)?;
+            return Ok(Some(count));
+        }
+        _ => return Ok(None),
+    }
+}
+
+fn direct_write_at_fd_from_user(
+    file_desc: &mut FileDescriptor,
+    src: *const u8,
+    count: usize,
+    _offset: usize,
+) -> Result<Option<usize>, SysErrNo> {
+    match file_desc {
+        FileDescriptor::MemFile { name, writable, .. }
+            if is_dev_null_name(name) || is_dev_zero_name(name) =>
+        {
+            if !*writable {
+                return Err(SysErrNo::EBADF);
+            }
+            super::user::check_user_readable(src as usize, count)?;
+            return Ok(Some(count));
+        }
+        _ => return Ok(None),
+    }
+}
+
 fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
     let wait_key = {
         let fds = fd_table.lock();
@@ -1895,7 +1991,13 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
             let res = {
                 let mut fds = fd_table.lock();
                 match fds.get_mut(fd) {
-                    Some(file_desc) => read_fd_into_kernel(file_desc, &mut kbuf[..count]),
+                    Some(file_desc) => {
+                        match direct_read_fd_to_user(file_desc, buf, count) {
+                            Ok(Some(n)) => return Ok(n),
+                            Ok(None) => read_fd_into_kernel(file_desc, &mut kbuf[..count]),
+                            Err(err) => Err(err),
+                        }
+                    }
                     None => Err(SysErrNo::EBADF),
                 }
             };
@@ -1969,6 +2071,16 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> SyscallRet {
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let fd_table = task.inner.lock().fd_table.clone();
+    if count <= SMALL_IO_STACK_BUF {
+        let mut fds = fd_table.lock();
+        if let Some(file_desc) = fds.get_mut(fd) {
+            if let Some(n) = direct_write_fd_from_user(file_desc, buf, count)? {
+                return Ok(n);
+            }
+        } else {
+            return Err(SysErrNo::EBADF);
+        }
+    }
     with_user_read_buf(buf, count, |kbuf| {
         let mut written = 0usize;
 
@@ -2053,10 +2165,19 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, count: usize, offset: usize) -> Sysc
 
     if count <= SMALL_IO_STACK_BUF {
         let mut kbuf = [0u8; SMALL_IO_STACK_BUF];
+        let mut direct = false;
         let n = with_fixed_io_fd_mut(fd, |file_desc| {
-            read_fixed_at_into_kernel(file_desc, offset, &mut kbuf[..count])
+            match direct_read_at_fd_to_user(file_desc, buf, count, offset)? {
+                Some(n) => {
+                    direct = true;
+                    Ok(n)
+                }
+                None => read_fixed_at_into_kernel(file_desc, offset, &mut kbuf[..count]),
+            }
         })?;
-        copy_to_user(buf, &kbuf[..n])?;
+        if !direct && n != 0 {
+            copy_to_user(buf, &kbuf[..n])?;
+        }
         return Ok(n);
     }
 
@@ -2078,6 +2199,14 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: usize) -> S
         return Err(SysErrNo::EFAULT);
     }
     checked_io_count(count)?;
+
+    if count <= SMALL_IO_STACK_BUF {
+        if let Some(n) = with_fixed_io_fd_mut(fd, |file_desc| {
+            direct_write_at_fd_from_user(file_desc, buf, count, offset)
+        })? {
+            return Ok(n);
+        }
+    }
 
     with_user_read_buf(buf, count, |kbuf| {
         with_fixed_io_fd_mut(fd, |file_desc| {
