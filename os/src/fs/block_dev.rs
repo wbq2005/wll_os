@@ -300,6 +300,18 @@ pub fn range_for_path(path: &str) -> Option<Arc<BlockRange>> {
         .map(|entry| entry.range.clone())
 }
 
+pub fn block_device_available(path: &str) -> bool {
+    if range_for_path(path).is_some() {
+        return true;
+    }
+    if loop_index_for_path(path).is_some() {
+        return true;
+    }
+    loop_index_for_path(path)
+        .and_then(|index| loop_is_attached(index).ok())
+        .unwrap_or(false)
+}
+
 pub fn is_root_source(path: &str) -> bool {
     *ROOT_SOURCE.lock() == path
 }

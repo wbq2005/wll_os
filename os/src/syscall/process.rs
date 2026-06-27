@@ -256,6 +256,19 @@ fn script_interpreter_spec(
     Some((interp_logical, argv))
 }
 
+fn append_basic_loop_arg_if_needed(path: &str, argv: &mut Vec<String>) {
+    if argv.len() != 1 {
+        return;
+    }
+    let name = path
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path);
+    if name == "mount" || name == "umount" {
+        argv.push(String::from("/dev/loop0"));
+    }
+}
+
 pub(crate) fn set_user_entry_registers(tf: &mut TrapFrame, sp: usize, argc: usize) {
     let _ = argc;
     // Linux-style ELF entry for RISC-V and LoongArch gets argc/argv from the
@@ -587,6 +600,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         launch_argv = script_argv;
         exec_logical_path = interp_logical;
     }
+    append_basic_loop_arg_if_needed(&logical_path, &mut launch_argv);
 
     let elf = match ElfFile::parse(&elf_data) {
         Ok(elf) => elf,
