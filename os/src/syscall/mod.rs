@@ -125,6 +125,7 @@ pub const SYSCALL_SETFSGID: usize = 152;
 pub const SYSCALL_TIMES: usize = 153;
 pub const SYSCALL_SETPGID: usize = 154;
 pub const SYSCALL_GETPGID: usize = 155;
+pub const SYSCALL_GETSID: usize = 156;
 pub const SYSCALL_SETSID: usize = 157;
 pub const SYSCALL_GETGROUPS: usize = 158;
 pub const SYSCALL_SETGROUPS: usize = 159;
@@ -439,6 +440,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_PRCTL => other::sys_prctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_GETPGID => other::sys_getpgid(args[0]),
         SYSCALL_SETPGID => other::sys_setpgid(args[0], args[1]),
+        SYSCALL_GETSID => other::sys_getsid(args[0]),
         SYSCALL_MEMBARRIER => other::sys_membarrier(args[0], args[1]),
         SYSCALL_MPROTECT => mm::sys_mprotect(args[0], args[1], args[2] as i32),
         SYSCALL_MADVISE => Ok(0), // madvise advisory, ignore
@@ -490,7 +492,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_MLOCK | SYSCALL_MUNLOCK | SYSCALL_MLOCKALL | SYSCALL_MUNLOCKALL => {
             other::sys_memory_lock_noop()
         }
-        SYSCALL_SETSID => other::sys_getpgid(0),
+        SYSCALL_SETSID => other::sys_setsid(),
 
         _ => {
             log::warn!("[syscall] Unsupported syscall: {}", syscall_id);

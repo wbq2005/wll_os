@@ -46,6 +46,7 @@ struct RLimit {
 const RLIMIT_NOFILE: usize = 7;
 const RLIMIT_FSIZE: usize = 1;
 const RLIMIT_STACK: usize = 3;
+const RLIMIT_CORE: usize = 4;
 const DEFAULT_STACK_LIMIT: usize = 256 * 1024;
 
 #[repr(C)]
@@ -874,6 +875,14 @@ fn resource_limit_snapshot(resource: usize) -> Result<RLimit, SysErrNo> {
                 rlim_max: inner.rlimit_fsize_max,
             })
         }
+        RLIMIT_CORE => {
+            let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            let inner = task.inner.lock();
+            Ok(RLimit {
+                rlim_cur: inner.rlimit_core,
+                rlim_max: inner.rlimit_core_max,
+            })
+        }
         _ => Ok(RLimit {
             rlim_cur: usize::MAX,
             rlim_max: usize::MAX,
@@ -897,6 +906,13 @@ fn apply_resource_limit(resource: usize, limit_ptr: usize) -> Result<(), SysErrN
         let mut inner = task.inner.lock();
         inner.rlimit_fsize = limit.rlim_cur;
         inner.rlimit_fsize_max = limit.rlim_max;
+        return Ok(());
+    }
+    if resource == RLIMIT_CORE {
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let mut inner = task.inner.lock();
+        inner.rlimit_core = limit.rlim_cur;
+        inner.rlimit_core_max = limit.rlim_max;
         return Ok(());
     }
     if resource != RLIMIT_NOFILE {
@@ -1179,6 +1195,16 @@ pub fn sys_getpgid(pid: usize) -> SyscallRet {
     Ok(pgid)
 }
 
+pub fn sys_getsid(pid: usize) -> SyscallRet {
+    let task = if pid == 0 {
+        current_task().ok_or(SysErrNo::ESRCH)?
+    } else {
+        manager::find_task(pid).ok_or(SysErrNo::ESRCH)?
+    };
+    let sid = task.inner.lock().sid;
+    Ok(sid)
+}
+
 pub fn sys_setpgid(pid: usize, pgid: usize) -> SyscallRet {
     let task = if pid == 0 {
         current_task().ok_or(SysErrNo::ESRCH)?
@@ -1194,6 +1220,20 @@ pub fn sys_setpgid(pid: usize, pgid: usize) -> SyscallRet {
         member.inner.lock().pgid = new_pgid;
     }
     Ok(0)
+}
+
+pub fn sys_setsid() -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let sid = task.thread_group.tgid();
+    if !manager::find_process_group(sid).is_empty() {
+        return Err(SysErrNo::EPERM);
+    }
+    for member in task.thread_group.user_members() {
+        let mut inner = member.inner.lock();
+        inner.sid = sid;
+        inner.pgid = sid;
+    }
+    Ok(sid)
 }
 
 pub fn sys_membarrier(cmd: usize, flags: usize) -> SyscallRet {

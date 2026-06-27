@@ -1065,10 +1065,13 @@ pub fn sys_clone(
         exec_path,
         thread_parent,
         pgid,
+        sid,
         rlimit_nofile,
         rlimit_nofile_max,
         rlimit_fsize,
         rlimit_fsize_max,
+        rlimit_core,
+        rlimit_core_max,
         inherited_timer_slack_ns,
     ) = {
         let inner = parent.inner.lock();
@@ -1083,10 +1086,13 @@ pub fn sys_clone(
             inner.exec_path.clone(),
             inner.parent.clone(),
             inner.pgid,
+            inner.sid,
             inner.rlimit_nofile,
             inner.rlimit_nofile_max,
             inner.rlimit_fsize,
             inner.rlimit_fsize_max,
+            inner.rlimit_core,
+            inner.rlimit_core_max,
             inner.current_timer_slack_ns,
         )
     };
@@ -1132,6 +1138,7 @@ pub fn sys_clone(
             root: fs_snapshot.root.clone(),
             exec_path,
             pgid,
+            sid,
             program_break: mm_snapshot.program_break,
             mapped_break: mm_snapshot.mapped_break,
             next_mmap: mm_snapshot.next_mmap,
@@ -1139,6 +1146,8 @@ pub fn sys_clone(
             rlimit_nofile_max,
             rlimit_fsize,
             rlimit_fsize_max,
+            rlimit_core,
+            rlimit_core_max,
             clear_child_tid: if (clone_bits & CLONE_CHILD_CLEARTID) != 0 {
                 child_tid
             } else {

@@ -1042,6 +1042,9 @@ fn init_pseudo_files() {
     let cpu_map = b"1\n";
     let node_meminfo = b"Node 0 MemTotal:       131072 kB\nNode 0 MemFree:         65536 kB\n";
     let kernel_config = b"CONFIG_EVENTFD=y\n";
+    let pid_max = b"4194304\n";
+    let threads_max = b"32768\n";
+    let core_pattern = b"core\n";
     let mut fs = MEM_FS.lock();
     for root in ["", "/musl", "/glibc"] {
         fs.add_dir_with_mode(&alloc::format!("{}/tmp", root), 0o1777);
@@ -1051,6 +1054,8 @@ fn init_pseudo_files() {
         fs.add_dir(&alloc::format!("{}/dev/shm", root));
         fs.add_dir(&alloc::format!("{}/proc", root));
         fs.add_dir(&alloc::format!("{}/proc/self", root));
+        fs.add_dir(&alloc::format!("{}/proc/sys", root));
+        fs.add_dir(&alloc::format!("{}/proc/sys/kernel", root));
         fs.add_dir(&alloc::format!("{}/sys", root));
         fs.add_dir(&alloc::format!("{}/sys/kernel", root));
         fs.add_dir(&alloc::format!("{}/sys/devices", root));
@@ -1068,6 +1073,18 @@ fn init_pseudo_files() {
             proc_self_maps.to_vec(),
         );
         fs.add_file(&alloc::format!("{}/proc/cpuinfo", root), cpuinfo.to_vec());
+        fs.add_file(
+            &alloc::format!("{}/proc/sys/kernel/pid_max", root),
+            pid_max.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/proc/sys/kernel/threads-max", root),
+            threads_max.to_vec(),
+        );
+        fs.add_file(
+            &alloc::format!("{}/proc/sys/kernel/core_pattern", root),
+            core_pattern.to_vec(),
+        );
         fs.add_file(&alloc::format!("{}/etc/mtab", root), mounts.to_vec());
         fs.add_file(
             &alloc::format!("{}/etc/localtime", root),
