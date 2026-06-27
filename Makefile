@@ -8,7 +8,7 @@ LIBCTEST ?= 0
 IOZONE ?= 1
 LMBENCH ?= 1
 LTP ?= 0
-FOCUSED_LTP_CASES ?= writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03,symlink01,readlink01,lstat01,lstat02,symlink02,symlink03,symlink04,symlinkat01,readlinkat01,setitimer02,setitimer01,getitimer01,getitimer02
+FOCUSED_LTP_CASES ?= writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03,symlink01,readlink01,lstat01,lstat02,symlink02,symlink03,symlink04,symlinkat01,readlinkat01,setitimer02,setitimer01,getitimer01,getitimer02,mkdir02,mkdir03,mkdir04,mkdir05,rmdir01,rmdir02,rmdir03,fallocate02,fallocate03,mknod09,open10,open11,open12,unlink09,futex_wait05,prctl08,prctl09,epoll_wait02,epoll_pwait03,epoll_wait01,epoll_wait03,epoll_wait04,epoll_ctl01,epoll_ctl02,epoll_create1_01,epoll_create1_02,splice01,splice03,splice04,splice07,eventfd2_01,eventfd2_02,eventfd2_03,eventfd01,eventfd02,eventfd03,eventfd04,eventfd05,chown02,chown04,fchown04,lchown02,fchmod04,fchmod05,fchmod06,utimes01,truncate03,getsid02,waitid07,waitid08,waitid10
 RUSTUP_TOOLCHAIN ?= $(shell sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null | head -n 1)
 ifeq ($(strip $(RUSTUP_TOOLCHAIN)),)
     # Keep judge builds on the repository-pinned compiler. Falling back to the
