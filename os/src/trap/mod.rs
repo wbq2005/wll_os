@@ -364,7 +364,7 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     ctx.syscall_ok();
     let should_return = syscall_task
         .as_ref()
-        .map(|task| task.status() != TaskStatus::Zombie)
+        .map(|task| !matches!(task.status(), TaskStatus::Zombie | TaskStatus::Stopped))
         .unwrap_or(true);
     if should_return {
         let _ = crate::syscall::signal::handle_pending_for_user(ctx);

@@ -206,6 +206,32 @@ pub struct ThreadGroup {
     members: Mutex<Vec<Weak<TaskControlBlock>>>,
     exit_code: Mutex<i32>,
     process_zombie: AtomicUsize,
+    stopped: AtomicUsize,
+    child_wait: Mutex<ChildWaitState>,
+}
+
+#[derive(Clone, Copy)]
+pub enum ChildWaitEvent {
+    Stopped(i32),
+    Continued(i32),
+}
+
+struct ChildWaitState {
+    stopped_signal: Option<i32>,
+    stopped_consumed: bool,
+    continued_signal: Option<i32>,
+    continued_consumed: bool,
+}
+
+impl ChildWaitState {
+    fn new() -> Self {
+        Self {
+            stopped_signal: None,
+            stopped_consumed: true,
+            continued_signal: None,
+            continued_consumed: true,
+        }
+    }
 }
 
 impl ThreadGroup {
@@ -215,6 +241,8 @@ impl ThreadGroup {
             members: Mutex::new(Vec::new()),
             exit_code: Mutex::new(0),
             process_zombie: AtomicUsize::new(0),
+            stopped: AtomicUsize::new(0),
+            child_wait: Mutex::new(ChildWaitState::new()),
         })
     }
 
@@ -265,6 +293,53 @@ impl ThreadGroup {
 
     pub fn exit_code(&self) -> i32 {
         *self.exit_code.lock()
+    }
+
+    pub fn mark_stopped(&self, signum: i32) {
+        self.stopped.store(1, Ordering::SeqCst);
+        let mut wait = self.child_wait.lock();
+        wait.stopped_signal = Some(signum);
+        wait.stopped_consumed = false;
+        wait.continued_signal = None;
+        wait.continued_consumed = true;
+    }
+
+    pub fn mark_continued(&self, signum: i32) -> bool {
+        let was_stopped = self.stopped.swap(0, Ordering::SeqCst) != 0;
+        let mut wait = self.child_wait.lock();
+        wait.stopped_signal = None;
+        wait.stopped_consumed = true;
+        if was_stopped {
+            wait.continued_signal = Some(signum);
+            wait.continued_consumed = false;
+        }
+        was_stopped
+    }
+
+    pub fn take_child_wait_event(
+        &self,
+        want_stopped: bool,
+        want_continued: bool,
+        consume: bool,
+    ) -> Option<ChildWaitEvent> {
+        let mut wait = self.child_wait.lock();
+        if want_stopped && !wait.stopped_consumed {
+            if let Some(signum) = wait.stopped_signal {
+                if consume {
+                    wait.stopped_consumed = true;
+                }
+                return Some(ChildWaitEvent::Stopped(signum));
+            }
+        }
+        if want_continued && !wait.continued_consumed {
+            if let Some(signum) = wait.continued_signal {
+                if consume {
+                    wait.continued_consumed = true;
+                }
+                return Some(ChildWaitEvent::Continued(signum));
+            }
+        }
+        None
     }
 }
 
@@ -482,7 +557,7 @@ fn task_ctx_ptr(task: &Arc<TaskControlBlock>) -> *mut TaskContext {
 
 pub(crate) fn requeue_after_user_run(task: Arc<TaskControlBlock>) {
     match task.status() {
-        TaskStatus::Zombie | TaskStatus::Blocked => {}
+        TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped => {}
         TaskStatus::Running | TaskStatus::Ready => {
             *task.block_reason.lock() = None;
             task.set_status(TaskStatus::Ready);
@@ -807,6 +882,41 @@ pub(crate) fn terminate_task_group(task: &Arc<TaskControlBlock>, exit_code: i32)
     finish_process_exit(task, exit_code);
 }
 
+pub(crate) fn stop_task_group(task: &Arc<TaskControlBlock>, signum: i32) {
+    if task.is_kernel || task.thread_group.is_process_zombie() {
+        return;
+    }
+    task.thread_group.mark_stopped(signum);
+    for member in task.thread_group.user_members() {
+        if member.status() == TaskStatus::Zombie {
+            continue;
+        }
+        purge_wait_state_for_task(&member);
+        manager::remove_task_instances(&member);
+        *member.block_reason.lock() = None;
+        *member.wait_outcome.lock() = None;
+        member.set_status(TaskStatus::Stopped);
+    }
+    wait_queue::wake_child_waiters();
+}
+
+pub(crate) fn continue_task_group(task: &Arc<TaskControlBlock>, signum: i32) {
+    if task.is_kernel || task.thread_group.is_process_zombie() {
+        return;
+    }
+    let was_stopped = task.thread_group.mark_continued(signum);
+    if !was_stopped {
+        return;
+    }
+    for member in task.thread_group.user_members() {
+        if member.status() == TaskStatus::Stopped {
+            member.set_status(TaskStatus::Ready);
+            manager::add_task(member);
+        }
+    }
+    wait_queue::wake_child_waiters();
+}
+
 pub(crate) fn terminate_thread_group_peers_for_exec(task: &Arc<TaskControlBlock>) {
     if task.is_kernel {
         return;
@@ -966,7 +1076,10 @@ pub(crate) fn run_next_task() {
     // UART marker: 'S' = scheduler entry
 
     if let Some(task) = fetch_dispatchable_task() {
-        if matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+        if matches!(
+            task.status(),
+            TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
+        ) {
             if crate::trap::foreground_driver_active() {
                 return;
             }
@@ -1124,7 +1237,10 @@ pub(crate) fn run_ready_task_once() -> bool {
     let Some(active) = fetch_dispatchable_user_task() else {
         return false;
     };
-    if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+    if matches!(
+        active.status(),
+        TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
+    ) {
         return true;
     }
 
@@ -1177,7 +1293,10 @@ pub(crate) fn drain_kernel_ready_once() -> bool {
     let Some(active) = manager::fetch_kernel_task() else {
         return false;
     };
-    if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+    if matches!(
+        active.status(),
+        TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
+    ) {
         return true;
     }
 
@@ -1329,6 +1448,7 @@ pub enum TaskStatus {
     Zombie,
     /// 阻塞状态 - 等待某个事件
     Blocked,
+    Stopped,
 }
 
 impl TaskControlBlock {

@@ -334,10 +334,11 @@ fn cannot_catch_or_ignore(signum: i32) -> bool {
 }
 
 fn default_ignored(signum: i32) -> bool {
-    matches!(
-        signum,
-        SIGCHLD | SIGCONT | SIGTSTP | SIGTTIN | SIGTTOU | SIGURG | SIGWINCH
-    )
+    matches!(signum, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
+}
+
+fn default_stops(signum: i32) -> bool {
+    matches!(signum, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
 }
 
 fn default_exit_code(signum: i32) -> i32 {
@@ -687,6 +688,12 @@ pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {
             continue;
         }
 
+        if action.handler == SIG_DFL && default_stops(signum) {
+            clear_pending_signal(&task, signum);
+            crate::task::stop_task_group(&task, signum);
+            return false;
+        }
+
         if action.handler == SIG_DFL {
             clear_pending_signal(&task, signum);
             crate::task::terminate_task_group(&task, default_exit_code(signum));
@@ -753,9 +760,22 @@ fn deliver_to_processes(targets: &[Arc<TaskControlBlock>], signum: i32, info: Pe
 }
 
 fn queue_signal(task: &Arc<TaskControlBlock>, signum: i32, info: PendingSignalInfo) {
+    if signum == SIGCONT {
+        crate::task::continue_task_group(task, SIGCONT);
+    }
     let action = task.signal_actions.lock().get(signum);
+    if action.handler == SIG_DFL
+        && default_stops(signum)
+        && (signum == SIGSTOP || signal_is_unblocked(task, signum))
+    {
+        crate::task::stop_task_group(task, signum);
+        return;
+    }
     if action.handler == SIG_DFL && !default_ignored(signum) && signal_is_unblocked(task, signum) {
         crate::task::terminate_task_group(task, default_exit_code(signum));
+        return;
+    }
+    if signum == SIGCONT && action.handler == SIG_DFL {
         return;
     }
     let mut state = task.signal_state.lock();
@@ -767,6 +787,9 @@ fn queue_signal(task: &Arc<TaskControlBlock>, signum: i32, info: PendingSignalIn
 }
 
 fn wake_for_signal(task: &Arc<TaskControlBlock>) {
+    if task.status() == TaskStatus::Stopped {
+        return;
+    }
     if has_deliverable_pending(task) {
         crate::task::wake_blocked_task(task, WaitOutcome::Interrupted);
     }

@@ -121,7 +121,10 @@ fn fetch_from_queue(queue: &Mutex<ReadyQueue>) -> Option<Arc<TaskControlBlock>> 
     let mut index = 0;
     while index < queue.tasks.len() {
         let task = &queue.tasks[index];
-        if matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+        if matches!(
+            task.status(),
+            TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
+        ) {
             queue.remove_at(index);
             continue;
         }
@@ -180,7 +183,10 @@ pub fn has_kernel_task() -> bool {
 fn has_runnable_task(queue: &Mutex<ReadyQueue>) -> bool {
     let mut queue = queue.lock();
     while let Some(task) = queue.tasks.front() {
-        if !matches!(task.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+        if !matches!(
+            task.status(),
+            TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
+        ) {
             return true;
         }
         queue.remove_at(0);

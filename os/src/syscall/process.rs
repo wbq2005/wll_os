@@ -4,7 +4,7 @@ use crate::mm::elf_loader::ElfFile;
 use crate::task::{
     current_task, dup_fd_table, dup_fs_context, dup_mm_context, exit_current_and_run_next,
     exit_thread_group_and_run_next, new_shared_memory_set, suspend_current_and_run_next,
-    yield_current_once, Credentials, TaskControlBlock, ThreadGroup,
+    yield_current_once, ChildWaitEvent, Credentials, TaskControlBlock, ThreadGroup,
 };
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
@@ -55,8 +55,10 @@ const CLONE_DETACHED: usize = 0x00400000;
 const CLONE_CHILD_SETTID: usize = 0x01000000;
 
 const WNOHANG: usize = 0x0000_0001;
+const WSTOPPED: usize = 0x0000_0002;
 const WNOWAIT: usize = 0x0100_0000;
 const WEXITED: usize = 0x0000_0004;
+const WCONTINUED: usize = 0x0000_0008;
 
 const P_ALL: usize = 0;
 const P_PID: usize = 1;
@@ -65,6 +67,8 @@ const P_PGID: usize = 2;
 const SIGCHLD: i32 = 17;
 const CLD_EXITED: i32 = 1;
 const CLD_KILLED: i32 = 2;
+const CLD_STOPPED: i32 = 5;
+const CLD_CONTINUED: i32 = 6;
 
 #[derive(Clone, Copy)]
 enum WaitTarget {
@@ -138,6 +142,31 @@ fn has_matching_child(waiter: &Arc<TaskControlBlock>, target: WaitTarget) -> boo
             .iter()
             .any(|child| child_matches_wait_target(child, target))
     })
+}
+
+fn take_child_wait_event(
+    waiter: &Arc<TaskControlBlock>,
+    target: WaitTarget,
+    want_stopped: bool,
+    want_continued: bool,
+    consume: bool,
+) -> Option<(usize, ChildWaitEvent)> {
+    for owner in waiter.thread_group.user_members() {
+        let children = owner.inner.lock().children.clone();
+        for child in children {
+            if !child_matches_wait_target(&child, target) {
+                continue;
+            }
+            if let Some(event) =
+                child
+                    .thread_group
+                    .take_child_wait_event(want_stopped, want_continued, consume)
+            {
+                return Some((child.thread_group.tgid(), event));
+            }
+        }
+    }
+    None
 }
 
 fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
@@ -933,12 +962,36 @@ fn write_waitid_siginfo(infop: usize, pid: usize, exit_code: i32) -> Result<(), 
     super::user::copy_object_to_user(infop, &waitid_siginfo(pid, exit_code))
 }
 
+fn write_waitid_child_event(
+    infop: usize,
+    pid: usize,
+    event: ChildWaitEvent,
+) -> Result<(), SysErrNo> {
+    let (code, status) = match event {
+        ChildWaitEvent::Stopped(signum) => (CLD_STOPPED, signum),
+        ChildWaitEvent::Continued(signum) => (CLD_CONTINUED, signum),
+    };
+    let info = UserWaitSigInfo {
+        signo: SIGCHLD,
+        errno: 0,
+        code,
+        _align: 0,
+        pid: pid as i32,
+        uid: 0,
+        status,
+        _reserved: [0; 100],
+    };
+    super::user::copy_object_to_user(infop, &info)
+}
+
 pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusage: usize) -> SyscallRet {
-    const SUPPORTED_OPTIONS: usize = WEXITED | WNOHANG | WNOWAIT;
+    const SUPPORTED_OPTIONS: usize = WEXITED | WSTOPPED | WCONTINUED | WNOHANG | WNOWAIT;
     if infop == 0 {
         return Err(SysErrNo::EFAULT);
     }
-    if (options & !SUPPORTED_OPTIONS) != 0 || (options & WEXITED) == 0 {
+    if (options & !SUPPORTED_OPTIONS) != 0
+        || (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0
+    {
         return Err(SysErrNo::EINVAL);
     }
 
@@ -946,6 +999,9 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusag
     let target = waitid_target(idtype, id)?;
     let nohang = (options & WNOHANG) != 0;
     let nowait = (options & WNOWAIT) != 0;
+    let want_exited = (options & WEXITED) != 0;
+    let want_stopped = (options & WSTOPPED) != 0;
+    let want_continued = (options & WCONTINUED) != 0;
 
     let take_child = |task: &Arc<TaskControlBlock>| {
         if nowait {
@@ -955,9 +1011,18 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusag
         }
     };
 
-    if let Some((cpid, exit_code)) = take_child(&task) {
-        write_waitid_siginfo(infop, cpid, exit_code)?;
+    if let Some((cpid, event)) =
+        take_child_wait_event(&task, target, want_stopped, want_continued, !nowait)
+    {
+        write_waitid_child_event(infop, cpid, event)?;
         return Ok(0);
+    }
+
+    if want_exited {
+        if let Some((cpid, exit_code)) = take_child(&task) {
+            write_waitid_siginfo(infop, cpid, exit_code)?;
+            return Ok(0);
+        }
     }
 
     if !has_matching_child(&task, target) {
@@ -969,9 +1034,17 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusag
     }
 
     loop {
-        if let Some((cpid, exit_code)) = take_child(&task) {
-            write_waitid_siginfo(infop, cpid, exit_code)?;
+        if let Some((cpid, event)) =
+            take_child_wait_event(&task, target, want_stopped, want_continued, !nowait)
+        {
+            write_waitid_child_event(infop, cpid, event)?;
             return Ok(0);
+        }
+        if want_exited {
+            if let Some((cpid, exit_code)) = take_child(&task) {
+                write_waitid_siginfo(infop, cpid, exit_code)?;
+                return Ok(0);
+            }
         }
         if !has_matching_child(&task, target) {
             return Err(SysErrNo::ECHILD);

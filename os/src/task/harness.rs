@@ -1166,7 +1166,10 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
         let Some(active) = manager::fetch_user_task_for_foreground() else {
             continue;
         };
-        if matches!(active.status(), TaskStatus::Zombie | TaskStatus::Blocked) {
+        if matches!(
+            active.status(),
+            TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
+        ) {
             continue;
         }
 
