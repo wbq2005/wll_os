@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  # 操作系统开发环境
+  os-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: os-dev-env
+    volumes:
+      # 挂载项目代码到容器
+      - .:/workspace
+      # 可选：挂载 cargo 缓存到宿主机，避免每次重建
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/workspace/target
+    working_dir: /workspace
+    # 保持容器运行
+    tty: true
+    stdin_open: true
+    # 使用 bash 作为默认命令
+    command: /bin/bash
+    # 环境变量
+    environment:
+      - RUST_BACKTRACE=1
+      - CARGO_TERM_COLOR=always
+
+  # 用于运行 QEMU 的服务（可选）
+  qemu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: os-qemu
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    # 使用 host 网络模式以便访问 QEMU 的 gdbstub
+    network_mode: host
+    # 特权模式运行 QEMU
+    privileged: true
+    command: >
+      bash -c "
+        make build &&
+        qemu-system-riscv64 \
+          -machine virt \
+          -nographic \
+          -bios none \
+          -kernel kernel-rv \
+          -s -S
+      "
+
+volumes:
+  cargo-cache:
+  target-cache:

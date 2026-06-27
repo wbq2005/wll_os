@@ -1,0 +1,6 @@
+FROM zhouzhouyi/os-contest:20260510
+RUN rustup install nightly-2026-05-05 && \
+    rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2026-05-05 && \
+    rustup target add loongarch64-unknown-none --toolchain nightly-2026-05-05 && \
+    rustup component add rust-src --toolchain nightly-2026-05-05 && \
+    rustup default nightly-2026-05-05

@@ -1,0 +1,60 @@
+# Rust
+target/
+**/*.rs.bk
+*.rlib
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Generated kernel/build artifacts; Makefile must recreate kernel-rv and kernel-la.
+kernel-rv
+kernel-la
+kernel-rv*
+kernel-la*
+kernel-*.test
+kernel-rv-test
+kernel-rv.new
+kernel.zip
+*.bin
+*.elf
+*.img
+*.iso
+testdata/*.img.gz
+
+# Benchmark/run outputs
+results/
+
+# 日志和临时文件
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Cargo - keep Cargo.lock for reproducible builds
+
+# 调试文件
+*.pdb
+*.dSYM/
+
+# Claude specific (optional)
+.claude/
+.cargo/
+.cargo-checksum.json
+vendor/**/.*
+
+# Local nested repositories / test harnesses
+autotest_repo/
+_tmp/
+
+# Build error logs (temporary files)
+os/build_err*.txt
+os/build_la*.txt

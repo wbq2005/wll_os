@@ -1,0 +1,14 @@
+[workspace]
+members = ["os"]
+resolver = "2"
+
+[profile.release]
+debug = false
+lto = false
+opt-level = 2
+
+# 本地 patch 修复 polyhal 的 naked 属性问题
+[patch.crates-io]
+polyhal = { path = "patch/polyhal" }
+polyhal-boot = { path = "patch/polyhal-boot" }
+polyhal-trap = { path = "patch/polyhal-trap" }
