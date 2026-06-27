@@ -48,6 +48,8 @@ const RLIMIT_FSIZE: usize = 1;
 const RLIMIT_STACK: usize = 3;
 const RLIMIT_CORE: usize = 4;
 const DEFAULT_STACK_LIMIT: usize = 256 * 1024;
+const PERSONALITY_QUERY: usize = 0xffff_ffff;
+const UNAME26: usize = 0x0002_0000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -508,7 +510,15 @@ pub fn sys_uname(buf: usize) -> SyscallRet {
     };
     write_c_string(&mut uts.sysname, "wll_OS");
     write_c_string(&mut uts.nodename, "os-contest");
-    write_c_string(&mut uts.release, "5.10.0");
+    let personality = current_task()
+        .map(|task| task.inner.lock().personality)
+        .unwrap_or(0);
+    let release = if (personality & UNAME26) != 0 {
+        "2.6.40"
+    } else {
+        "5.10.0"
+    };
+    write_c_string(&mut uts.release, release);
     write_c_string(&mut uts.version, "2026");
     #[cfg(target_arch = "riscv64")]
     write_c_string(&mut uts.machine, "riscv64");
@@ -517,6 +527,16 @@ pub fn sys_uname(buf: usize) -> SyscallRet {
     write_c_string(&mut uts.domainname, "localdomain");
     copy_object_to_user(buf, &uts)?;
     Ok(0)
+}
+
+pub fn sys_personality(persona: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let mut inner = task.inner.lock();
+    let old = inner.personality;
+    if persona != PERSONALITY_QUERY {
+        inner.personality = persona;
+    }
+    Ok(old)
 }
 
 pub fn sys_times(buf: usize) -> SyscallRet {

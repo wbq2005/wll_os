@@ -1429,6 +1429,7 @@ pub struct TaskControlBlockInner {
     pub rlimit_fsize_max: usize,
     pub rlimit_core: usize,
     pub rlimit_core_max: usize,
+    pub personality: usize,
     pub clear_child_tid: usize,
     pub robust_list_head: usize,
     pub robust_list_len: usize,

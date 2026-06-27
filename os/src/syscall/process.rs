@@ -1145,6 +1145,7 @@ pub fn sys_clone(
         rlimit_fsize_max,
         rlimit_core,
         rlimit_core_max,
+        personality,
         inherited_timer_slack_ns,
     ) = {
         let inner = parent.inner.lock();
@@ -1166,6 +1167,7 @@ pub fn sys_clone(
             inner.rlimit_fsize_max,
             inner.rlimit_core,
             inner.rlimit_core_max,
+            inner.personality,
             inner.current_timer_slack_ns,
         )
     };
@@ -1221,6 +1223,7 @@ pub fn sys_clone(
             rlimit_fsize_max,
             rlimit_core,
             rlimit_core_max,
+            personality,
             clear_child_tid: if (clone_bits & CLONE_CHILD_CLEARTID) != 0 {
                 child_tid
             } else {

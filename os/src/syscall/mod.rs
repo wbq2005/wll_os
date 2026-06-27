@@ -89,6 +89,7 @@ pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 pub const SYSCALL_NANOSLEEP: usize = 101;
 pub const SYSCALL_GETITIMER: usize = 102;
 pub const SYSCALL_SETITIMER: usize = 103;
+pub const SYSCALL_PERSONALITY: usize = 92;
 pub const SYSCALL_CLOCK_SETTIME: usize = 112;
 pub const SYSCALL_CLOCK_GETTIME: usize = 113;
 pub const SYSCALL_CLOCK_GETRES: usize = 114;
@@ -408,6 +409,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_CLOCK_GETRES => other::sys_clock_getres(args[0], args[1]),
         SYSCALL_TIMES => other::sys_times(args[0]),
         SYSCALL_UNAME => other::sys_uname(args[0]),
+        SYSCALL_PERSONALITY => other::sys_personality(args[0]),
         SYSCALL_GETTIMEOFDAY => other::sys_gettimeofday(args[0], args[1]),
         SYSCALL_GETUID => other::sys_getuid(),
         SYSCALL_GETEUID => other::sys_geteuid(),
