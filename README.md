@@ -8,7 +8,16 @@
 
 ## 项目简介
 
-wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内核赛道的 Rust 内核项目，当前支持 RISC-V64 和 LoongArch64 两种架构。项目以真实评测语义为目标：构建、运行、性能与回归结论都以 QEMU 串口日志和 judge parser 输出为准，不使用假 marker 或仅靠脚本包装的成功状态替代内核运行结果。
+wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内核赛道的教学与竞赛型 Rust 内核项目。项目目标是在受限时间内构建一个结构清晰、可持续演进、能够真实运行评测程序的类 Unix 内核，并尽量让每一项功能都可以通过 QEMU 串口日志、judge parser 输出和回归脚本进行验证。
+
+当前内核支持 RISC-V64 与 LoongArch64 两种架构，围绕进程管理、虚拟内存、文件系统、系统调用、信号、同步原语和评测 harness 等核心模块展开实现。项目不追求用脚本包装“看起来通过”的结果，而是将 libc、BusyBox、benchmark 与 bounded LTP slice 作为主要驱动力，逐步补齐真实用户态程序所依赖的内核语义。
+
+在大赛场景中，wll_OS 的重点包括：
+
+- **可复现**：固定 Rust 工具链和构建入口，保留每次评测的 kernel/sdcard hash、串口日志与 judge summary。
+- **可移植**：通过 polyhal 抽象架构差异，在同一套内核主体上支持 RISC-V64 与 LoongArch64。
+- **可验证**：以真实 QEMU 运行结果和 parser 输出作为功能、性能与回归判断依据。
+- **可扩展**：按子系统拆分 syscall 与内核模块，便于继续扩展 LTP case、文件系统语义和调度能力。
 
 当前实现围绕以下能力展开：
 
@@ -214,6 +223,15 @@ wll_os/
 - ext4 写入、同步和 mmap writeback 以评测用例所需语义为优先，尚不是完整 journal/persistence 实现。
 - 当前 LTP 只声明 bounded slice，不声明 full LTP 可用。
 - 性能优化以真实 benchmark 串口日志和 parser summary 为准，单次低分或零分需要复跑确认。
+
+## 未来计划
+
+- **扩大 LTP 覆盖面**：继续按文件系统、进程/线程、信号、时间、权限和内存管理等子系统分批增加 case，避免一次性宣称 full LTP 支持。
+- **完善 POSIX/Linux 兼容语义**：补齐更多 pthread、process group、session、权限检查、signal queue、robust futex 与 `/proc` 相关能力。
+- **增强文件系统可靠性**：完善 ext4 写入、同步、truncate、rename、mmap writeback 等路径，逐步减少只面向评测用例的特殊处理。
+- **改进调度与性能表现**：优化 futex wait path、定时器、上下文切换、文件 I/O 和 benchmark 热路径，形成更稳定的性能基线。
+- **补充网络与设备支持**：在现有 loopback/socket 子集基础上，逐步扩展 TCP/UDP、virtio-net 和常用 pseudo device。
+- **提升工程化质量**：持续整理 syscall matrix、设计文档和回归脚本，完善自动化证据归档，使功能变化、性能波动和风险边界更容易追踪。
 
 ## 许可证
 
