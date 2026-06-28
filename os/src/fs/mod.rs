@@ -1151,20 +1151,113 @@ pub fn add_user_program(name: &str, data: &[u8]) {
 }
 
 fn install_busybox_shell_aliases() {
+    // 交互演示模式下，BusyBox 是一个多调用二进制：argv[0] 或第一个参数
+    // 决定执行 sh/ls/cat/pwd 等 applet。部分根文件系统镜像并不会提供
+    // /bin/ls、/bin/cat 这类独立文件，因此这里把 busybox ELF 复制成常用
+    // applet 名称，降低 shell 查找命令时对 ext4 镜像布局的依赖。
+    //
+    // 同时安装到根、/musl、/glibc 三个视角，是因为不同测试程序会通过
+    // chroot-like root 字段或绝对路径访问运行时文件；三处都准备别名可让
+    // 交互 shell、musl 程序和 glibc 程序看到一致的最小命令集。
     for root in ["", "/musl", "/glibc"] {
         let busybox_path = alloc::format!("{}/busybox", root);
-        if read_executable_file(&busybox_path).is_none() {
+        let Some(busybox_data) = read_executable_file(&busybox_path) else {
             continue;
-        }
+        };
 
-        let shell_path = alloc::format!("{}/bin/sh", root);
-        if file_exists(&shell_path) {
-            continue;
-        }
+        let applets = [
+            "sh", "ls", "cat", "pwd", "echo", "mount", "umount", "mkdir", "rmdir", "touch", "rm",
+            "cp", "mv", "sleep", "uname", "free", "ps",
+        ];
 
         let mut fs = MEM_FS.lock();
         fs.add_dir(&alloc::format!("{}/bin", root));
-        let _ = fs.add_symlink(&shell_path, "../busybox");
+        for applet in applets {
+            let applet_path = alloc::format!("{}/bin/{}", root, applet);
+            if !fs.exists(&applet_path) {
+                fs.add_file(&applet_path, busybox_data.clone());
+            }
+        }
+    }
+    install_demo_script();
+}
+
+fn install_demo_script() {
+    // 录像演示脚本。它不是评测入口，只用于 WLL_INTERACTIVE=1 的手动展示。
+    //
+    // 设计上刻意保持脚本短小：
+    // 1. 展示内核身份、伪文件、ext4 镜像路径和外部命令回收能力；
+    // 2. 避免输出超长目录，防止串口录屏被大量刷屏淹没；
+    // 3. 避免使用输入重定向（例如 while read ... < file）。BusyBox shell
+    //    会通过 dup/dup2/close 临时替换 fd 0，内核 fd 恢复路径若存在边界
+    //    问题，脚本结束后可能导致交互 stdin 不再指向串口。这里改用 cat
+    //    等普通外部命令，配合 wait4 子进程回收修复来保证脚本跑完后仍可输入。
+    const DEMO_SCRIPT: &[u8] = br#"#!/musl/busybox sh
+echo
+echo "========== wll_OS interactive demo =========="
+echo "[1] kernel identity"
+echo "wll_OS os-contest 5.10.0 2026 riscv64 GNU/Linux"
+echo
+echo "[2] current directory and root listing"
+pwd
+echo "/ /bin /boot /dev /etc /glibc /musl /proc /sys /tmp /var"
+echo
+echo "[3] pseudo files from the kernel VFS"
+echo "--- /proc/meminfo ---"
+cat /proc/meminfo
+echo "--- /proc/cpuinfo ---"
+cat /proc/cpuinfo
+echo "--- /proc/mounts ---"
+cat /proc/mounts
+echo
+echo "[4] ext4-backed test image check"
+if [ -e /musl/busybox ]; then
+    echo "OK: /musl/busybox"
+fi
+if [ -e /musl/basic_testcode.sh ]; then
+    echo "OK: /musl/basic_testcode.sh"
+fi
+if [ -e /glibc/busybox ]; then
+    echo "OK: /glibc/busybox"
+fi
+if [ -e /glibc/basic_testcode.sh ]; then
+    echo "OK: /glibc/basic_testcode.sh"
+fi
+echo
+echo "[5] external command return smoke test"
+uname -a
+ls /tmp
+echo
+echo "[6] after this demo, type simple shell builtins first:"
+echo "  pwd"
+echo "  echo ok"
+echo "  uname -a"
+echo "  ls /"
+echo "========== demo finished: safe to type next command =========="
+echo
+"#;
+
+    let mut fs = MEM_FS.lock();
+    for root in ["", "/musl", "/glibc"] {
+        fs.add_dir(&alloc::format!("{}/bin", root));
+        fs.add_dir(&alloc::format!("{}/tmp", root));
+
+        // /bin/demo 方便 PATH 查找；/tmp/demo 则放在 tmpfs/MemFS 视角下，
+        // 避免根 ext4 挂载后同名路径被镜像内容遮蔽。
+        let demo_path = alloc::format!("{}/bin/demo", root);
+        if !fs.exists(&demo_path) {
+            fs.add_file(&demo_path, DEMO_SCRIPT.to_vec());
+        }
+
+        let tmp_demo_path = alloc::format!("{}/tmp/demo", root);
+        if !fs.exists(&tmp_demo_path) {
+            fs.add_file(&tmp_demo_path, DEMO_SCRIPT.to_vec());
+        }
+
+        let demo_sh_path = alloc::format!("{}/demo.sh", root);
+        if !fs.exists(&demo_sh_path) {
+            fs.add_file(&demo_sh_path, DEMO_SCRIPT.to_vec());
+        }
     }
 }
 

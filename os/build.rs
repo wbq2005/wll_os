@@ -44,6 +44,12 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
     println!("cargo:rerun-if-env-changed=LOG");
     println!("cargo:rerun-if-env-changed=LIBCTEST_FILTER");
     println!("cargo:rerun-if-env-changed=LTP_CASES");
+    // 交互演示相关开关通过 option_env! 在内核代码中读取，属于编译期配置。
+    // 如果不声明 rerun-if-env-changed，切换 INTERACTIVE/输入自测/输入 trace 后
+    // Cargo 可能复用旧产物，导致 QEMU 里看到的行为和本次命令行不一致。
+    println!("cargo:rerun-if-env-changed=WLL_INTERACTIVE");
+    println!("cargo:rerun-if-env-changed=WLL_INPUT_SELFTEST");
+    println!("cargo:rerun-if-env-changed=WLL_STDIN_TRACE");
     println!("cargo:rerun-if-env-changed=WLL_HARNESS_GROUPS");
     println!("cargo:rerun-if-env-changed=WLL_TRACE_TEST_COMMANDS");
     println!("cargo:rerun-if-env-changed=WLL_TRACE_TEST_GROUPS");
