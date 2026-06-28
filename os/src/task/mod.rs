@@ -630,6 +630,17 @@ pub fn add_initproc() {
     // 尝试从文件系统加载 init 程序
     log::info!("[task] Loading init process...");
 
+    // 手动演示/录屏入口。普通评测仍走 /init 或 harness；只有编译时设置
+    // WLL_INTERACTIVE=1 才提前启动 BusyBox shell。这样可以避免把交互逻辑
+    // 混入 judge 路径，也不会影响默认自动测试。
+    if interactive_mode_enabled() {
+        run_input_selftest_if_enabled();
+        if start_interactive_shell() {
+            return;
+        }
+        console_write("[interactive] failed to start BusyBox shell; falling back to normal init/harness\n");
+    }
+
     let init_candidates = ["init", "/init"];
     let elf_data = init_candidates
         .iter()
@@ -653,6 +664,99 @@ pub fn add_initproc() {
         log::warn!("[task] No init program found in filesystem");
         if !harness::try_start_runtime_test_harness() {
             report_no_init_and_maybe_shutdown("init not found in MemFS");
+        }
+    }
+}
+
+fn interactive_mode_enabled() -> bool {
+    matches!(
+        option_env!("WLL_INTERACTIVE"),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on") | Some("ON")
+    )
+}
+
+fn input_selftest_enabled() -> bool {
+    matches!(
+        option_env!("WLL_INPUT_SELFTEST"),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on") | Some("ON")
+    )
+}
+
+fn console_write_hex_byte(byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    putchar(HEX[(byte >> 4) as usize]);
+    putchar(HEX[(byte & 0x0f) as usize]);
+}
+
+fn run_input_selftest_if_enabled() {
+    if !input_selftest_enabled() {
+        return;
+    }
+
+    console_write("[input-test] press one key within 10 seconds...\n");
+    let deadline = crate::timer::deadline_after_us(10_000_000);
+    loop {
+        if let Some(byte) = crate::console::getchar() {
+            console_write("[input-test] got byte 0x");
+            console_write_hex_byte(byte);
+            console_write("\n");
+            return;
+        }
+        if crate::timer::get_time_us() >= deadline {
+            console_write("[input-test] timeout: no byte seen by kernel console\n");
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn start_interactive_shell() -> bool {
+    // 运行时 ext4 镜像在不同 libc 根目录下可能都有 busybox；优先选择能被
+    // VFS 读到的第一个候选路径。这里不假设 /bin/sh 一定存在，因为测试镜像
+    // 中常常只提供 /musl/busybox 或 /glibc/busybox。
+    let shell_candidates = ["/busybox", "/bin/busybox", "/musl/busybox", "/glibc/busybox"];
+    let Some(shell_path) = shell_candidates
+        .iter()
+        .find(|path| crate::fs::read_executable_file(path).is_some())
+    else {
+        console_write("[interactive] BusyBox not found. Build with DEV_PRELOAD=1 and attach sdcard image.\n");
+        return false;
+    };
+
+    console_write("[interactive] starting BusyBox shell: ");
+    console_write(shell_path);
+    console_write(" sh -i\n");
+
+    let spec = UserProgramSpec {
+        path: String::from(*shell_path),
+        argv: vec![String::from(*shell_path), String::from("sh"), String::from("-i")],
+        envp: vec![
+            // /tmp 放在最前面，是为了让内核安装的 demo 脚本优先被找到。
+            // 后续路径覆盖根目录、普通 /bin，以及 musl/glibc 镜像中的工具。
+            String::from("PATH=/tmp:/:/bin:/usr/bin:/musl/bin:/glibc/bin"),
+            String::from("LD_LIBRARY_PATH=/lib:/"),
+            String::from("SHELL=/busybox"),
+            String::from("HOME=/"),
+            String::from("PS1=wll_OS # "),
+            String::from("TERM=vt100"),
+        ],
+        cwd: String::from("/"),
+        // root 保持 /，避免 path=/musl/busybox 时再叠加 /musl 造成
+        // /musl/musl/busybox 之类的错误解析。不同 libc 目录通过 PATH 访问。
+        root: String::from("/"),
+        marker_name: None,
+    };
+
+    match TaskControlBlock::new_user_with_args_env_cwd(&spec) {
+        Ok(task) => {
+            log::info!("[interactive] shell loaded, pid={}", task.pid.0);
+            set_orphan_reaper(task.clone());
+            manager::add_task(task);
+            true
+        }
+        Err(err) => {
+            log::error!("[interactive] failed to load shell: {:?}", err);
+            false
         }
     }
 }
@@ -1038,6 +1142,9 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
         return;
     }
 
+    // 先记录父进程。后续 release_process_runtime_resources 会关闭 fd、释放
+    // 地址空间等资源；父子关系本身仍需保留给 wait4/waitpid 回收 zombie。
+    let parent = task.inner.lock().parent.clone();
     let members = task.thread_group.user_members();
     detach_thread_group_shared_memory(&members);
     release_process_runtime_resources(&members);
@@ -1063,6 +1170,19 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
                 let mut cin = child.inner.lock();
                 cin.parent = None;
             }
+        }
+    }
+    if let Some(parent) = parent {
+        // 正常路径下 wake_child_waiters() 会唤醒所有等待子进程退出的任务。
+        // 这里再定向唤醒一次直接父进程，是为了覆盖交互 shell 这类场景：
+        // shell 启动外部命令后阻塞在 wait4，子进程已经输出并退出，但父进程
+        // 若处在 wait 队列注册/调度切换的边界，单纯广播可能无法立刻让它
+        // 回到 Ready。定向唤醒可确保父进程看到 zombie child 并完成回收。
+        if matches!(
+            *parent.block_reason.lock(),
+            Some(wait_queue::BlockReason::ChildExit)
+        ) {
+            wake_blocked_task(&parent, wait_queue::WaitOutcome::Woken);
         }
     }
     crate::task::wait_queue::wake_child_waiters();

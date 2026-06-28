@@ -858,13 +858,18 @@ impl FileDescriptor {
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, SysErrNo> {
         match self {
             FileDescriptor::Stdin => {
-                if let Some(c) = crate::console::getchar() {
-                    if !buf.is_empty() {
-                        buf[0] = c;
-                        Ok(1)
-                    } else {
-                        Ok(0)
+                if interactive_stdin_enabled() {
+                    return read_interactive_stdin(buf);
+                }
+                trace_stdin("[stdin-trace] read enter\n");
+                let c = crate::console::getchar();
+                if let Some(c) = c {
+                    if buf.is_empty() {
+                        return Ok(0);
                     }
+                    trace_stdin_byte(c);
+                    buf[0] = c;
+                    Ok(1)
                 } else {
                     // No input available. In the evaluation environment there is no
                     // interactive terminal, so return EOF (0) immediately instead
@@ -2000,6 +2005,72 @@ impl Default for FileDescriptorTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn interactive_stdin_enabled() -> bool {
+    matches!(
+        option_env!("WLL_INTERACTIVE"),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on") | Some("ON")
+    )
+}
+
+/// 交互模式下的标准输入读取。
+///
+/// 默认评测路径中没有真人终端，stdin 在无输入时会立即返回 EOF，避免评测
+/// 程序因为阻塞读而卡死。录制演示视频时则需要 BusyBox shell 等待键盘，
+/// 因此 WLL_INTERACTIVE=1 时这里会轮询 UART，直到拿到一个字节再返回。
+///
+/// 这里故意一次只返回 1 字节。BusyBox shell 在脚本、重定向和 fd 恢复过程
+/// 中会多次 read(0)，如果内核侧做全局行缓冲，脚本结束后容易让 shell 的
+/// fd 0 状态和内核缓冲状态脱节，表现为 prompt 出现但后续按键没有反应。
+/// 逐字返回牺牲了大段粘贴体验，但人工演示最稳定。
+fn read_interactive_stdin(buf: &mut [u8]) -> Result<usize, SysErrNo> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+
+    trace_stdin("[stdin-trace] read interactive byte\n");
+    let mut byte = loop {
+        if let Some(byte) = crate::console::getchar() {
+            break byte;
+        }
+        core::hint::spin_loop();
+    };
+    if byte == b'\r' {
+        // PowerShell/QEMU 串口通常把 Enter 传成 CR；BusyBox shell 期望 LF。
+        byte = b'\n';
+    }
+    trace_stdin_byte(byte);
+    // 本内核没有完整 tty line discipline，这里做最小回显，保证录屏时能看见输入。
+    crate::console::putchar(byte);
+    buf[0] = byte;
+    Ok(1)
+}
+
+fn stdin_trace_enabled() -> bool {
+    matches!(
+        option_env!("WLL_STDIN_TRACE"),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on") | Some("ON")
+    )
+}
+
+fn trace_stdin(msg: &str) {
+    if stdin_trace_enabled() {
+        for byte in msg.bytes() {
+            crate::console::putchar(byte);
+        }
+    }
+}
+
+fn trace_stdin_byte(byte: u8) {
+    if !stdin_trace_enabled() {
+        return;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    trace_stdin("[stdin-trace] got 0x");
+    crate::console::putchar(HEX[(byte >> 4) as usize]);
+    crate::console::putchar(HEX[(byte & 0x0f) as usize]);
+    crate::console::putchar(b'\n');
 }
 
 /// 打开路径：`flags`/`mode` 语义对齐 Linux `openat` 子集。
