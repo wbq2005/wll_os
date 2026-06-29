@@ -12,13 +12,13 @@ pub use vfs::{
     check_access, check_access_with_effective, check_fd_access, check_fd_access_with_effective,
     check_metadata_access, check_metadata_access_with_effective, create_dir, create_dir_with_mode,
     create_regular_file, create_special_node, create_symlink, dir_exists, file_exists,
-    file_flags_for_fd, filesystem_magic, is_removed, link_path, list_dir, list_files, metadata,
-    metadata_for_fd, metadata_for_lookup, mount_fs, open_path, read_executable_file, read_file,
-    read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file,
-    rename_exchange_path, rename_path, set_file_flags_for_fd, set_mode_fd, set_mode_path,
-    set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd, statfs_for_path,
-    sync_all, sync_fd, truncate_fd, truncate_path, umount_fs, TimesUpdatePermission, VfsMetadata,
-    VfsNodeKind, VfsStatFs,
+    file_flags_for_fd, filesystem_magic, is_removed, link_mem_file_fd, link_path, list_dir,
+    list_files, metadata, metadata_for_fd, metadata_for_lookup, mount_fs, open_path,
+    read_executable_file, read_file, read_interpreter, read_link, refresh_block_device_nodes,
+    remove_dir, remove_file, rename_exchange_path, rename_path, set_file_flags_for_fd, set_mode_fd,
+    set_mode_path, set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd,
+    statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path, umount_fs,
+    TimesUpdatePermission, VfsMetadata, VfsNodeKind, VfsStatFs,
 };
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -83,6 +83,14 @@ impl MemNodeMetadata {
         let mut child_mode = mode & 0o7777;
         if is_dir && parent_setgid {
             child_mode |= 0o2000;
+        }
+        if !is_dir
+            && parent_setgid
+            && (child_mode & 0o2000) != 0
+            && !credentials.is_root_capable()
+            && !credentials.is_in_filesystem_group(parent.map(|meta| meta.gid).unwrap_or(0))
+        {
+            child_mode &= !0o2000;
         }
         Self {
             mode: child_mode,
@@ -347,6 +355,13 @@ impl MemFileSystem {
         MemNodeMetadata::new_child_for_current(parent_meta, mode, is_dir)
     }
 
+    pub fn tmpfile_metadata_for_current(&mut self, dir: &str, mode: u32) -> MemNodeMetadata {
+        let parent_meta = self.metadata(&normalize_path(dir));
+        let mut metadata = MemNodeMetadata::new_child_for_current(parent_meta, mode, false);
+        metadata = self.allocate_metadata(metadata);
+        metadata
+    }
+
     /// 添加文件
     pub fn add_file(&mut self, name: &str, content: Vec<u8>) {
         let name = normalize_path(name);
@@ -377,6 +392,33 @@ impl MemFileSystem {
         let metadata = self.child_metadata_for_current(&name, mode, false);
         self.insert_new_metadata(name.clone(), metadata);
         log::info!("[fs] Added file '{}' ({} bytes)", name, len);
+    }
+
+    pub fn add_file_with_metadata(
+        &mut self,
+        name: &str,
+        content: FileContent,
+        times: FileTimes,
+        metadata: MemNodeMetadata,
+    ) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        let parent = parent_path(&name);
+        if !self.is_dir(&parent) {
+            return Err(SysErrNo::ENOENT);
+        }
+        if self.exists(&name) {
+            return Err(SysErrNo::EEXIST);
+        }
+        self.symlinks.remove(&name);
+        self.specials.remove(&name);
+        self.files.push(MemFile::with_link_key(
+            &name,
+            content,
+            times,
+            String::from(&name),
+        ));
+        self.metadata.insert(name, metadata);
+        Ok(())
     }
 
     pub fn write_file_content(

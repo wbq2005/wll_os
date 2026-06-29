@@ -11,8 +11,8 @@ use spin::Mutex;
 use crate::fs::block_dev;
 use crate::fs::ext4_vol;
 use crate::fs::vfs::VfsNodeKind;
-use crate::fs::FileTimes;
 use crate::fs::MEM_FS;
+use crate::fs::{FileTimes, MemNodeMetadata};
 use crate::task::wait_queue::WaitKey;
 use crate::utils::error::SysErrNo;
 
@@ -319,6 +319,7 @@ pub mod open_flags {
     pub const O_DIRECTORY: u32 = 0o00200000;
     pub const O_NOFOLLOW: u32 = 0o00400000;
     pub const O_NOATIME: u32 = 0o01000000;
+    pub const O_TMPFILE: u32 = 0o20200000;
     pub const O_PATH: u32 = 0o10000000;
     pub const O_CLOEXEC: u32 = 0o2000000;
 }
@@ -348,6 +349,7 @@ pub enum FileDescriptor {
         writable: bool,
         append: bool,
         linked: bool,
+        node: Option<MemNodeMetadata>,
     },
     /// 内存目录
     MemDir {
@@ -1584,6 +1586,7 @@ impl Clone for FileDescriptor {
                 writable,
                 append,
                 linked,
+                node,
             } => FileDescriptor::MemFile {
                 name: name.clone(),
                 content: content.clone(),
@@ -1593,6 +1596,7 @@ impl Clone for FileDescriptor {
                 writable: *writable,
                 append: *append,
                 linked: *linked,
+                node: *node,
             },
             FileDescriptor::MemDir {
                 path,
@@ -2156,6 +2160,7 @@ fn open_file_legacy_unused(
             writable: write_ok,
             append,
             linked: true,
+            node: None,
         });
     }
 
@@ -2253,6 +2258,7 @@ fn open_file_legacy_unused(
                 writable: write_ok,
                 append,
                 linked: true,
+                node: None,
             });
         }
         if ext_parent {
@@ -2265,6 +2271,7 @@ fn open_file_legacy_unused(
                 writable: write_ok,
                 append,
                 linked: true,
+                node: None,
             });
         }
         if mem_parent {

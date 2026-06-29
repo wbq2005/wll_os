@@ -1063,6 +1063,7 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
             content,
             times,
             linked,
+            node,
             ..
         } => {
             if *linked {
@@ -1078,6 +1079,22 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
                     drop(mem);
                     Ok(metadata_from_mem_fd(name, content, *times))
                 }
+            } else if let Some(node) = *node {
+                let mut meta = metadata_for_mem_file(
+                    name,
+                    content.len(),
+                    content.is_elf_image(),
+                    node,
+                    0,
+                    name,
+                );
+                meta.atime_sec = times.atime_sec;
+                meta.atime_nsec = times.atime_nsec;
+                meta.mtime_sec = times.mtime_sec;
+                meta.mtime_nsec = times.mtime_nsec;
+                meta.ctime_sec = times.ctime_sec;
+                meta.ctime_nsec = times.ctime_nsec;
+                Ok(meta)
             } else {
                 Ok(metadata_from_mem_fd(name, content, *times))
             }
@@ -2104,6 +2121,66 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
     Ok(())
 }
 
+pub fn link_mem_file_fd(file: &mut fd::FileDescriptor, new: &str) -> Result<(), SysErrNo> {
+    let new = normalize_path(new);
+    if file_exists(&new) || dir_exists(&new) {
+        return Err(SysErrNo::EEXIST);
+    }
+    if let Some(parent_meta) = parent_vfat_metadata_for_path(&new) {
+        let parent_meta = parent_meta?;
+        return if parent_meta.is_dir {
+            Err(SysErrNo::EROFS)
+        } else {
+            Err(SysErrNo::ENOTDIR)
+        };
+    }
+    ensure_mount_writable(&new)?;
+    let parent = parent_path(&new);
+    let parent_tmpfs = is_tmpfs_path(&parent);
+    let parent_mounted_ext4 = !parent_tmpfs && mounted_ext4_backend_path(&parent).is_some();
+    let mem_parent = !parent_mounted_ext4 && MEM_FS.lock().is_dir(&parent);
+    let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&ext4_lookup_path(&parent));
+    if !mem_parent {
+        if ext_parent {
+            return Err(SysErrNo::EXDEV);
+        }
+        if path_exists_non_dir(&parent) {
+            return Err(SysErrNo::ENOTDIR);
+        }
+        return Err(SysErrNo::ENOENT);
+    }
+    if ext_parent && !super::is_memfs_overlay_create_dir(&parent) {
+        return Err(SysErrNo::EXDEV);
+    }
+    check_create_access(&parent)?;
+    match file {
+        fd::FileDescriptor::MemFile {
+            name,
+            content,
+            times,
+            linked,
+            node,
+            ..
+        } => {
+            if *linked {
+                MEM_FS.lock().link_path(name, &new)?;
+            } else if let Some(metadata) = *node {
+                MEM_FS
+                    .lock()
+                    .add_file_with_metadata(&new, content.clone(), *times, metadata)?;
+                *name = new.clone();
+                *linked = true;
+                *node = None;
+            } else {
+                return Err(SysErrNo::ENOENT);
+            }
+            clear_whiteout(&new);
+            Ok(())
+        }
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
 pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
     let norm = normalize_path(link_path);
     if file_exists(&norm) || dir_exists(&norm) {
@@ -2292,7 +2369,18 @@ pub fn set_mode_fd(file: &mut fd::FileDescriptor, mode: u32) -> Result<(), SysEr
     check_chmod_permission(&meta)?;
     let mode = chmod_mode_after_permission(mode, &meta);
     match file {
-        fd::FileDescriptor::MemFile { name, .. } => MEM_FS.lock().set_mode(name, mode),
+        fd::FileDescriptor::MemFile {
+            name, linked, node, ..
+        } => {
+            if *linked {
+                MEM_FS.lock().set_mode(name, mode)
+            } else if let Some(node) = node.as_mut() {
+                node.mode = mode & 0o7777;
+                Ok(())
+            } else {
+                Err(SysErrNo::ENOENT)
+            }
+        }
         fd::FileDescriptor::MemDir { host_path, .. } => MEM_FS.lock().set_mode(host_path, mode),
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::set_mode_ino(*ino, mode)
@@ -2361,8 +2449,31 @@ pub fn set_owner_fd(
     let meta = metadata_for_fd(file)?;
     check_chown_permission(&meta, uid, gid)?;
     match file {
-        fd::FileDescriptor::MemFile { name, .. } => MEM_FS.lock().set_owner(name, uid, gid),
-        fd::FileDescriptor::MemDir { host_path, .. } => MEM_FS.lock().set_owner(host_path, uid, gid),
+        fd::FileDescriptor::MemFile {
+            name, linked, node, ..
+        } => {
+            if *linked {
+                MEM_FS.lock().set_owner(name, uid, gid)
+            } else if let Some(node) = node.as_mut() {
+                node.mode = super::chown_mode_after_owner_update(
+                    node.mode,
+                    true,
+                    uid.is_some() || gid.is_some(),
+                );
+                if let Some(uid) = uid {
+                    node.uid = uid;
+                }
+                if let Some(gid) = gid {
+                    node.gid = gid;
+                }
+                Ok(())
+            } else {
+                Err(SysErrNo::ENOENT)
+            }
+        }
+        fd::FileDescriptor::MemDir { host_path, .. } => {
+            MEM_FS.lock().set_owner(host_path, uid, gid)
+        }
         fd::FileDescriptor::Ext4Regular { ino, .. } | fd::FileDescriptor::Ext4Dir { ino, .. } => {
             ext4_vol::set_owner_ino(*ino, uid, gid)
         }
@@ -2454,8 +2565,15 @@ pub fn set_times_fd(
         return Ok(());
     }
     match file {
-        fd::FileDescriptor::MemFile { name, times, .. } => {
-            let _ = MEM_FS.lock().set_file_times(name, atime, mtime);
+        fd::FileDescriptor::MemFile {
+            name,
+            times,
+            linked,
+            ..
+        } => {
+            if *linked {
+                let _ = MEM_FS.lock().set_file_times(name, atime, mtime);
+            }
             times.set_access_modify(atime, mtime);
             Ok(())
         }
@@ -2726,7 +2844,35 @@ fn open_char_device_descriptor(
         writable: write_ok,
         append,
         linked: false,
+        node: None,
     }))
+}
+
+fn open_mem_tmpfile_descriptor(
+    dir_path: &str,
+    mode: u32,
+    read_ok: bool,
+    write_ok: bool,
+    append: bool,
+) -> Result<fd::FileDescriptor, SysErrNo> {
+    let dir = normalize_path(dir_path);
+    if !MEM_FS.lock().is_dir(&dir) {
+        return Err(SysErrNo::ENOENT);
+    }
+    check_create_access(&dir)?;
+    let node = MEM_FS.lock().tmpfile_metadata_for_current(&dir, mode);
+    let name = alloc::format!("{}/.tmpfile-{:x}", dir, node.ino);
+    Ok(fd::FileDescriptor::MemFile {
+        name,
+        content: fd::MemFileContent::new(),
+        times: super::FileTimes::now(),
+        offset: 0,
+        readable: read_ok,
+        writable: write_ok,
+        append,
+        linked: false,
+        node: Some(node),
+    })
 }
 
 pub fn open_path(
@@ -2747,6 +2893,7 @@ pub fn open_path(
     let write_ok = accmode == O_WRONLY || accmode == O_RDWR;
     let want_dir = (flags & O_DIRECTORY) != 0;
     let want_create = (flags & O_CREAT) != 0;
+    let want_tmpfile = (flags & O_TMPFILE) == O_TMPFILE;
     let want_excl = (flags & O_EXCL) != 0;
     let want_trunc = (flags & O_TRUNC) != 0;
     let nofollow = (flags & O_NOFOLLOW) != 0;
@@ -2761,7 +2908,10 @@ pub fn open_path(
         open_access |= 2;
     }
 
-    if want_dir && want_create {
+    if want_tmpfile && !write_ok {
+        return Err(SysErrNo::EINVAL);
+    }
+    if want_dir && want_create && !want_tmpfile {
         return Err(SysErrNo::EINVAL);
     }
 
@@ -2829,6 +2979,7 @@ pub fn open_path(
             writable: false,
             append: false,
             linked: false,
+            node: None,
         });
     }
     let tmpfs_path = is_tmpfs_path(&open_norm);
@@ -2836,6 +2987,26 @@ pub fn open_path(
     let mem_has_file = !mounted_ext4 && MEM_FS.lock().get_file(&open_norm).is_some();
     let mem_has_special = !mounted_ext4 && MEM_FS.lock().get_special(&open_norm).is_some();
     let ext_path_norm = ext4_lookup_path(&open_norm);
+
+    if want_tmpfile {
+        if want_create {
+            return Err(SysErrNo::EINVAL);
+        }
+        let mem_dir = !mounted_ext4 && MEM_FS.lock().is_dir(&open_norm);
+        let ext_dir = !tmpfs_path && ext4_vol::ext4_dir_path_exists(&ext_path_norm);
+        if mem_dir && (tmpfs_path || !ext_dir || super::is_memfs_overlay_create_dir(&open_norm)) {
+            return open_mem_tmpfile_descriptor(&open_norm, mode, read_ok, write_ok, append);
+        }
+        if mem_dir || ext_dir {
+            return Err(SysErrNo::EOPNOTSUPP);
+        }
+        if path_exists_non_dir(&open_norm)
+            || (!tmpfs_path && ext4_vol::ext4_regular_file_exists(&ext_path_norm))
+        {
+            return Err(SysErrNo::ENOTDIR);
+        }
+        return Err(missing_path_errno(&open_norm));
+    }
 
     if mem_has_file {
         if want_dir {
@@ -2872,6 +3043,7 @@ pub fn open_path(
             writable: write_ok,
             append,
             linked: true,
+            node: None,
         });
     }
 
@@ -2988,6 +3160,7 @@ pub fn open_path(
                 writable: write_ok,
                 append,
                 linked: true,
+                node: None,
             });
         }
         if ext_parent {
@@ -3022,6 +3195,7 @@ pub fn open_path(
                 writable: write_ok,
                 append,
                 linked: true,
+                node: None,
             });
         }
         return Err(missing_path_errno(&open_norm));

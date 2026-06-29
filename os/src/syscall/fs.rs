@@ -1056,6 +1056,41 @@ fn proc_self_fd_number(logical_path: &str) -> Result<Option<usize>, SysErrNo> {
     Ok(None)
 }
 
+fn proc_self_fd_target(logical_path: &str) -> Result<Option<String>, SysErrNo> {
+    let Some(fd) = proc_self_fd_number(logical_path)? else {
+        return Ok(None);
+    };
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    let target = match file_desc {
+        FileDescriptor::MemFile { name, linked, .. } => {
+            if *linked {
+                name.clone()
+            } else {
+                alloc::format!("{} (deleted)", name)
+            }
+        }
+        FileDescriptor::MemDir { path, .. } => path.clone(),
+        FileDescriptor::Ext4Regular { ino, .. } => alloc::format!("anon_inode:[ext4:{}]", ino),
+        FileDescriptor::Ext4Dir { path, .. } => path.clone(),
+        FileDescriptor::Path { logical_path, .. } => logical_path.clone(),
+        FileDescriptor::Stdin => String::from("/dev/stdin"),
+        FileDescriptor::Stdout => String::from("/dev/stdout"),
+        FileDescriptor::Stderr => String::from("/dev/stderr"),
+        FileDescriptor::LoopControl => String::from("/dev/loop-control"),
+        FileDescriptor::LoopDevice { index, .. } => alloc::format!("/dev/loop{}", index),
+        FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
+            String::from("pipe:[0]")
+        }
+        FileDescriptor::Socket { .. } => String::from("socket:[0]"),
+        FileDescriptor::EventFd { .. } => String::from("anon_inode:[eventfd]"),
+        FileDescriptor::Epoll { .. } => String::from("anon_inode:[eventpoll]"),
+    };
+    Ok(Some(target))
+}
+
 fn resolve_base_dir(dirfd: isize) -> Result<String, SysErrNo> {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     if dirfd == AT_FDCWD {
@@ -1360,11 +1395,12 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
 
     // 获取当前任务的文件描述符表
     if let Some(task) = current_task() {
-        let create_mode = if (open_flags & fd::open_flags::O_CREAT) != 0 {
-            mode & !task.fs.lock().umask
-        } else {
-            mode
-        };
+        let create_mode =
+            if (open_flags & (fd::open_flags::O_CREAT | fd::open_flags::O_TMPFILE)) != 0 {
+                mode & !task.fs.lock().umask
+            } else {
+                mode
+            };
         let inner = task.inner.lock();
         let nofile_limit = inner.rlimit_nofile;
 
@@ -1664,8 +1700,18 @@ pub fn sys_linkat(
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return Err(SysErrNo::EINVAL);
     }
-    let (_old_logical, old_host) = resolve_host_path(olddirfd, oldpath)?;
+    let (old_logical, old_host) = resolve_host_path(olddirfd, oldpath)?;
     let (_new_logical, new_host) = resolve_host_path(newdirfd, newpath)?;
+    if (flags & AT_SYMLINK_FOLLOW) != 0 {
+        if let Some(fd) = proc_self_fd_number(&old_logical)? {
+            let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            let inner = task.inner.lock();
+            let mut fds = inner.fd_table.lock();
+            let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+            super::with_kernel_page_table(|| crate::fs::link_mem_file_fd(file_desc, &new_host))?;
+            return Ok(0);
+        }
+    }
     super::with_kernel_page_table(|| {
         crate::fs::link_path(&old_host, &new_host, flags & AT_SYMLINK_FOLLOW != 0)
     })?;
@@ -1764,6 +1810,9 @@ fn readlink_target_at(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
     // diagnostics and pointer-guard setup. Model this as a procfs symlink
     // backed by task metadata rather than a BusyBox-specific string.
     let logical = resolve_path_str(dirfd, path)?;
+    if let Some(target) = proc_self_fd_target(&logical)? {
+        return Ok(target);
+    }
     if let Some(target) = super::process::proc_self_exe_target(&logical)? {
         return Ok(target);
     }
