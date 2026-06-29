@@ -1855,19 +1855,157 @@ pub fn sys_fchown(fd: usize, uid: usize, gid: usize) -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_fgetxattr(fd: usize, name: *const u8, _value: *mut u8, _size: usize) -> SyscallRet {
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    {
-        let inner = task.inner.lock();
-        let fds = inner.fd_table.lock();
-        match fds.get(fd).ok_or(SysErrNo::EBADF)? {
-            FileDescriptor::Path { .. } => return Err(SysErrNo::EBADF),
-            _ => {}
-        }
+fn read_xattr_value(value: *const u8, size: usize) -> Result<Vec<u8>, SysErrNo> {
+    const XATTR_SIZE_MAX: usize = 65536;
+    if size > XATTR_SIZE_MAX {
+        return Err(SysErrNo::E2BIG);
     }
+    let mut data = Vec::new();
+    data.resize(size, 0);
+    if size != 0 {
+        copy_from_user(value, &mut data)?;
+    }
+    Ok(data)
+}
 
-    let _name = read_user_cstr(name)?;
-    Err(SysErrNo::EOPNOTSUPP)
+fn validate_xattr_name_and_flags(key: &str, flags: usize, check_flags: bool) -> Result<(), SysErrNo> {
+    const XATTR_CREATE: usize = 0x1;
+    const XATTR_REPLACE: usize = 0x2;
+    const XATTR_NAME_MAX: usize = 255;
+    if check_flags
+        && (flags & !(XATTR_CREATE | XATTR_REPLACE) != 0
+            || flags == (XATTR_CREATE | XATTR_REPLACE))
+    {
+        return Err(SysErrNo::EINVAL);
+    }
+    if key.is_empty() || key.as_bytes().len() > XATTR_NAME_MAX {
+        return Err(SysErrNo::ERANGE);
+    }
+    Ok(())
+}
+
+fn copy_xattr_output(value: *mut u8, size: usize, data: &[u8]) -> SyscallRet {
+    if size == 0 {
+        return Ok(data.len());
+    }
+    if size < data.len() {
+        return Err(SysErrNo::ERANGE);
+    }
+    copy_to_user(value, data)?;
+    Ok(data.len())
+}
+
+pub fn sys_setxattr(
+    pathname: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: usize,
+    follow_symlink: bool,
+) -> SyscallRet {
+    let path = read_user_path(pathname)?;
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, flags, true)?;
+    let data = read_xattr_value(value, size)?;
+    let (_logical_path, host_path) = resolve_host_path_str(AT_FDCWD, &path)?;
+    super::with_kernel_page_table(|| {
+        crate::fs::set_xattr_path(&host_path, follow_symlink, &key, &data, flags)
+    })?;
+    Ok(0)
+}
+
+pub fn sys_fsetxattr(
+    fd: usize,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: usize,
+) -> SyscallRet {
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, flags, true)?;
+    let data = read_xattr_value(value, size)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    super::with_kernel_page_table(|| crate::fs::set_xattr_fd(file_desc, &key, &data, flags))?;
+    Ok(0)
+}
+
+pub fn sys_getxattr(
+    pathname: *const u8,
+    name: *const u8,
+    value: *mut u8,
+    size: usize,
+    follow_symlink: bool,
+) -> SyscallRet {
+    let path = read_user_path(pathname)?;
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, 0, false)?;
+    let (_logical_path, host_path) = resolve_host_path_str(AT_FDCWD, &path)?;
+    let data = super::with_kernel_page_table(|| {
+        crate::fs::get_xattr_path(&host_path, follow_symlink, &key)
+    })?;
+    copy_xattr_output(value, size, &data)
+}
+
+pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) -> SyscallRet {
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, 0, false)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    let data = super::with_kernel_page_table(|| crate::fs::get_xattr_fd(file_desc, &key))?;
+    copy_xattr_output(value, size, &data)
+}
+
+pub fn sys_listxattr(
+    pathname: *const u8,
+    list: *mut u8,
+    size: usize,
+    follow_symlink: bool,
+) -> SyscallRet {
+    let path = read_user_path(pathname)?;
+    let (_logical_path, host_path) = resolve_host_path_str(AT_FDCWD, &path)?;
+    let data =
+        super::with_kernel_page_table(|| crate::fs::list_xattr_path(&host_path, follow_symlink))?;
+    copy_xattr_output(list, size, &data)
+}
+
+pub fn sys_flistxattr(fd: usize, list: *mut u8, size: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    let data = super::with_kernel_page_table(|| crate::fs::list_xattr_fd(file_desc))?;
+    copy_xattr_output(list, size, &data)
+}
+
+pub fn sys_removexattr(
+    pathname: *const u8,
+    name: *const u8,
+    follow_symlink: bool,
+) -> SyscallRet {
+    let path = read_user_path(pathname)?;
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, 0, false)?;
+    let (_logical_path, host_path) = resolve_host_path_str(AT_FDCWD, &path)?;
+    super::with_kernel_page_table(|| {
+        crate::fs::remove_xattr_path(&host_path, follow_symlink, &key)
+    })?;
+    Ok(0)
+}
+
+pub fn sys_fremovexattr(fd: usize, name: *const u8) -> SyscallRet {
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, 0, false)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    super::with_kernel_page_table(|| crate::fs::remove_xattr_fd(file_desc, &key))?;
+    Ok(0)
 }
 
 pub fn sys_unlinkat(dirfd: isize, pathname: *const u8, flags: usize) -> SyscallRet {

@@ -2333,6 +2333,150 @@ pub fn truncate_fd(file: &mut fd::FileDescriptor, size: u64) -> Result<(), SysEr
     file.truncate(size as usize)
 }
 
+fn resolve_xattr_path(path: &str, follow_symlink: bool) -> Result<String, SysErrNo> {
+    let norm = resolve_parent_symlinks_for_lookup(path)?;
+    if is_removed(&norm) {
+        return Err(SysErrNo::ENOENT);
+    }
+    check_search_access(&norm, CredentialIdentity::Filesystem)?;
+    if follow_symlink {
+        resolve_final_symlink(&norm, false)
+    } else {
+        Ok(norm)
+    }
+}
+
+pub fn set_xattr_path(
+    path: &str,
+    follow_symlink: bool,
+    key: &str,
+    value: &[u8],
+    flags: usize,
+) -> Result<(), SysErrNo> {
+    let target = resolve_xattr_path(path, follow_symlink)?;
+    if let Some(meta) = vfat_metadata_for_path(&target) {
+        meta?;
+        return Err(SysErrNo::EROFS);
+    }
+    ensure_mount_writable(&target)?;
+    if MEM_FS.lock().exists(&target) {
+        return MEM_FS.lock().set_xattr(&target, key, value, flags);
+    }
+    if is_tmpfs_path(&target) {
+        return Err(missing_path_errno(&target));
+    }
+    match ext4_vol::lookup_kind(&ext4_lookup_path(&target)) {
+        Some(_) => Err(SysErrNo::EOPNOTSUPP),
+        None => Err(missing_path_errno(&target)),
+    }
+}
+
+pub fn get_xattr_path(
+    path: &str,
+    follow_symlink: bool,
+    key: &str,
+) -> Result<Vec<u8>, SysErrNo> {
+    let target = resolve_xattr_path(path, follow_symlink)?;
+    if let Some(meta) = vfat_metadata_for_path(&target) {
+        meta?;
+        return Err(SysErrNo::EOPNOTSUPP);
+    }
+    if MEM_FS.lock().exists(&target) {
+        return MEM_FS.lock().get_xattr(&target, key);
+    }
+    if is_tmpfs_path(&target) {
+        return Err(missing_path_errno(&target));
+    }
+    match ext4_vol::lookup_kind(&ext4_lookup_path(&target)) {
+        Some(_) => Err(SysErrNo::EOPNOTSUPP),
+        None => Err(missing_path_errno(&target)),
+    }
+}
+
+pub fn list_xattr_path(path: &str, follow_symlink: bool) -> Result<Vec<u8>, SysErrNo> {
+    let target = resolve_xattr_path(path, follow_symlink)?;
+    if let Some(meta) = vfat_metadata_for_path(&target) {
+        meta?;
+        return Err(SysErrNo::EOPNOTSUPP);
+    }
+    if MEM_FS.lock().exists(&target) {
+        return MEM_FS.lock().list_xattr(&target);
+    }
+    if is_tmpfs_path(&target) {
+        return Err(missing_path_errno(&target));
+    }
+    match ext4_vol::lookup_kind(&ext4_lookup_path(&target)) {
+        Some(_) => Err(SysErrNo::EOPNOTSUPP),
+        None => Err(missing_path_errno(&target)),
+    }
+}
+
+pub fn remove_xattr_path(
+    path: &str,
+    follow_symlink: bool,
+    key: &str,
+) -> Result<(), SysErrNo> {
+    let target = resolve_xattr_path(path, follow_symlink)?;
+    if let Some(meta) = vfat_metadata_for_path(&target) {
+        meta?;
+        return Err(SysErrNo::EROFS);
+    }
+    ensure_mount_writable(&target)?;
+    if MEM_FS.lock().exists(&target) {
+        return MEM_FS.lock().remove_xattr(&target, key);
+    }
+    if is_tmpfs_path(&target) {
+        return Err(missing_path_errno(&target));
+    }
+    match ext4_vol::lookup_kind(&ext4_lookup_path(&target)) {
+        Some(_) => Err(SysErrNo::EOPNOTSUPP),
+        None => Err(missing_path_errno(&target)),
+    }
+}
+
+fn xattr_path_for_fd(file: &fd::FileDescriptor) -> Result<Option<String>, SysErrNo> {
+    match file {
+        fd::FileDescriptor::MemFile { name, linked, .. } if *linked => Ok(Some(name.clone())),
+        fd::FileDescriptor::MemDir { host_path, .. } => Ok(Some(host_path.clone())),
+        fd::FileDescriptor::Path { .. } => Err(SysErrNo::EBADF),
+        fd::FileDescriptor::Ext4Regular { .. } | fd::FileDescriptor::Ext4Dir { .. } => Ok(None),
+        _ => Err(SysErrNo::ENODATA),
+    }
+}
+
+pub fn set_xattr_fd(
+    file: &fd::FileDescriptor,
+    key: &str,
+    value: &[u8],
+    flags: usize,
+) -> Result<(), SysErrNo> {
+    match xattr_path_for_fd(file)? {
+        Some(path) => set_xattr_path(&path, false, key, value, flags),
+        None => Err(SysErrNo::EOPNOTSUPP),
+    }
+}
+
+pub fn get_xattr_fd(file: &fd::FileDescriptor, key: &str) -> Result<Vec<u8>, SysErrNo> {
+    match xattr_path_for_fd(file)? {
+        Some(path) => get_xattr_path(&path, false, key),
+        None => Err(SysErrNo::EOPNOTSUPP),
+    }
+}
+
+pub fn list_xattr_fd(file: &fd::FileDescriptor) -> Result<Vec<u8>, SysErrNo> {
+    match xattr_path_for_fd(file)? {
+        Some(path) => list_xattr_path(&path, false),
+        None => Err(SysErrNo::EOPNOTSUPP),
+    }
+}
+
+pub fn remove_xattr_fd(file: &fd::FileDescriptor, key: &str) -> Result<(), SysErrNo> {
+    match xattr_path_for_fd(file)? {
+        Some(path) => remove_xattr_path(&path, false, key),
+        None => Err(SysErrNo::EOPNOTSUPP),
+    }
+}
+
 pub fn set_mode_path(path: &str, follow_symlink: bool, mode: u32) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
     if let Some(meta) = vfat_metadata_for_path(&norm) {

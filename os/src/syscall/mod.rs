@@ -31,7 +31,18 @@ pub const SYSCALL_EVENTFD2: usize = 19;
 pub const SYSCALL_EPOLL_CREATE1: usize = 20;
 pub const SYSCALL_EPOLL_CTL: usize = 21;
 pub const SYSCALL_EPOLL_PWAIT: usize = 22;
+pub const SYSCALL_SETXATTR: usize = 5;
+pub const SYSCALL_LSETXATTR: usize = 6;
+pub const SYSCALL_FSETXATTR: usize = 7;
+pub const SYSCALL_GETXATTR: usize = 8;
+pub const SYSCALL_LGETXATTR: usize = 9;
 pub const SYSCALL_FGETXATTR: usize = 10;
+pub const SYSCALL_LISTXATTR: usize = 11;
+pub const SYSCALL_LLISTXATTR: usize = 12;
+pub const SYSCALL_FLISTXATTR: usize = 13;
+pub const SYSCALL_REMOVEXATTR: usize = 14;
+pub const SYSCALL_LREMOVEXATTR: usize = 15;
+pub const SYSCALL_FREMOVEXATTR: usize = 16;
 pub const SYSCALL_DUP: usize = 23;
 pub const SYSCALL_DUP3: usize = 24;
 pub const SYSCALL_FCNTL: usize = 25;
@@ -212,9 +223,52 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
 
     match syscall_id {
         // 文件操作
+        SYSCALL_SETXATTR => fs::sys_setxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4],
+            true,
+        ),
+        SYSCALL_LSETXATTR => fs::sys_setxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4],
+            false,
+        ),
+        SYSCALL_FSETXATTR => fs::sys_fsetxattr(
+            args[0],
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4],
+        ),
+        SYSCALL_GETXATTR => fs::sys_getxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+            true,
+        ),
+        SYSCALL_LGETXATTR => fs::sys_getxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+            false,
+        ),
         SYSCALL_FGETXATTR => {
             fs::sys_fgetxattr(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
         }
+        SYSCALL_LISTXATTR => fs::sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2], true),
+        SYSCALL_LLISTXATTR => fs::sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2], false),
+        SYSCALL_FLISTXATTR => fs::sys_flistxattr(args[0], args[1] as *mut u8, args[2]),
+        SYSCALL_REMOVEXATTR => fs::sys_removexattr(args[0] as *const u8, args[1] as *const u8, true),
+        SYSCALL_LREMOVEXATTR => fs::sys_removexattr(args[0] as *const u8, args[1] as *const u8, false),
+        SYSCALL_FREMOVEXATTR => fs::sys_fremovexattr(args[0], args[1] as *const u8),
         SYSCALL_GETCWD => fs::sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_EPOLL_CREATE1 => fs::sys_epoll_create1(args[0]),
         SYSCALL_EPOLL_CTL => fs::sys_epoll_ctl(

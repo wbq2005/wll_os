@@ -13,12 +13,13 @@ pub use vfs::{
     check_metadata_access, check_metadata_access_with_effective, create_dir, create_dir_with_mode,
     create_regular_file, create_special_node, create_symlink, dir_exists, file_exists,
     file_flags_for_fd, filesystem_magic, is_removed, link_mem_file_fd, link_path, list_dir,
-    list_files, metadata, metadata_for_fd, metadata_for_lookup, mount_fs, open_path,
-    path_contains_symlink, path_crosses_mountpoint, read_executable_file, read_file,
-    read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file,
-    rename_exchange_path, rename_path, set_file_flags_for_fd, set_mode_fd, set_mode_path,
-    set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd, statfs_for_path,
-    sync_all, sync_fd, truncate_fd, truncate_path, umount_fs,
+    list_files, list_xattr_fd, list_xattr_path, metadata, metadata_for_fd, metadata_for_lookup,
+    mount_fs, open_path, path_contains_symlink, path_crosses_mountpoint, read_executable_file,
+    read_file, read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file,
+    remove_xattr_fd, remove_xattr_path, rename_exchange_path, rename_path, set_file_flags_for_fd,
+    set_mode_fd, set_mode_path, set_owner_fd, set_owner_path, set_times_fd, set_times_path,
+    set_xattr_fd, set_xattr_path, statfs_for_fd, statfs_for_path, sync_all, sync_fd, truncate_fd,
+    truncate_path, umount_fs, get_xattr_fd, get_xattr_path,
     TimesUpdatePermission, VfsMetadata, VfsNodeKind, VfsStatFs,
 };
 
@@ -303,6 +304,7 @@ pub struct MemFileSystem {
     symlinks: BTreeMap<String, String>,
     specials: BTreeMap<String, MemSpecialKind>,
     metadata: BTreeMap<String, MemNodeMetadata>,
+    xattrs: BTreeMap<u64, BTreeMap<String, Vec<u8>>>,
     next_ino: u64,
 }
 
@@ -316,6 +318,7 @@ impl MemFileSystem {
             symlinks: BTreeMap::new(),
             specials: BTreeMap::new(),
             metadata,
+            xattrs: BTreeMap::new(),
             next_ino: 2,
         }
     }
@@ -600,6 +603,112 @@ impl MemFileSystem {
     pub fn metadata(&self, name: &str) -> Option<MemNodeMetadata> {
         let name = normalize_path(name);
         self.metadata.get(&name).copied()
+    }
+
+    fn xattr_inode_and_set_allowed(&self, name: &str) -> Result<(u64, bool), SysErrNo> {
+        let name = normalize_path(name);
+        let set_allowed = self.files.iter().any(|file| file.name == name)
+            || self.dirs.iter().any(|dir| dir == &name);
+        let exists = set_allowed || self.symlinks.contains_key(&name) || self.specials.contains_key(&name);
+        if !exists {
+            return Err(SysErrNo::ENOENT);
+        }
+        let ino = self
+            .metadata
+            .get(&name)
+            .map(|meta| meta.ino)
+            .filter(|ino| *ino != 0)
+            .ok_or(SysErrNo::ENOENT)?;
+        Ok((ino, set_allowed))
+    }
+
+    pub fn set_xattr(
+        &mut self,
+        name: &str,
+        key: &str,
+        value: &[u8],
+        flags: usize,
+    ) -> Result<(), SysErrNo> {
+        const XATTR_CREATE: usize = 0x1;
+        const XATTR_REPLACE: usize = 0x2;
+        const XATTR_NAME_MAX: usize = 255;
+        const XATTR_SIZE_MAX: usize = 65536;
+
+        if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0
+            || flags == (XATTR_CREATE | XATTR_REPLACE)
+        {
+            return Err(SysErrNo::EINVAL);
+        }
+        if key.is_empty() || key.as_bytes().len() > XATTR_NAME_MAX {
+            return Err(SysErrNo::ERANGE);
+        }
+        if value.len() > XATTR_SIZE_MAX {
+            return Err(SysErrNo::E2BIG);
+        }
+
+        let (ino, set_allowed) = self.xattr_inode_and_set_allowed(name)?;
+        if !set_allowed {
+            return Err(SysErrNo::EPERM);
+        }
+
+        let attrs = self.xattrs.entry(ino).or_default();
+        let exists = attrs.contains_key(key);
+        if flags & XATTR_CREATE != 0 && exists {
+            return Err(SysErrNo::EEXIST);
+        }
+        if flags & XATTR_REPLACE != 0 && !exists {
+            return Err(SysErrNo::ENODATA);
+        }
+        attrs.insert(String::from(key), value.to_vec());
+        if let Some(file) = self.files.iter().find(|file| file.name == normalize_path(name)) {
+            file.touch_ctime();
+        }
+        Ok(())
+    }
+
+    pub fn get_xattr(&self, name: &str, key: &str) -> Result<Vec<u8>, SysErrNo> {
+        if key.is_empty() || key.as_bytes().len() > 255 {
+            return Err(SysErrNo::ERANGE);
+        }
+        let (ino, _) = self.xattr_inode_and_set_allowed(name)?;
+        self.xattrs
+            .get(&ino)
+            .and_then(|attrs| attrs.get(key))
+            .cloned()
+            .ok_or(SysErrNo::ENODATA)
+    }
+
+    pub fn list_xattr(&self, name: &str) -> Result<Vec<u8>, SysErrNo> {
+        let (ino, _) = self.xattr_inode_and_set_allowed(name)?;
+        let mut out = Vec::new();
+        if let Some(attrs) = self.xattrs.get(&ino) {
+            for key in attrs.keys() {
+                out.extend_from_slice(key.as_bytes());
+                out.push(0);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn remove_xattr(&mut self, name: &str, key: &str) -> Result<(), SysErrNo> {
+        if key.is_empty() || key.as_bytes().len() > 255 {
+            return Err(SysErrNo::ERANGE);
+        }
+        let (ino, set_allowed) = self.xattr_inode_and_set_allowed(name)?;
+        if !set_allowed {
+            return Err(SysErrNo::EPERM);
+        }
+        let attrs = self.xattrs.get_mut(&ino).ok_or(SysErrNo::ENODATA)?;
+        if attrs.remove(key).is_none() {
+            return Err(SysErrNo::ENODATA);
+        }
+        if attrs.is_empty() {
+            self.xattrs.remove(&ino);
+        }
+        if let Some(file) = self.files.iter().find(|file| file.name == normalize_path(name)) {
+            file.touch_ctime();
+        }
+        Ok(())
     }
 
     pub fn inode(&self, name: &str) -> Option<u64> {
