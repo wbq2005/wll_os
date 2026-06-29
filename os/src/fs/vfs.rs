@@ -1901,7 +1901,7 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
         return Err(SysErrNo::EXDEV);
     }
 
-    let mut m = MEM_FS.lock();
+    let m = MEM_FS.lock();
     if m.exists(&old) {
         if !no_replace
             && !new_tmpfs
@@ -1917,6 +1917,17 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
             }
             return Err(missing_path_errno(&new));
         }
+        let new_exists = m.exists(&new);
+        drop(m);
+        let old_meta = metadata(&old, false)?;
+        check_delete_access(&old, &old_meta)?;
+        if new_exists {
+            let new_meta = metadata(&new, false)?;
+            check_delete_access(&new, &new_meta)?;
+        } else {
+            check_create_access(&new_parent)?;
+        }
+        let mut m = MEM_FS.lock();
         let result = m.rename_path(&old, &new);
         if result.is_ok() {
             clear_whiteout(&new);
@@ -1944,6 +1955,13 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
         }
         if MEM_FS.lock().is_dir(&new_parent) && !ext4_vol::ext4_dir_path_exists(&new_parent) {
             return Err(SysErrNo::EXDEV);
+        }
+        let old_meta = metadata(&old, false)?;
+        check_delete_access(&old, &old_meta)?;
+        match metadata(&new, false) {
+            Ok(new_meta) => check_delete_access(&new, &new_meta)?,
+            Err(SysErrNo::ENOENT) => check_create_access(&new_parent)?,
+            Err(e) => return Err(e),
         }
         ext4_vol::rename_ext4(&old, &new, no_replace)?;
         clear_whiteout(&new);
