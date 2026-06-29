@@ -2330,7 +2330,7 @@ pub fn truncate_fd(file: &mut fd::FileDescriptor, size: u64) -> Result<(), SysEr
     if size > usize::MAX as u64 {
         return Err(SysErrNo::EFBIG);
     }
-    file.truncate(size as usize)
+    file.ftruncate(size as usize)
 }
 
 fn resolve_xattr_path(path: &str, follow_symlink: bool) -> Result<String, SysErrNo> {

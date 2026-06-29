@@ -1412,7 +1412,11 @@ impl FileDescriptor {
         }
     }
 
-    pub fn truncate(&mut self, new_len: usize) -> Result<(), SysErrNo> {
+    fn truncate_with_readonly_errno(
+        &mut self,
+        new_len: usize,
+        readonly_errno: SysErrNo,
+    ) -> Result<(), SysErrNo> {
         if new_len > MAX_FILE_OFFSET {
             return Err(SysErrNo::EFBIG);
         }
@@ -1426,7 +1430,7 @@ impl FileDescriptor {
                 ..
             } => {
                 if !*writable {
-                    return Err(SysErrNo::EBADF);
+                    return Err(readonly_errno);
                 }
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(());
@@ -1443,7 +1447,7 @@ impl FileDescriptor {
             }
             FileDescriptor::Ext4Regular { ino, writable, .. } => {
                 if !*writable {
-                    return Err(SysErrNo::EBADF);
+                    return Err(readonly_errno);
                 }
                 ext4_vol::truncate_regular_ino(*ino, new_len as u64)
             }
@@ -1454,6 +1458,14 @@ impl FileDescriptor {
             }
             _ => Err(SysErrNo::EINVAL),
         }
+    }
+
+    pub fn truncate(&mut self, new_len: usize) -> Result<(), SysErrNo> {
+        self.truncate_with_readonly_errno(new_len, SysErrNo::EBADF)
+    }
+
+    pub fn ftruncate(&mut self, new_len: usize) -> Result<(), SysErrNo> {
+        self.truncate_with_readonly_errno(new_len, SysErrNo::EINVAL)
     }
 
     pub fn allocate(&mut self, offset: usize, len: usize, keep_size: bool) -> Result<(), SysErrNo> {
