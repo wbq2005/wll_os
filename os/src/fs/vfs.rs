@@ -1975,6 +1975,7 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
         return Err(SysErrNo::EEXIST);
     }
     ensure_mount_writable(&new)?;
+    check_search_access(&old, CredentialIdentity::Filesystem)?;
     let old_tmpfs = is_tmpfs_path(&old);
     let new_tmpfs = is_tmpfs_path(&new);
     if old_tmpfs != new_tmpfs {
@@ -1999,6 +2000,7 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
         if ext_new_parent && !super::is_memfs_overlay_create_dir(&new_parent) {
             return Err(SysErrNo::EXDEV);
         }
+        check_create_access(&new_parent)?;
         MEM_FS.lock().link_path(&old, &new)?;
         clear_whiteout(&new);
         return Ok(());
@@ -2022,6 +2024,7 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
     if !ext4_vol::ext4_dir_path_exists(&new_parent) {
         return Err(SysErrNo::ENOENT);
     }
+    check_create_access(&new_parent)?;
     ext4_vol::link_ext4(&old, &new, follow_old)?;
     clear_whiteout(&new);
     Ok(())
@@ -2450,6 +2453,9 @@ pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
     let parent_tmpfs = is_tmpfs_path(&parent);
     let mem_parent = MEM_FS.lock().is_dir(&parent);
     let ext_parent = !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&parent);
+    if mem_parent || ext_parent {
+        check_create_access(&parent)?;
+    }
     if mem_parent && (super::is_memfs_overlay_create_dir(&parent) || !ext_parent) {
         MEM_FS.lock().add_file_with_mode(&norm, Vec::new(), mode);
         return Ok(memfs_inode_u32(&norm));
@@ -2886,6 +2892,9 @@ pub fn open_path(
         let mem_parent = !parent_mounted_ext4 && MEM_FS.lock().is_dir(&parent);
         let ext_parent =
             !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&ext4_lookup_path(&parent));
+        if mem_parent || ext_parent {
+            check_create_access(&parent)?;
+        }
         if mem_parent && (super::is_memfs_overlay_create_dir(&parent) || !ext_parent) {
             MEM_FS
                 .lock()
