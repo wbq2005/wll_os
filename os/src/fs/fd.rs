@@ -5,6 +5,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -40,6 +41,34 @@ const PIPE_WAIT_WRITABLE: usize = 2;
 const EVENTFD_WAIT_READABLE: usize = 1;
 const EVENTFD_WAIT_WRITABLE: usize = 2;
 const PIPE_SMALL_COPY: usize = 64;
+static NEXT_OPEN_FILE_DESCRIPTION_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Debug)]
+pub struct OpenFileDescriptionOwner {
+    id: usize,
+}
+
+impl OpenFileDescriptionOwner {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Drop for OpenFileDescriptionOwner {
+    fn drop(&mut self) {
+        crate::syscall::fs::release_file_locks_for_ofd(self.id);
+    }
+}
+
+pub fn new_open_file_description_owner() -> Arc<OpenFileDescriptionOwner> {
+    let id = loop {
+        let id = NEXT_OPEN_FILE_DESCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            break id;
+        }
+    };
+    Arc::new(OpenFileDescriptionOwner { id })
+}
 
 fn pipe_wait_key(state: &Arc<Mutex<PipeState>>, event: usize) -> WaitKey {
     WaitKey::new(Arc::as_ptr(state) as usize, event)
@@ -155,7 +184,9 @@ impl MemFileContent {
 
     pub fn write_at(&mut self, offset: usize, buf: &[u8]) -> usize {
         let end = offset + buf.len();
-        self.resize(end);
+        if end > self.len() {
+            self.resize(end);
+        }
         match self {
             Self::Inline(content) => {
                 content[offset..end].copy_from_slice(buf);
@@ -345,6 +376,7 @@ pub enum FileDescriptor {
         content: MemFileContent,
         times: FileTimes,
         offset: FileOffset,
+        ofd_owner: Arc<OpenFileDescriptionOwner>,
         readable: bool,
         writable: bool,
         append: bool,
@@ -362,6 +394,7 @@ pub enum FileDescriptor {
     Ext4Regular {
         ino: u32,
         offset: usize,
+        ofd_owner: Arc<OpenFileDescriptionOwner>,
         readable: bool,
         writable: bool,
         append: bool,
@@ -635,6 +668,14 @@ impl FileDescriptor {
                 },
             ) => left == right,
             _ => false,
+        }
+    }
+
+    pub fn ofd_owner_id(&self) -> Option<usize> {
+        match self {
+            FileDescriptor::MemFile { ofd_owner, .. }
+            | FileDescriptor::Ext4Regular { ofd_owner, .. } => Some(ofd_owner.id()),
+            _ => None,
         }
     }
 
@@ -1594,6 +1635,7 @@ impl Clone for FileDescriptor {
                 content,
                 times,
                 offset,
+                ofd_owner,
                 readable,
                 writable,
                 append,
@@ -1604,6 +1646,7 @@ impl Clone for FileDescriptor {
                 content: content.clone(),
                 times: *times,
                 offset: *offset,
+                ofd_owner: ofd_owner.clone(),
                 readable: *readable,
                 writable: *writable,
                 append: *append,
@@ -1624,6 +1667,7 @@ impl Clone for FileDescriptor {
             FileDescriptor::Ext4Regular {
                 ino,
                 offset,
+                ofd_owner,
                 readable,
                 writable,
                 append,
@@ -1632,6 +1676,7 @@ impl Clone for FileDescriptor {
                 FileDescriptor::Ext4Regular {
                     ino: *ino,
                     offset: *offset,
+                    ofd_owner: ofd_owner.clone(),
                     readable: *readable,
                     writable: *writable,
                     append: *append,

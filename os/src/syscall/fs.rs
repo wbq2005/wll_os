@@ -33,6 +33,9 @@ const F_SETFL: usize = 4;
 const F_GETLK: usize = 5;
 const F_SETLK: usize = 6;
 const F_SETLKW: usize = 7;
+const F_OFD_GETLK: usize = 36;
+const F_OFD_SETLK: usize = 37;
+const F_OFD_SETLKW: usize = 38;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
@@ -1516,6 +1519,7 @@ enum FileLockKey {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileLockOwner {
     Posix(usize),
+    Ofd(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1863,7 +1867,10 @@ fn apply_file_lock(
 }
 
 fn file_lock_conflict_pid(conflict: &FileRecordLock) -> i32 {
-    conflict.pid as i32
+    match conflict.owner {
+        FileLockOwner::Posix(_) => conflict.pid as i32,
+        FileLockOwner::Ofd(_) => -1,
+    }
 }
 
 fn flock_from_record(lock: &FileRecordLock) -> UserFlock64 {
@@ -1906,6 +1913,25 @@ pub fn release_file_locks_for_pid(pid: usize) {
     FILE_RECORD_LOCKS.lock().retain(|lock| {
         if lock.owner == owner {
             files.push(lock.file.clone());
+            false
+        } else {
+            true
+        }
+    });
+    remove_lock_waiter(owner);
+    for file in files {
+        wake_file_lock_waiters(&file);
+    }
+}
+
+pub fn release_file_locks_for_ofd(id: usize) {
+    let owner = FileLockOwner::Ofd(id);
+    let mut files = Vec::new();
+    FILE_RECORD_LOCKS.lock().retain(|lock| {
+        if lock.owner == owner {
+            if !files.iter().any(|file| file == &lock.file) {
+                files.push(lock.file.clone());
+            }
             false
         } else {
             true
@@ -3163,7 +3189,10 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: usize) -> SyscallRet {
 }
 
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
-    if matches!(cmd, F_GETLK | F_SETLK | F_SETLKW) {
+    if matches!(
+        cmd,
+        F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW
+    ) {
         return sys_fcntl_file_lock(fd, cmd, arg);
     }
 
@@ -3207,8 +3236,12 @@ fn sys_fcntl_file_lock(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let flock = copy_flock_from_user(arg)?;
     let kind = flock_kind(flock.l_type)?;
-    let blocking = cmd == F_SETLKW;
-    let getlk = cmd == F_GETLK;
+    let is_ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+    let blocking = matches!(cmd, F_SETLKW | F_OFD_SETLKW);
+    let getlk = matches!(cmd, F_GETLK | F_OFD_GETLK);
+    if is_ofd && flock.l_pid != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
     if getlk && kind.is_none() {
         return Err(SysErrNo::EINVAL);
     }
@@ -3230,9 +3263,14 @@ fn sys_fcntl_file_lock(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
                 _ => {}
             }
         }
-        let owner = FileLockOwner::Posix(task.thread_group.tgid());
+        let owner = if is_ofd {
+            FileLockOwner::Ofd(file_desc.ofd_owner_id().ok_or(SysErrNo::EINVAL)?)
+        } else {
+            FileLockOwner::Posix(task.thread_group.tgid())
+        };
         let wait_key = file_lock_wait_key(&file_key);
-        (file_key, range, owner, task.thread_group.tgid(), wait_key)
+        let pid = if is_ofd { 0 } else { task.thread_group.tgid() };
+        (file_key, range, owner, pid, wait_key)
     };
 
     if getlk {
@@ -3271,11 +3309,13 @@ fn sys_fcntl_file_lock(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
                 return Err(SysErrNo::EAGAIN);
             }
             Some(conflict_owner) => {
-                if file_lock_would_deadlock(owner, conflict_owner) {
-                    remove_lock_waiter(owner);
-                    return Err(SysErrNo::EDEADLK);
+                if !is_ofd {
+                    if file_lock_would_deadlock(owner, conflict_owner) {
+                        remove_lock_waiter(owner);
+                        return Err(SysErrNo::EDEADLK);
+                    }
+                    set_lock_waiter(owner, conflict_owner);
                 }
-                set_lock_waiter(owner, conflict_owner);
                 let sleep_result = sleep_on_io_key_if(wait_key, None, || {
                     let locks = FILE_RECORD_LOCKS.lock();
                     Ok(find_lock_conflict(&locks, &file_key, owner, kind, range).is_some())
