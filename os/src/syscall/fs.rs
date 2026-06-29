@@ -1717,6 +1717,25 @@ fn lock_ranges_overlap(left: FileLockRange, right: FileLockRange) -> bool {
     !left_before_right && !right_before_left
 }
 
+fn lock_ranges_touch_or_overlap(left: FileLockRange, right: FileLockRange) -> bool {
+    let left_before_right = left.end.map(|end| end < right.start).unwrap_or(false);
+    let right_before_left = right.end.map(|end| end < left.start).unwrap_or(false);
+    !left_before_right && !right_before_left
+}
+
+fn merge_lock_ranges(left: FileLockRange, right: FileLockRange) -> FileLockRange {
+    let start = left.start.min(right.start);
+    let end = match (left.end, right.end) {
+        (Some(left_end), Some(right_end)) => Some(left_end.max(right_end)),
+        _ => None,
+    };
+    FileLockRange { start, end }
+}
+
+fn lock_overlap_start(left: FileLockRange, right: FileLockRange) -> Option<u64> {
+    lock_ranges_overlap(left, right).then_some(left.start.max(right.start))
+}
+
 fn lock_kinds_conflict(left: FileLockKind, right: FileLockKind) -> bool {
     !(left == FileLockKind::Read && right == FileLockKind::Read)
 }
@@ -1758,15 +1777,26 @@ fn find_lock_conflict(
     kind: FileLockKind,
     range: FileLockRange,
 ) -> Option<FileRecordLock> {
-    locks
-        .iter()
-        .find(|lock| {
-            &lock.file == file
-                && lock.owner != owner
-                && lock_ranges_overlap(lock.range, range)
-                && lock_kinds_conflict(lock.kind, kind)
-        })
-        .cloned()
+    let mut best: Option<(u64, FileRecordLock)> = None;
+    for lock in locks.iter() {
+        if &lock.file != file || lock.owner == owner || !lock_kinds_conflict(lock.kind, kind) {
+            continue;
+        }
+        let Some(overlap_start) = lock_overlap_start(lock.range, range) else {
+            continue;
+        };
+        let replace = best
+            .as_ref()
+            .map(|(best_start, best_lock)| {
+                overlap_start < *best_start
+                    || (overlap_start == *best_start && lock.range.start < best_lock.range.start)
+            })
+            .unwrap_or(true);
+        if replace {
+            best = Some((overlap_start, lock.clone()));
+        }
+    }
+    best.map(|(_, lock)| lock)
 }
 
 fn remove_lock_waiter(owner: FileLockOwner) {
@@ -1839,6 +1869,23 @@ fn apply_file_unlock(
     changed
 }
 
+fn push_merged_file_lock(locks: &mut Vec<FileRecordLock>, mut new_lock: FileRecordLock) {
+    let mut index = 0usize;
+    while index < locks.len() {
+        if locks[index].file == new_lock.file
+            && locks[index].owner == new_lock.owner
+            && locks[index].kind == new_lock.kind
+            && lock_ranges_touch_or_overlap(locks[index].range, new_lock.range)
+        {
+            let old = locks.remove(index);
+            new_lock.range = merge_lock_ranges(new_lock.range, old.range);
+        } else {
+            index += 1;
+        }
+    }
+    locks.push(new_lock);
+}
+
 fn apply_file_lock(
     file: &FileLockKey,
     owner: FileLockOwner,
@@ -1852,7 +1899,7 @@ fn apply_file_lock(
             return Ok(Some(conflict.owner));
         }
         apply_file_unlock(&mut locks, file, owner, range);
-        locks.push(FileRecordLock {
+        push_merged_file_lock(&mut locks, FileRecordLock {
             file: file.clone(),
             owner,
             pid,
