@@ -1475,18 +1475,12 @@ cat /proc/cpuinfo
 echo "--- /proc/mounts ---"
 cat /proc/mounts
 echo
-echo "[4] ext4-backed test image check"
+echo "[4] ext4-backed runtime image check"
 if [ -e /musl/busybox ]; then
     echo "OK: /musl/busybox"
 fi
-if [ -e /musl/basic_testcode.sh ]; then
-    echo "OK: /musl/basic_testcode.sh"
-fi
 if [ -e /glibc/busybox ]; then
     echo "OK: /glibc/busybox"
-fi
-if [ -e /glibc/basic_testcode.sh ]; then
-    echo "OK: /glibc/basic_testcode.sh"
 fi
 echo
 echo "[5] external command return smoke test"

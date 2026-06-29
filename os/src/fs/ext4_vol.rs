@@ -2589,7 +2589,7 @@ fn ext4_gather_file_paths(fs: &Ext4, dir_path: &str, parent_ino: u32, out: &mut 
     }
 }
 
-/// 枚举卷上全部普通文件的绝对路径（用于 harness 发现 *_testcode.sh）。
+/// 枚举卷上全部普通文件的绝对路径（用于 harness 发现测试脚本）。
 pub fn ext4_list_all_file_paths() -> Vec<String> {
     let Some(fs) = ROOT_EXT4.lock().clone() else {
         return Vec::new();
