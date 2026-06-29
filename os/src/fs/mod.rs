@@ -14,10 +14,11 @@ pub use vfs::{
     create_regular_file, create_special_node, create_symlink, dir_exists, file_exists,
     file_flags_for_fd, filesystem_magic, is_removed, link_path, list_dir, list_files, metadata,
     metadata_for_fd, metadata_for_lookup, mount_fs, open_path, read_executable_file, read_file,
-    read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file, rename_path,
-    set_file_flags_for_fd, set_mode_fd, set_mode_path, set_owner_fd, set_owner_path, set_times_fd,
-    set_times_path, statfs_for_fd, statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path,
-    umount_fs, TimesUpdatePermission, VfsMetadata, VfsNodeKind, VfsStatFs,
+    read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file,
+    rename_exchange_path, rename_path, set_file_flags_for_fd, set_mode_fd, set_mode_path,
+    set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd, statfs_for_path,
+    sync_all, sync_fd, truncate_fd, truncate_path, umount_fs, TimesUpdatePermission, VfsMetadata,
+    VfsNodeKind, VfsStatFs,
 };
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -879,6 +880,53 @@ impl MemFileSystem {
             .push(MemFile::with_backing(&new, backing, link_key));
         self.metadata.remove(&old);
         self.metadata.insert(new, metadata);
+        Ok(())
+    }
+
+    pub fn exchange_path(&mut self, old: &str, new: &str) -> Result<(), SysErrNo> {
+        let old = normalize_path(old);
+        let new = normalize_path(new);
+        if old == new {
+            return Ok(());
+        }
+        if old == "/" || new == "/" {
+            return Err(SysErrNo::EINVAL);
+        }
+        if !self.exists(&old) || !self.exists(&new) {
+            return Err(SysErrNo::ENOENT);
+        }
+        if self.is_dir(&old) && is_descendant(&old, &new) {
+            return Err(SysErrNo::EINVAL);
+        }
+        if self.is_dir(&new) && is_descendant(&new, &old) {
+            return Err(SysErrNo::EINVAL);
+        }
+
+        let old_parent = parent_path(&old);
+        let mut temp = String::new();
+        for attempt in 0..32usize {
+            temp = if old_parent == "/" {
+                format!("/.wll_rename_exchange_{}", attempt)
+            } else {
+                format!("{}/.wll_rename_exchange_{}", old_parent, attempt)
+            };
+            if !self.exists(&temp) {
+                break;
+            }
+            temp.clear();
+        }
+        if temp.is_empty() {
+            return Err(SysErrNo::EEXIST);
+        }
+
+        self.rename_path(&old, &temp)?;
+        if let Err(e) = self.rename_path(&new, &old) {
+            let _ = self.rename_path(&temp, &old);
+            return Err(e);
+        }
+        if let Err(e) = self.rename_path(&temp, &new) {
+            return Err(e);
+        }
         Ok(())
     }
 

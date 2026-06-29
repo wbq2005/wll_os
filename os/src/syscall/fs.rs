@@ -1618,14 +1618,25 @@ pub fn sys_renameat2(
     flags: usize,
 ) -> SyscallRet {
     const RENAME_NOREPLACE: usize = 1;
-    if flags & !RENAME_NOREPLACE != 0 {
+    const RENAME_EXCHANGE: usize = 2;
+    const RENAME_WHITEOUT: usize = 4;
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if (flags & RENAME_WHITEOUT) != 0
+        || (flags & RENAME_NOREPLACE) != 0 && (flags & RENAME_EXCHANGE) != 0
+    {
         return Err(SysErrNo::EINVAL);
     }
     let (_old_logical, old_host) = resolve_host_path(olddirfd, oldpath)?;
     let (_new_logical, new_host) = resolve_host_path(newdirfd, newpath)?;
-    super::with_kernel_page_table(|| {
-        crate::fs::rename_path(&old_host, &new_host, flags & RENAME_NOREPLACE != 0)
-    })?;
+    if (flags & RENAME_EXCHANGE) != 0 {
+        super::with_kernel_page_table(|| crate::fs::rename_exchange_path(&old_host, &new_host))?;
+    } else {
+        super::with_kernel_page_table(|| {
+            crate::fs::rename_path(&old_host, &new_host, flags & RENAME_NOREPLACE != 0)
+        })?;
+    }
     Ok(0)
 }
 

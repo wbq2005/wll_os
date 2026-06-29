@@ -1971,6 +1971,62 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
     Err(missing_path_errno(&old))
 }
 
+pub fn rename_exchange_path(old: &str, new: &str) -> Result<(), SysErrNo> {
+    let old = normalize_path(old);
+    let new = normalize_path(new);
+    if old == new {
+        return Ok(());
+    }
+    if is_removed(&old) || is_removed(&new) {
+        return Err(SysErrNo::ENOENT);
+    }
+    if let Some(meta) = vfat_metadata_for_path(&old) {
+        meta?;
+        return Err(SysErrNo::EROFS);
+    }
+    if let Some(meta) = vfat_metadata_for_path(&new) {
+        meta?;
+        return Err(SysErrNo::EROFS);
+    }
+    ensure_mount_writable(&old)?;
+    ensure_mount_writable(&new)?;
+
+    let old_meta = metadata(&old, false)?;
+    let new_meta = metadata(&new, false)?;
+    check_delete_access(&old, &old_meta)?;
+    check_delete_access(&new, &new_meta)?;
+
+    let old_tmpfs = is_tmpfs_path(&old);
+    let new_tmpfs = is_tmpfs_path(&new);
+    if old_tmpfs != new_tmpfs {
+        return Err(SysErrNo::EXDEV);
+    }
+
+    let old_mem = MEM_FS.lock().exists(&old);
+    let new_mem = MEM_FS.lock().exists(&new);
+    match (old_mem, new_mem) {
+        (true, true) => {
+            MEM_FS.lock().exchange_path(&old, &new)?;
+            clear_whiteout(&old);
+            clear_whiteout(&new);
+            Ok(())
+        }
+        (true, false) | (false, true) => Err(SysErrNo::EXDEV),
+        (false, false) => {
+            if old_tmpfs {
+                return Err(SysErrNo::ENOENT);
+            }
+            if ext4_vol::lookup_kind(&old).is_none() || ext4_vol::lookup_kind(&new).is_none() {
+                return Err(SysErrNo::ENOENT);
+            }
+            ext4_vol::exchange_ext4(&old, &new)?;
+            clear_whiteout(&old);
+            clear_whiteout(&new);
+            Ok(())
+        }
+    }
+}
+
 pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo> {
     let old = normalize_path(old);
     let new = normalize_path(new);
