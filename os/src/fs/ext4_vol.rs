@@ -1263,6 +1263,8 @@ fn finish_unlinked_regular(ino: u32) -> Result<(), SysErrNo> {
     iref.inode.set_ctime(now);
     iref.inode.set_dtime(now);
     fs.write_back_inode(&mut iref);
+    fs.ialloc_free_inode(ino, false);
+    clear_namespace_cache();
     Ok(())
 }
 
@@ -1745,9 +1747,13 @@ pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
             fs.truncate_inode(&mut child_ref, 0).map_err(map_ext4_err)?;
         }
         child_ref.inode.set_dtime(now);
+        child_ref.inode.set_links_count(0);
     }
     fs.write_back_inode(&mut parent_ref);
     fs.write_back_inode(&mut child_ref);
+    if old_links <= 1 && !delay_delete {
+        fs.ialloc_free_inode(child_ino, child_kind == Ext4NodeKind::Directory);
+    }
     clear_namespace_cache();
     Ok(())
 }
@@ -1833,6 +1839,7 @@ pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
     parent_ref.inode.set_ctime(now);
     fs.write_back_inode(&mut child_ref);
     fs.write_back_inode(&mut parent_ref);
+    fs.ialloc_free_inode(child_ino, true);
     clear_namespace_cache();
     Ok(())
 }

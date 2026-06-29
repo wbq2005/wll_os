@@ -4,10 +4,15 @@ use crate::return_errno_with_message;
 use crate::utils::bitmap::*;
 
 impl Ext4 {
+    fn ialloc_super_block(&self) -> Ext4Superblock {
+        let block = Block::load(&self.block_device, SUPERBLOCK_OFFSET);
+        block.read_as()
+    }
+
     pub fn ialloc_alloc_inode(&self, is_dir: bool) -> Result<u32> {
         let mut bgid = 0;
-        let bg_count = self.super_block.block_group_count();
-        let mut super_block = self.super_block;
+        let mut super_block = self.ialloc_super_block();
+        let bg_count = super_block.block_group_count();
 
         while bgid <= bg_count {
             if bgid == bg_count {
@@ -80,10 +85,14 @@ impl Ext4 {
     }
 
     pub fn ialloc_free_inode(&self, index: u32, is_dir: bool) {
+        if index == 0 {
+            return;
+        }
         // Compute index of block group
-        let bgid = self.get_bgid_of_inode(index);
+        let mut super_block = self.ialloc_super_block();
+        let inodes_per_group = super_block.inodes_per_group();
+        let bgid = (index - 1) / inodes_per_group;
 
-        let mut super_block = self.super_block;
         let mut bg =
             Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
 
@@ -94,7 +103,10 @@ impl Ext4 {
             .read_offset(inode_bitmap_block as usize * BLOCK_SIZE);
 
         // Find index within group and clear bit
-        let index_in_group = self.inode_to_bgidx(index);
+        let index_in_group = (index - 1) % inodes_per_group;
+        if ext4_bmap_is_bit_clr(&bitmap_data, index_in_group) {
+            return;
+        }
         ext4_bmap_bit_clr(&mut bitmap_data, index_in_group);
 
         // Set new checksum after modification
@@ -109,13 +121,13 @@ impl Ext4 {
 
         // If inode was a directory, decrement the used directories count
         if is_dir {
-            let used_dirs = bg.get_used_dirs_count(&self.super_block) - 1;
+            let used_dirs = bg.get_used_dirs_count(&self.super_block).saturating_sub(1);
             bg.set_used_dirs_count(&self.super_block, used_dirs);
         }
 
         bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
 
-        super_block.decrease_free_inodes_count();
+        super_block.increase_free_inodes_count();
         super_block.sync_to_disk_with_csum(&self.block_device);
     }
 }

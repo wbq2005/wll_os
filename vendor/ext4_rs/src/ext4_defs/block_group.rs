@@ -96,9 +96,9 @@ impl Ext4BlockGroup {
 
     /// Set the count of used directories in this block group.
     pub fn set_used_dirs_count(&mut self, s: &Ext4Superblock, cnt: u32) {
-        self.itable_unused_lo = (cnt & 0xffff) as u16; 
+        self.used_dirs_count_lo = (cnt & 0xffff) as u16;
         if s.desc_size() > EXT4_MIN_BLOCK_GROUP_DESCRIPTOR_SIZE {
-            self.itable_unused_hi = (cnt >> 16) as u16;
+            self.used_dirs_count_hi = (cnt >> 16) as u16;
         }
     }
 
@@ -128,7 +128,7 @@ impl Ext4BlockGroup {
 
     /// Set the count of unused inodes in this block group.
     pub fn set_itable_unused(&mut self, s: &Ext4Superblock, cnt: u32) {
-        self.itable_unused_lo = (cnt & 0xffff) as u16; 
+        self.itable_unused_lo = (cnt & 0xffff) as u16;
         if s.desc_size() > EXT4_MIN_BLOCK_GROUP_DESCRIPTOR_SIZE {
             self.itable_unused_hi = (cnt >> 16) as u16;
         }
@@ -254,7 +254,7 @@ impl Ext4BlockGroup {
 
     /// Set the count of free blocks in this block group.
     pub fn set_free_blocks_count(&mut self, cnt: u32) {
-        self.free_blocks_count_lo = (cnt & 0xffff) as u16; 
+        self.free_blocks_count_lo = (cnt & 0xffff) as u16;
         self.free_blocks_count_hi = (cnt >> 16) as u16;
     }
 
