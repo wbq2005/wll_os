@@ -196,7 +196,7 @@ pub const SYSCALL_STATX: usize = 291;
 pub const SYSCALL_OPENAT2: usize = 437;
 pub const SYSCALL_FACCESSAT2: usize = 439;
 pub const SYSCALL_EPOLL_PWAIT2: usize = 441;
-pub const SYSCALL_COPY_FILE_RANGE: usize = 326;
+pub const SYSCALL_COPY_FILE_RANGE: usize = 285;
 pub const SYSCALL_GETRANDOM: usize = 278;
 
 /// Old SYS_open = 1024, used by some basic test binaries via syscall(SYS_open, ...).
@@ -329,6 +329,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_PREADV => fs::sys_preadv(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_PWRITEV => fs::sys_pwritev(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_SENDFILE => fs::sys_sendfile(args[0], args[1], args[2], args[3]),
+        SYSCALL_COPY_FILE_RANGE => {
+            fs::sys_copy_file_range(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
         SYSCALL_TRUNCATE => fs::sys_truncate(args[0] as *const u8, args[1]),
         SYSCALL_FTRUNCATE => fs::sys_ftruncate(args[0], args[1]),
         SYSCALL_FALLOCATE => fs::sys_fallocate(args[0], args[1], args[2], args[3]),

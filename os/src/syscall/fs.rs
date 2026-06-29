@@ -68,6 +68,7 @@ const SPLICE_F_MORE: usize = 0x04;
 const SPLICE_F_GIFT: usize = 0x08;
 const SPLICE_F_ALL: usize = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
 const SPLICE_CHUNK: usize = 64 * 1024;
+const COPY_FILE_RANGE_CHUNK: usize = 64 * 1024;
 
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EACCESS: usize = 0x200;
@@ -3712,6 +3713,37 @@ fn fd_is_regular_without_write(file_desc: &FileDescriptor) -> bool {
     )
 }
 
+fn fd_is_copy_file_regular_source(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::MemFile { readable: true, .. }
+            | FileDescriptor::Ext4Regular { readable: true, .. }
+    )
+}
+
+fn fd_is_copy_file_regular_target(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::MemFile {
+            writable: true,
+            append: false,
+            ..
+        } | FileDescriptor::Ext4Regular {
+            writable: true,
+            append: false,
+            ..
+        }
+    )
+}
+
+fn fd_copy_file_backend(file_desc: &FileDescriptor) -> Option<u8> {
+    match file_desc {
+        FileDescriptor::MemFile { .. } => Some(0),
+        FileDescriptor::Ext4Regular { .. } => Some(1),
+        _ => None,
+    }
+}
+
 fn load_splice_offset(ptr: usize) -> Result<Option<usize>, SysErrNo> {
     if ptr == 0 {
         return Ok(None);
@@ -3726,6 +3758,133 @@ fn store_splice_offset(ptr: usize, offset: usize) -> Result<(), SysErrNo> {
     }
     let offset = i64::try_from(offset).map_err(|_| SysErrNo::EINVAL)?;
     super::user::copy_object_to_user(ptr, &offset)
+}
+
+pub fn sys_copy_file_range(
+    fd_in: usize,
+    off_in: usize,
+    fd_out: usize,
+    off_out: usize,
+    len: usize,
+    flags: usize,
+) -> SyscallRet {
+    if flags != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    checked_io_count(len)?;
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let fd_table = task.inner.lock().fd_table.clone();
+
+    {
+        let fds = fd_table.lock();
+        let input = fds.get(fd_in).ok_or(SysErrNo::EBADF)?;
+        let output = fds.get(fd_out).ok_or(SysErrNo::EBADF)?;
+
+        let input_meta = super::with_kernel_page_table(|| crate::fs::metadata_for_fd(input))?;
+        let output_meta = super::with_kernel_page_table(|| crate::fs::metadata_for_fd(output))?;
+        if input_meta.kind != crate::fs::VfsNodeKind::Regular
+            || output_meta.kind != crate::fs::VfsNodeKind::Regular
+        {
+            return Err(if output_meta.kind == crate::fs::VfsNodeKind::Directory {
+                SysErrNo::EISDIR
+            } else {
+                SysErrNo::EINVAL
+            });
+        }
+        if fd_has_append_mode(output) {
+            return Err(SysErrNo::EBADF);
+        }
+        if !fd_is_copy_file_regular_source(input) || !fd_is_copy_file_regular_target(output) {
+            return Err(SysErrNo::EBADF);
+        }
+        if fd_copy_file_backend(input) != fd_copy_file_backend(output) {
+            return Err(SysErrNo::EXDEV);
+        }
+
+        if input.same_file_identity(output) {
+            let in_start = if off_in != 0 {
+                usize::try_from(super::user::copy_object_from_user::<i64>(off_in)?)
+                    .map_err(|_| SysErrNo::EINVAL)?
+            } else {
+                input_meta.size as usize
+            };
+            let out_start = if off_out != 0 {
+                usize::try_from(super::user::copy_object_from_user::<i64>(off_out)?)
+                    .map_err(|_| SysErrNo::EINVAL)?
+            } else {
+                output_meta.size as usize
+            };
+            let in_end = in_start.saturating_add(len);
+            let out_end = out_start.saturating_add(len);
+            if len != 0 && in_start < out_end && out_start < in_end {
+                return Err(SysErrNo::EINVAL);
+            }
+        }
+    }
+
+    let mut input_offset = load_splice_offset(off_in)?;
+    let mut output_offset = load_splice_offset(off_out)?;
+    if len == 0 {
+        store_splice_offset(off_in, input_offset.unwrap_or(0))?;
+        store_splice_offset(off_out, output_offset.unwrap_or(0))?;
+        return Ok(0);
+    }
+
+    let mut copied = 0usize;
+    let mut kbuf = Vec::new();
+    while copied < len {
+        let want = (len - copied).min(COPY_FILE_RANGE_CHUNK);
+        kbuf.resize(want, 0);
+
+        let nread = {
+            let mut fds = fd_table.lock();
+            let input = fds.get_mut(fd_in).ok_or(SysErrNo::EBADF)?;
+            if let Some(offset) = input_offset {
+                let fixed_offset = checked_fixed_offset(offset, copied)?;
+                read_fixed_at_into_kernel(input, fixed_offset, &mut kbuf[..want])?
+            } else {
+                read_fd_into_kernel(input, &mut kbuf[..want])?
+            }
+        };
+        if nread == 0 {
+            break;
+        }
+
+        let mut nwritten_total = 0usize;
+        while nwritten_total < nread {
+            let nwritten = {
+                let mut fds = fd_table.lock();
+                let output = fds.get_mut(fd_out).ok_or(SysErrNo::EBADF)?;
+                let buf = &kbuf[nwritten_total..nread];
+                if let Some(offset) = output_offset {
+                    let fixed_offset = checked_fixed_offset(offset, copied + nwritten_total)?;
+                    write_fixed_at_from_kernel(output, fixed_offset, buf)?
+                } else {
+                    write_fd_from_kernel(output, buf)?
+                }
+            };
+            if nwritten == 0 {
+                break;
+            }
+            nwritten_total += nwritten;
+        }
+
+        copied += nwritten_total;
+        if nwritten_total == 0 || nwritten_total < nread {
+            break;
+        }
+    }
+
+    if let Some(offset) = input_offset.as_mut() {
+        *offset = checked_fixed_offset(*offset, copied)?;
+    }
+    if let Some(offset) = output_offset.as_mut() {
+        *offset = checked_fixed_offset(*offset, copied)?;
+    }
+    store_splice_offset(off_in, input_offset.unwrap_or(0))?;
+    store_splice_offset(off_out, output_offset.unwrap_or(0))?;
+    Ok(copied)
 }
 
 pub fn sys_splice(
