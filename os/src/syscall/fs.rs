@@ -3275,7 +3275,10 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
             file_desc.set_status_flags(arg);
             Ok(0)
         }
-        _ => Err(SysErrNo::ENOSYS),
+        // Linux reports EINVAL for fcntl commands outside the supported
+        // command set.  ENOSYS is reserved for a missing syscall entry, not
+        // for an unrecognized command argument to an implemented syscall.
+        _ => Err(SysErrNo::EINVAL),
     }
 }
 
