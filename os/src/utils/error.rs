@@ -35,6 +35,7 @@ pub enum SysErrNo {
     EPIPE = 32,           // Broken pipe
     EDOM = 33,            // Math argument out of domain of func
     ERANGE = 34,          // Math result not representable
+    EDEADLK = 35,         // Resource deadlock would occur
     ENAMETOOLONG = 36,    // File name too long
     ENOTEMPTY = 39,       // Directory not empty
     ELOOP = 40,           // Too many symbolic links encountered

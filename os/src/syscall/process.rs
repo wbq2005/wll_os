@@ -759,15 +759,21 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         crate::task::terminate_thread_group_peers_for_exec(&task);
         crate::syscall::mm::detach_task_shared_memory(&task);
         crate::syscall::signal::reset_signal_handlers_for_exec(&task);
-        {
+        let closed_on_exec = {
             let mut inner = task.inner.lock();
 
             // 重置堆
             inner.exec_path = exec_logical_path.clone();
             inner.robust_list_head = 0;
             inner.robust_list_len = 0;
-            inner.fd_table.lock().close_on_exec();
-        }
+            let closed = inner.fd_table.lock().close_on_exec();
+            closed
+        };
+        crate::syscall::fs::release_posix_locks_for_closed_files(
+            task.thread_group.tgid(),
+            &closed_on_exec,
+        );
+        drop(closed_on_exec);
         {
             let mut mm = task.mm.lock();
             mm.program_break = crate::config::USER_HEAP_START;

@@ -1951,15 +1951,19 @@ impl FileDescriptorTable {
         Ok(())
     }
 
-    pub fn close_on_exec(&mut self) {
+    pub fn close_on_exec(&mut self) -> Vec<FileDescriptor> {
+        let mut closed = Vec::new();
         if self.cloexec_count == 0 {
-            return;
+            return closed;
         }
         for index in 0..MAX_FD_NUM {
             if self.fds[index].is_some() && (self.fd_flags[index] & FD_CLOEXEC) != 0 {
-                self.clear_slot(index);
+                if let Some(file) = self.clear_slot(index) {
+                    closed.push(file);
+                }
             }
         }
+        closed
     }
 
     pub fn close_all(&mut self) {

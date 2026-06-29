@@ -1,12 +1,14 @@
 use super::SyscallRet;
 use crate::console::putchar;
-use crate::task::wait_queue::{sleep_on_io_if, sleep_on_io_key_if, WaitOutcome};
+use crate::task::wait_queue::{sleep_on_io_if, sleep_on_io_key_if, WaitKey, WaitOutcome};
 use crate::task::{current_task, SharedFdTable};
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
 
 use crate::fs::fd::{self, FileDescriptor};
 use alloc::vec::Vec;
+use lazy_static::lazy_static;
+use spin::Mutex;
 
 /// 标准文件描述符
 const FD_STDOUT: usize = 1;
@@ -28,7 +30,13 @@ const F_GETFD: usize = 1;
 const F_SETFD: usize = 2;
 const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
+const F_GETLK: usize = 5;
+const F_SETLK: usize = 6;
+const F_SETLKW: usize = 7;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
 const FIONREAD: usize = 0x541B;
 const FIONBIO: usize = 0x5421;
 const FS_IOC_GETFLAGS: usize = 0x8008_6601;
@@ -1498,6 +1506,431 @@ fn copy_statfs_out(buf: *mut u8, st: &StatFs) -> Result<(), SysErrNo> {
     copy_to_user(buf, bytes)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum FileLockKey {
+    MemInode(u64),
+    MemPath(String),
+    Ext4(u32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileLockOwner {
+    Posix(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileLockKind {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy)]
+struct FileLockRange {
+    start: u64,
+    end: Option<u64>,
+}
+
+#[derive(Clone)]
+struct FileRecordLock {
+    file: FileLockKey,
+    owner: FileLockOwner,
+    pid: usize,
+    kind: FileLockKind,
+    range: FileLockRange,
+}
+
+#[derive(Clone, Copy)]
+struct FileLockWaiter {
+    waiter: FileLockOwner,
+    waiting_for: FileLockOwner,
+}
+
+#[derive(Clone, Copy)]
+struct UserFlock64 {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+}
+
+lazy_static! {
+    static ref FILE_RECORD_LOCKS: Mutex<Vec<FileRecordLock>> = Mutex::new(Vec::new());
+    static ref FILE_LOCK_WAITERS: Mutex<Vec<FileLockWaiter>> = Mutex::new(Vec::new());
+}
+
+fn file_lock_hash_bytes(mut hash: usize, bytes: &[u8]) -> usize {
+    for &byte in bytes {
+        hash ^= byte as usize;
+        hash = hash.wrapping_mul(0x0100_0000_01b3usize);
+    }
+    hash
+}
+
+fn file_lock_wait_key(file: &FileLockKey) -> WaitKey {
+    let hash = match file {
+        FileLockKey::MemInode(ino) => {
+            file_lock_hash_bytes(0xcbf2_9ce4_8422_2325usize, &ino.to_ne_bytes())
+        }
+        FileLockKey::MemPath(name) => {
+            file_lock_hash_bytes(0x9ce4_8422_2325_cbf2usize, name.as_bytes())
+        }
+        FileLockKey::Ext4(ino) => {
+            file_lock_hash_bytes(0x8422_2325_cbf2_9ce4usize, &ino.to_ne_bytes())
+        }
+    };
+    WaitKey::new(hash, 0x464c_4f43)
+}
+
+fn fd_lock_key(file_desc: &FileDescriptor) -> Option<FileLockKey> {
+    match file_desc {
+        FileDescriptor::MemFile { name, node, .. } => {
+            let ino = node
+                .and_then(|metadata| (metadata.ino != 0).then_some(metadata.ino))
+                .or_else(|| crate::fs::MEM_FS.lock().inode(name));
+            Some(match ino {
+                Some(ino) => FileLockKey::MemInode(ino),
+                None => FileLockKey::MemPath(name.clone()),
+            })
+        }
+        FileDescriptor::Ext4Regular { ino, .. } => Some(FileLockKey::Ext4(*ino)),
+        _ => None,
+    }
+}
+
+fn fd_lock_offset(file_desc: &FileDescriptor) -> usize {
+    match file_desc {
+        FileDescriptor::MemFile { offset, .. } | FileDescriptor::Ext4Regular { offset, .. } => {
+            *offset
+        }
+        _ => 0,
+    }
+}
+
+fn flock_i16(bytes: &[u8], offset: usize) -> i16 {
+    i16::from_ne_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn flock_i32(bytes: &[u8], offset: usize) -> i32 {
+    i32::from_ne_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn flock_i64(bytes: &[u8], offset: usize) -> i64 {
+    i64::from_ne_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn copy_flock_from_user(arg: usize) -> Result<UserFlock64, SysErrNo> {
+    if arg == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let mut bytes = [0u8; 32];
+    copy_from_user(arg as *const u8, &mut bytes)?;
+    Ok(UserFlock64 {
+        l_type: flock_i16(&bytes, 0),
+        l_whence: flock_i16(&bytes, 2),
+        l_start: flock_i64(&bytes, 8),
+        l_len: flock_i64(&bytes, 16),
+        l_pid: flock_i32(&bytes, 24),
+    })
+}
+
+fn copy_flock_to_user(arg: usize, flock: &UserFlock64) -> Result<(), SysErrNo> {
+    if arg == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let mut bytes = [0u8; 32];
+    bytes[0..2].copy_from_slice(&flock.l_type.to_ne_bytes());
+    bytes[2..4].copy_from_slice(&flock.l_whence.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&flock.l_start.to_ne_bytes());
+    bytes[16..24].copy_from_slice(&flock.l_len.to_ne_bytes());
+    bytes[24..28].copy_from_slice(&flock.l_pid.to_ne_bytes());
+    copy_to_user(arg as *mut u8, &bytes)
+}
+
+fn flock_kind(lock_type: i16) -> Result<Option<FileLockKind>, SysErrNo> {
+    match lock_type {
+        F_RDLCK => Ok(Some(FileLockKind::Read)),
+        F_WRLCK => Ok(Some(FileLockKind::Write)),
+        F_UNLCK => Ok(None),
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+fn signed_lock_base(whence: i16, current_offset: usize, file_size: usize) -> Result<i128, SysErrNo> {
+    match whence {
+        0 => Ok(0),
+        1 => Ok(current_offset as i128),
+        2 => Ok(file_size as i128),
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+fn flock_range(
+    flock: &UserFlock64,
+    current_offset: usize,
+    file_size: usize,
+) -> Result<FileLockRange, SysErrNo> {
+    let base = signed_lock_base(flock.l_whence, current_offset, file_size)?;
+    let start = base
+        .checked_add(flock.l_start as i128)
+        .ok_or(SysErrNo::EINVAL)?;
+    let len = flock.l_len as i128;
+    let (start, end) = if len > 0 {
+        let end = start.checked_add(len).ok_or(SysErrNo::EINVAL)?;
+        (start, Some(end))
+    } else if len < 0 {
+        let new_start = start.checked_add(len).ok_or(SysErrNo::EINVAL)?;
+        (new_start, Some(start))
+    } else {
+        (start, None)
+    };
+    if start < 0 || end.map(|value| value < 0).unwrap_or(false) {
+        return Err(SysErrNo::EINVAL);
+    }
+    Ok(FileLockRange {
+        start: start as u64,
+        end: end.map(|value| value as u64),
+    })
+}
+
+fn lock_ranges_overlap(left: FileLockRange, right: FileLockRange) -> bool {
+    let left_before_right = left.end.map(|end| end <= right.start).unwrap_or(false);
+    let right_before_left = right.end.map(|end| end <= left.start).unwrap_or(false);
+    !left_before_right && !right_before_left
+}
+
+fn lock_kinds_conflict(left: FileLockKind, right: FileLockKind) -> bool {
+    !(left == FileLockKind::Read && right == FileLockKind::Read)
+}
+
+fn lock_range_nonempty(range: FileLockRange) -> bool {
+    range.end.map(|end| range.start < end).unwrap_or(true)
+}
+
+fn subtract_lock_range(old: FileLockRange, cut: FileLockRange) -> Vec<FileLockRange> {
+    let mut out = Vec::new();
+    if old.start < cut.start {
+        let left = FileLockRange {
+            start: old.start,
+            end: Some(cut.start),
+        };
+        if lock_range_nonempty(left) {
+            out.push(left);
+        }
+    }
+    if let Some(cut_end) = cut.end {
+        let has_right = old.end.map(|end| end > cut_end).unwrap_or(true);
+        if has_right {
+            let right = FileLockRange {
+                start: cut_end.max(old.start),
+                end: old.end,
+            };
+            if lock_range_nonempty(right) {
+                out.push(right);
+            }
+        }
+    }
+    out
+}
+
+fn find_lock_conflict(
+    locks: &[FileRecordLock],
+    file: &FileLockKey,
+    owner: FileLockOwner,
+    kind: FileLockKind,
+    range: FileLockRange,
+) -> Option<FileRecordLock> {
+    locks
+        .iter()
+        .find(|lock| {
+            &lock.file == file
+                && lock.owner != owner
+                && lock_ranges_overlap(lock.range, range)
+                && lock_kinds_conflict(lock.kind, kind)
+        })
+        .cloned()
+}
+
+fn remove_lock_waiter(owner: FileLockOwner) {
+    FILE_LOCK_WAITERS
+        .lock()
+        .retain(|waiter| waiter.waiter != owner);
+}
+
+fn set_lock_waiter(waiter: FileLockOwner, waiting_for: FileLockOwner) {
+    let mut waiters = FILE_LOCK_WAITERS.lock();
+    if let Some(entry) = waiters.iter_mut().find(|entry| entry.waiter == waiter) {
+        entry.waiting_for = waiting_for;
+    } else {
+        waiters.push(FileLockWaiter {
+            waiter,
+            waiting_for,
+        });
+    }
+}
+
+fn file_lock_would_deadlock(waiter: FileLockOwner, waiting_for: FileLockOwner) -> bool {
+    if waiter == waiting_for {
+        return true;
+    }
+    let waiters = FILE_LOCK_WAITERS.lock();
+    let mut owner = waiting_for;
+    let mut depth = 0usize;
+    while depth <= waiters.len() {
+        if owner == waiter {
+            return true;
+        }
+        let Some(next) = waiters
+            .iter()
+            .find(|entry| entry.waiter == owner)
+            .map(|entry| entry.waiting_for)
+        else {
+            return false;
+        };
+        owner = next;
+        depth += 1;
+    }
+    false
+}
+
+fn apply_file_unlock(
+    locks: &mut Vec<FileRecordLock>,
+    file: &FileLockKey,
+    owner: FileLockOwner,
+    range: FileLockRange,
+) -> bool {
+    let mut changed = false;
+    let mut index = 0usize;
+    while index < locks.len() {
+        if &locks[index].file == file
+            && locks[index].owner == owner
+            && lock_ranges_overlap(locks[index].range, range)
+        {
+            let lock = locks.remove(index);
+            for remainder in subtract_lock_range(lock.range, range) {
+                locks.push(FileRecordLock {
+                    range: remainder,
+                    ..lock.clone()
+                });
+            }
+            changed = true;
+        } else {
+            index += 1;
+        }
+    }
+    changed
+}
+
+fn apply_file_lock(
+    file: &FileLockKey,
+    owner: FileLockOwner,
+    pid: usize,
+    kind: Option<FileLockKind>,
+    range: FileLockRange,
+) -> Result<Option<FileLockOwner>, SysErrNo> {
+    let mut locks = FILE_RECORD_LOCKS.lock();
+    if let Some(kind) = kind {
+        if let Some(conflict) = find_lock_conflict(&locks, file, owner, kind, range) {
+            return Ok(Some(conflict.owner));
+        }
+        apply_file_unlock(&mut locks, file, owner, range);
+        locks.push(FileRecordLock {
+            file: file.clone(),
+            owner,
+            pid,
+            kind,
+            range,
+        });
+        Ok(None)
+    } else {
+        apply_file_unlock(&mut locks, file, owner, range);
+        Ok(None)
+    }
+}
+
+fn file_lock_conflict_pid(conflict: &FileRecordLock) -> i32 {
+    conflict.pid as i32
+}
+
+fn flock_from_record(lock: &FileRecordLock) -> UserFlock64 {
+    UserFlock64 {
+        l_type: match lock.kind {
+            FileLockKind::Read => F_RDLCK,
+            FileLockKind::Write => F_WRLCK,
+        },
+        l_whence: 0,
+        l_start: lock.range.start as i64,
+        l_len: lock
+            .range
+            .end
+            .map(|end| end.saturating_sub(lock.range.start) as i64)
+            .unwrap_or(0),
+        l_pid: file_lock_conflict_pid(lock),
+    }
+}
+
+fn wake_file_lock_waiters(file: &FileLockKey) {
+    crate::task::wait_queue::wake_io_keyed_waiters(file_lock_wait_key(file));
+}
+
+fn release_posix_locks_for_file(pid: usize, file: &FileLockKey) {
+    let mut changed = false;
+    FILE_RECORD_LOCKS.lock().retain(|lock| {
+        let remove = lock.file == *file && lock.owner == FileLockOwner::Posix(pid);
+        changed |= remove;
+        !remove
+    });
+    remove_lock_waiter(FileLockOwner::Posix(pid));
+    if changed {
+        wake_file_lock_waiters(file);
+    }
+}
+
+pub fn release_file_locks_for_pid(pid: usize) {
+    let owner = FileLockOwner::Posix(pid);
+    let mut files = Vec::new();
+    FILE_RECORD_LOCKS.lock().retain(|lock| {
+        if lock.owner == owner {
+            files.push(lock.file.clone());
+            false
+        } else {
+            true
+        }
+    });
+    remove_lock_waiter(owner);
+    for file in files {
+        wake_file_lock_waiters(&file);
+    }
+}
+
+pub fn release_posix_locks_for_closed_files(pid: usize, files: &[FileDescriptor]) {
+    let mut keys = Vec::new();
+    for file in files {
+        if let Some(key) = fd_lock_key(file) {
+            if !keys.iter().any(|seen| seen == &key) {
+                keys.push(key);
+            }
+        }
+    }
+    for key in keys {
+        release_posix_locks_for_file(pid, &key);
+    }
+}
+
 fn make_statfs(info: crate::fs::VfsStatFs) -> StatFs {
     StatFs {
         f_type: info.f_type,
@@ -2405,6 +2838,9 @@ pub fn sys_close(fd: usize) -> SyscallRet {
             let mut fds = fd_table.lock();
             fds.remove(fd)?
         };
+        if let Some(file_key) = fd_lock_key(&old) {
+            release_posix_locks_for_file(task.thread_group.tgid(), &file_key);
+        }
         super::with_kernel_page_table(|| drop(old));
         Ok(0)
     } else {
@@ -2711,15 +3147,26 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: usize) -> SyscallRet {
     };
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let pid = task.thread_group.tgid();
     let inner = task.inner.lock();
     let nofile_limit = inner.rlimit_nofile;
     let mut fds = inner.fd_table.lock();
+    let replaced_key = fds.get(new_fd).and_then(fd_lock_key);
     let new_fd = fds.dup2_below(old_fd, new_fd, nofile_limit)?;
     fds.set_fd_flags(new_fd, fd_flags)?;
+    drop(fds);
+    drop(inner);
+    if let Some(file_key) = replaced_key {
+        release_posix_locks_for_file(pid, &file_key);
+    }
     Ok(new_fd)
 }
 
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
+    if matches!(cmd, F_GETLK | F_SETLK | F_SETLKW) {
+        return sys_fcntl_file_lock(fd, cmd, arg);
+    }
+
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
     let nofile_limit = inner.rlimit_nofile;
@@ -2753,6 +3200,96 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
             Ok(0)
         }
         _ => Err(SysErrNo::ENOSYS),
+    }
+}
+
+fn sys_fcntl_file_lock(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let flock = copy_flock_from_user(arg)?;
+    let kind = flock_kind(flock.l_type)?;
+    let blocking = cmd == F_SETLKW;
+    let getlk = cmd == F_GETLK;
+    if getlk && kind.is_none() {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let (file_key, range, owner, pid, wait_key) = {
+        let inner = task.inner.lock();
+        let fd_table = inner.fd_table.clone();
+        drop(inner);
+        let fds = fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        let file_key = fd_lock_key(file_desc).ok_or(SysErrNo::EINVAL)?;
+        let range = flock_range(&flock, fd_lock_offset(file_desc), file_desc.size())?;
+        if !getlk {
+            match kind {
+                Some(FileLockKind::Read) if !file_desc.readable() => return Err(SysErrNo::EBADF),
+                Some(FileLockKind::Write) if !file_desc.writable() => {
+                    return Err(SysErrNo::EBADF)
+                }
+                _ => {}
+            }
+        }
+        let owner = FileLockOwner::Posix(task.thread_group.tgid());
+        let wait_key = file_lock_wait_key(&file_key);
+        (file_key, range, owner, task.thread_group.tgid(), wait_key)
+    };
+
+    if getlk {
+        let mut out = flock;
+        if let Some(kind) = kind {
+            let locks = FILE_RECORD_LOCKS.lock();
+            if let Some(conflict) = find_lock_conflict(&locks, &file_key, owner, kind, range) {
+                out = flock_from_record(&conflict);
+            } else {
+                out.l_type = F_UNLCK;
+            }
+        } else {
+            out.l_type = F_UNLCK;
+        }
+        copy_flock_to_user(arg, &out)?;
+        return Ok(0);
+    }
+
+    if kind.is_none() {
+        let conflict = apply_file_lock(&file_key, owner, pid, None, range)?;
+        debug_assert!(conflict.is_none());
+        remove_lock_waiter(owner);
+        wake_file_lock_waiters(&file_key);
+        return Ok(0);
+    }
+
+    let kind = kind.unwrap();
+    loop {
+        match apply_file_lock(&file_key, owner, pid, Some(kind), range)? {
+            None => {
+                remove_lock_waiter(owner);
+                return Ok(0);
+            }
+            Some(_conflict_owner) if !blocking => {
+                remove_lock_waiter(owner);
+                return Err(SysErrNo::EAGAIN);
+            }
+            Some(conflict_owner) => {
+                if file_lock_would_deadlock(owner, conflict_owner) {
+                    remove_lock_waiter(owner);
+                    return Err(SysErrNo::EDEADLK);
+                }
+                set_lock_waiter(owner, conflict_owner);
+                let sleep_result = sleep_on_io_key_if(wait_key, None, || {
+                    let locks = FILE_RECORD_LOCKS.lock();
+                    Ok(find_lock_conflict(&locks, &file_key, owner, kind, range).is_some())
+                });
+                match sleep_result {
+                    Ok(_) => {}
+                    Err(SysErrNo::ERESTARTSYS) => return Err(SysErrNo::ERESTARTSYS),
+                    Err(err) => {
+                        remove_lock_waiter(owner);
+                        return Err(err);
+                    }
+                }
+            }
+        }
     }
 }
 

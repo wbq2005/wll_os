@@ -3198,6 +3198,7 @@ pub fn open_path(
             .lock()
             .get_file(&open_norm)
             .map(|file| file.snapshot());
+        let node = MEM_FS.lock().metadata(&open_norm);
         let (mut content, mut times) =
             source.unwrap_or_else(|| (fd::MemFileContent::new(), super::FileTimes::now()));
         if want_trunc && write_ok {
@@ -3217,7 +3218,7 @@ pub fn open_path(
             writable: write_ok,
             append,
             linked: true,
-            node: None,
+            node,
         });
     }
 
@@ -3325,6 +3326,7 @@ pub fn open_path(
                 .get_file(&open_norm)
                 .map(|file| file.times())
                 .unwrap_or_else(super::FileTimes::now);
+            let node = MEM_FS.lock().metadata(&open_norm);
             return Ok(fd::FileDescriptor::MemFile {
                 name: open_norm,
                 content: fd::MemFileContent::new(),
@@ -3334,7 +3336,7 @@ pub fn open_path(
                 writable: write_ok,
                 append,
                 linked: true,
-                node: None,
+                node,
             });
         }
         if ext_parent {
@@ -3360,6 +3362,7 @@ pub fn open_path(
                 .get_file(&open_norm)
                 .map(|file| file.times())
                 .unwrap_or_else(super::FileTimes::now);
+            let node = MEM_FS.lock().metadata(&open_norm);
             return Ok(fd::FileDescriptor::MemFile {
                 name: open_norm,
                 content: fd::MemFileContent::new(),
@@ -3369,7 +3372,7 @@ pub fn open_path(
                 writable: write_ok,
                 append,
                 linked: true,
-                node: None,
+                node,
             });
         }
         return Err(missing_path_errno(&open_norm));
