@@ -252,8 +252,9 @@ fn refresh_mem_file(
         return false;
     }
     if let Some(file) = MEM_FS.lock().get_file(name) {
-        *content = file.content.clone();
-        *times = file.times;
+        let (snapshot, file_times) = file.snapshot();
+        *content = snapshot;
+        *times = file_times;
         true
     } else {
         *linked = false;
@@ -1390,7 +1391,7 @@ impl FileDescriptor {
                     MEM_FS
                         .lock()
                         .get_file(name)
-                        .map(|file| file.content.len())
+                        .map(|file| file.size())
                         .unwrap_or(content.len())
                 }
             }
@@ -2135,14 +2136,14 @@ fn open_file_legacy_unused(
         let source = fs::MEM_FS
             .lock()
             .get_file(&path_norm)
-            .map(|file| (file.content.clone(), file.times));
+            .map(|file| file.snapshot());
         let (mut content, mut times) =
             source.unwrap_or_else(|| (MemFileContent::new(), FileTimes::now()));
         if want_trunc && write_ok {
             content.clear();
             fs::MEM_FS.lock().truncate_file(&path_norm, 0)?;
             if let Some(file) = fs::MEM_FS.lock().get_file(&path_norm) {
-                times = file.times;
+                times = file.times();
             }
         }
         let base_off = if append && write_ok { content.len() } else { 0 };
@@ -2241,7 +2242,7 @@ fn open_file_legacy_unused(
             let times = fs::MEM_FS
                 .lock()
                 .get_file(&path_norm)
-                .map(|file| file.times)
+                .map(|file| file.times())
                 .unwrap_or_else(FileTimes::now);
             return Ok(FileDescriptor::MemFile {
                 name: path_norm,
@@ -2273,7 +2274,7 @@ fn open_file_legacy_unused(
             let times = fs::MEM_FS
                 .lock()
                 .get_file(&path_norm)
-                .map(|file| file.times)
+                .map(|file| file.times())
                 .unwrap_or_else(FileTimes::now);
             return Ok(FileDescriptor::MemFile {
                 name: path_norm,

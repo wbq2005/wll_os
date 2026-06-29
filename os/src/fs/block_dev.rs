@@ -436,7 +436,7 @@ pub fn loop_size(index: usize) -> Result<usize, SysErrNo> {
         LoopBacking::MemFile { path } => crate::fs::MEM_FS
             .lock()
             .get_file(&path)
-            .map(|file| file.content.len())
+            .map(|file| file.size())
             .ok_or(SysErrNo::ENOENT),
         LoopBacking::Ext4Regular { ino } => crate::fs::ext4_vol::regular_file_size(ino),
     }

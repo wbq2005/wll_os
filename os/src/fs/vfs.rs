@@ -681,18 +681,19 @@ fn metadata_from_mem_file(
 ) -> VfsMetadata {
     let mut meta = metadata_for_mem_file(
         &file.name,
-        file.content.len(),
-        file.content.is_elf_image(),
+        file.size(),
+        file.is_elf_image(),
         node,
         nlink,
         ino_key,
     );
-    meta.atime_sec = file.times.atime_sec;
-    meta.atime_nsec = file.times.atime_nsec;
-    meta.mtime_sec = file.times.mtime_sec;
-    meta.mtime_nsec = file.times.mtime_nsec;
-    meta.ctime_sec = file.times.ctime_sec;
-    meta.ctime_nsec = file.times.ctime_nsec;
+    let times = file.times();
+    meta.atime_sec = times.atime_sec;
+    meta.atime_nsec = times.atime_nsec;
+    meta.mtime_sec = times.mtime_sec;
+    meta.mtime_nsec = times.mtime_nsec;
+    meta.ctime_sec = times.ctime_sec;
+    meta.ctime_nsec = times.ctime_nsec;
     meta
 }
 
@@ -771,11 +772,7 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
         }
         if let Some(file) = mem.get_file(&norm) {
             let node = mem.metadata(&norm).unwrap_or_else(|| {
-                default_mem_metadata(if file.content.is_elf_image() {
-                    0o777
-                } else {
-                    0o666
-                })
+                default_mem_metadata(if file.is_elf_image() { 0o777 } else { 0o666 })
             });
             let nlink = mem.file_link_count(&norm);
             let link_key = mem.file_link_key(&norm).unwrap_or_else(|| norm.clone());
@@ -1072,11 +1069,7 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
                 let mem = MEM_FS.lock();
                 if let Some(file) = mem.get_file(name) {
                     let node = mem.metadata(name).unwrap_or_else(|| {
-                        default_mem_metadata(if file.content.is_elf_image() {
-                            0o777
-                        } else {
-                            0o666
-                        })
+                        default_mem_metadata(if file.is_elf_image() { 0o777 } else { 0o666 })
                     });
                     let nlink = mem.file_link_count(name);
                     let link_key = mem.file_link_key(name).unwrap_or_else(|| name.clone());
@@ -1472,7 +1465,7 @@ pub fn read_file(name: &str) -> Option<Vec<u8>> {
     if is_tmpfs_path(&norm) || mounted_ext4_backend_path(&norm).is_none() {
         let m = MEM_FS.lock();
         if let Some(f) = m.get_file(&norm) {
-            return Some(f.content.to_vec());
+            return Some(f.to_vec());
         }
         drop(m);
     }
@@ -1505,7 +1498,7 @@ pub fn read_executable_file(name: &str) -> Option<Vec<u8>> {
 
     let tmpfs_path = is_tmpfs_path(&norm);
     let mem_data = if tmpfs_path || mounted_ext4_backend_path(&norm).is_none() {
-        MEM_FS.lock().get_file(&norm).map(|f| f.content.to_vec())
+        MEM_FS.lock().get_file(&norm).map(|f| f.to_vec())
     } else {
         None
     };
@@ -2779,14 +2772,14 @@ pub fn open_path(
         let source = MEM_FS
             .lock()
             .get_file(&open_norm)
-            .map(|file| (file.content.clone(), file.times));
+            .map(|file| file.snapshot());
         let (mut content, mut times) =
             source.unwrap_or_else(|| (fd::MemFileContent::new(), super::FileTimes::now()));
         if want_trunc && write_ok {
             content.clear();
             MEM_FS.lock().truncate_file(&open_norm, 0)?;
             if let Some(file) = MEM_FS.lock().get_file(&open_norm) {
-                times = file.times;
+                times = file.times();
             }
         }
         let base_off = if append && write_ok { content.len() } else { 0 };
@@ -2901,7 +2894,7 @@ pub fn open_path(
             let times = MEM_FS
                 .lock()
                 .get_file(&open_norm)
-                .map(|file| file.times)
+                .map(|file| file.times())
                 .unwrap_or_else(super::FileTimes::now);
             return Ok(fd::FileDescriptor::MemFile {
                 name: open_norm,
@@ -2935,7 +2928,7 @@ pub fn open_path(
             let times = MEM_FS
                 .lock()
                 .get_file(&open_norm)
-                .map(|file| file.times)
+                .map(|file| file.times())
                 .unwrap_or_else(super::FileTimes::now);
             return Ok(fd::FileDescriptor::MemFile {
                 name: open_norm,
