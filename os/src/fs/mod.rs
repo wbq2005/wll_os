@@ -14,10 +14,11 @@ pub use vfs::{
     create_regular_file, create_special_node, create_symlink, dir_exists, file_exists,
     file_flags_for_fd, filesystem_magic, is_removed, link_mem_file_fd, link_path, list_dir,
     list_files, metadata, metadata_for_fd, metadata_for_lookup, mount_fs, open_path,
-    read_executable_file, read_file, read_interpreter, read_link, refresh_block_device_nodes,
-    remove_dir, remove_file, rename_exchange_path, rename_path, set_file_flags_for_fd, set_mode_fd,
-    set_mode_path, set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd,
-    statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path, umount_fs,
+    path_contains_symlink, path_crosses_mountpoint, read_executable_file, read_file,
+    read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file,
+    rename_exchange_path, rename_path, set_file_flags_for_fd, set_mode_fd, set_mode_path,
+    set_owner_fd, set_owner_path, set_times_fd, set_times_path, statfs_for_fd, statfs_for_path,
+    sync_all, sync_fd, truncate_fd, truncate_path, umount_fs,
     TimesUpdatePermission, VfsMetadata, VfsNodeKind, VfsStatFs,
 };
 
@@ -1156,6 +1157,7 @@ pub fn init() {
 
 fn init_pseudo_files() {
     let mounts = b"rootfs / ext4 rw 0 0\n";
+    let proc_version = b"Linux version 5.10.0 (wll_OS) #1 SMP PREEMPT\n";
     let meminfo = b"MemTotal:       131072 kB\nMemFree:         65536 kB\nMemAvailable:    65536 kB\nBuffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\nSwapFree:            0 kB\n";
     let cpuinfo = b"processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imac\n";
     let proc_self_status = b"Name:\twll_OS\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nMems_allowed:\t1\nMems_allowed_list:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n";
@@ -1202,6 +1204,10 @@ fn init_pseudo_files() {
         fs.add_dir(&alloc::format!("{}/sys/devices/system/node", root));
         fs.add_dir(&alloc::format!("{}/sys/devices/system/node/node0", root));
         fs.add_file(&alloc::format!("{}/proc/mounts", root), mounts.to_vec());
+        fs.add_file(
+            &alloc::format!("{}/proc/version", root),
+            proc_version.to_vec(),
+        );
         fs.add_file(
             &alloc::format!("{}/proc/self/status", root),
             proc_self_status.to_vec(),

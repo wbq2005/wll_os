@@ -182,6 +182,7 @@ pub const SYSCALL_SCHED_GETATTR: usize = 275;
 pub const SYSCALL_RENAMEAT2: usize = 276;
 pub const SYSCALL_MEMBARRIER: usize = 283;
 pub const SYSCALL_STATX: usize = 291;
+pub const SYSCALL_OPENAT2: usize = 437;
 pub const SYSCALL_FACCESSAT2: usize = 439;
 pub const SYSCALL_EPOLL_PWAIT2: usize = 441;
 pub const SYSCALL_COPY_FILE_RANGE: usize = 326;
@@ -243,6 +244,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[1] as *const u8,
             args[2] as u32,
             args[3] as u32,
+        ),
+        SYSCALL_OPENAT2 => fs::sys_openat2(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *const fs::OpenHow,
+            args[3],
         ),
         SYSCALL_OPEN => fs::sys_openat(
             AT_FDCWD,

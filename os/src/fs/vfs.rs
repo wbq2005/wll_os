@@ -528,6 +528,36 @@ fn procfs_link_source(path: &str) -> bool {
     local == "/proc" || local.starts_with("/proc/")
 }
 
+pub fn path_crosses_mountpoint(path: &str) -> bool {
+    let norm = normalize_path(path);
+    if procfs_link_source(&norm) {
+        return true;
+    }
+    let mounts = MOUNT_TABLE.lock();
+    mounts
+        .iter()
+        .any(|entry| entry.host_target != "/" && path_is_under(&norm, &entry.host_target))
+}
+
+pub fn path_contains_symlink(path: &str) -> Result<bool, SysErrNo> {
+    let norm = normalize_path(path);
+    let components: Vec<&str> = norm.split('/').filter(|part| !part.is_empty()).collect();
+    if components.is_empty() {
+        return Ok(false);
+    }
+    let mut current = String::from("/");
+    for component in components {
+        if current != "/" {
+            current.push('/');
+        }
+        current.push_str(component);
+        if lookup_symlink_target(&current)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn metadata_for_char_device(path: &str, major: u32, minor: u32) -> VfsMetadata {
     let mut meta = synthetic_metadata(path, VfsNodeKind::Other, S_IFCHR | 0o666, 0, 1);
     meta.rdev_major = major;

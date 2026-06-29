@@ -74,6 +74,24 @@ const UTIME_NOW: isize = 0x3fffffff;
 const UTIME_OMIT: isize = 0x3ffffffe;
 const IOV_MAX: usize = 1024;
 const NAME_MAX: usize = 255;
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+const RESOLVE_KNOWN_MASK: u64 = RESOLVE_NO_XDEV
+    | RESOLVE_NO_MAGICLINKS
+    | RESOLVE_NO_SYMLINKS
+    | RESOLVE_BENEATH
+    | RESOLVE_IN_ROOT;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1029,6 +1047,176 @@ fn resolve_host_path(dirfd: isize, pathname: *const u8) -> Result<(String, Strin
     Ok((logical, host))
 }
 
+fn path_has_parent_component(path: &str) -> bool {
+    path.split('/').any(|component| component == "..")
+}
+
+fn path_is_under_or_same(path: &str, base: &str) -> bool {
+    let path = crate::fs::normalize_path(path);
+    let base = crate::fs::normalize_path(base);
+    path == base
+        || (base != "/"
+            && path
+                .strip_prefix(base.as_str())
+                .is_some_and(|tail| tail.starts_with('/')))
+}
+
+fn resolve_path_in_root_str(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
+    if path.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+    check_path_component_lengths(path)?;
+    let base = resolve_base_dir(dirfd)?;
+    let mut components: Vec<String> = base
+        .trim_matches('/')
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .map(String::from)
+        .collect();
+    let root_len = components.len();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.len() > root_len {
+                    components.pop();
+                }
+            }
+            name => components.push(String::from(name)),
+        }
+    }
+    if components.is_empty() {
+        Ok(String::from("/"))
+    } else {
+        Ok(crate::fs::normalize_path(&alloc::format!(
+            "/{}",
+            components.join("/")
+        )))
+    }
+}
+
+fn openat2_resolve_path_str(
+    dirfd: isize,
+    path: &str,
+    resolve: u64,
+) -> Result<(String, String), SysErrNo> {
+    if resolve & RESOLVE_BENEATH != 0 && (path.starts_with('/') || path_has_parent_component(path))
+    {
+        return Err(SysErrNo::EXDEV);
+    }
+
+    let logical = if resolve & RESOLVE_IN_ROOT != 0 {
+        resolve_path_in_root_str(dirfd, path)?
+    } else {
+        resolve_path_str(dirfd, path)?
+    };
+
+    if resolve & RESOLVE_BENEATH != 0 {
+        let base = resolve_base_dir(dirfd)?;
+        if !path_is_under_or_same(&logical, &base) {
+            return Err(SysErrNo::EXDEV);
+        }
+    }
+
+    let root = current_root()?;
+    let host = crate::fs::apply_root(&root, &logical);
+
+    if (resolve & (RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS)) != 0
+        && is_proc_magic_link_path(&logical)
+    {
+        return Err(SysErrNo::ELOOP);
+    }
+
+    if resolve & RESOLVE_NO_XDEV != 0 && crate::fs::path_crosses_mountpoint(&host) {
+        return Err(SysErrNo::EXDEV);
+    }
+
+    if resolve & RESOLVE_NO_SYMLINKS != 0
+        && super::with_kernel_page_table(|| crate::fs::path_contains_symlink(&host))?
+    {
+        return Err(SysErrNo::ELOOP);
+    }
+
+    Ok((logical, host))
+}
+
+fn copy_open_how_from_user(how: *const OpenHow, size: usize) -> Result<OpenHow, SysErrNo> {
+    let expected = core::mem::size_of::<OpenHow>();
+    if size < expected {
+        return Err(SysErrNo::EINVAL);
+    }
+    let value = copy_object_from_user(how)?;
+    if size > expected {
+        let extra_len = size - expected;
+        if extra_len > 4096 {
+            return Err(SysErrNo::E2BIG);
+        }
+        let extra_addr = (how as usize).checked_add(expected).ok_or(SysErrNo::EFAULT)?;
+        let mut extra = Vec::new();
+        extra.resize(extra_len, 0);
+        super::user::copy_from_user(extra_addr, &mut extra)?;
+        if extra.iter().any(|byte| *byte != 0) {
+            return Err(SysErrNo::E2BIG);
+        }
+    }
+    Ok(value)
+}
+
+fn validate_openat2_how(how: OpenHow) -> Result<(u32, u32, u64), SysErrNo> {
+    const O_NOCTTY: u64 = 0o00000400;
+    const O_NONBLOCK: u64 = 0o00004000;
+    const O_DSYNC: u64 = 0o00010000;
+    const O_ASYNC: u64 = 0o00020000;
+    const O_DIRECT: u64 = 0o00040000;
+    const O_LARGEFILE: u64 = 0o00100000;
+    const O_SYNC: u64 = 0o04010000;
+    let known_flags = fd::open_flags::O_ACCMODE as u64
+        | fd::open_flags::O_CREAT as u64
+        | fd::open_flags::O_EXCL as u64
+        | O_NOCTTY
+        | fd::open_flags::O_TRUNC as u64
+        | fd::open_flags::O_APPEND as u64
+        | O_NONBLOCK
+        | O_DSYNC
+        | O_ASYNC
+        | O_DIRECT
+        | O_LARGEFILE
+        | fd::open_flags::O_DIRECTORY as u64
+        | fd::open_flags::O_NOFOLLOW as u64
+        | fd::open_flags::O_NOATIME as u64
+        | fd::open_flags::O_CLOEXEC as u64
+        | O_SYNC
+        | fd::open_flags::O_PATH as u64
+        | fd::open_flags::O_TMPFILE as u64;
+    if how.flags & !known_flags != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let tmpfile_bit = fd::open_flags::O_TMPFILE as u64 & !(fd::open_flags::O_DIRECTORY as u64);
+    if (how.flags & tmpfile_bit) != 0
+        && (how.flags & fd::open_flags::O_TMPFILE as u64) != fd::open_flags::O_TMPFILE as u64
+    {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    if how.mode & !0o7777 != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if how.mode != 0
+        && (how.flags & (fd::open_flags::O_CREAT as u64 | fd::open_flags::O_TMPFILE as u64)) == 0
+    {
+        return Err(SysErrNo::EINVAL);
+    }
+    if how.resolve & !RESOLVE_KNOWN_MASK != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if (how.resolve & RESOLVE_BENEATH) != 0 && (how.resolve & RESOLVE_IN_ROOT) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    Ok((how.flags as u32, how.mode as u32, how.resolve))
+}
+
 fn parse_decimal_fd(text: &str) -> Result<usize, SysErrNo> {
     if text.is_empty() || !text.as_bytes().iter().all(|b| b.is_ascii_digit()) {
         return Err(SysErrNo::ENOENT);
@@ -1089,6 +1277,40 @@ fn proc_self_fd_target(logical_path: &str) -> Result<Option<String>, SysErrNo> {
         FileDescriptor::Epoll { .. } => String::from("anon_inode:[eventpoll]"),
     };
     Ok(Some(target))
+}
+
+fn local_pseudo_path(path: &str) -> &str {
+    for root in ["/glibc", "/musl"] {
+        if let Some(tail) = path.strip_prefix(root) {
+            return if tail.is_empty() {
+                "/"
+            } else if tail.starts_with('/') {
+                tail
+            } else {
+                path
+            };
+        }
+    }
+    path
+}
+
+fn is_proc_magic_link_path(path: &str) -> bool {
+    matches!(
+        local_pseudo_path(path),
+        "/proc/self/exe" | "/proc/thread-self/exe"
+    )
+}
+
+fn proc_magic_link_target(logical_path: &str) -> Result<Option<String>, SysErrNo> {
+    if !is_proc_magic_link_path(logical_path) {
+        return Ok(None);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let exec_path = task.inner.lock().exec_path.clone();
+    if exec_path.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+    Ok(Some(exec_path))
 }
 
 fn resolve_base_dir(dirfd: isize) -> Result<String, SysErrNo> {
@@ -1377,6 +1599,15 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
 /// - mode: 文件模式
 pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> SyscallRet {
     let (logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    open_resolved_path(logical_path, host_path, flags, mode)
+}
+
+fn open_resolved_path(
+    logical_path: String,
+    host_path: String,
+    flags: u32,
+    mode: u32,
+) -> SyscallRet {
     let fd_flags = if (flags & fd::open_flags::O_CLOEXEC) != 0 {
         fd::FD_CLOEXEC
     } else {
@@ -1384,9 +1615,19 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
     };
     let open_flags = flags & !fd::open_flags::O_CLOEXEC;
 
+    let (logical_path, host_path) = if let Some(target) = proc_magic_link_target(&logical_path)? {
+        if (open_flags & fd::open_flags::O_NOFOLLOW) != 0 {
+            return Err(SysErrNo::ELOOP);
+        }
+        let root = current_root()?;
+        let host = crate::fs::apply_root(&root, &target);
+        (target, host)
+    } else {
+        (logical_path, host_path)
+    };
+
     log::info!(
-        "[syscall] openat(dirfd={}, pathname='{}' -> '{}', flags={}, mode={})",
-        dirfd,
+        "[syscall] open(path='{}' -> '{}', flags={}, mode={})",
         logical_path,
         host_path,
         flags,
@@ -1428,6 +1669,19 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
     } else {
         Err(SysErrNo::ESRCH)
     }
+}
+
+pub fn sys_openat2(
+    dirfd: isize,
+    pathname: *const u8,
+    how: *const OpenHow,
+    size: usize,
+) -> SyscallRet {
+    let how = copy_open_how_from_user(how, size)?;
+    let (flags, mode, resolve) = validate_openat2_how(how)?;
+    let path = read_user_path(pathname)?;
+    let (logical_path, host_path) = openat2_resolve_path_str(dirfd, &path, resolve)?;
+    open_resolved_path(logical_path, host_path, flags, mode)
 }
 
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallRet {
