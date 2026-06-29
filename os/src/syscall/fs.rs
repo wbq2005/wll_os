@@ -15,6 +15,7 @@ const AT_FDCWD: isize = -100;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_NO_AUTOMOUNT: usize = 0x800;
 const AT_STATX_SYNC_TYPE: usize = 0x6000;
+const STATX_RESERVED: usize = 0x8000_0000;
 const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFCHR: u32 = 0o020000;
@@ -1413,6 +1414,14 @@ fn check_fstatat_flags(flags: usize) -> Result<(), SysErrNo> {
 
 fn check_statx_flags(flags: usize) -> Result<(), SysErrNo> {
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0 {
+        Err(SysErrNo::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
+fn check_statx_mask(mask: usize) -> Result<(), SysErrNo> {
+    if mask & STATX_RESERVED != 0 {
         Err(SysErrNo::EINVAL)
     } else {
         Ok(())
@@ -3950,6 +3959,7 @@ pub fn sys_statx(
         return Err(SysErrNo::EFAULT);
     }
     check_statx_flags(flags)?;
+    check_statx_mask(mask)?;
 
     let path = read_user_path(pathname)?;
     let st = if path.is_empty() {
