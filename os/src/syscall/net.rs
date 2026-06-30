@@ -1,3 +1,4 @@
+use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -6,6 +7,7 @@ use spin::Mutex;
 
 use super::SyscallRet;
 use crate::fs::fd::{self, FileDescriptor, SocketPacket, SocketState};
+use crate::fs::{self, MemSpecialKind, VfsNodeKind};
 use crate::task::current_task;
 use crate::utils::error::SysErrNo;
 
@@ -15,10 +17,12 @@ const AF_INET6: i32 = 10;
 
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
+const SOCK_RAW: usize = 3;
 const SOCK_NONBLOCK: usize = fd::pipe_flags::O_NONBLOCK;
 const SOCK_CLOEXEC: usize = fd::pipe_flags::O_CLOEXEC;
 const SOCK_FLAG_MASK: usize = SOCK_NONBLOCK | SOCK_CLOEXEC;
 
+const IPPROTO_IP: i32 = 0;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
 const SOL_SOCKET: usize = 1;
@@ -30,6 +34,7 @@ const SO_BROADCAST: usize = 6;
 const SO_SNDBUF: usize = 7;
 const SO_RCVBUF: usize = 8;
 const SO_KEEPALIVE: usize = 9;
+const SO_OOBINLINE: usize = 10;
 const SO_REUSEPORT: usize = 15;
 const SO_RCVTIMEO: usize = 20;
 const SO_SNDTIMEO: usize = 21;
@@ -38,6 +43,8 @@ const SO_PROTOCOL: usize = 38;
 const TCP_NODELAY: usize = 1;
 
 const MSG_DONTWAIT: usize = 0x40;
+const MSG_OOB: usize = 0x1;
+const MSG_ERRQUEUE: usize = 0x2000;
 const MSG_NOSIGNAL: usize = 0x4000;
 const MSG_SUPPORTED: usize = MSG_DONTWAIT | MSG_NOSIGNAL;
 
@@ -46,6 +53,8 @@ const SHUT_WR: usize = 1;
 const SHUT_RDWR: usize = 2;
 
 const MAX_SOCKADDR_LEN: usize = 128;
+const INADDR_LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+const UDP_MAX_PAYLOAD: usize = 65_507;
 static NEXT_EPHEMERAL_PORT: AtomicUsize = AtomicUsize::new(49152);
 
 #[repr(C)]
@@ -73,8 +82,9 @@ fn socket_type(raw_type: usize) -> Result<(usize, bool, usize), SysErrNo> {
     }
     let base = raw_type & !SOCK_FLAG_MASK;
     match base {
-        SOCK_STREAM | SOCK_DGRAM => Ok((base, (flags & SOCK_NONBLOCK) != 0, flags)),
-        _ => Err(SysErrNo::EOPNOTSUPP),
+        SOCK_STREAM | SOCK_DGRAM | SOCK_RAW => Ok((base, (flags & SOCK_NONBLOCK) != 0, flags)),
+        0 => Err(SysErrNo::EINVAL),
+        _ => Err(SysErrNo::EINVAL),
     }
 }
 
@@ -86,6 +96,12 @@ fn validate_domain(domain: i32) -> Result<(), SysErrNo> {
 }
 
 fn validate_protocol(sock_type: usize, protocol: i32) -> Result<(), SysErrNo> {
+    if sock_type == SOCK_RAW {
+        return Err(SysErrNo::EPROTONOSUPPORT);
+    }
+    if sock_type != SOCK_STREAM && sock_type != SOCK_DGRAM {
+        return Err(SysErrNo::EPROTONOSUPPORT);
+    }
     match (sock_type, protocol) {
         (SOCK_STREAM, 0 | IPPROTO_TCP) => Ok(()),
         (SOCK_DGRAM, 0 | IPPROTO_UDP) => Ok(()),
@@ -150,7 +166,10 @@ fn find_bound_socket(
 }
 
 fn copy_sockaddr_from_user(addr: usize, addrlen: usize) -> Result<Vec<u8>, SysErrNo> {
-    if addr == 0 || addrlen < core::mem::size_of::<u16>() || addrlen > MAX_SOCKADDR_LEN {
+    if addr == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if addrlen < core::mem::size_of::<u16>() || addrlen > MAX_SOCKADDR_LEN {
         return Err(SysErrNo::EINVAL);
     }
     let mut buf = alloc::vec![0u8; addrlen];
@@ -163,6 +182,23 @@ fn sockaddr_family(addr: &[u8]) -> i32 {
         return 0;
     }
     u16::from_ne_bytes([addr[0], addr[1]]) as i32
+}
+
+fn min_sockaddr_len_for_family(family: i32) -> Result<usize, SysErrNo> {
+    match family {
+        AF_UNIX => Ok(2),
+        AF_INET => Ok(16),
+        AF_INET6 => Ok(28),
+        0 => Err(SysErrNo::EAFNOSUPPORT),
+        _ => Err(SysErrNo::EAFNOSUPPORT),
+    }
+}
+
+fn validate_sockaddr_len(addr: &[u8]) -> Result<(), SysErrNo> {
+    if addr.len() < min_sockaddr_len_for_family(sockaddr_family(addr))? {
+        return Err(SysErrNo::EINVAL);
+    }
+    Ok(())
 }
 
 fn sockaddr_matches_domain(socket: &SocketState, addr: &[u8]) -> bool {
@@ -180,6 +216,25 @@ fn sockaddr_port(addr: &[u8]) -> Option<u16> {
 fn set_sockaddr_port(addr: &mut [u8], port: u16) {
     if matches!(sockaddr_family(addr), AF_INET | AF_INET6) && addr.len() >= 4 {
         addr[2..4].copy_from_slice(&port.to_be_bytes());
+    }
+}
+
+fn sockaddr_in_addr(addr: &[u8]) -> Option<[u8; 4]> {
+    if sockaddr_family(addr) == AF_INET && addr.len() >= 8 {
+        Some([addr[4], addr[5], addr[6], addr[7]])
+    } else {
+        None
+    }
+}
+
+fn sockaddr_is_local_bind(addr: &[u8]) -> bool {
+    match sockaddr_family(addr) {
+        AF_INET => sockaddr_in_addr(addr)
+            .map(|ip| ip == [0, 0, 0, 0] || ip == INADDR_LOOPBACK)
+            .unwrap_or(false),
+        AF_INET6 => addr.len() >= 24 && addr[8..24].iter().all(|byte| *byte == 0),
+        AF_UNIX => true,
+        _ => false,
     }
 }
 
@@ -207,6 +262,59 @@ fn assign_ephemeral_port_if_needed(addr: &mut [u8]) {
     }
 }
 
+fn sockaddr_un_path(addr: &[u8]) -> Option<String> {
+    if sockaddr_family(addr) != AF_UNIX || addr.len() <= 2 {
+        return None;
+    }
+    let path = &addr[2..];
+    if path.first().copied() == Some(0) {
+        return None;
+    }
+    let len = path.iter().position(|byte| *byte == 0).unwrap_or(path.len());
+    if len == 0 {
+        None
+    } else {
+        core::str::from_utf8(&path[..len])
+            .ok()
+            .map(|value| value.to_string())
+    }
+}
+
+fn current_root_cwd() -> Result<(String, String), SysErrNo> {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let fs = task.fs.lock();
+    Ok((fs.root.clone(), fs.cwd.clone()))
+}
+
+fn validate_unix_bind_path(path: &str) -> Result<String, SysErrNo> {
+    let (root, cwd) = current_root_cwd()?;
+    let logical = fs::resolve_path(&cwd, path);
+    let host = fs::apply_root(&root, &logical);
+    match fs::metadata(&host, false) {
+        Ok(meta) => {
+            if meta.kind == VfsNodeKind::Directory {
+                Err(SysErrNo::EAFNOSUPPORT)
+            } else {
+                Err(SysErrNo::EADDRINUSE)
+            }
+        }
+        Err(SysErrNo::ENOENT) => {
+            let parent = fs::parent_path(&host);
+            match fs::metadata(&parent, true) {
+                Ok(meta) if meta.kind == VfsNodeKind::Directory => Ok(host),
+                Ok(_) => Err(SysErrNo::ENOTDIR),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn bind_unix_path(host_path: &str) -> Result<(), SysErrNo> {
+    fs::create_special_node(host_path, MemSpecialKind::Socket, 0o777)?;
+    Ok(())
+}
+
 fn default_sockaddr(domain: i32) -> Vec<u8> {
     let len = match domain {
         AF_INET => 16,
@@ -224,6 +332,9 @@ fn copy_sockaddr_to_user(addr: usize, addrlen: usize, stored: &[u8]) -> Result<(
         return Err(SysErrNo::EFAULT);
     }
     let user_len = super::user::copy_object_from_user::<u32>(addrlen)? as usize;
+    if user_len > i32::MAX as usize {
+        return Err(SysErrNo::EINVAL);
+    }
     if user_len != 0 {
         let copy_len = user_len.min(stored.len());
         super::user::copy_to_user(addr, &stored[..copy_len])?;
@@ -232,9 +343,19 @@ fn copy_sockaddr_to_user(addr: usize, addrlen: usize, stored: &[u8]) -> Result<(
     super::user::copy_object_to_user(addrlen, &stored_len)
 }
 
-fn validate_msg_flags(flags: usize) -> Result<(), SysErrNo> {
+fn validate_send_flags(flags: usize) -> Result<(), SysErrNo> {
     if flags & !MSG_SUPPORTED != 0 {
         Err(SysErrNo::EOPNOTSUPP)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_recv_flags(flags: usize) -> Result<(), SysErrNo> {
+    if flags & MSG_ERRQUEUE != 0 {
+        Err(SysErrNo::EAGAIN)
+    } else if flags & MSG_OOB != 0 || flags & !MSG_SUPPORTED != 0 {
+        Err(SysErrNo::EINVAL)
     } else {
         Ok(())
     }
@@ -245,6 +366,9 @@ fn copy_i32_option_out(optval: usize, optlen: usize, value: i32) -> Result<(), S
         return Err(SysErrNo::EFAULT);
     }
     let user_len = super::user::copy_object_from_user::<u32>(optlen)? as usize;
+    if user_len > i32::MAX as usize {
+        return Err(SysErrNo::EINVAL);
+    }
     let bytes = value.to_ne_bytes();
     let copy_len = user_len.min(bytes.len());
     if copy_len != 0 {
@@ -255,14 +379,20 @@ fn copy_i32_option_out(optval: usize, optlen: usize, value: i32) -> Result<(), S
 }
 
 fn copy_i32_option_in(optval: usize, optlen: usize) -> Result<i32, SysErrNo> {
-    if optval == 0 || optlen < core::mem::size_of::<i32>() {
+    if optval == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if optlen < core::mem::size_of::<i32>() {
         return Err(SysErrNo::EINVAL);
     }
     super::user::copy_object_from_user::<i32>(optval)
 }
 
 fn copy_timeval_option_in(optval: usize, optlen: usize) -> Result<Option<usize>, SysErrNo> {
-    if optval == 0 || optlen < core::mem::size_of::<TimeVal>() {
+    if optval == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    if optlen < core::mem::size_of::<TimeVal>() {
         return Err(SysErrNo::EINVAL);
     }
     let tv = super::user::copy_object_from_user::<TimeVal>(optval)?;
@@ -276,6 +406,46 @@ fn copy_timeval_option_in(optval: usize, optlen: usize) -> Result<Option<usize>,
         Ok(None)
     } else {
         Ok(Some(us))
+    }
+}
+
+fn validate_sockopt_user(optval: usize, optlen: usize, output: bool) -> Result<usize, SysErrNo> {
+    if optval == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let len = if output {
+        if optlen == 0 {
+            return Err(SysErrNo::EFAULT);
+        }
+        super::user::copy_object_from_user::<u32>(optlen)? as usize
+    } else {
+        if optlen == 0 {
+            return Err(SysErrNo::EINVAL);
+        }
+        optlen
+    };
+    if len > i32::MAX as usize {
+        return Err(SysErrNo::EINVAL);
+    }
+    if output {
+        super::user::check_user_readable(optval, len.min(core::mem::size_of::<i32>()))?;
+    } else {
+        super::user::check_user_readable(optval, len.min(core::mem::size_of::<i32>()))?;
+    }
+    Ok(len)
+}
+
+fn unsupported_getsockopt_errno(level: usize) -> SysErrNo {
+    match level {
+        level if level == IPPROTO_IP as usize => SysErrNo::ENOPROTOOPT,
+        level if level == IPPROTO_TCP as usize => SysErrNo::ENOPROTOOPT,
+        _ => SysErrNo::EOPNOTSUPP,
+    }
+}
+
+fn send_sigpipe_if_needed(flags: usize) {
+    if flags & MSG_NOSIGNAL == 0 {
+        crate::syscall::signal::send_sigpipe_to_current();
     }
 }
 
@@ -309,12 +479,13 @@ pub fn sys_socketpair(domain: usize, raw_type: usize, protocol: usize, sv: usize
         return Err(SysErrNo::EFAULT);
     }
     let domain = domain as i32;
-    if domain != AF_UNIX {
-        return Err(SysErrNo::EOPNOTSUPP);
-    }
     let (sock_type, nonblock, flags) = socket_type(raw_type)?;
     let protocol = protocol as i32;
     validate_protocol(sock_type, protocol)?;
+    if domain != AF_UNIX {
+        validate_domain(domain)?;
+        return Err(SysErrNo::EOPNOTSUPP);
+    }
 
     let left = Arc::new(Mutex::new(SocketState::new(
         domain, sock_type, protocol, nonblock,
@@ -379,6 +550,7 @@ pub fn sys_socketpair(domain: usize, raw_type: usize, protocol: usize, sv: usize
 
 pub fn sys_bind(fd: usize, addr: usize, addrlen: usize) -> SyscallRet {
     let mut sockaddr = copy_sockaddr_from_user(addr, addrlen)?;
+    validate_sockaddr_len(&sockaddr)?;
     let state = socket_state_for_fd(fd)?;
     let mut socket = state.lock();
     if !sockaddr_matches_domain(&socket, &sockaddr) {
@@ -386,6 +558,31 @@ pub fn sys_bind(fd: usize, addr: usize, addrlen: usize) -> SyscallRet {
     }
     if socket.bound {
         return Err(SysErrNo::EINVAL);
+    }
+    let unix_path = if socket.domain == AF_UNIX {
+        sockaddr_un_path(&sockaddr)
+    } else {
+        None
+    };
+    let unix_host_path = if let Some(path) = unix_path.as_deref() {
+        Some(validate_unix_bind_path(path)?)
+    } else {
+        None
+    };
+    if matches!(socket.domain, AF_INET | AF_INET6) && !sockaddr_is_local_bind(&sockaddr) {
+        return Err(SysErrNo::EADDRNOTAVAIL);
+    }
+    let privileged_port = match sockaddr_port(&sockaddr) {
+        Some(port) => port != 0 && port < 1024,
+        None => false,
+    };
+    if matches!(socket.domain, AF_INET | AF_INET6)
+        && privileged_port
+        && !current_task()
+            .map(|task| task.credentials.lock().is_root_capable())
+            .unwrap_or(false)
+    {
+        return Err(SysErrNo::EACCES);
     }
     assign_ephemeral_port_if_needed(&mut sockaddr);
     register_bound_socket(
@@ -395,6 +592,9 @@ pub fn sys_bind(fd: usize, addr: usize, addrlen: usize) -> SyscallRet {
         &state,
         socket.reuse_addr,
     )?;
+    if let Some(path) = unix_host_path {
+        bind_unix_path(&path)?;
+    }
     socket.local_addr = Some(sockaddr);
     socket.bound = true;
     Ok(0)
@@ -425,7 +625,10 @@ pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: usize) -> Sysc
     }
     let state = socket_state_for_fd(fd)?;
     let mut socket = state.lock();
-    if !socket.is_stream() || !socket.listening {
+    if !socket.is_stream() {
+        return Err(SysErrNo::EOPNOTSUPP);
+    }
+    if !socket.listening {
         return Err(SysErrNo::EINVAL);
     }
     if let Some(accepted) = socket.pending.pop_front() {
@@ -463,6 +666,7 @@ pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: usize) -> Sysc
 
 pub fn sys_connect(fd: usize, addr: usize, addrlen: usize) -> SyscallRet {
     let peer = copy_sockaddr_from_user(addr, addrlen)?;
+    validate_sockaddr_len(&peer)?;
     let state = socket_state_for_fd(fd)?;
     let mut socket = state.lock();
     if !sockaddr_matches_domain(&socket, &peer) {
@@ -546,26 +750,33 @@ pub fn sys_sendto(
     dest_addr: usize,
     addrlen: usize,
 ) -> SyscallRet {
-    validate_msg_flags(flags)?;
+    validate_send_flags(flags)?;
     if len != 0 && buf == 0 {
         return Err(SysErrNo::EFAULT);
     }
-    let dest = if dest_addr != 0 {
-        Some(copy_sockaddr_from_user(dest_addr, addrlen)?)
-    } else {
-        None
-    };
     if len == 0 {
         return Ok(0);
     }
     let state = socket_state_for_fd(fd)?;
     let socket = state.lock();
     if socket.shutdown_write {
+        send_sigpipe_if_needed(flags);
         return Err(SysErrNo::EPIPE);
     }
     if socket.is_stream() && !socket.connected {
-        return Err(SysErrNo::ENOTCONN);
+        send_sigpipe_if_needed(flags);
+        return Err(SysErrNo::EPIPE);
     }
+    if socket.is_datagram() && len > UDP_MAX_PAYLOAD {
+        return Err(SysErrNo::EMSGSIZE);
+    }
+    let dest = if socket.is_datagram() && dest_addr != 0 {
+        let addr = copy_sockaddr_from_user(dest_addr, addrlen)?;
+        validate_sockaddr_len(&addr)?;
+        Some(addr)
+    } else {
+        None
+    };
     let mut data = alloc::vec![0u8; len];
     super::user::copy_from_user(buf, &mut data)?;
     if socket.is_datagram() {
@@ -603,9 +814,15 @@ pub fn sys_recvfrom(
     src_addr: usize,
     addrlen: usize,
 ) -> SyscallRet {
-    validate_msg_flags(flags)?;
+    validate_recv_flags(flags)?;
     if len != 0 && buf == 0 {
         return Err(SysErrNo::EFAULT);
+    }
+    if src_addr != 0 {
+        let user_len = super::user::copy_object_from_user::<u32>(addrlen)? as usize;
+        if user_len > i32::MAX as usize {
+            return Err(SysErrNo::EINVAL);
+        }
     }
     if len == 0 {
         return Ok(0);
@@ -657,8 +874,13 @@ pub fn sys_setsockopt(
     optlen: usize,
 ) -> SyscallRet {
     let state = socket_state_for_fd(fd)?;
+    validate_sockopt_user(optval, optlen, false)?;
     let mut socket = state.lock();
     match (level, optname) {
+        (SOL_SOCKET, SO_OOBINLINE) => {
+            let _ = copy_i32_option_in(optval, optlen)?;
+            Ok(0)
+        }
         (SOL_SOCKET, SO_REUSEADDR) => {
             socket.reuse_addr = copy_i32_option_in(optval, optlen)? != 0;
             Ok(0)
@@ -707,7 +929,11 @@ pub fn sys_getsockopt(
     optlen: usize,
 ) -> SyscallRet {
     let state = socket_state_for_fd(fd)?;
+    let user_len = validate_sockopt_user(optval, optlen, true)?;
     let socket = state.lock();
+    if user_len < core::mem::size_of::<i32>() {
+        return Err(SysErrNo::EINVAL);
+    }
     let value = match (level, optname) {
         (SOL_SOCKET, SO_TYPE) => socket.sock_type as i32,
         (SOL_SOCKET, SO_ERROR) => socket.error,
@@ -718,10 +944,11 @@ pub fn sys_getsockopt(
         (SOL_SOCKET, SO_BROADCAST) => socket.broadcast as i32,
         (SOL_SOCKET, SO_SNDBUF) => socket.sndbuf as i32,
         (SOL_SOCKET, SO_RCVBUF) => socket.rcvbuf as i32,
+        (SOL_SOCKET, SO_OOBINLINE) => 0,
         (level, TCP_NODELAY) if level == IPPROTO_TCP as usize && socket.is_stream() => {
             socket.tcp_nodelay as i32
         }
-        _ => return Err(SysErrNo::ENOPROTOOPT),
+        _ => return Err(unsupported_getsockopt_errno(level)),
     };
     drop(socket);
     copy_i32_option_out(optval, optlen, value)?;

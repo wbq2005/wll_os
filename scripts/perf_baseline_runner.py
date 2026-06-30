@@ -34,12 +34,16 @@ FOCUSED_LTP_CASES_20260630 = "fcntl23"
 FOCUSED_LTP_CASES_20260630_PGRP = (
     "getpgid01,getpgid02,setpgid01,setpgid02,setsid01,getsid01"
 )
+FOCUSED_LTP_CASES_20260630_NET = (
+    "socket01,socket02,socketpair01,socketpair02,bind01,bind02,listen01,accept01,accept4_01,connect01,sendto01,recvfrom01,getsockname01,getpeername01,getsockopt01,setsockopt01"
+)
 FOCUSED_LTP_CASES = ",".join(
     (
         FOCUSED_LTP_CASES_BASE,
         FOCUSED_LTP_CASES_20260629,
         FOCUSED_LTP_CASES_20260630,
         FOCUSED_LTP_CASES_20260630_PGRP,
+        FOCUSED_LTP_CASES_20260630_NET,
     )
 )
 

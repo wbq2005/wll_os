@@ -13,7 +13,8 @@ FOCUSED_LTP_CASES_BASE := writev01,setegid02,getgroups01,setgroups01,setgroups02
 FOCUSED_LTP_CASES_20260629 := copy_file_range01,creat01,creat03,creat04,creat05,faccessat02,faccessat201,faccessat202,fallocate04,fchmodat01,fchmodat02,fchownat01,fchownat02,fcntl14,fcntl17,fcntl36,ftruncate03,getxattr01,getxattr02,link02,link04,link05,linkat01,listxattr01,mkdirat01,mkdirat02,open14,openat01,openat02,openat03,openat04,openat201,openat202,openat203,readlinkat02,removexattr01,rename01,rename03,rename04,rename05,rename06,rename07,rename08,rename09,rename10,rename12,rename13,rename14,renameat201,renameat202,sendfile06,setxattr01,setxattr02,statx01,statx02,statx03,truncate02,unlinkat01
 FOCUSED_LTP_CASES_20260630 := fcntl23
 FOCUSED_LTP_CASES_20260630_PGRP := getpgid01,getpgid02,setpgid01,setpgid02,setsid01,getsid01
-FOCUSED_LTP_CASES ?= $(FOCUSED_LTP_CASES_BASE),$(FOCUSED_LTP_CASES_20260629),$(FOCUSED_LTP_CASES_20260630),$(FOCUSED_LTP_CASES_20260630_PGRP)
+FOCUSED_LTP_CASES_20260630_NET := socket01,socket02,socketpair01,socketpair02,bind01,bind02,listen01,accept01,accept4_01,connect01,sendto01,recvfrom01,getsockname01,getpeername01,getsockopt01,setsockopt01
+FOCUSED_LTP_CASES ?= $(FOCUSED_LTP_CASES_BASE),$(FOCUSED_LTP_CASES_20260629),$(FOCUSED_LTP_CASES_20260630),$(FOCUSED_LTP_CASES_20260630_PGRP),$(FOCUSED_LTP_CASES_20260630_NET)
 RUSTUP_TOOLCHAIN ?= $(shell sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null | head -n 1)
 ifeq ($(strip $(RUSTUP_TOOLCHAIN)),)
     # Keep judge builds on the repository-pinned compiler. Falling back to the
