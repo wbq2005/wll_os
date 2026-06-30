@@ -534,6 +534,74 @@ fn procfs_link_source(path: &str) -> bool {
     local == "/proc" || local.starts_with("/proc/")
 }
 
+fn proc_pid_stat_path(path: &str) -> Option<(String, usize)> {
+    let norm = normalize_path(path);
+    let local = local_device_path(&norm);
+    let rest = local.strip_prefix("/proc/")?;
+    let (pid_text, tail) = rest.split_once('/')?;
+    if tail != "stat" || pid_text.is_empty() || !pid_text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid = pid_text.parse::<usize>().ok()?;
+    Some((norm, pid))
+}
+
+fn proc_pid_stat_text(pid: usize) -> Result<Vec<u8>, SysErrNo> {
+    let task = crate::task::manager::find_task(pid).ok_or(SysErrNo::ENOENT)?;
+    let (comm, ppid, pgid, sid) = {
+        let inner = task.inner.lock();
+        let comm = inner
+            .exec_path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("wll_OS")
+            .chars()
+            .filter(|ch| *ch != '(' && *ch != ')')
+            .take(15)
+            .collect::<String>();
+        let ppid = inner
+            .parent
+            .as_ref()
+            .map(|parent| parent.thread_group.tgid())
+            .unwrap_or(0);
+        (comm, ppid, inner.pgid, inner.sid)
+    };
+    let state = match task.status() {
+        crate::task::TaskStatus::Zombie => 'Z',
+        crate::task::TaskStatus::Stopped => 'T',
+        crate::task::TaskStatus::Blocked => 'S',
+        _ => 'R',
+    };
+    Ok(alloc::format!(
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        task.thread_group.tgid(),
+        comm,
+        state,
+        ppid,
+        pgid,
+        sid
+    )
+    .into_bytes())
+}
+
+fn refresh_proc_pid_stat(path: &str) -> Result<(), SysErrNo> {
+    let Some((norm, pid)) = proc_pid_stat_path(path) else {
+        return Ok(());
+    };
+    let data = proc_pid_stat_text(pid)?;
+    let now = super::FileTimes::now();
+    let mut fs = MEM_FS.lock();
+    let parent = parent_path(&norm);
+    if !fs.is_dir(&parent) {
+        fs.add_dir(&parent);
+    }
+    if !fs.write_file_content(&norm, fd::MemFileContent::from_slice(&data), now) {
+        fs.add_file_with_mode(&norm, data, 0o444);
+    }
+    Ok(())
+}
+
 pub fn path_crosses_mountpoint(path: &str) -> bool {
     let norm = normalize_path(path);
     if procfs_link_source(&norm) {
@@ -3086,6 +3154,7 @@ pub fn open_path(
 
     let path_norm = normalize_path(host_path);
     let logical_norm = normalize_path(logical_path);
+    refresh_proc_pid_stat(&path_norm)?;
     let accmode = flags & O_ACCMODE;
     if accmode == O_ACCMODE {
         return Err(SysErrNo::EINVAL);

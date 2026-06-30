@@ -1038,12 +1038,20 @@ fn run_user_program_spec_foreground(spec: &UserProgramSpec) -> Result<(), SysErr
 }
 
 fn run_user_program_spec_foreground_exit_code(spec: &UserProgramSpec) -> Result<i32, SysErrNo> {
+    let harness = current_task();
     let task = match TaskControlBlock::new_user_with_args_env_cwd(spec) {
         Ok(task) => task,
         Err(err) => return Err(err),
     };
 
-    let harness = current_task();
+    // A real LTP binary is normally launched by a shell/test runner inside the
+    // runner's session, not as a fresh session leader. Keep each foreground test
+    // as its own process-group leader for signal/wait isolation, but inherit the
+    // harness session so Linux setpgid(2)/setsid(2) rules see realistic state.
+    if let Some(ref h) = harness {
+        let harness_sid = h.inner.lock().sid;
+        task.inner.lock().sid = harness_sid;
+    }
     let _foreground = ForegroundDriverGuard::enter();
 
     run_user_task_foreground(task.clone(), foreground_timeout_us(spec));

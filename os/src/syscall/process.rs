@@ -764,6 +764,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
 
             // 重置堆
             inner.exec_path = exec_logical_path.clone();
+            inner.has_execed = true;
             inner.robust_list_head = 0;
             inner.robust_list_len = 0;
             let closed = inner.fd_table.lock().close_on_exec();
@@ -1232,6 +1233,7 @@ pub fn sys_clone(
             cwd: fs_snapshot.cwd.clone(),
             root: fs_snapshot.root.clone(),
             exec_path,
+            has_execed: false,
             pgid,
             sid,
             program_break: mm_snapshot.program_break,
