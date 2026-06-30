@@ -1,12 +1,14 @@
 use super::SyscallRet;
 use crate::console::putchar;
-use crate::task::wait_queue::{sleep_on_io_if, sleep_on_io_key_if, WaitOutcome};
+use crate::task::wait_queue::{sleep_on_io_if, sleep_on_io_key_if, WaitKey, WaitOutcome};
 use crate::task::{current_task, SharedFdTable};
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
 
 use crate::fs::fd::{self, FileDescriptor};
 use alloc::vec::Vec;
+use lazy_static::lazy_static;
+use spin::Mutex;
 
 /// 标准文件描述符
 const FD_STDOUT: usize = 1;
@@ -15,6 +17,7 @@ const AT_FDCWD: isize = -100;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_NO_AUTOMOUNT: usize = 0x800;
 const AT_STATX_SYNC_TYPE: usize = 0x6000;
+const STATX_RESERVED: usize = 0x8000_0000;
 const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFCHR: u32 = 0o020000;
@@ -27,7 +30,16 @@ const F_GETFD: usize = 1;
 const F_SETFD: usize = 2;
 const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
+const F_GETLK: usize = 5;
+const F_SETLK: usize = 6;
+const F_SETLKW: usize = 7;
+const F_OFD_GETLK: usize = 36;
+const F_OFD_SETLK: usize = 37;
+const F_OFD_SETLKW: usize = 38;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
 const FIONREAD: usize = 0x541B;
 const FIONBIO: usize = 0x5421;
 const FS_IOC_GETFLAGS: usize = 0x8008_6601;
@@ -67,6 +79,7 @@ const SPLICE_F_MORE: usize = 0x04;
 const SPLICE_F_GIFT: usize = 0x08;
 const SPLICE_F_ALL: usize = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
 const SPLICE_CHUNK: usize = 64 * 1024;
+const COPY_FILE_RANGE_CHUNK: usize = 64 * 1024;
 
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EACCESS: usize = 0x200;
@@ -74,6 +87,24 @@ const UTIME_NOW: isize = 0x3fffffff;
 const UTIME_OMIT: isize = 0x3ffffffe;
 const IOV_MAX: usize = 1024;
 const NAME_MAX: usize = 255;
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+const RESOLVE_KNOWN_MASK: u64 = RESOLVE_NO_XDEV
+    | RESOLVE_NO_MAGICLINKS
+    | RESOLVE_NO_SYMLINKS
+    | RESOLVE_BENEATH
+    | RESOLVE_IN_ROOT;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1029,6 +1060,176 @@ fn resolve_host_path(dirfd: isize, pathname: *const u8) -> Result<(String, Strin
     Ok((logical, host))
 }
 
+fn path_has_parent_component(path: &str) -> bool {
+    path.split('/').any(|component| component == "..")
+}
+
+fn path_is_under_or_same(path: &str, base: &str) -> bool {
+    let path = crate::fs::normalize_path(path);
+    let base = crate::fs::normalize_path(base);
+    path == base
+        || (base != "/"
+            && path
+                .strip_prefix(base.as_str())
+                .is_some_and(|tail| tail.starts_with('/')))
+}
+
+fn resolve_path_in_root_str(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
+    if path.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+    check_path_component_lengths(path)?;
+    let base = resolve_base_dir(dirfd)?;
+    let mut components: Vec<String> = base
+        .trim_matches('/')
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .map(String::from)
+        .collect();
+    let root_len = components.len();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.len() > root_len {
+                    components.pop();
+                }
+            }
+            name => components.push(String::from(name)),
+        }
+    }
+    if components.is_empty() {
+        Ok(String::from("/"))
+    } else {
+        Ok(crate::fs::normalize_path(&alloc::format!(
+            "/{}",
+            components.join("/")
+        )))
+    }
+}
+
+fn openat2_resolve_path_str(
+    dirfd: isize,
+    path: &str,
+    resolve: u64,
+) -> Result<(String, String), SysErrNo> {
+    if resolve & RESOLVE_BENEATH != 0 && (path.starts_with('/') || path_has_parent_component(path))
+    {
+        return Err(SysErrNo::EXDEV);
+    }
+
+    let logical = if resolve & RESOLVE_IN_ROOT != 0 {
+        resolve_path_in_root_str(dirfd, path)?
+    } else {
+        resolve_path_str(dirfd, path)?
+    };
+
+    if resolve & RESOLVE_BENEATH != 0 {
+        let base = resolve_base_dir(dirfd)?;
+        if !path_is_under_or_same(&logical, &base) {
+            return Err(SysErrNo::EXDEV);
+        }
+    }
+
+    let root = current_root()?;
+    let host = crate::fs::apply_root(&root, &logical);
+
+    if (resolve & (RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS)) != 0
+        && is_proc_magic_link_path(&logical)
+    {
+        return Err(SysErrNo::ELOOP);
+    }
+
+    if resolve & RESOLVE_NO_XDEV != 0 && crate::fs::path_crosses_mountpoint(&host) {
+        return Err(SysErrNo::EXDEV);
+    }
+
+    if resolve & RESOLVE_NO_SYMLINKS != 0
+        && super::with_kernel_page_table(|| crate::fs::path_contains_symlink(&host))?
+    {
+        return Err(SysErrNo::ELOOP);
+    }
+
+    Ok((logical, host))
+}
+
+fn copy_open_how_from_user(how: *const OpenHow, size: usize) -> Result<OpenHow, SysErrNo> {
+    let expected = core::mem::size_of::<OpenHow>();
+    if size < expected {
+        return Err(SysErrNo::EINVAL);
+    }
+    let value = copy_object_from_user(how)?;
+    if size > expected {
+        let extra_len = size - expected;
+        if extra_len > 4096 {
+            return Err(SysErrNo::E2BIG);
+        }
+        let extra_addr = (how as usize).checked_add(expected).ok_or(SysErrNo::EFAULT)?;
+        let mut extra = Vec::new();
+        extra.resize(extra_len, 0);
+        super::user::copy_from_user(extra_addr, &mut extra)?;
+        if extra.iter().any(|byte| *byte != 0) {
+            return Err(SysErrNo::E2BIG);
+        }
+    }
+    Ok(value)
+}
+
+fn validate_openat2_how(how: OpenHow) -> Result<(u32, u32, u64), SysErrNo> {
+    const O_NOCTTY: u64 = 0o00000400;
+    const O_NONBLOCK: u64 = 0o00004000;
+    const O_DSYNC: u64 = 0o00010000;
+    const O_ASYNC: u64 = 0o00020000;
+    const O_DIRECT: u64 = 0o00040000;
+    const O_LARGEFILE: u64 = 0o00100000;
+    const O_SYNC: u64 = 0o04010000;
+    let known_flags = fd::open_flags::O_ACCMODE as u64
+        | fd::open_flags::O_CREAT as u64
+        | fd::open_flags::O_EXCL as u64
+        | O_NOCTTY
+        | fd::open_flags::O_TRUNC as u64
+        | fd::open_flags::O_APPEND as u64
+        | O_NONBLOCK
+        | O_DSYNC
+        | O_ASYNC
+        | O_DIRECT
+        | O_LARGEFILE
+        | fd::open_flags::O_DIRECTORY as u64
+        | fd::open_flags::O_NOFOLLOW as u64
+        | fd::open_flags::O_NOATIME as u64
+        | fd::open_flags::O_CLOEXEC as u64
+        | O_SYNC
+        | fd::open_flags::O_PATH as u64
+        | fd::open_flags::O_TMPFILE as u64;
+    if how.flags & !known_flags != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let tmpfile_bit = fd::open_flags::O_TMPFILE as u64 & !(fd::open_flags::O_DIRECTORY as u64);
+    if (how.flags & tmpfile_bit) != 0
+        && (how.flags & fd::open_flags::O_TMPFILE as u64) != fd::open_flags::O_TMPFILE as u64
+    {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    if how.mode & !0o7777 != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if how.mode != 0
+        && (how.flags & (fd::open_flags::O_CREAT as u64 | fd::open_flags::O_TMPFILE as u64)) == 0
+    {
+        return Err(SysErrNo::EINVAL);
+    }
+    if how.resolve & !RESOLVE_KNOWN_MASK != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if (how.resolve & RESOLVE_BENEATH) != 0 && (how.resolve & RESOLVE_IN_ROOT) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    Ok((how.flags as u32, how.mode as u32, how.resolve))
+}
+
 fn parse_decimal_fd(text: &str) -> Result<usize, SysErrNo> {
     if text.is_empty() || !text.as_bytes().iter().all(|b| b.is_ascii_digit()) {
         return Err(SysErrNo::ENOENT);
@@ -1054,6 +1255,75 @@ fn proc_self_fd_number(logical_path: &str) -> Result<Option<usize>, SysErrNo> {
         }
     }
     Ok(None)
+}
+
+fn proc_self_fd_target(logical_path: &str) -> Result<Option<String>, SysErrNo> {
+    let Some(fd) = proc_self_fd_number(logical_path)? else {
+        return Ok(None);
+    };
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    let target = match file_desc {
+        FileDescriptor::MemFile { name, linked, .. } => {
+            if *linked {
+                name.clone()
+            } else {
+                alloc::format!("{} (deleted)", name)
+            }
+        }
+        FileDescriptor::MemDir { path, .. } => path.clone(),
+        FileDescriptor::Ext4Regular { ino, .. } => alloc::format!("anon_inode:[ext4:{}]", ino),
+        FileDescriptor::Ext4Dir { path, .. } => path.clone(),
+        FileDescriptor::Path { logical_path, .. } => logical_path.clone(),
+        FileDescriptor::Stdin => String::from("/dev/stdin"),
+        FileDescriptor::Stdout => String::from("/dev/stdout"),
+        FileDescriptor::Stderr => String::from("/dev/stderr"),
+        FileDescriptor::LoopControl => String::from("/dev/loop-control"),
+        FileDescriptor::LoopDevice { index, .. } => alloc::format!("/dev/loop{}", index),
+        FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
+            String::from("pipe:[0]")
+        }
+        FileDescriptor::Socket { .. } => String::from("socket:[0]"),
+        FileDescriptor::EventFd { .. } => String::from("anon_inode:[eventfd]"),
+        FileDescriptor::Epoll { .. } => String::from("anon_inode:[eventpoll]"),
+    };
+    Ok(Some(target))
+}
+
+fn local_pseudo_path(path: &str) -> &str {
+    for root in ["/glibc", "/musl"] {
+        if let Some(tail) = path.strip_prefix(root) {
+            return if tail.is_empty() {
+                "/"
+            } else if tail.starts_with('/') {
+                tail
+            } else {
+                path
+            };
+        }
+    }
+    path
+}
+
+fn is_proc_magic_link_path(path: &str) -> bool {
+    matches!(
+        local_pseudo_path(path),
+        "/proc/self/exe" | "/proc/thread-self/exe"
+    )
+}
+
+fn proc_magic_link_target(logical_path: &str) -> Result<Option<String>, SysErrNo> {
+    if !is_proc_magic_link_path(logical_path) {
+        return Ok(None);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let exec_path = task.inner.lock().exec_path.clone();
+    if exec_path.is_empty() {
+        return Err(SysErrNo::ENOENT);
+    }
+    Ok(Some(exec_path))
 }
 
 fn resolve_base_dir(dirfd: isize) -> Result<String, SysErrNo> {
@@ -1162,6 +1432,14 @@ fn check_statx_flags(flags: usize) -> Result<(), SysErrNo> {
     }
 }
 
+fn check_statx_mask(mask: usize) -> Result<(), SysErrNo> {
+    if mask & STATX_RESERVED != 0 {
+        Err(SysErrNo::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
 fn copy_kstat_out(statbuf: *mut u8, st: &KStat) -> Result<(), SysErrNo> {
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -1229,6 +1507,501 @@ fn copy_statfs_out(buf: *mut u8, st: &StatFs) -> Result<(), SysErrNo> {
         )
     };
     copy_to_user(buf, bytes)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum FileLockKey {
+    MemInode(u64),
+    MemPath(String),
+    Ext4(u32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileLockOwner {
+    Posix(usize),
+    Ofd(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileLockKind {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy)]
+struct FileLockRange {
+    start: u64,
+    end: Option<u64>,
+}
+
+#[derive(Clone)]
+struct FileRecordLock {
+    file: FileLockKey,
+    owner: FileLockOwner,
+    pid: usize,
+    kind: FileLockKind,
+    range: FileLockRange,
+}
+
+#[derive(Clone, Copy)]
+struct FileLockWaiter {
+    waiter: FileLockOwner,
+    waiting_for: FileLockOwner,
+}
+
+#[derive(Clone, Copy)]
+struct UserFlock64 {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+}
+
+lazy_static! {
+    static ref FILE_RECORD_LOCKS: Mutex<Vec<FileRecordLock>> = Mutex::new(Vec::new());
+    static ref FILE_LOCK_WAITERS: Mutex<Vec<FileLockWaiter>> = Mutex::new(Vec::new());
+}
+
+fn file_lock_hash_bytes(mut hash: usize, bytes: &[u8]) -> usize {
+    for &byte in bytes {
+        hash ^= byte as usize;
+        hash = hash.wrapping_mul(0x0100_0000_01b3usize);
+    }
+    hash
+}
+
+fn file_lock_wait_key(file: &FileLockKey) -> WaitKey {
+    let hash = match file {
+        FileLockKey::MemInode(ino) => {
+            file_lock_hash_bytes(0xcbf2_9ce4_8422_2325usize, &ino.to_ne_bytes())
+        }
+        FileLockKey::MemPath(name) => {
+            file_lock_hash_bytes(0x9ce4_8422_2325_cbf2usize, name.as_bytes())
+        }
+        FileLockKey::Ext4(ino) => {
+            file_lock_hash_bytes(0x8422_2325_cbf2_9ce4usize, &ino.to_ne_bytes())
+        }
+    };
+    WaitKey::new(hash, 0x464c_4f43)
+}
+
+fn fd_lock_key(file_desc: &FileDescriptor) -> Option<FileLockKey> {
+    match file_desc {
+        FileDescriptor::MemFile { name, node, .. } => {
+            let ino = node
+                .and_then(|metadata| (metadata.ino != 0).then_some(metadata.ino))
+                .or_else(|| crate::fs::MEM_FS.lock().inode(name));
+            Some(match ino {
+                Some(ino) => FileLockKey::MemInode(ino),
+                None => FileLockKey::MemPath(name.clone()),
+            })
+        }
+        FileDescriptor::Ext4Regular { ino, .. } => Some(FileLockKey::Ext4(*ino)),
+        _ => None,
+    }
+}
+
+fn fd_lock_offset(file_desc: &FileDescriptor) -> usize {
+    match file_desc {
+        FileDescriptor::MemFile { offset, .. } | FileDescriptor::Ext4Regular { offset, .. } => {
+            *offset
+        }
+        _ => 0,
+    }
+}
+
+fn flock_i16(bytes: &[u8], offset: usize) -> i16 {
+    i16::from_ne_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn flock_i32(bytes: &[u8], offset: usize) -> i32 {
+    i32::from_ne_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn flock_i64(bytes: &[u8], offset: usize) -> i64 {
+    i64::from_ne_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn copy_flock_from_user(arg: usize) -> Result<UserFlock64, SysErrNo> {
+    if arg == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let mut bytes = [0u8; 32];
+    copy_from_user(arg as *const u8, &mut bytes)?;
+    Ok(UserFlock64 {
+        l_type: flock_i16(&bytes, 0),
+        l_whence: flock_i16(&bytes, 2),
+        l_start: flock_i64(&bytes, 8),
+        l_len: flock_i64(&bytes, 16),
+        l_pid: flock_i32(&bytes, 24),
+    })
+}
+
+fn copy_flock_to_user(arg: usize, flock: &UserFlock64) -> Result<(), SysErrNo> {
+    if arg == 0 {
+        return Err(SysErrNo::EFAULT);
+    }
+    let mut bytes = [0u8; 32];
+    bytes[0..2].copy_from_slice(&flock.l_type.to_ne_bytes());
+    bytes[2..4].copy_from_slice(&flock.l_whence.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&flock.l_start.to_ne_bytes());
+    bytes[16..24].copy_from_slice(&flock.l_len.to_ne_bytes());
+    bytes[24..28].copy_from_slice(&flock.l_pid.to_ne_bytes());
+    copy_to_user(arg as *mut u8, &bytes)
+}
+
+fn flock_kind(lock_type: i16) -> Result<Option<FileLockKind>, SysErrNo> {
+    match lock_type {
+        F_RDLCK => Ok(Some(FileLockKind::Read)),
+        F_WRLCK => Ok(Some(FileLockKind::Write)),
+        F_UNLCK => Ok(None),
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+fn signed_lock_base(whence: i16, current_offset: usize, file_size: usize) -> Result<i128, SysErrNo> {
+    match whence {
+        0 => Ok(0),
+        1 => Ok(current_offset as i128),
+        2 => Ok(file_size as i128),
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+fn flock_range(
+    flock: &UserFlock64,
+    current_offset: usize,
+    file_size: usize,
+) -> Result<FileLockRange, SysErrNo> {
+    let base = signed_lock_base(flock.l_whence, current_offset, file_size)?;
+    let start = base
+        .checked_add(flock.l_start as i128)
+        .ok_or(SysErrNo::EINVAL)?;
+    let len = flock.l_len as i128;
+    let (start, end) = if len > 0 {
+        let end = start.checked_add(len).ok_or(SysErrNo::EINVAL)?;
+        (start, Some(end))
+    } else if len < 0 {
+        let new_start = start.checked_add(len).ok_or(SysErrNo::EINVAL)?;
+        (new_start, Some(start))
+    } else {
+        (start, None)
+    };
+    if start < 0 || end.map(|value| value < 0).unwrap_or(false) {
+        return Err(SysErrNo::EINVAL);
+    }
+    Ok(FileLockRange {
+        start: start as u64,
+        end: end.map(|value| value as u64),
+    })
+}
+
+fn lock_ranges_overlap(left: FileLockRange, right: FileLockRange) -> bool {
+    let left_before_right = left.end.map(|end| end <= right.start).unwrap_or(false);
+    let right_before_left = right.end.map(|end| end <= left.start).unwrap_or(false);
+    !left_before_right && !right_before_left
+}
+
+fn lock_ranges_touch_or_overlap(left: FileLockRange, right: FileLockRange) -> bool {
+    let left_before_right = left.end.map(|end| end < right.start).unwrap_or(false);
+    let right_before_left = right.end.map(|end| end < left.start).unwrap_or(false);
+    !left_before_right && !right_before_left
+}
+
+fn merge_lock_ranges(left: FileLockRange, right: FileLockRange) -> FileLockRange {
+    let start = left.start.min(right.start);
+    let end = match (left.end, right.end) {
+        (Some(left_end), Some(right_end)) => Some(left_end.max(right_end)),
+        _ => None,
+    };
+    FileLockRange { start, end }
+}
+
+fn lock_overlap_start(left: FileLockRange, right: FileLockRange) -> Option<u64> {
+    lock_ranges_overlap(left, right).then_some(left.start.max(right.start))
+}
+
+fn lock_kinds_conflict(left: FileLockKind, right: FileLockKind) -> bool {
+    !(left == FileLockKind::Read && right == FileLockKind::Read)
+}
+
+fn lock_range_nonempty(range: FileLockRange) -> bool {
+    range.end.map(|end| range.start < end).unwrap_or(true)
+}
+
+fn subtract_lock_range(old: FileLockRange, cut: FileLockRange) -> Vec<FileLockRange> {
+    let mut out = Vec::new();
+    if old.start < cut.start {
+        let left = FileLockRange {
+            start: old.start,
+            end: Some(cut.start),
+        };
+        if lock_range_nonempty(left) {
+            out.push(left);
+        }
+    }
+    if let Some(cut_end) = cut.end {
+        let has_right = old.end.map(|end| end > cut_end).unwrap_or(true);
+        if has_right {
+            let right = FileLockRange {
+                start: cut_end.max(old.start),
+                end: old.end,
+            };
+            if lock_range_nonempty(right) {
+                out.push(right);
+            }
+        }
+    }
+    out
+}
+
+fn find_lock_conflict(
+    locks: &[FileRecordLock],
+    file: &FileLockKey,
+    owner: FileLockOwner,
+    kind: FileLockKind,
+    range: FileLockRange,
+) -> Option<FileRecordLock> {
+    let mut best: Option<(u64, FileRecordLock)> = None;
+    for lock in locks.iter() {
+        if &lock.file != file || lock.owner == owner || !lock_kinds_conflict(lock.kind, kind) {
+            continue;
+        }
+        let Some(overlap_start) = lock_overlap_start(lock.range, range) else {
+            continue;
+        };
+        let replace = best
+            .as_ref()
+            .map(|(best_start, best_lock)| {
+                overlap_start < *best_start
+                    || (overlap_start == *best_start && lock.range.start < best_lock.range.start)
+            })
+            .unwrap_or(true);
+        if replace {
+            best = Some((overlap_start, lock.clone()));
+        }
+    }
+    best.map(|(_, lock)| lock)
+}
+
+fn remove_lock_waiter(owner: FileLockOwner) {
+    FILE_LOCK_WAITERS
+        .lock()
+        .retain(|waiter| waiter.waiter != owner);
+}
+
+fn set_lock_waiter(waiter: FileLockOwner, waiting_for: FileLockOwner) {
+    let mut waiters = FILE_LOCK_WAITERS.lock();
+    if let Some(entry) = waiters.iter_mut().find(|entry| entry.waiter == waiter) {
+        entry.waiting_for = waiting_for;
+    } else {
+        waiters.push(FileLockWaiter {
+            waiter,
+            waiting_for,
+        });
+    }
+}
+
+fn file_lock_would_deadlock(waiter: FileLockOwner, waiting_for: FileLockOwner) -> bool {
+    if waiter == waiting_for {
+        return true;
+    }
+    let waiters = FILE_LOCK_WAITERS.lock();
+    let mut owner = waiting_for;
+    let mut depth = 0usize;
+    while depth <= waiters.len() {
+        if owner == waiter {
+            return true;
+        }
+        let Some(next) = waiters
+            .iter()
+            .find(|entry| entry.waiter == owner)
+            .map(|entry| entry.waiting_for)
+        else {
+            return false;
+        };
+        owner = next;
+        depth += 1;
+    }
+    false
+}
+
+fn apply_file_unlock(
+    locks: &mut Vec<FileRecordLock>,
+    file: &FileLockKey,
+    owner: FileLockOwner,
+    range: FileLockRange,
+) -> bool {
+    let mut changed = false;
+    let mut index = 0usize;
+    while index < locks.len() {
+        if &locks[index].file == file
+            && locks[index].owner == owner
+            && lock_ranges_overlap(locks[index].range, range)
+        {
+            let lock = locks.remove(index);
+            for remainder in subtract_lock_range(lock.range, range) {
+                locks.push(FileRecordLock {
+                    range: remainder,
+                    ..lock.clone()
+                });
+            }
+            changed = true;
+        } else {
+            index += 1;
+        }
+    }
+    changed
+}
+
+fn push_merged_file_lock(locks: &mut Vec<FileRecordLock>, mut new_lock: FileRecordLock) {
+    let mut index = 0usize;
+    while index < locks.len() {
+        if locks[index].file == new_lock.file
+            && locks[index].owner == new_lock.owner
+            && locks[index].kind == new_lock.kind
+            && lock_ranges_touch_or_overlap(locks[index].range, new_lock.range)
+        {
+            let old = locks.remove(index);
+            new_lock.range = merge_lock_ranges(new_lock.range, old.range);
+        } else {
+            index += 1;
+        }
+    }
+    locks.push(new_lock);
+}
+
+fn apply_file_lock(
+    file: &FileLockKey,
+    owner: FileLockOwner,
+    pid: usize,
+    kind: Option<FileLockKind>,
+    range: FileLockRange,
+) -> Result<Option<FileLockOwner>, SysErrNo> {
+    let mut locks = FILE_RECORD_LOCKS.lock();
+    if let Some(kind) = kind {
+        if let Some(conflict) = find_lock_conflict(&locks, file, owner, kind, range) {
+            return Ok(Some(conflict.owner));
+        }
+        apply_file_unlock(&mut locks, file, owner, range);
+        push_merged_file_lock(&mut locks, FileRecordLock {
+            file: file.clone(),
+            owner,
+            pid,
+            kind,
+            range,
+        });
+        Ok(None)
+    } else {
+        apply_file_unlock(&mut locks, file, owner, range);
+        Ok(None)
+    }
+}
+
+fn file_lock_conflict_pid(conflict: &FileRecordLock) -> i32 {
+    match conflict.owner {
+        FileLockOwner::Posix(_) => conflict.pid as i32,
+        FileLockOwner::Ofd(_) => -1,
+    }
+}
+
+fn flock_from_record(lock: &FileRecordLock) -> UserFlock64 {
+    UserFlock64 {
+        l_type: match lock.kind {
+            FileLockKind::Read => F_RDLCK,
+            FileLockKind::Write => F_WRLCK,
+        },
+        l_whence: 0,
+        l_start: lock.range.start as i64,
+        l_len: lock
+            .range
+            .end
+            .map(|end| end.saturating_sub(lock.range.start) as i64)
+            .unwrap_or(0),
+        l_pid: file_lock_conflict_pid(lock),
+    }
+}
+
+fn wake_file_lock_waiters(file: &FileLockKey) {
+    crate::task::wait_queue::wake_io_keyed_waiters(file_lock_wait_key(file));
+}
+
+fn release_posix_locks_for_file(pid: usize, file: &FileLockKey) {
+    let mut changed = false;
+    FILE_RECORD_LOCKS.lock().retain(|lock| {
+        let remove = lock.file == *file && lock.owner == FileLockOwner::Posix(pid);
+        changed |= remove;
+        !remove
+    });
+    remove_lock_waiter(FileLockOwner::Posix(pid));
+    if changed {
+        wake_file_lock_waiters(file);
+    }
+}
+
+pub fn release_file_locks_for_pid(pid: usize) {
+    let owner = FileLockOwner::Posix(pid);
+    let mut files = Vec::new();
+    FILE_RECORD_LOCKS.lock().retain(|lock| {
+        if lock.owner == owner {
+            files.push(lock.file.clone());
+            false
+        } else {
+            true
+        }
+    });
+    remove_lock_waiter(owner);
+    for file in files {
+        wake_file_lock_waiters(&file);
+    }
+}
+
+pub fn release_file_locks_for_ofd(id: usize) {
+    let owner = FileLockOwner::Ofd(id);
+    let mut files = Vec::new();
+    FILE_RECORD_LOCKS.lock().retain(|lock| {
+        if lock.owner == owner {
+            if !files.iter().any(|file| file == &lock.file) {
+                files.push(lock.file.clone());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    remove_lock_waiter(owner);
+    for file in files {
+        wake_file_lock_waiters(&file);
+    }
+}
+
+pub fn release_posix_locks_for_closed_files(pid: usize, files: &[FileDescriptor]) {
+    let mut keys = Vec::new();
+    for file in files {
+        if let Some(key) = fd_lock_key(file) {
+            if !keys.iter().any(|seen| seen == &key) {
+                keys.push(key);
+            }
+        }
+    }
+    for key in keys {
+        release_posix_locks_for_file(pid, &key);
+    }
 }
 
 fn make_statfs(info: crate::fs::VfsStatFs) -> StatFs {
@@ -1342,6 +2115,15 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
 /// - mode: 文件模式
 pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> SyscallRet {
     let (logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+    open_resolved_path(logical_path, host_path, flags, mode)
+}
+
+fn open_resolved_path(
+    logical_path: String,
+    host_path: String,
+    flags: u32,
+    mode: u32,
+) -> SyscallRet {
     let fd_flags = if (flags & fd::open_flags::O_CLOEXEC) != 0 {
         fd::FD_CLOEXEC
     } else {
@@ -1349,9 +2131,19 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
     };
     let open_flags = flags & !fd::open_flags::O_CLOEXEC;
 
+    let (logical_path, host_path) = if let Some(target) = proc_magic_link_target(&logical_path)? {
+        if (open_flags & fd::open_flags::O_NOFOLLOW) != 0 {
+            return Err(SysErrNo::ELOOP);
+        }
+        let root = current_root()?;
+        let host = crate::fs::apply_root(&root, &target);
+        (target, host)
+    } else {
+        (logical_path, host_path)
+    };
+
     log::info!(
-        "[syscall] openat(dirfd={}, pathname='{}' -> '{}', flags={}, mode={})",
-        dirfd,
+        "[syscall] open(path='{}' -> '{}', flags={}, mode={})",
         logical_path,
         host_path,
         flags,
@@ -1360,11 +2152,12 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
 
     // 获取当前任务的文件描述符表
     if let Some(task) = current_task() {
-        let create_mode = if (open_flags & fd::open_flags::O_CREAT) != 0 {
-            mode & !task.fs.lock().umask
-        } else {
-            mode
-        };
+        let create_mode =
+            if (open_flags & (fd::open_flags::O_CREAT | fd::open_flags::O_TMPFILE)) != 0 {
+                mode & !task.fs.lock().umask
+            } else {
+                mode
+            };
         let inner = task.inner.lock();
         let nofile_limit = inner.rlimit_nofile;
 
@@ -1392,6 +2185,19 @@ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> S
     } else {
         Err(SysErrNo::ESRCH)
     }
+}
+
+pub fn sys_openat2(
+    dirfd: isize,
+    pathname: *const u8,
+    how: *const OpenHow,
+    size: usize,
+) -> SyscallRet {
+    let how = copy_open_how_from_user(how, size)?;
+    let (flags, mode, resolve) = validate_openat2_how(how)?;
+    let path = read_user_path(pathname)?;
+    let (logical_path, host_path) = openat2_resolve_path_str(dirfd, &path, resolve)?;
+    open_resolved_path(logical_path, host_path, flags, mode)
 }
 
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallRet {
@@ -1565,19 +2371,157 @@ pub fn sys_fchown(fd: usize, uid: usize, gid: usize) -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_fgetxattr(fd: usize, name: *const u8, _value: *mut u8, _size: usize) -> SyscallRet {
-    let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    {
-        let inner = task.inner.lock();
-        let fds = inner.fd_table.lock();
-        match fds.get(fd).ok_or(SysErrNo::EBADF)? {
-            FileDescriptor::Path { .. } => return Err(SysErrNo::EBADF),
-            _ => {}
-        }
+fn read_xattr_value(value: *const u8, size: usize) -> Result<Vec<u8>, SysErrNo> {
+    const XATTR_SIZE_MAX: usize = 65536;
+    if size > XATTR_SIZE_MAX {
+        return Err(SysErrNo::E2BIG);
     }
+    let mut data = Vec::new();
+    data.resize(size, 0);
+    if size != 0 {
+        copy_from_user(value, &mut data)?;
+    }
+    Ok(data)
+}
 
-    let _name = read_user_cstr(name)?;
-    Err(SysErrNo::EOPNOTSUPP)
+fn validate_xattr_name_and_flags(key: &str, flags: usize, check_flags: bool) -> Result<(), SysErrNo> {
+    const XATTR_CREATE: usize = 0x1;
+    const XATTR_REPLACE: usize = 0x2;
+    const XATTR_NAME_MAX: usize = 255;
+    if check_flags
+        && (flags & !(XATTR_CREATE | XATTR_REPLACE) != 0
+            || flags == (XATTR_CREATE | XATTR_REPLACE))
+    {
+        return Err(SysErrNo::EINVAL);
+    }
+    if key.is_empty() || key.as_bytes().len() > XATTR_NAME_MAX {
+        return Err(SysErrNo::ERANGE);
+    }
+    Ok(())
+}
+
+fn copy_xattr_output(value: *mut u8, size: usize, data: &[u8]) -> SyscallRet {
+    if size == 0 {
+        return Ok(data.len());
+    }
+    if size < data.len() {
+        return Err(SysErrNo::ERANGE);
+    }
+    copy_to_user(value, data)?;
+    Ok(data.len())
+}
+
+pub fn sys_setxattr(
+    pathname: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: usize,
+    follow_symlink: bool,
+) -> SyscallRet {
+    let path = read_user_path(pathname)?;
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, flags, true)?;
+    let data = read_xattr_value(value, size)?;
+    let (_logical_path, host_path) = resolve_host_path_str(AT_FDCWD, &path)?;
+    super::with_kernel_page_table(|| {
+        crate::fs::set_xattr_path(&host_path, follow_symlink, &key, &data, flags)
+    })?;
+    Ok(0)
+}
+
+pub fn sys_fsetxattr(
+    fd: usize,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: usize,
+) -> SyscallRet {
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, flags, true)?;
+    let data = read_xattr_value(value, size)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    super::with_kernel_page_table(|| crate::fs::set_xattr_fd(file_desc, &key, &data, flags))?;
+    Ok(0)
+}
+
+pub fn sys_getxattr(
+    pathname: *const u8,
+    name: *const u8,
+    value: *mut u8,
+    size: usize,
+    follow_symlink: bool,
+) -> SyscallRet {
+    let path = read_user_path(pathname)?;
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, 0, false)?;
+    let (_logical_path, host_path) = resolve_host_path_str(AT_FDCWD, &path)?;
+    let data = super::with_kernel_page_table(|| {
+        crate::fs::get_xattr_path(&host_path, follow_symlink, &key)
+    })?;
+    copy_xattr_output(value, size, &data)
+}
+
+pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) -> SyscallRet {
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, 0, false)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    let data = super::with_kernel_page_table(|| crate::fs::get_xattr_fd(file_desc, &key))?;
+    copy_xattr_output(value, size, &data)
+}
+
+pub fn sys_listxattr(
+    pathname: *const u8,
+    list: *mut u8,
+    size: usize,
+    follow_symlink: bool,
+) -> SyscallRet {
+    let path = read_user_path(pathname)?;
+    let (_logical_path, host_path) = resolve_host_path_str(AT_FDCWD, &path)?;
+    let data =
+        super::with_kernel_page_table(|| crate::fs::list_xattr_path(&host_path, follow_symlink))?;
+    copy_xattr_output(list, size, &data)
+}
+
+pub fn sys_flistxattr(fd: usize, list: *mut u8, size: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    let data = super::with_kernel_page_table(|| crate::fs::list_xattr_fd(file_desc))?;
+    copy_xattr_output(list, size, &data)
+}
+
+pub fn sys_removexattr(
+    pathname: *const u8,
+    name: *const u8,
+    follow_symlink: bool,
+) -> SyscallRet {
+    let path = read_user_path(pathname)?;
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, 0, false)?;
+    let (_logical_path, host_path) = resolve_host_path_str(AT_FDCWD, &path)?;
+    super::with_kernel_page_table(|| {
+        crate::fs::remove_xattr_path(&host_path, follow_symlink, &key)
+    })?;
+    Ok(0)
+}
+
+pub fn sys_fremovexattr(fd: usize, name: *const u8) -> SyscallRet {
+    let key = read_user_cstr(name)?;
+    validate_xattr_name_and_flags(&key, 0, false)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fds = inner.fd_table.lock();
+    let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+    super::with_kernel_page_table(|| crate::fs::remove_xattr_fd(file_desc, &key))?;
+    Ok(0)
 }
 
 pub fn sys_unlinkat(dirfd: isize, pathname: *const u8, flags: usize) -> SyscallRet {
@@ -1618,14 +2562,25 @@ pub fn sys_renameat2(
     flags: usize,
 ) -> SyscallRet {
     const RENAME_NOREPLACE: usize = 1;
-    if flags & !RENAME_NOREPLACE != 0 {
+    const RENAME_EXCHANGE: usize = 2;
+    const RENAME_WHITEOUT: usize = 4;
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if (flags & RENAME_WHITEOUT) != 0
+        || (flags & RENAME_NOREPLACE) != 0 && (flags & RENAME_EXCHANGE) != 0
+    {
         return Err(SysErrNo::EINVAL);
     }
     let (_old_logical, old_host) = resolve_host_path(olddirfd, oldpath)?;
     let (_new_logical, new_host) = resolve_host_path(newdirfd, newpath)?;
-    super::with_kernel_page_table(|| {
-        crate::fs::rename_path(&old_host, &new_host, flags & RENAME_NOREPLACE != 0)
-    })?;
+    if (flags & RENAME_EXCHANGE) != 0 {
+        super::with_kernel_page_table(|| crate::fs::rename_exchange_path(&old_host, &new_host))?;
+    } else {
+        super::with_kernel_page_table(|| {
+            crate::fs::rename_path(&old_host, &new_host, flags & RENAME_NOREPLACE != 0)
+        })?;
+    }
     Ok(0)
 }
 
@@ -1653,8 +2608,18 @@ pub fn sys_linkat(
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return Err(SysErrNo::EINVAL);
     }
-    let (_old_logical, old_host) = resolve_host_path(olddirfd, oldpath)?;
+    let (old_logical, old_host) = resolve_host_path(olddirfd, oldpath)?;
     let (_new_logical, new_host) = resolve_host_path(newdirfd, newpath)?;
+    if (flags & AT_SYMLINK_FOLLOW) != 0 {
+        if let Some(fd) = proc_self_fd_number(&old_logical)? {
+            let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            let inner = task.inner.lock();
+            let mut fds = inner.fd_table.lock();
+            let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+            super::with_kernel_page_table(|| crate::fs::link_mem_file_fd(file_desc, &new_host))?;
+            return Ok(0);
+        }
+    }
     super::with_kernel_page_table(|| {
         crate::fs::link_path(&old_host, &new_host, flags & AT_SYMLINK_FOLLOW != 0)
     })?;
@@ -1753,6 +2718,9 @@ fn readlink_target_at(dirfd: isize, path: &str) -> Result<String, SysErrNo> {
     // diagnostics and pointer-guard setup. Model this as a procfs symlink
     // backed by task metadata rather than a BusyBox-specific string.
     let logical = resolve_path_str(dirfd, path)?;
+    if let Some(target) = proc_self_fd_target(&logical)? {
+        return Ok(target);
+    }
     if let Some(target) = super::process::proc_self_exe_target(&logical)? {
         return Ok(target);
     }
@@ -1943,6 +2911,9 @@ pub fn sys_close(fd: usize) -> SyscallRet {
             let mut fds = fd_table.lock();
             fds.remove(fd)?
         };
+        if let Some(file_key) = fd_lock_key(&old) {
+            release_posix_locks_for_file(task.thread_group.tgid(), &file_key);
+        }
         super::with_kernel_page_table(|| drop(old));
         Ok(0)
     } else {
@@ -2249,15 +3220,29 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: usize) -> SyscallRet {
     };
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let pid = task.thread_group.tgid();
     let inner = task.inner.lock();
     let nofile_limit = inner.rlimit_nofile;
     let mut fds = inner.fd_table.lock();
+    let replaced_key = fds.get(new_fd).and_then(fd_lock_key);
     let new_fd = fds.dup2_below(old_fd, new_fd, nofile_limit)?;
     fds.set_fd_flags(new_fd, fd_flags)?;
+    drop(fds);
+    drop(inner);
+    if let Some(file_key) = replaced_key {
+        release_posix_locks_for_file(pid, &file_key);
+    }
     Ok(new_fd)
 }
 
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
+    if matches!(
+        cmd,
+        F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW
+    ) {
+        return sys_fcntl_file_lock(fd, cmd, arg);
+    }
+
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
     let nofile_limit = inner.rlimit_nofile;
@@ -2290,7 +3275,111 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
             file_desc.set_status_flags(arg);
             Ok(0)
         }
-        _ => Err(SysErrNo::ENOSYS),
+        // Linux reports EINVAL for fcntl commands outside the supported
+        // command set.  ENOSYS is reserved for a missing syscall entry, not
+        // for an unrecognized command argument to an implemented syscall.
+        _ => Err(SysErrNo::EINVAL),
+    }
+}
+
+fn sys_fcntl_file_lock(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let flock = copy_flock_from_user(arg)?;
+    let kind = flock_kind(flock.l_type)?;
+    let is_ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+    let blocking = matches!(cmd, F_SETLKW | F_OFD_SETLKW);
+    let getlk = matches!(cmd, F_GETLK | F_OFD_GETLK);
+    if is_ofd && flock.l_pid != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if getlk && kind.is_none() {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let (file_key, range, owner, pid, wait_key) = {
+        let inner = task.inner.lock();
+        let fd_table = inner.fd_table.clone();
+        drop(inner);
+        let fds = fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        let file_key = fd_lock_key(file_desc).ok_or(SysErrNo::EINVAL)?;
+        let range = flock_range(&flock, fd_lock_offset(file_desc), file_desc.size())?;
+        if !getlk {
+            match kind {
+                Some(FileLockKind::Read) if !file_desc.readable() => return Err(SysErrNo::EBADF),
+                Some(FileLockKind::Write) if !file_desc.writable() => {
+                    return Err(SysErrNo::EBADF)
+                }
+                _ => {}
+            }
+        }
+        let owner = if is_ofd {
+            FileLockOwner::Ofd(file_desc.ofd_owner_id().ok_or(SysErrNo::EINVAL)?)
+        } else {
+            FileLockOwner::Posix(task.thread_group.tgid())
+        };
+        let wait_key = file_lock_wait_key(&file_key);
+        let pid = if is_ofd { 0 } else { task.thread_group.tgid() };
+        (file_key, range, owner, pid, wait_key)
+    };
+
+    if getlk {
+        let mut out = flock;
+        if let Some(kind) = kind {
+            let locks = FILE_RECORD_LOCKS.lock();
+            if let Some(conflict) = find_lock_conflict(&locks, &file_key, owner, kind, range) {
+                out = flock_from_record(&conflict);
+            } else {
+                out.l_type = F_UNLCK;
+            }
+        } else {
+            out.l_type = F_UNLCK;
+        }
+        copy_flock_to_user(arg, &out)?;
+        return Ok(0);
+    }
+
+    if kind.is_none() {
+        let conflict = apply_file_lock(&file_key, owner, pid, None, range)?;
+        debug_assert!(conflict.is_none());
+        remove_lock_waiter(owner);
+        wake_file_lock_waiters(&file_key);
+        return Ok(0);
+    }
+
+    let kind = kind.unwrap();
+    loop {
+        match apply_file_lock(&file_key, owner, pid, Some(kind), range)? {
+            None => {
+                remove_lock_waiter(owner);
+                return Ok(0);
+            }
+            Some(_conflict_owner) if !blocking => {
+                remove_lock_waiter(owner);
+                return Err(SysErrNo::EAGAIN);
+            }
+            Some(conflict_owner) => {
+                if !is_ofd {
+                    if file_lock_would_deadlock(owner, conflict_owner) {
+                        remove_lock_waiter(owner);
+                        return Err(SysErrNo::EDEADLK);
+                    }
+                    set_lock_waiter(owner, conflict_owner);
+                }
+                let sleep_result = sleep_on_io_key_if(wait_key, None, || {
+                    let locks = FILE_RECORD_LOCKS.lock();
+                    Ok(find_lock_conflict(&locks, &file_key, owner, kind, range).is_some())
+                });
+                match sleep_result {
+                    Ok(_) => {}
+                    Err(SysErrNo::ERESTARTSYS) => return Err(SysErrNo::ERESTARTSYS),
+                    Err(err) => {
+                        remove_lock_waiter(owner);
+                        return Err(err);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3251,6 +4340,37 @@ fn fd_is_regular_without_write(file_desc: &FileDescriptor) -> bool {
     )
 }
 
+fn fd_is_copy_file_regular_source(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::MemFile { readable: true, .. }
+            | FileDescriptor::Ext4Regular { readable: true, .. }
+    )
+}
+
+fn fd_is_copy_file_regular_target(file_desc: &FileDescriptor) -> bool {
+    matches!(
+        file_desc,
+        FileDescriptor::MemFile {
+            writable: true,
+            append: false,
+            ..
+        } | FileDescriptor::Ext4Regular {
+            writable: true,
+            append: false,
+            ..
+        }
+    )
+}
+
+fn fd_copy_file_backend(file_desc: &FileDescriptor) -> Option<u8> {
+    match file_desc {
+        FileDescriptor::MemFile { .. } => Some(0),
+        FileDescriptor::Ext4Regular { .. } => Some(1),
+        _ => None,
+    }
+}
+
 fn load_splice_offset(ptr: usize) -> Result<Option<usize>, SysErrNo> {
     if ptr == 0 {
         return Ok(None);
@@ -3265,6 +4385,133 @@ fn store_splice_offset(ptr: usize, offset: usize) -> Result<(), SysErrNo> {
     }
     let offset = i64::try_from(offset).map_err(|_| SysErrNo::EINVAL)?;
     super::user::copy_object_to_user(ptr, &offset)
+}
+
+pub fn sys_copy_file_range(
+    fd_in: usize,
+    off_in: usize,
+    fd_out: usize,
+    off_out: usize,
+    len: usize,
+    flags: usize,
+) -> SyscallRet {
+    if flags != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    checked_io_count(len)?;
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let fd_table = task.inner.lock().fd_table.clone();
+
+    {
+        let fds = fd_table.lock();
+        let input = fds.get(fd_in).ok_or(SysErrNo::EBADF)?;
+        let output = fds.get(fd_out).ok_or(SysErrNo::EBADF)?;
+
+        let input_meta = super::with_kernel_page_table(|| crate::fs::metadata_for_fd(input))?;
+        let output_meta = super::with_kernel_page_table(|| crate::fs::metadata_for_fd(output))?;
+        if input_meta.kind != crate::fs::VfsNodeKind::Regular
+            || output_meta.kind != crate::fs::VfsNodeKind::Regular
+        {
+            return Err(if output_meta.kind == crate::fs::VfsNodeKind::Directory {
+                SysErrNo::EISDIR
+            } else {
+                SysErrNo::EINVAL
+            });
+        }
+        if fd_has_append_mode(output) {
+            return Err(SysErrNo::EBADF);
+        }
+        if !fd_is_copy_file_regular_source(input) || !fd_is_copy_file_regular_target(output) {
+            return Err(SysErrNo::EBADF);
+        }
+        if fd_copy_file_backend(input) != fd_copy_file_backend(output) {
+            return Err(SysErrNo::EXDEV);
+        }
+
+        if input.same_file_identity(output) {
+            let in_start = if off_in != 0 {
+                usize::try_from(super::user::copy_object_from_user::<i64>(off_in)?)
+                    .map_err(|_| SysErrNo::EINVAL)?
+            } else {
+                input_meta.size as usize
+            };
+            let out_start = if off_out != 0 {
+                usize::try_from(super::user::copy_object_from_user::<i64>(off_out)?)
+                    .map_err(|_| SysErrNo::EINVAL)?
+            } else {
+                output_meta.size as usize
+            };
+            let in_end = in_start.saturating_add(len);
+            let out_end = out_start.saturating_add(len);
+            if len != 0 && in_start < out_end && out_start < in_end {
+                return Err(SysErrNo::EINVAL);
+            }
+        }
+    }
+
+    let mut input_offset = load_splice_offset(off_in)?;
+    let mut output_offset = load_splice_offset(off_out)?;
+    if len == 0 {
+        store_splice_offset(off_in, input_offset.unwrap_or(0))?;
+        store_splice_offset(off_out, output_offset.unwrap_or(0))?;
+        return Ok(0);
+    }
+
+    let mut copied = 0usize;
+    let mut kbuf = Vec::new();
+    while copied < len {
+        let want = (len - copied).min(COPY_FILE_RANGE_CHUNK);
+        kbuf.resize(want, 0);
+
+        let nread = {
+            let mut fds = fd_table.lock();
+            let input = fds.get_mut(fd_in).ok_or(SysErrNo::EBADF)?;
+            if let Some(offset) = input_offset {
+                let fixed_offset = checked_fixed_offset(offset, copied)?;
+                read_fixed_at_into_kernel(input, fixed_offset, &mut kbuf[..want])?
+            } else {
+                read_fd_into_kernel(input, &mut kbuf[..want])?
+            }
+        };
+        if nread == 0 {
+            break;
+        }
+
+        let mut nwritten_total = 0usize;
+        while nwritten_total < nread {
+            let nwritten = {
+                let mut fds = fd_table.lock();
+                let output = fds.get_mut(fd_out).ok_or(SysErrNo::EBADF)?;
+                let buf = &kbuf[nwritten_total..nread];
+                if let Some(offset) = output_offset {
+                    let fixed_offset = checked_fixed_offset(offset, copied + nwritten_total)?;
+                    write_fixed_at_from_kernel(output, fixed_offset, buf)?
+                } else {
+                    write_fd_from_kernel(output, buf)?
+                }
+            };
+            if nwritten == 0 {
+                break;
+            }
+            nwritten_total += nwritten;
+        }
+
+        copied += nwritten_total;
+        if nwritten_total == 0 || nwritten_total < nread {
+            break;
+        }
+    }
+
+    if let Some(offset) = input_offset.as_mut() {
+        *offset = checked_fixed_offset(*offset, copied)?;
+    }
+    if let Some(offset) = output_offset.as_mut() {
+        *offset = checked_fixed_offset(*offset, copied)?;
+    }
+    store_splice_offset(off_in, input_offset.unwrap_or(0))?;
+    store_splice_offset(off_out, output_offset.unwrap_or(0))?;
+    Ok(copied)
 }
 
 pub fn sys_splice(
@@ -3498,6 +4745,7 @@ pub fn sys_statx(
         return Err(SysErrNo::EFAULT);
     }
     check_statx_flags(flags)?;
+    check_statx_mask(mask)?;
 
     let path = read_user_path(pathname)?;
     let st = if path.is_empty() {

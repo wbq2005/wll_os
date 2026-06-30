@@ -12,17 +12,21 @@ pub use vfs::{
     check_access, check_access_with_effective, check_fd_access, check_fd_access_with_effective,
     check_metadata_access, check_metadata_access_with_effective, create_dir, create_dir_with_mode,
     create_regular_file, create_special_node, create_symlink, dir_exists, file_exists,
-    file_flags_for_fd, filesystem_magic, is_removed, link_path, list_dir, list_files, metadata,
-    metadata_for_fd, metadata_for_lookup, mount_fs, open_path, read_executable_file, read_file,
-    read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file, rename_path,
-    set_file_flags_for_fd, set_mode_fd, set_mode_path, set_owner_fd, set_owner_path, set_times_fd,
-    set_times_path, statfs_for_fd, statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path,
-    umount_fs, TimesUpdatePermission, VfsMetadata, VfsNodeKind, VfsStatFs,
+    file_flags_for_fd, filesystem_magic, is_removed, link_mem_file_fd, link_path, list_dir,
+    list_files, list_xattr_fd, list_xattr_path, metadata, metadata_for_fd, metadata_for_lookup,
+    mount_fs, open_path, path_contains_symlink, path_crosses_mountpoint, read_executable_file,
+    read_file, read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file,
+    remove_xattr_fd, remove_xattr_path, rename_exchange_path, rename_path, set_file_flags_for_fd,
+    set_mode_fd, set_mode_path, set_owner_fd, set_owner_path, set_times_fd, set_times_path,
+    set_xattr_fd, set_xattr_path, statfs_for_fd, statfs_for_path, sync_all, sync_fd, truncate_fd,
+    truncate_path, umount_fs, get_xattr_fd, get_xattr_path,
+    TimesUpdatePermission, VfsMetadata, VfsNodeKind, VfsStatFs,
 };
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
@@ -81,6 +85,14 @@ impl MemNodeMetadata {
         let mut child_mode = mode & 0o7777;
         if is_dir && parent_setgid {
             child_mode |= 0o2000;
+        }
+        if !is_dir
+            && parent_setgid
+            && (child_mode & 0o2000) != 0
+            && !credentials.is_root_capable()
+            && !credentials.is_in_filesystem_group(parent.map(|meta| meta.gid).unwrap_or(0))
+        {
+            child_mode &= !0o2000;
         }
         Self {
             mode: child_mode,
@@ -175,21 +187,25 @@ impl FileTimes {
 }
 
 /// 内存中的文件
-pub struct MemFile {
-    pub name: String,
+pub struct MemFileBacking {
     pub content: FileContent,
     pub times: FileTimes,
+}
+
+pub struct MemFile {
+    pub name: String,
+    backing: Arc<Mutex<MemFileBacking>>,
     link_key: String,
 }
 
 impl MemFile {
     pub fn new(name: &str, content: Vec<u8>) -> Self {
-        Self {
-            name: String::from(name),
-            content: FileContent::from_slice(&content),
-            times: FileTimes::now(),
-            link_key: String::from(name),
-        }
+        Self::with_link_key(
+            name,
+            FileContent::from_slice(&content),
+            FileTimes::now(),
+            String::from(name),
+        )
     }
 
     pub fn with_times(name: &str, content: Vec<u8>, times: FileTimes) -> Self {
@@ -202,16 +218,82 @@ impl MemFile {
     }
 
     fn with_link_key(name: &str, content: FileContent, times: FileTimes, link_key: String) -> Self {
+        Self::with_backing(
+            name,
+            Arc::new(Mutex::new(MemFileBacking { content, times })),
+            link_key,
+        )
+    }
+
+    fn with_backing(name: &str, backing: Arc<Mutex<MemFileBacking>>, link_key: String) -> Self {
         Self {
             name: String::from(name),
-            content,
-            times,
+            backing,
             link_key,
         }
     }
 
+    fn shared_backing(&self) -> Arc<Mutex<MemFileBacking>> {
+        self.backing.clone()
+    }
+
+    fn backing_id(&self) -> usize {
+        Arc::as_ptr(&self.backing) as usize
+    }
+
     pub fn size(&self) -> usize {
-        self.content.len()
+        self.backing.lock().content.len()
+    }
+
+    pub fn is_elf_image(&self) -> bool {
+        self.backing.lock().content.is_elf_image()
+    }
+
+    pub fn times(&self) -> FileTimes {
+        self.backing.lock().times
+    }
+
+    pub fn snapshot(&self) -> (FileContent, FileTimes) {
+        let backing = self.backing.lock();
+        (backing.content.clone(), backing.times)
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.backing.lock().content.to_vec()
+    }
+
+    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.backing.lock().content.read_at(offset, buf)
+    }
+
+    fn replace_content(&self, content: FileContent, times: FileTimes) {
+        let mut backing = self.backing.lock();
+        backing.content = content;
+        backing.times = times;
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
+        let mut backing = self.backing.lock();
+        let written_end = backing.content.write_at(offset, buf);
+        backing.times.touch_modified();
+        written_end
+    }
+
+    fn resize(&self, new_len: usize) {
+        let mut backing = self.backing.lock();
+        backing.content.resize(new_len);
+        backing.times.touch_modified();
+    }
+
+    fn set_times(&self, atime: Option<(isize, isize)>, mtime: Option<(isize, isize)>) {
+        self.backing.lock().times.set_access_modify(atime, mtime);
+    }
+
+    fn touch_ctime(&self) {
+        let now = FileTimes::now();
+        let mut backing = self.backing.lock();
+        backing.times.ctime_sec = now.ctime_sec;
+        backing.times.ctime_nsec = now.ctime_nsec;
     }
 }
 
@@ -222,6 +304,7 @@ pub struct MemFileSystem {
     symlinks: BTreeMap<String, String>,
     specials: BTreeMap<String, MemSpecialKind>,
     metadata: BTreeMap<String, MemNodeMetadata>,
+    xattrs: BTreeMap<u64, BTreeMap<String, Vec<u8>>>,
     next_ino: u64,
 }
 
@@ -235,6 +318,7 @@ impl MemFileSystem {
             symlinks: BTreeMap::new(),
             specials: BTreeMap::new(),
             metadata,
+            xattrs: BTreeMap::new(),
             next_ino: 2,
         }
     }
@@ -275,6 +359,13 @@ impl MemFileSystem {
         MemNodeMetadata::new_child_for_current(parent_meta, mode, is_dir)
     }
 
+    pub fn tmpfile_metadata_for_current(&mut self, dir: &str, mode: u32) -> MemNodeMetadata {
+        let parent_meta = self.metadata(&normalize_path(dir));
+        let mut metadata = MemNodeMetadata::new_child_for_current(parent_meta, mode, false);
+        metadata = self.allocate_metadata(metadata);
+        metadata
+    }
+
     /// 添加文件
     pub fn add_file(&mut self, name: &str, content: Vec<u8>) {
         let name = normalize_path(name);
@@ -307,6 +398,33 @@ impl MemFileSystem {
         log::info!("[fs] Added file '{}' ({} bytes)", name, len);
     }
 
+    pub fn add_file_with_metadata(
+        &mut self,
+        name: &str,
+        content: FileContent,
+        times: FileTimes,
+        metadata: MemNodeMetadata,
+    ) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        let parent = parent_path(&name);
+        if !self.is_dir(&parent) {
+            return Err(SysErrNo::ENOENT);
+        }
+        if self.exists(&name) {
+            return Err(SysErrNo::EEXIST);
+        }
+        self.symlinks.remove(&name);
+        self.specials.remove(&name);
+        self.files.push(MemFile::with_link_key(
+            &name,
+            content,
+            times,
+            String::from(&name),
+        ));
+        self.metadata.insert(name, metadata);
+        Ok(())
+    }
+
     pub fn write_file_content(
         &mut self,
         name: &str,
@@ -314,20 +432,8 @@ impl MemFileSystem {
         times: FileTimes,
     ) -> bool {
         let name = normalize_path(name);
-        if let Some(link_key) = self
-            .files
-            .iter()
-            .find(|file| file.name == name)
-            .map(|file| file.link_key.clone())
-        {
-            for file in self
-                .files
-                .iter_mut()
-                .filter(|file| file.link_key == link_key)
-            {
-                file.content = content.clone();
-                file.times = times;
-            }
+        if let Some(file) = self.files.iter().find(|file| file.name == name) {
+            file.replace_content(content, times);
             true
         } else {
             false
@@ -347,10 +453,10 @@ impl MemFileSystem {
             .iter()
             .find(|file| file.name == name)
             .ok_or(SysErrNo::ENOENT)?;
-        if offset >= file.content.len() {
+        if offset >= file.size() {
             return Ok(0);
         }
-        Ok(file.content.read_at(offset, buf))
+        Ok(file.read_at(offset, buf))
     }
 
     pub fn write_file_at(
@@ -360,11 +466,10 @@ impl MemFileSystem {
         buf: &[u8],
     ) -> Result<usize, SysErrNo> {
         let name = normalize_path(name);
-        let link_key = self
+        let file = self
             .files
             .iter()
             .find(|file| file.name == name)
-            .map(|file| file.link_key.clone())
             .ok_or(SysErrNo::ENOENT)?;
         if offset.checked_add(buf.len()).ok_or(SysErrNo::EFBIG)? > isize::MAX as usize {
             return Err(SysErrNo::EFBIG);
@@ -372,18 +477,7 @@ impl MemFileSystem {
         if buf.is_empty() {
             return Ok(0);
         }
-        let now = FileTimes::now();
-        for file in self
-            .files
-            .iter_mut()
-            .filter(|file| file.link_key == link_key)
-        {
-            file.content.write_at(offset, buf);
-            file.times.mtime_sec = now.mtime_sec;
-            file.times.mtime_nsec = now.mtime_nsec;
-            file.times.ctime_sec = now.ctime_sec;
-            file.times.ctime_nsec = now.ctime_nsec;
-        }
+        file.write_at(offset, buf);
         Ok(buf.len())
     }
 
@@ -511,6 +605,112 @@ impl MemFileSystem {
         self.metadata.get(&name).copied()
     }
 
+    fn xattr_inode_and_set_allowed(&self, name: &str) -> Result<(u64, bool), SysErrNo> {
+        let name = normalize_path(name);
+        let set_allowed = self.files.iter().any(|file| file.name == name)
+            || self.dirs.iter().any(|dir| dir == &name);
+        let exists = set_allowed || self.symlinks.contains_key(&name) || self.specials.contains_key(&name);
+        if !exists {
+            return Err(SysErrNo::ENOENT);
+        }
+        let ino = self
+            .metadata
+            .get(&name)
+            .map(|meta| meta.ino)
+            .filter(|ino| *ino != 0)
+            .ok_or(SysErrNo::ENOENT)?;
+        Ok((ino, set_allowed))
+    }
+
+    pub fn set_xattr(
+        &mut self,
+        name: &str,
+        key: &str,
+        value: &[u8],
+        flags: usize,
+    ) -> Result<(), SysErrNo> {
+        const XATTR_CREATE: usize = 0x1;
+        const XATTR_REPLACE: usize = 0x2;
+        const XATTR_NAME_MAX: usize = 255;
+        const XATTR_SIZE_MAX: usize = 65536;
+
+        if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0
+            || flags == (XATTR_CREATE | XATTR_REPLACE)
+        {
+            return Err(SysErrNo::EINVAL);
+        }
+        if key.is_empty() || key.as_bytes().len() > XATTR_NAME_MAX {
+            return Err(SysErrNo::ERANGE);
+        }
+        if value.len() > XATTR_SIZE_MAX {
+            return Err(SysErrNo::E2BIG);
+        }
+
+        let (ino, set_allowed) = self.xattr_inode_and_set_allowed(name)?;
+        if !set_allowed {
+            return Err(SysErrNo::EPERM);
+        }
+
+        let attrs = self.xattrs.entry(ino).or_default();
+        let exists = attrs.contains_key(key);
+        if flags & XATTR_CREATE != 0 && exists {
+            return Err(SysErrNo::EEXIST);
+        }
+        if flags & XATTR_REPLACE != 0 && !exists {
+            return Err(SysErrNo::ENODATA);
+        }
+        attrs.insert(String::from(key), value.to_vec());
+        if let Some(file) = self.files.iter().find(|file| file.name == normalize_path(name)) {
+            file.touch_ctime();
+        }
+        Ok(())
+    }
+
+    pub fn get_xattr(&self, name: &str, key: &str) -> Result<Vec<u8>, SysErrNo> {
+        if key.is_empty() || key.as_bytes().len() > 255 {
+            return Err(SysErrNo::ERANGE);
+        }
+        let (ino, _) = self.xattr_inode_and_set_allowed(name)?;
+        self.xattrs
+            .get(&ino)
+            .and_then(|attrs| attrs.get(key))
+            .cloned()
+            .ok_or(SysErrNo::ENODATA)
+    }
+
+    pub fn list_xattr(&self, name: &str) -> Result<Vec<u8>, SysErrNo> {
+        let (ino, _) = self.xattr_inode_and_set_allowed(name)?;
+        let mut out = Vec::new();
+        if let Some(attrs) = self.xattrs.get(&ino) {
+            for key in attrs.keys() {
+                out.extend_from_slice(key.as_bytes());
+                out.push(0);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn remove_xattr(&mut self, name: &str, key: &str) -> Result<(), SysErrNo> {
+        if key.is_empty() || key.as_bytes().len() > 255 {
+            return Err(SysErrNo::ERANGE);
+        }
+        let (ino, set_allowed) = self.xattr_inode_and_set_allowed(name)?;
+        if !set_allowed {
+            return Err(SysErrNo::EPERM);
+        }
+        let attrs = self.xattrs.get_mut(&ino).ok_or(SysErrNo::ENODATA)?;
+        if attrs.remove(key).is_none() {
+            return Err(SysErrNo::ENODATA);
+        }
+        if attrs.is_empty() {
+            self.xattrs.remove(&ino);
+        }
+        if let Some(file) = self.files.iter().find(|file| file.name == normalize_path(name)) {
+            file.touch_ctime();
+        }
+        Ok(())
+    }
+
     pub fn inode(&self, name: &str) -> Option<u64> {
         self.metadata(name)
             .and_then(|meta| (meta.ino != 0).then_some(meta.ino))
@@ -518,17 +718,17 @@ impl MemFileSystem {
 
     pub fn file_link_count(&self, name: &str) -> u32 {
         let name = normalize_path(name);
-        let Some(link_key) = self
+        let Some(backing_id) = self
             .files
             .iter()
             .find(|file| file.name == name)
-            .map(|file| file.link_key.as_str())
+            .map(|file| file.backing_id())
         else {
             return 1;
         };
         self.files
             .iter()
-            .filter(|file| file.link_key == link_key)
+            .filter(|file| file.backing_id() == backing_id)
             .count()
             .max(1)
             .min(u32::MAX as usize) as u32
@@ -536,9 +736,14 @@ impl MemFileSystem {
 
     pub fn file_link_key(&self, name: &str) -> Option<String> {
         let name = normalize_path(name);
-        self.files
+        let backing_id = self
+            .files
             .iter()
             .find(|file| file.name == name)
+            .map(|file| file.backing_id())?;
+        self.files
+            .iter()
+            .find(|file| file.backing_id() == backing_id)
             .map(|file| file.link_key.clone())
     }
 
@@ -560,7 +765,19 @@ impl MemFileSystem {
     }
 
     pub fn total_file_bytes(&self) -> usize {
-        self.files.iter().map(|f| f.content.len()).sum::<usize>()
+        let mut seen = BTreeSet::new();
+        let regular = self
+            .files
+            .iter()
+            .filter_map(|file| {
+                if seen.insert(file.backing_id()) {
+                    Some(file.size())
+                } else {
+                    None
+                }
+            })
+            .sum::<usize>();
+        regular
             + self
                 .symlinks
                 .values()
@@ -638,21 +855,22 @@ impl MemFileSystem {
             return Err(SysErrNo::ENOENT);
         }
 
-        if let Some(link_key) = self
+        if let Some(backing_id) = self
             .files
             .iter()
             .find(|file| file.name == name)
-            .map(|file| file.link_key.clone())
+            .map(|file| file.backing_id())
         {
             let linked_names: Vec<String> = self
                 .files
                 .iter()
-                .filter(|file| file.link_key == link_key)
+                .filter(|file| file.backing_id() == backing_id)
                 .map(|file| file.name.clone())
                 .collect();
             for linked_name in linked_names {
                 let meta = self.metadata_or_alloc(&linked_name, 0o666);
-                self.metadata.insert(linked_name, MemNodeMetadata { flags, ..meta });
+                self.metadata
+                    .insert(linked_name, MemNodeMetadata { flags, ..meta });
             }
             return Ok(());
         }
@@ -665,7 +883,8 @@ impl MemFileSystem {
             0o666
         };
         let meta = self.metadata_or_alloc(&name, mode);
-        self.metadata.insert(name, MemNodeMetadata { flags, ..meta });
+        self.metadata
+            .insert(name, MemNodeMetadata { flags, ..meta });
         Ok(())
     }
 
@@ -794,13 +1013,13 @@ impl MemFileSystem {
             return Ok(());
         }
 
-        let content = self
+        let file_state = self
             .files
             .iter()
             .find(|file| file.name == old)
-            .map(|file| (file.content.clone(), file.times, file.link_key.clone()))
+            .map(|file| (file.shared_backing(), file.link_key.clone()))
             .ok_or(SysErrNo::ENOENT)?;
-        let (content, times, link_key) = content;
+        let (backing, link_key) = file_state;
         if self.is_dir(&new) {
             return Err(SysErrNo::EISDIR);
         }
@@ -810,9 +1029,56 @@ impl MemFileSystem {
         self.symlinks.remove(&new);
         self.specials.remove(&new);
         self.files
-            .push(MemFile::with_link_key(&new, content, times, link_key));
+            .push(MemFile::with_backing(&new, backing, link_key));
         self.metadata.remove(&old);
         self.metadata.insert(new, metadata);
+        Ok(())
+    }
+
+    pub fn exchange_path(&mut self, old: &str, new: &str) -> Result<(), SysErrNo> {
+        let old = normalize_path(old);
+        let new = normalize_path(new);
+        if old == new {
+            return Ok(());
+        }
+        if old == "/" || new == "/" {
+            return Err(SysErrNo::EINVAL);
+        }
+        if !self.exists(&old) || !self.exists(&new) {
+            return Err(SysErrNo::ENOENT);
+        }
+        if self.is_dir(&old) && is_descendant(&old, &new) {
+            return Err(SysErrNo::EINVAL);
+        }
+        if self.is_dir(&new) && is_descendant(&new, &old) {
+            return Err(SysErrNo::EINVAL);
+        }
+
+        let old_parent = parent_path(&old);
+        let mut temp = String::new();
+        for attempt in 0..32usize {
+            temp = if old_parent == "/" {
+                format!("/.wll_rename_exchange_{}", attempt)
+            } else {
+                format!("{}/.wll_rename_exchange_{}", old_parent, attempt)
+            };
+            if !self.exists(&temp) {
+                break;
+            }
+            temp.clear();
+        }
+        if temp.is_empty() {
+            return Err(SysErrNo::EEXIST);
+        }
+
+        self.rename_path(&old, &temp)?;
+        if let Err(e) = self.rename_path(&new, &old) {
+            let _ = self.rename_path(&temp, &old);
+            return Err(e);
+        }
+        if let Err(e) = self.rename_path(&temp, &new) {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -830,15 +1096,15 @@ impl MemFileSystem {
             return Err(SysErrNo::ENOENT);
         }
 
-        if let Some((content, times, link_key)) = self
+        if let Some((backing, link_key)) = self
             .files
             .iter()
             .find(|file| file.name == old)
-            .map(|file| (file.content.clone(), file.times, file.link_key.clone()))
+            .map(|file| (file.shared_backing(), file.link_key.clone()))
         {
             let metadata = self.metadata_or_alloc(&old, 0o666);
             self.files
-                .push(MemFile::with_link_key(&new, content, times, link_key));
+                .push(MemFile::with_backing(&new, backing, link_key));
             self.metadata.insert(new, metadata);
             return Ok(());
         }
@@ -862,20 +1128,12 @@ impl MemFileSystem {
 
     pub fn truncate_file(&mut self, name: &str, new_len: usize) -> Result<(), SysErrNo> {
         let name = normalize_path(name);
-        let link_key = self
+        let file = self
             .files
             .iter()
             .find(|f| f.name == name)
-            .map(|f| f.link_key.clone())
             .ok_or(SysErrNo::ENOENT)?;
-        let now = FileTimes::now();
-        for file in self.files.iter_mut().filter(|f| f.link_key == link_key) {
-            file.content.resize(new_len);
-            file.times.mtime_sec = now.mtime_sec;
-            file.times.mtime_nsec = now.mtime_nsec;
-            file.times.ctime_sec = now.ctime_sec;
-            file.times.ctime_nsec = now.ctime_nsec;
-        }
+        file.resize(new_len);
         Ok(())
     }
 
@@ -886,15 +1144,12 @@ impl MemFileSystem {
         mtime: Option<(isize, isize)>,
     ) -> Result<(), SysErrNo> {
         let name = normalize_path(name);
-        let link_key = self
+        let file = self
             .files
             .iter()
             .find(|f| f.name == name)
-            .map(|f| f.link_key.clone())
             .ok_or(SysErrNo::ENOENT)?;
-        for file in self.files.iter_mut().filter(|f| f.link_key == link_key) {
-            file.times.set_access_modify(atime, mtime);
-        }
+        file.set_times(atime, mtime);
         Ok(())
     }
 
@@ -909,10 +1164,8 @@ impl MemFileSystem {
         }
         let entry = self.metadata.get_mut(&name).expect("metadata exists");
         entry.mode = mode & 0o7777;
-        if let Some(file) = self.files.iter_mut().find(|f| f.name == name) {
-            let now = FileTimes::now();
-            file.times.ctime_sec = now.ctime_sec;
-            file.times.ctime_nsec = now.ctime_nsec;
+        if let Some(file) = self.files.iter().find(|f| f.name == name) {
+            file.touch_ctime();
         }
         Ok(())
     }
@@ -933,21 +1186,16 @@ impl MemFileSystem {
         }
         let is_regular = self.files.iter().any(|f| f.name == name);
         let entry = self.metadata.get_mut(&name).expect("metadata exists");
-        entry.mode = chown_mode_after_owner_update(
-            entry.mode,
-            is_regular,
-            uid.is_some() || gid.is_some(),
-        );
+        entry.mode =
+            chown_mode_after_owner_update(entry.mode, is_regular, uid.is_some() || gid.is_some());
         if let Some(uid) = uid {
             entry.uid = uid;
         }
         if let Some(gid) = gid {
             entry.gid = gid;
         }
-        if let Some(file) = self.files.iter_mut().find(|f| f.name == name) {
-            let now = FileTimes::now();
-            file.times.ctime_sec = now.ctime_sec;
-            file.times.ctime_nsec = now.ctime_nsec;
+        if let Some(file) = self.files.iter().find(|f| f.name == name) {
+            file.touch_ctime();
         }
         Ok(())
     }
@@ -1018,6 +1266,7 @@ pub fn init() {
 
 fn init_pseudo_files() {
     let mounts = b"rootfs / ext4 rw 0 0\n";
+    let proc_version = b"Linux version 5.10.0 (wll_OS) #1 SMP PREEMPT\n";
     let meminfo = b"MemTotal:       131072 kB\nMemFree:         65536 kB\nMemAvailable:    65536 kB\nBuffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\nSwapFree:            0 kB\n";
     let cpuinfo = b"processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imac\n";
     let proc_self_status = b"Name:\twll_OS\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nMems_allowed:\t1\nMems_allowed_list:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n";
@@ -1064,6 +1313,10 @@ fn init_pseudo_files() {
         fs.add_dir(&alloc::format!("{}/sys/devices/system/node", root));
         fs.add_dir(&alloc::format!("{}/sys/devices/system/node/node0", root));
         fs.add_file(&alloc::format!("{}/proc/mounts", root), mounts.to_vec());
+        fs.add_file(
+            &alloc::format!("{}/proc/version", root),
+            proc_version.to_vec(),
+        );
         fs.add_file(
             &alloc::format!("{}/proc/self/status", root),
             proc_self_status.to_vec(),
@@ -1161,21 +1414,33 @@ fn install_busybox_shell_aliases() {
     // 交互 shell、musl 程序和 glibc 程序看到一致的最小命令集。
     for root in ["", "/musl", "/glibc"] {
         let busybox_path = alloc::format!("{}/busybox", root);
-        let Some(busybox_data) = read_executable_file(&busybox_path) else {
+        let source_in_memfs = MEM_FS.lock().get_file(&busybox_path).is_some();
+        let source_in_ext4 = ext4_vol::lookup_kind(&busybox_path)
+            .is_some_and(|(_ino, kind)| kind == ext4_vol::Ext4NodeKind::Regular);
+        if !source_in_memfs && !source_in_ext4 {
             continue;
-        };
+        }
 
         let applets = [
             "sh", "ls", "cat", "pwd", "echo", "mount", "umount", "mkdir", "rmdir", "touch", "rm",
             "cp", "mv", "sleep", "uname", "free", "ps",
         ];
 
-        let mut fs = MEM_FS.lock();
-        fs.add_dir(&alloc::format!("{}/bin", root));
-        for applet in applets {
-            let applet_path = alloc::format!("{}/bin/{}", root, applet);
-            if !fs.exists(&applet_path) {
-                fs.add_file(&applet_path, busybox_data.clone());
+        if source_in_memfs {
+            let mut fs = MEM_FS.lock();
+            fs.add_dir(&alloc::format!("{}/bin", root));
+            for applet in applets {
+                let applet_path = alloc::format!("{}/bin/{}", root, applet);
+                let _ = fs.link_path(&busybox_path, &applet_path);
+            }
+        } else {
+            let bin_path = alloc::format!("{}/bin", root);
+            if !ext4_vol::ext4_dir_path_exists(&bin_path) {
+                let _ = ext4_vol::mkdir_ext4(&bin_path);
+            }
+            for applet in applets {
+                let applet_path = alloc::format!("{}/bin/{}", root, applet);
+                let _ = ext4_vol::link_ext4(&busybox_path, &applet_path, true);
             }
         }
     }
@@ -1210,18 +1475,12 @@ cat /proc/cpuinfo
 echo "--- /proc/mounts ---"
 cat /proc/mounts
 echo
-echo "[4] ext4-backed test image check"
+echo "[4] ext4-backed runtime image check"
 if [ -e /musl/busybox ]; then
     echo "OK: /musl/busybox"
 fi
-if [ -e /musl/basic_testcode.sh ]; then
-    echo "OK: /musl/basic_testcode.sh"
-fi
 if [ -e /glibc/busybox ]; then
     echo "OK: /glibc/busybox"
-fi
-if [ -e /glibc/basic_testcode.sh ]; then
-    echo "OK: /glibc/basic_testcode.sh"
 fi
 echo
 echo "[5] external command return smoke test"

@@ -5,14 +5,15 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::fs::block_dev;
 use crate::fs::ext4_vol;
 use crate::fs::vfs::VfsNodeKind;
-use crate::fs::FileTimes;
 use crate::fs::MEM_FS;
+use crate::fs::{FileTimes, MemNodeMetadata};
 use crate::task::wait_queue::WaitKey;
 use crate::utils::error::SysErrNo;
 
@@ -40,6 +41,34 @@ const PIPE_WAIT_WRITABLE: usize = 2;
 const EVENTFD_WAIT_READABLE: usize = 1;
 const EVENTFD_WAIT_WRITABLE: usize = 2;
 const PIPE_SMALL_COPY: usize = 64;
+static NEXT_OPEN_FILE_DESCRIPTION_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Debug)]
+pub struct OpenFileDescriptionOwner {
+    id: usize,
+}
+
+impl OpenFileDescriptionOwner {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Drop for OpenFileDescriptionOwner {
+    fn drop(&mut self) {
+        crate::syscall::fs::release_file_locks_for_ofd(self.id);
+    }
+}
+
+pub fn new_open_file_description_owner() -> Arc<OpenFileDescriptionOwner> {
+    let id = loop {
+        let id = NEXT_OPEN_FILE_DESCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            break id;
+        }
+    };
+    Arc::new(OpenFileDescriptionOwner { id })
+}
 
 fn pipe_wait_key(state: &Arc<Mutex<PipeState>>, event: usize) -> WaitKey {
     WaitKey::new(Arc::as_ptr(state) as usize, event)
@@ -155,7 +184,9 @@ impl MemFileContent {
 
     pub fn write_at(&mut self, offset: usize, buf: &[u8]) -> usize {
         let end = offset + buf.len();
-        self.resize(end);
+        if end > self.len() {
+            self.resize(end);
+        }
         match self {
             Self::Inline(content) => {
                 content[offset..end].copy_from_slice(buf);
@@ -252,8 +283,9 @@ fn refresh_mem_file(
         return false;
     }
     if let Some(file) = MEM_FS.lock().get_file(name) {
-        *content = file.content.clone();
-        *times = file.times;
+        let (snapshot, file_times) = file.snapshot();
+        *content = snapshot;
+        *times = file_times;
         true
     } else {
         *linked = false;
@@ -318,6 +350,7 @@ pub mod open_flags {
     pub const O_DIRECTORY: u32 = 0o00200000;
     pub const O_NOFOLLOW: u32 = 0o00400000;
     pub const O_NOATIME: u32 = 0o01000000;
+    pub const O_TMPFILE: u32 = 0o20200000;
     pub const O_PATH: u32 = 0o10000000;
     pub const O_CLOEXEC: u32 = 0o2000000;
 }
@@ -343,10 +376,12 @@ pub enum FileDescriptor {
         content: MemFileContent,
         times: FileTimes,
         offset: FileOffset,
+        ofd_owner: Arc<OpenFileDescriptionOwner>,
         readable: bool,
         writable: bool,
         append: bool,
         linked: bool,
+        node: Option<MemNodeMetadata>,
     },
     /// 内存目录
     MemDir {
@@ -359,6 +394,7 @@ pub enum FileDescriptor {
     Ext4Regular {
         ino: u32,
         offset: usize,
+        ofd_owner: Arc<OpenFileDescriptionOwner>,
         readable: bool,
         writable: bool,
         append: bool,
@@ -632,6 +668,14 @@ impl FileDescriptor {
                 },
             ) => left == right,
             _ => false,
+        }
+    }
+
+    pub fn ofd_owner_id(&self) -> Option<usize> {
+        match self {
+            FileDescriptor::MemFile { ofd_owner, .. }
+            | FileDescriptor::Ext4Regular { ofd_owner, .. } => Some(ofd_owner.id()),
+            _ => None,
         }
     }
 
@@ -1390,7 +1434,7 @@ impl FileDescriptor {
                     MEM_FS
                         .lock()
                         .get_file(name)
-                        .map(|file| file.content.len())
+                        .map(|file| file.size())
                         .unwrap_or(content.len())
                 }
             }
@@ -1409,7 +1453,11 @@ impl FileDescriptor {
         }
     }
 
-    pub fn truncate(&mut self, new_len: usize) -> Result<(), SysErrNo> {
+    fn truncate_with_readonly_errno(
+        &mut self,
+        new_len: usize,
+        readonly_errno: SysErrNo,
+    ) -> Result<(), SysErrNo> {
         if new_len > MAX_FILE_OFFSET {
             return Err(SysErrNo::EFBIG);
         }
@@ -1423,7 +1471,7 @@ impl FileDescriptor {
                 ..
             } => {
                 if !*writable {
-                    return Err(SysErrNo::EBADF);
+                    return Err(readonly_errno);
                 }
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(());
@@ -1440,7 +1488,7 @@ impl FileDescriptor {
             }
             FileDescriptor::Ext4Regular { ino, writable, .. } => {
                 if !*writable {
-                    return Err(SysErrNo::EBADF);
+                    return Err(readonly_errno);
                 }
                 ext4_vol::truncate_regular_ino(*ino, new_len as u64)
             }
@@ -1451,6 +1499,14 @@ impl FileDescriptor {
             }
             _ => Err(SysErrNo::EINVAL),
         }
+    }
+
+    pub fn truncate(&mut self, new_len: usize) -> Result<(), SysErrNo> {
+        self.truncate_with_readonly_errno(new_len, SysErrNo::EBADF)
+    }
+
+    pub fn ftruncate(&mut self, new_len: usize) -> Result<(), SysErrNo> {
+        self.truncate_with_readonly_errno(new_len, SysErrNo::EINVAL)
     }
 
     pub fn allocate(&mut self, offset: usize, len: usize, keep_size: bool) -> Result<(), SysErrNo> {
@@ -1579,19 +1635,23 @@ impl Clone for FileDescriptor {
                 content,
                 times,
                 offset,
+                ofd_owner,
                 readable,
                 writable,
                 append,
                 linked,
+                node,
             } => FileDescriptor::MemFile {
                 name: name.clone(),
                 content: content.clone(),
                 times: *times,
                 offset: *offset,
+                ofd_owner: ofd_owner.clone(),
                 readable: *readable,
                 writable: *writable,
                 append: *append,
                 linked: *linked,
+                node: *node,
             },
             FileDescriptor::MemDir {
                 path,
@@ -1607,6 +1667,7 @@ impl Clone for FileDescriptor {
             FileDescriptor::Ext4Regular {
                 ino,
                 offset,
+                ofd_owner,
                 readable,
                 writable,
                 append,
@@ -1615,6 +1676,7 @@ impl Clone for FileDescriptor {
                 FileDescriptor::Ext4Regular {
                     ino: *ino,
                     offset: *offset,
+                    ofd_owner: ofd_owner.clone(),
                     readable: *readable,
                     writable: *writable,
                     append: *append,
@@ -1934,15 +1996,19 @@ impl FileDescriptorTable {
         Ok(())
     }
 
-    pub fn close_on_exec(&mut self) {
+    pub fn close_on_exec(&mut self) -> Vec<FileDescriptor> {
+        let mut closed = Vec::new();
         if self.cloexec_count == 0 {
-            return;
+            return closed;
         }
         for index in 0..MAX_FD_NUM {
             if self.fds[index].is_some() && (self.fd_flags[index] & FD_CLOEXEC) != 0 {
-                self.clear_slot(index);
+                if let Some(file) = self.clear_slot(index) {
+                    closed.push(file);
+                }
             }
         }
+        closed
     }
 
     pub fn close_all(&mut self) {
@@ -2135,14 +2201,14 @@ fn open_file_legacy_unused(
         let source = fs::MEM_FS
             .lock()
             .get_file(&path_norm)
-            .map(|file| (file.content.clone(), file.times));
+            .map(|file| file.snapshot());
         let (mut content, mut times) =
             source.unwrap_or_else(|| (MemFileContent::new(), FileTimes::now()));
         if want_trunc && write_ok {
             content.clear();
             fs::MEM_FS.lock().truncate_file(&path_norm, 0)?;
             if let Some(file) = fs::MEM_FS.lock().get_file(&path_norm) {
-                times = file.times;
+                times = file.times();
             }
         }
         let base_off = if append && write_ok { content.len() } else { 0 };
@@ -2155,6 +2221,7 @@ fn open_file_legacy_unused(
             writable: write_ok,
             append,
             linked: true,
+            node: None,
         });
     }
 
@@ -2241,7 +2308,7 @@ fn open_file_legacy_unused(
             let times = fs::MEM_FS
                 .lock()
                 .get_file(&path_norm)
-                .map(|file| file.times)
+                .map(|file| file.times())
                 .unwrap_or_else(FileTimes::now);
             return Ok(FileDescriptor::MemFile {
                 name: path_norm,
@@ -2252,6 +2319,7 @@ fn open_file_legacy_unused(
                 writable: write_ok,
                 append,
                 linked: true,
+                node: None,
             });
         }
         if ext_parent {
@@ -2264,6 +2332,7 @@ fn open_file_legacy_unused(
                 writable: write_ok,
                 append,
                 linked: true,
+                node: None,
             });
         }
         if mem_parent {
@@ -2273,7 +2342,7 @@ fn open_file_legacy_unused(
             let times = fs::MEM_FS
                 .lock()
                 .get_file(&path_norm)
-                .map(|file| file.times)
+                .map(|file| file.times())
                 .unwrap_or_else(FileTimes::now);
             return Ok(FileDescriptor::MemFile {
                 name: path_norm,

@@ -1146,6 +1146,7 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     // 地址空间等资源；父子关系本身仍需保留给 wait4/waitpid 回收 zombie。
     let parent = task.inner.lock().parent.clone();
     let members = task.thread_group.user_members();
+    crate::syscall::fs::release_file_locks_for_pid(task.thread_group.tgid());
     detach_thread_group_shared_memory(&members);
     release_process_runtime_resources(&members);
     crate::syscall::signal::notify_child_exit(task);

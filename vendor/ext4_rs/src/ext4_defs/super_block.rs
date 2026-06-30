@@ -165,8 +165,8 @@ impl Ext4Superblock {
         block_group_count as u32
     }
 
-    pub fn blocks_count(&self) -> u32 {
-        ((self.blocks_count_hi.to_le() as u64) << 32) as u32 | self.blocks_count_lo
+    pub fn blocks_count(&self) -> u64 {
+        ((self.blocks_count_hi as u64) << 32) | self.blocks_count_lo as u64
     }
 
     pub fn desc_size(&self) -> u16 {
@@ -197,6 +197,10 @@ impl Ext4Superblock {
 
     pub fn decrease_free_inodes_count(&mut self) {
         self.free_inodes_count -= 1;
+    }
+
+    pub fn increase_free_inodes_count(&mut self) {
+        self.free_inodes_count += 1;
     }
 
     pub fn free_blocks_count(&self) -> u64 {

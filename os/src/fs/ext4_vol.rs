@@ -1263,6 +1263,8 @@ fn finish_unlinked_regular(ino: u32) -> Result<(), SysErrNo> {
     iref.inode.set_ctime(now);
     iref.inode.set_dtime(now);
     fs.write_back_inode(&mut iref);
+    fs.ialloc_free_inode(ino, false);
+    clear_namespace_cache();
     Ok(())
 }
 
@@ -1745,9 +1747,13 @@ pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
             fs.truncate_inode(&mut child_ref, 0).map_err(map_ext4_err)?;
         }
         child_ref.inode.set_dtime(now);
+        child_ref.inode.set_links_count(0);
     }
     fs.write_back_inode(&mut parent_ref);
     fs.write_back_inode(&mut child_ref);
+    if old_links <= 1 && !delay_delete {
+        fs.ialloc_free_inode(child_ino, child_kind == Ext4NodeKind::Directory);
+    }
     clear_namespace_cache();
     Ok(())
 }
@@ -1833,6 +1839,7 @@ pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
     parent_ref.inode.set_ctime(now);
     fs.write_back_inode(&mut child_ref);
     fs.write_back_inode(&mut parent_ref);
+    fs.ialloc_free_inode(child_ino, true);
     clear_namespace_cache();
     Ok(())
 }
@@ -2432,6 +2439,65 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, Ext4NodeKind)> {
 }
 
 /// 整块读入普通文件（用于 `execve` / harness）。目录或不存在返回 `None`。
+pub fn exchange_ext4(old_path: &str, new_path: &str) -> Result<(), SysErrNo> {
+    let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+    let old = normalize_path(old_path);
+    let new = normalize_path(new_path);
+    if old == new {
+        return Ok(());
+    }
+    if old == "/" || new == "/" {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let (old_parent_path, _) = split_parent_name(&old)?;
+    let Some((old_ino, old_kind)) = resolve_existing(&fs, &old) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    let Some((new_ino, new_kind)) = resolve_existing(&fs, &new) else {
+        return Err(SysErrNo::ENOENT);
+    };
+    if old_kind == Ext4NodeKind::Directory && path_is_descendant(&old, &new) {
+        return Err(SysErrNo::EINVAL);
+    }
+    if new_kind == Ext4NodeKind::Directory && path_is_descendant(&new, &old) {
+        return Err(SysErrNo::EINVAL);
+    }
+
+    let mut temp = String::new();
+    for attempt in 0..32usize {
+        temp = if old_parent_path == "/" {
+            format!(
+                "/.wll_rename_exchange_{}_{}_{}",
+                old_ino, new_ino, attempt
+            )
+        } else {
+            format!(
+                "{}/.wll_rename_exchange_{}_{}_{}",
+                old_parent_path, old_ino, new_ino, attempt
+            )
+        };
+        if resolve_existing(&fs, &temp).is_none() {
+            break;
+        }
+        temp.clear();
+    }
+    if temp.is_empty() {
+        return Err(SysErrNo::EEXIST);
+    }
+    drop(fs);
+
+    rename_ext4(&old, &temp, true)?;
+    if let Err(e) = rename_ext4(&new, &old, true) {
+        let _ = rename_ext4(&temp, &old, true);
+        return Err(e);
+    }
+    if let Err(e) = rename_ext4(&temp, &new, true) {
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub fn slurp_regular_file(path: &str) -> Option<Vec<u8>> {
     let resolved = resolve_symlinks(path).ok()?;
     let fs = ROOT_EXT4.lock().clone()?;
@@ -2523,7 +2589,7 @@ fn ext4_gather_file_paths(fs: &Ext4, dir_path: &str, parent_ino: u32, out: &mut 
     }
 }
 
-/// 枚举卷上全部普通文件的绝对路径（用于 harness 发现 *_testcode.sh）。
+/// 枚举卷上全部普通文件的绝对路径（用于 harness 发现测试脚本）。
 pub fn ext4_list_all_file_paths() -> Vec<String> {
     let Some(fs) = ROOT_EXT4.lock().clone() else {
         return Vec::new();

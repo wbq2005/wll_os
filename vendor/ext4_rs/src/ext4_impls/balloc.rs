@@ -71,6 +71,310 @@ impl BlockGroupCacheManager {
 }
 
 impl Ext4 {
+    fn balloc_super_block(&self) -> Ext4Superblock {
+        let block = Block::load(&self.block_device, SUPERBLOCK_OFFSET);
+        block.read_as()
+    }
+
+    fn mark_system_zone_bits(
+        &self,
+        super_block: &Ext4Superblock,
+        bgid: u32,
+        bitmap: &mut [u8],
+    ) {
+        let start = self.get_block_of_bgid(bgid);
+        let end = start + super_block.blocks_per_group() as u64;
+        if let Some(zones) = &self.system_zone_cache {
+            for zone in zones {
+                let zone_start = zone.start_blk.max(start);
+                let zone_end = (zone.end_blk + 1).min(end);
+                if zone_start >= zone_end {
+                    continue;
+                }
+                for block in zone_start..zone_end {
+                    ext4_bmap_bit_set(bitmap, self.addr_to_idx_bg(block));
+                }
+            }
+        }
+
+        // The bitmap covers a whole group even when the final group extends
+        // beyond the filesystem. Those tail bits must never be allocatable.
+        let blocks_count = super_block.blocks_count();
+        for block in blocks_count.max(start)..end {
+            ext4_bmap_bit_set(bitmap, self.addr_to_idx_bg(block));
+        }
+    }
+
+    fn bitmap_free_blocks(bitmap: &[u8], block_count: u32) -> u32 {
+        let full_bytes = (block_count / 8) as usize;
+        let tail_bits = block_count % 8;
+        let mut used = bitmap[..full_bytes]
+            .iter()
+            .map(|byte| byte.count_ones())
+            .sum::<u32>();
+        if tail_bits != 0 {
+            let mask = (1u8 << tail_bits) - 1;
+            used += (bitmap[full_bytes] & mask).count_ones();
+        }
+        block_count - used
+    }
+
+    fn has_allocatable_clear_bit(
+        &self,
+        super_block: &Ext4Superblock,
+        bgid: u32,
+        bitmap: &[u8],
+    ) -> bool {
+        let start = self.get_block_of_bgid(bgid);
+        let group_end = start + super_block.blocks_per_group() as u64;
+        let end = group_end.min(super_block.blocks_count());
+
+        for block in start..end {
+            let idx = self.addr_to_idx_bg(block);
+            if ext4_bmap_is_bit_clr(bitmap, idx) && !self.is_system_reserved_block(block, bgid) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn mark_block_if_in_group(&self, super_block: &Ext4Superblock, bgid: u32, bitmap: &mut [u8], block: u64) {
+        if block == 0 || block >= super_block.blocks_count() {
+            return;
+        }
+
+        if self.get_bgid_of_block(block) == bgid {
+            ext4_bmap_bit_set(bitmap, self.addr_to_idx_bg(block));
+        }
+    }
+
+    fn mark_block_range_if_in_group(
+        &self,
+        super_block: &Ext4Superblock,
+        bgid: u32,
+        bitmap: &mut [u8],
+        start_block: u64,
+        count: u32,
+    ) {
+        let group_start = self.get_block_of_bgid(bgid);
+        let group_end = (group_start + super_block.blocks_per_group() as u64)
+            .min(super_block.blocks_count());
+        let range_start = start_block.max(group_start);
+        let range_end = start_block
+            .saturating_add(count as u64)
+            .min(group_end);
+
+        if range_start >= range_end {
+            return;
+        }
+
+        for block in range_start..range_end {
+            ext4_bmap_bit_set(bitmap, self.addr_to_idx_bg(block));
+        }
+    }
+
+    fn mark_extent_node_blocks(
+        &self,
+        super_block: &Ext4Superblock,
+        bgid: u32,
+        bitmap: &mut [u8],
+        data: &[u8],
+        is_root: bool,
+    ) {
+        let node = match ExtentNode::load_from_data(data, is_root) {
+            Ok(node) => node,
+            Err(_) => return,
+        };
+
+        if node.header.magic != EXT4_EXTENT_MAGIC {
+            return;
+        }
+
+        let entries = core::cmp::min(
+            node.header.entries_count as usize,
+            node.header.max_entries_count as usize,
+        );
+
+        if entries == 0 {
+            return;
+        }
+
+        for pos in 0..entries {
+            if node.header.depth == 0 {
+                if let Some(extent) = node.get_extent(pos) {
+                    self.mark_block_range_if_in_group(
+                        super_block,
+                        bgid,
+                        bitmap,
+                        extent.get_pblock(),
+                        extent.get_actual_len() as u32,
+                    );
+                }
+            } else if let Ok(index) = node.get_index(pos) {
+                let child_block = index.get_pblock();
+                self.mark_block_if_in_group(super_block, bgid, bitmap, child_block);
+
+                if child_block < super_block.blocks_count() {
+                    let child_data = self
+                        .block_device
+                        .read_offset(child_block as usize * BLOCK_SIZE);
+                    self.mark_extent_node_blocks(super_block, bgid, bitmap, &child_data, false);
+                }
+            }
+        }
+    }
+
+    fn mark_legacy_inode_blocks(
+        &self,
+        super_block: &Ext4Superblock,
+        bgid: u32,
+        bitmap: &mut [u8],
+        inode: &Ext4Inode,
+    ) {
+        for block in inode.block.iter().take(12) {
+            self.mark_block_if_in_group(super_block, bgid, bitmap, *block as u64);
+        }
+
+        // Mark indirect pointer blocks conservatively. Recursing into the full
+        // legacy tree is unnecessary for the current ext4 images, but these
+        // pointer blocks are allocated metadata and must not be reused.
+        for block in inode.block.iter().skip(12) {
+            self.mark_block_if_in_group(super_block, bgid, bitmap, *block as u64);
+        }
+    }
+
+    fn rebuild_balloc_bitmap_from_metadata(
+        &self,
+        super_block: &Ext4Superblock,
+        bgid: u32,
+        expected_free: u64,
+    ) -> Vec<u8> {
+        let mut rebuilt = vec![0u8; BLOCK_SIZE];
+        self.mark_system_zone_bits(super_block, bgid, &mut rebuilt);
+
+        let group_count = super_block.block_group_count();
+        for inode_bgid in 0..group_count {
+            let mut inode_group =
+                Ext4BlockGroup::load_new(&self.block_device, super_block, inode_bgid as usize);
+            let inode_bitmap_block = inode_group.get_inode_bitmap_block(super_block);
+            let inode_bitmap = self
+                .block_device
+                .read_offset(inode_bitmap_block as usize * BLOCK_SIZE);
+            let inodes_in_group = super_block.get_inodes_in_group_cnt(inode_bgid);
+
+            for idx in 0..inodes_in_group {
+                if !ext4_bmap_is_bit_set(&inode_bitmap, idx) {
+                    continue;
+                }
+
+                let inode_num = inode_bgid * super_block.inodes_per_group() + idx + 1;
+                let inode_ref = self.get_inode_ref(inode_num);
+                let inode = inode_ref.inode;
+
+                if inode.mode() == 0 || inode.dtime() != 0 {
+                    continue;
+                }
+
+                if (inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0 {
+                    let root_data = unsafe {
+                        core::slice::from_raw_parts(
+                            inode.block.as_ptr() as *const u8,
+                            inode.block.len() * size_of::<u32>(),
+                        )
+                    };
+                    self.mark_extent_node_blocks(super_block, bgid, &mut rebuilt, root_data, true);
+                } else {
+                    self.mark_legacy_inode_blocks(super_block, bgid, &mut rebuilt, &inode);
+                }
+            }
+        }
+
+        // If the metadata walk misses format-specific reservations, keep the
+        // descriptor free count as an upper bound by reserving high blocks until
+        // the rebuilt bitmap is no more permissive than the descriptor.
+        let mut rebuilt_free =
+            Self::bitmap_free_blocks(&rebuilt, super_block.blocks_per_group()) as u64;
+        let mut idx = super_block.blocks_per_group();
+        while rebuilt_free > expected_free && idx > 0 {
+            idx -= 1;
+            if ext4_bmap_is_bit_clr(&rebuilt, idx) {
+                ext4_bmap_bit_set(&mut rebuilt, idx);
+                rebuilt_free -= 1;
+            }
+        }
+
+        rebuilt
+    }
+
+    fn reconcile_super_free_blocks(&self, old_free: u64, new_free: u64) {
+        if old_free == new_free {
+            return;
+        }
+
+        let mut super_block = self.balloc_super_block();
+        let current = super_block.free_blocks_count();
+        let reconciled = if new_free > old_free {
+            current.saturating_add(new_free - old_free)
+        } else {
+            current.saturating_sub(old_free - new_free)
+        };
+        super_block.set_free_blocks_count(reconciled);
+        super_block.sync_to_disk_with_csum(&self.block_device);
+    }
+
+    fn load_balloc_bitmap_for_alloc(
+        &self,
+        super_block: &Ext4Superblock,
+        bgid: u32,
+        block_group: &mut Ext4BlockGroup,
+    ) -> Vec<u8> {
+        let bmp_blk_adr = block_group.get_block_bitmap_block(super_block);
+        let mut bitmap = self
+            .block_device
+            .read_offset(bmp_blk_adr as usize * BLOCK_SIZE);
+
+        let old_free = block_group.get_free_blocks_count();
+        let bitmap_has_allocatable =
+            self.has_allocatable_clear_bit(super_block, bgid, &bitmap);
+        if old_free > 0 && !bitmap_has_allocatable {
+            bitmap = self.rebuild_balloc_bitmap_from_metadata(super_block, bgid, old_free);
+            let rebuilt_free =
+                Self::bitmap_free_blocks(&bitmap, super_block.blocks_per_group()) as u64;
+            if rebuilt_free != old_free {
+                block_group.set_free_blocks_count(rebuilt_free as u32);
+                self.reconcile_super_free_blocks(old_free, rebuilt_free);
+            }
+            if block_group.has_block_uninit() {
+                block_group.clear_block_uninit();
+            }
+            block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap);
+            self.block_device
+                .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap);
+            block_group.sync_to_disk_with_csum(&self.block_device, bgid as usize, super_block);
+            return bitmap;
+        }
+
+        if !block_group.has_block_uninit() {
+            return bitmap;
+        }
+
+        self.mark_system_zone_bits(super_block, bgid, &mut bitmap);
+        let initialized_free =
+            Self::bitmap_free_blocks(&bitmap, super_block.blocks_per_group()) as u64;
+        if initialized_free != old_free {
+            block_group.set_free_blocks_count(initialized_free as u32);
+            self.reconcile_super_free_blocks(old_free, initialized_free);
+        }
+
+        block_group.clear_block_uninit();
+        block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap);
+        self.block_device
+            .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap);
+        block_group.sync_to_disk_with_csum(&self.block_device, bgid as usize, super_block);
+        bitmap
+    }
+
     /// Compute number of block group from block address.
     ///
     /// Params:
@@ -194,19 +498,19 @@ impl Ext4 {
 
             // Load block with bitmap
             let bmp_blk_adr = block_group.get_block_bitmap_block(super_block);
-            let mut bitmap_block =
-                Block::load(&self.block_device, bmp_blk_adr as usize * BLOCK_SIZE);
+            let mut bitmap_data =
+                self.load_balloc_bitmap_for_alloc(super_block, bgid, &mut block_group);
 
             // Check if goal is free
-            if ext4_bmap_is_bit_clr(&bitmap_block.data, idx_in_bg) {
+            if ext4_bmap_is_bit_clr(&bitmap_data, idx_in_bg) {
                 let block_num = self.bg_idx_to_addr(idx_in_bg, bgid);
                 if self.is_system_reserved_block(block_num, bgid) {
                     // 跳过 system zone
                 } else {
-                    ext4_bmap_bit_set(&mut bitmap_block.data, idx_in_bg);
-                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_block.data);
+                    ext4_bmap_bit_set(&mut bitmap_data, idx_in_bg);
+                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_data);
                     self.block_device
-                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_block.data);
+                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_data);
                     alloc = self.bg_idx_to_addr(idx_in_bg, bgid);
 
                     /* Update free block counts */
@@ -220,37 +524,43 @@ impl Ext4 {
             let end_idx = min((idx_in_bg + 63) & !63, blk_in_bg);
 
             for tmp_idx in (idx_in_bg + 1)..end_idx {
-                if ext4_bmap_is_bit_clr(&bitmap_block.data, tmp_idx) {
+                if ext4_bmap_is_bit_clr(&bitmap_data, tmp_idx) {
                     // Check if this is a system reserved block
                     let block_num = self.bg_idx_to_addr(tmp_idx, bgid);
                     if self.is_system_reserved_block(block_num, bgid) {
                         continue;
                     }
                     
-                    ext4_bmap_bit_set(&mut bitmap_block.data, tmp_idx);
-                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_block.data);
+                    ext4_bmap_bit_set(&mut bitmap_data, tmp_idx);
+                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_data);
                     self.block_device
-                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_block.data);
+                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_data);
                     alloc = self.bg_idx_to_addr(tmp_idx, bgid);
                     self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
                     return Ok(alloc);
                 }
             }
 
-            // Find free bit in bitmap
-            let mut rel_blk_idx = 0;
-            if ext4_bmap_bit_find_clr(&bitmap_block.data, idx_in_bg, blk_in_bg, &mut rel_blk_idx) {
-                // Check if this is a system reserved block
-                let block_num = self.bg_idx_to_addr(rel_blk_idx, bgid);
-                if !self.is_system_reserved_block(block_num, bgid) {
-                    ext4_bmap_bit_set(&mut bitmap_block.data, rel_blk_idx);
-                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_block.data);
-                    self.block_device
-                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_block.data);
-                    alloc = self.bg_idx_to_addr(rel_blk_idx, bgid);
-                    self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
-                    return Ok(alloc);
+            // Find a non-metadata free bit in this group. ext4 images may leave a
+            // metadata bit clear; that must not make the whole group look full.
+            let mut search_idx = idx_in_bg;
+            while search_idx < blk_in_bg {
+                let mut rel_blk_idx = 0;
+                if !ext4_bmap_bit_find_clr(&bitmap_data, search_idx, blk_in_bg, &mut rel_blk_idx) {
+                    break;
                 }
+                let block_num = self.bg_idx_to_addr(rel_blk_idx, bgid);
+                if self.is_system_reserved_block(block_num, bgid) {
+                    search_idx = rel_blk_idx.saturating_add(1);
+                    continue;
+                }
+                ext4_bmap_bit_set(&mut bitmap_data, rel_blk_idx);
+                block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_data);
+                self.block_device
+                    .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_data);
+                alloc = block_num;
+                self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
+                return Ok(alloc);
             }
 
             // No free block found in this group, try other block groups
@@ -323,17 +633,17 @@ impl Ext4 {
 
             // Load block with bitmap
             let bmp_blk_adr = block_group.get_block_bitmap_block(super_block);
-            let mut bitmap_block =
-                Block::load(&self.block_device, bmp_blk_adr as usize * BLOCK_SIZE);
+            let mut bitmap_data =
+                self.load_balloc_bitmap_for_alloc(super_block, bgid, &mut block_group);
 
             // Check if goal is free
-            if ext4_bmap_is_bit_clr(&bitmap_block.data, idx_in_bg) {
+            if ext4_bmap_is_bit_clr(&bitmap_data, idx_in_bg) {
                 let block_num = self.bg_idx_to_addr(idx_in_bg, bgid);
                 if !self.is_system_reserved_block(block_num, bgid) {
-                    ext4_bmap_bit_set(&mut bitmap_block.data, idx_in_bg);
-                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_block.data);
+                    ext4_bmap_bit_set(&mut bitmap_data, idx_in_bg);
+                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_data);
                     self.block_device
-                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_block.data);
+                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_data);
                     alloc = block_num;
 
                     /* Update free block counts */
@@ -348,17 +658,17 @@ impl Ext4 {
             let end_idx = min((idx_in_bg + 63) & !63, max_blocks_in_bitmap as u32);
 
             for tmp_idx in (idx_in_bg + 1)..end_idx {
-                if ext4_bmap_is_bit_clr(&bitmap_block.data, tmp_idx) {
+                if ext4_bmap_is_bit_clr(&bitmap_data, tmp_idx) {
                     // Check if this is a system reserved block
                     let block_num = self.bg_idx_to_addr(tmp_idx, bgid);
                     if self.is_system_reserved_block(block_num, bgid) {
                         continue;
                     }
                     
-                    ext4_bmap_bit_set(&mut bitmap_block.data, tmp_idx);
-                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_block.data);
+                    ext4_bmap_bit_set(&mut bitmap_data, tmp_idx);
+                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_data);
                     self.block_device
-                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_block.data);
+                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_data);
                     alloc = self.bg_idx_to_addr(tmp_idx, bgid);
                     self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
 
@@ -367,22 +677,32 @@ impl Ext4 {
                 }
             }
 
-            // Find free bit in bitmap
-            let mut rel_blk_idx = 0;
-            if ext4_bmap_bit_find_clr(&bitmap_block.data, idx_in_bg, max_blocks_in_bitmap as u32, &mut rel_blk_idx) {
-                // Check if this is a system reserved block
-                let block_num = self.bg_idx_to_addr(rel_blk_idx, bgid);
-                if !self.is_system_reserved_block(block_num, bgid) {
-                    ext4_bmap_bit_set(&mut bitmap_block.data, rel_blk_idx);
-                    block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_block.data);
-                    self.block_device
-                        .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_block.data);
-                    alloc = self.bg_idx_to_addr(rel_blk_idx, bgid);
-                    self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
-
-                    *start_bgid = bgid;
-                    return Ok(alloc);
+            // Find a non-metadata free bit in this group.
+            let mut search_idx = idx_in_bg;
+            while search_idx < max_blocks_in_bitmap as u32 {
+                let mut rel_blk_idx = 0;
+                if !ext4_bmap_bit_find_clr(
+                    &bitmap_data,
+                    search_idx,
+                    max_blocks_in_bitmap as u32,
+                    &mut rel_blk_idx,
+                ) {
+                    break;
                 }
+                let block_num = self.bg_idx_to_addr(rel_blk_idx, bgid);
+                if self.is_system_reserved_block(block_num, bgid) {
+                    search_idx = rel_blk_idx.saturating_add(1);
+                    continue;
+                }
+                ext4_bmap_bit_set(&mut bitmap_data, rel_blk_idx);
+                block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_data);
+                self.block_device
+                    .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_data);
+                alloc = block_num;
+                self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
+
+                *start_bgid = bgid;
+                return Ok(alloc);
             }
 
             // No free block found in this group, try other block groups
@@ -400,7 +720,7 @@ impl Ext4 {
         block_group: &mut Ext4BlockGroup,
         bgid: usize,
     ) -> Result<()> {
-        let mut super_block = self.super_block;
+        let mut super_block = self.balloc_super_block();
         let block_size = BLOCK_SIZE as u64;
 
         // Update superblock free blocks count
@@ -434,7 +754,7 @@ impl Ext4 {
             return;
         }
 
-        let mut super_block = self.super_block;
+        let mut super_block = self.balloc_super_block();
         let blocks_per_group = super_block.blocks_per_group() as u64;
 
         while remaining > 0 {
@@ -560,8 +880,11 @@ impl Ext4 {
             
             // Get block bitmap for this group
             let bmp_blk_adr = block_group.get_block_bitmap_block(super_block);
-            let mut bitmap_data = 
-                self.block_device.read_offset(bmp_blk_adr as usize * BLOCK_SIZE);
+            let mut bitmap_data = self.load_balloc_bitmap_for_alloc(
+                super_block,
+                bgid,
+                &mut block_group,
+            );
             
             // Compute indexes and limits
             let first_in_bg = self.get_block_of_bgid(bgid);
@@ -668,7 +991,7 @@ impl Ext4 {
                 block_group.sync_to_disk_with_csum(&self.block_device, bgid as usize, super_block);
                 
                 // Update superblock free blocks count
-                let mut sb_copy = *super_block;
+                let mut sb_copy = self.balloc_super_block();
                 let sb_free_blocks = sb_copy.free_blocks_count();
                 sb_copy.set_free_blocks_count(sb_free_blocks - found_blocks as u64);
                 sb_copy.sync_to_disk_with_csum(&self.block_device);

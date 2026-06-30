@@ -35,10 +35,12 @@ pub enum SysErrNo {
     EPIPE = 32,           // Broken pipe
     EDOM = 33,            // Math argument out of domain of func
     ERANGE = 34,          // Math result not representable
+    EDEADLK = 35,         // Resource deadlock would occur
     ENAMETOOLONG = 36,    // File name too long
     ENOTEMPTY = 39,       // Directory not empty
     ELOOP = 40,           // Too many symbolic links encountered
     ECANCELED = 47,       // Operation canceled (used by exit in foreground mode)
+    ENODATA = 61,         // No data available
     ENOTSOCK = 88,        // Socket operation on non-socket
     EDESTADDRREQ = 89,    // Destination address required
     ENOPROTOOPT = 92,     // Protocol not available
