@@ -33,6 +33,8 @@ const F_SETFL: usize = 4;
 const F_GETLK: usize = 5;
 const F_SETLK: usize = 6;
 const F_SETLKW: usize = 7;
+const F_SETLEASE: usize = 1024;
+const F_GETLEASE: usize = 1025;
 const F_OFD_GETLK: usize = 36;
 const F_OFD_SETLK: usize = 37;
 const F_OFD_SETLKW: usize = 38;
@@ -3274,6 +3276,31 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
             let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
             file_desc.set_status_flags(arg);
             Ok(0)
+        }
+        F_SETLEASE => {
+            let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+            let lease = match arg {
+                value if value == F_RDLCK as usize => {
+                    if !file_desc.readable() {
+                        return Err(SysErrNo::EBADF);
+                    }
+                    F_RDLCK
+                }
+                value if value == F_WRLCK as usize => {
+                    if !file_desc.writable() {
+                        return Err(SysErrNo::EBADF);
+                    }
+                    F_WRLCK
+                }
+                value if value == F_UNLCK as usize => F_UNLCK,
+                _ => return Err(SysErrNo::EINVAL),
+            };
+            file_desc.set_lease(lease)?;
+            Ok(0)
+        }
+        F_GETLEASE => {
+            let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+            file_desc.lease().map(|lease| lease as usize).ok_or(SysErrNo::EINVAL)
         }
         // Linux reports EINVAL for fcntl commands outside the supported
         // command set.  ENOSYS is reserved for a missing syscall entry, not

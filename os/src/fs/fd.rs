@@ -45,11 +45,20 @@ static NEXT_OPEN_FILE_DESCRIPTION_ID: AtomicUsize = AtomicUsize::new(1);
 #[derive(Debug)]
 pub struct OpenFileDescriptionOwner {
     id: usize,
+    lease: Mutex<i16>,
 }
 
 impl OpenFileDescriptionOwner {
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub fn lease(&self) -> i16 {
+        *self.lease.lock()
+    }
+
+    pub fn set_lease(&self, lease: i16) {
+        *self.lease.lock() = lease;
     }
 }
 
@@ -66,7 +75,10 @@ pub fn new_open_file_description_owner() -> Arc<OpenFileDescriptionOwner> {
             break id;
         }
     };
-    Arc::new(OpenFileDescriptionOwner { id })
+    Arc::new(OpenFileDescriptionOwner {
+        id,
+        lease: Mutex::new(2),
+    })
 }
 
 fn pipe_wait_key(state: &Arc<Mutex<PipeState>>, event: usize) -> WaitKey {
@@ -647,6 +659,32 @@ impl FileDescriptor {
             FileDescriptor::MemFile { ofd_owner, .. }
             | FileDescriptor::Ext4Regular { ofd_owner, .. } => Some(ofd_owner.id()),
             _ => None,
+        }
+    }
+
+    pub fn lease(&self) -> Option<i16> {
+        match self {
+            FileDescriptor::MemFile {
+                name, ofd_owner, ..
+            } if !is_dev_null_path(name) && !is_dev_zero_path(name) => Some(ofd_owner.lease()),
+            FileDescriptor::Ext4Regular { ofd_owner, .. } => Some(ofd_owner.lease()),
+            _ => None,
+        }
+    }
+
+    pub fn set_lease(&self, lease: i16) -> Result<(), SysErrNo> {
+        match self {
+            FileDescriptor::MemFile {
+                name, ofd_owner, ..
+            } if !is_dev_null_path(name) && !is_dev_zero_path(name) => {
+                ofd_owner.set_lease(lease);
+                Ok(())
+            }
+            FileDescriptor::Ext4Regular { ofd_owner, .. } => {
+                ofd_owner.set_lease(lease);
+                Ok(())
+            }
+            _ => Err(SysErrNo::EINVAL),
         }
     }
 
