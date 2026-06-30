@@ -187,6 +187,7 @@ impl FileTimes {
 }
 
 /// 内存中的文件
+#[derive(Debug)]
 pub struct MemFileBacking {
     pub content: FileContent,
     pub times: FileTimes,
@@ -233,7 +234,7 @@ impl MemFile {
         }
     }
 
-    fn shared_backing(&self) -> Arc<Mutex<MemFileBacking>> {
+    pub(crate) fn shared_backing(&self) -> Arc<Mutex<MemFileBacking>> {
         self.backing.clone()
     }
 
@@ -419,6 +420,31 @@ impl MemFileSystem {
             &name,
             content,
             times,
+            String::from(&name),
+        ));
+        self.metadata.insert(name, metadata);
+        Ok(())
+    }
+
+    pub fn add_file_with_backing_and_metadata(
+        &mut self,
+        name: &str,
+        backing: Arc<Mutex<MemFileBacking>>,
+        metadata: MemNodeMetadata,
+    ) -> Result<(), SysErrNo> {
+        let name = normalize_path(name);
+        let parent = parent_path(&name);
+        if !self.is_dir(&parent) {
+            return Err(SysErrNo::ENOENT);
+        }
+        if self.exists(&name) {
+            return Err(SysErrNo::EEXIST);
+        }
+        self.symlinks.remove(&name);
+        self.specials.remove(&name);
+        self.files.push(MemFile::with_backing(
+            &name,
+            backing,
             String::from(&name),
         ));
         self.metadata.insert(name, metadata);

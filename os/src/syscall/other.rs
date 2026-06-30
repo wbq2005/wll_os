@@ -1225,18 +1225,76 @@ pub fn sys_getsid(pid: usize) -> SyscallRet {
     Ok(sid)
 }
 
+fn same_process(left: &Arc<crate::task::TaskControlBlock>, right: &Arc<crate::task::TaskControlBlock>) -> bool {
+    left.thread_group.tgid() == right.thread_group.tgid()
+}
+
+fn is_child_process(
+    parent: &Arc<crate::task::TaskControlBlock>,
+    child: &Arc<crate::task::TaskControlBlock>,
+) -> bool {
+    if same_process(parent, child) {
+        return false;
+    }
+    child
+        .inner
+        .lock()
+        .parent
+        .as_ref()
+        .map(|candidate| same_process(candidate, parent))
+        .unwrap_or(false)
+}
+
+fn process_group_exists_in_session(pgid: usize, sid: usize) -> bool {
+    manager::find_process_group(pgid)
+        .into_iter()
+        .any(|member| member.inner.lock().sid == sid)
+}
+
 pub fn sys_setpgid(pid: usize, pgid: usize) -> SyscallRet {
-    let task = if pid == 0 {
-        current_task().ok_or(SysErrNo::ESRCH)?
+    // Linux only accepts non-negative pid/pgid values; on the 64-bit syscall ABI
+    // negative user arguments arrive here as large unsigned integers.
+    const MAX_PID: usize = i32::MAX as usize;
+    if pgid > MAX_PID {
+        return Err(SysErrNo::EINVAL);
+    }
+    if pid > MAX_PID {
+        return Err(SysErrNo::ESRCH);
+    }
+
+    let current = current_task().ok_or(SysErrNo::ESRCH)?;
+    let target = if pid == 0 {
+        current.clone()
     } else {
         manager::find_task(pid).ok_or(SysErrNo::ESRCH)?
     };
+    if !same_process(&current, &target) && !is_child_process(&current, &target) {
+        return Err(SysErrNo::ESRCH);
+    }
+    if !same_process(&current, &target) && target.inner.lock().has_execed {
+        return Err(SysErrNo::EACCES);
+    }
+
     let new_pgid = if pgid == 0 {
-        task.thread_group.tgid()
+        target.thread_group.tgid()
     } else {
         pgid
     };
-    for member in task.thread_group.user_members() {
+
+    let (target_sid, target_is_session_leader) = {
+        let inner = target.inner.lock();
+        (inner.sid, inner.sid == target.thread_group.tgid())
+    };
+    if target_is_session_leader {
+        return Err(SysErrNo::EPERM);
+    }
+    if new_pgid != target.thread_group.tgid()
+        && !process_group_exists_in_session(new_pgid, target_sid)
+    {
+        return Err(SysErrNo::EPERM);
+    }
+
+    for member in target.thread_group.user_members() {
         member.inner.lock().pgid = new_pgid;
     }
     Ok(0)

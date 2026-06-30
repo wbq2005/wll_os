@@ -199,6 +199,9 @@ fn mounted_ext4_backend_path(path: &str) -> Option<String> {
 
 fn is_tmpfs_path(path: &str) -> bool {
     let norm = normalize_path(path);
+    if super::is_memfs_volatile_dir(&norm) {
+        return true;
+    }
     let mounts = MOUNT_TABLE.lock();
     mounts.iter().any(|entry| {
         matches!(entry.backend, MountBackend::Tmpfs) && path_is_under(&norm, &entry.host_target)
@@ -333,6 +336,9 @@ fn lookup_symlink_target(path: &str) -> Result<Option<String>, SysErrNo> {
     if mounted_ext4_backend_path(&norm).is_none() {
         if let Some(target) = MEM_FS.lock().get_symlink(&norm) {
             return Ok(Some(target));
+        }
+        if is_tmpfs_path(&norm) {
+            return Ok(None);
         }
     }
     match ext4_vol::lookup_kind(&ext4_lookup_path(&norm)) {
@@ -526,6 +532,74 @@ fn procfs_link_source(path: &str) -> bool {
     let norm = normalize_path(path);
     let local = local_device_path(&norm);
     local == "/proc" || local.starts_with("/proc/")
+}
+
+fn proc_pid_stat_path(path: &str) -> Option<(String, usize)> {
+    let norm = normalize_path(path);
+    let local = local_device_path(&norm);
+    let rest = local.strip_prefix("/proc/")?;
+    let (pid_text, tail) = rest.split_once('/')?;
+    if tail != "stat" || pid_text.is_empty() || !pid_text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid = pid_text.parse::<usize>().ok()?;
+    Some((norm, pid))
+}
+
+fn proc_pid_stat_text(pid: usize) -> Result<Vec<u8>, SysErrNo> {
+    let task = crate::task::manager::find_task(pid).ok_or(SysErrNo::ENOENT)?;
+    let (comm, ppid, pgid, sid) = {
+        let inner = task.inner.lock();
+        let comm = inner
+            .exec_path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("wll_OS")
+            .chars()
+            .filter(|ch| *ch != '(' && *ch != ')')
+            .take(15)
+            .collect::<String>();
+        let ppid = inner
+            .parent
+            .as_ref()
+            .map(|parent| parent.thread_group.tgid())
+            .unwrap_or(0);
+        (comm, ppid, inner.pgid, inner.sid)
+    };
+    let state = match task.status() {
+        crate::task::TaskStatus::Zombie => 'Z',
+        crate::task::TaskStatus::Stopped => 'T',
+        crate::task::TaskStatus::Blocked => 'S',
+        _ => 'R',
+    };
+    Ok(alloc::format!(
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        task.thread_group.tgid(),
+        comm,
+        state,
+        ppid,
+        pgid,
+        sid
+    )
+    .into_bytes())
+}
+
+fn refresh_proc_pid_stat(path: &str) -> Result<(), SysErrNo> {
+    let Some((norm, pid)) = proc_pid_stat_path(path) else {
+        return Ok(());
+    };
+    let data = proc_pid_stat_text(pid)?;
+    let now = super::FileTimes::now();
+    let mut fs = MEM_FS.lock();
+    let parent = parent_path(&norm);
+    if !fs.is_dir(&parent) {
+        fs.add_dir(&parent);
+    }
+    if !fs.write_file_content(&norm, fd::MemFileContent::from_slice(&data), now) {
+        fs.add_file_with_mode(&norm, data, 0o444);
+    }
+    Ok(())
 }
 
 pub fn path_crosses_mountpoint(path: &str) -> bool {
@@ -758,6 +832,23 @@ fn metadata_from_mem_fd(
     meta
 }
 
+fn new_mem_file_backing(
+    content: fd::MemFileContent,
+    times: super::FileTimes,
+) -> Arc<Mutex<super::MemFileBacking>> {
+    Arc::new(Mutex::new(super::MemFileBacking { content, times }))
+}
+
+fn linked_mem_file_backing(
+    path: &str,
+) -> Result<Arc<Mutex<super::MemFileBacking>>, SysErrNo> {
+    MEM_FS
+        .lock()
+        .get_file(path)
+        .map(|file| file.shared_backing())
+        .ok_or(SysErrNo::ENOENT)
+}
+
 pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrNo> {
     let norm = normalize_path(path);
     if is_removed(&norm) {
@@ -775,7 +866,6 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
     if tmpfs_path || !mounted_ext4 {
         let mem = MEM_FS.lock();
         if mem.is_dir(&norm) {
-            let entries = mem.list_dir(&norm)?;
             let (sec, nsec) = current_times();
             let node = mem
                 .metadata(&norm)
@@ -789,8 +879,11 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
                 gid: node.gid,
                 rdev_major: 0,
                 rdev_minor: 0,
-                size: entries.len() as u64,
-                blocks: regular_blocks(entries.len() as u64),
+                // Directory st_size is filesystem-defined. Avoid constructing
+                // and sorting the full directory listing on every metadata or
+                // permission lookup; getdents remains the authoritative view.
+                size: 0,
+                blocks: 0,
                 atime_sec: sec,
                 atime_nsec: nsec,
                 mtime_sec: sec,
@@ -1090,8 +1183,7 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
         )),
         fd::FileDescriptor::MemFile {
             name,
-            content,
-            times,
+            backing,
             linked,
             node,
             ..
@@ -1107,26 +1199,29 @@ pub fn metadata_for_fd(file: &fd::FileDescriptor) -> Result<VfsMetadata, SysErrN
                     Ok(metadata_from_mem_file(file, node, nlink, &link_key))
                 } else {
                     drop(mem);
-                    Ok(metadata_from_mem_fd(name, content, *times))
+                    let backing = backing.lock();
+                    Ok(metadata_from_mem_fd(name, &backing.content, backing.times))
                 }
             } else if let Some(node) = *node {
+                let backing = backing.lock();
                 let mut meta = metadata_for_mem_file(
                     name,
-                    content.len(),
-                    content.is_elf_image(),
+                    backing.content.len(),
+                    backing.content.is_elf_image(),
                     node,
                     0,
                     name,
                 );
-                meta.atime_sec = times.atime_sec;
-                meta.atime_nsec = times.atime_nsec;
-                meta.mtime_sec = times.mtime_sec;
-                meta.mtime_nsec = times.mtime_nsec;
-                meta.ctime_sec = times.ctime_sec;
-                meta.ctime_nsec = times.ctime_nsec;
+                meta.atime_sec = backing.times.atime_sec;
+                meta.atime_nsec = backing.times.atime_nsec;
+                meta.mtime_sec = backing.times.mtime_sec;
+                meta.mtime_nsec = backing.times.mtime_nsec;
+                meta.ctime_sec = backing.times.ctime_sec;
+                meta.ctime_nsec = backing.times.ctime_nsec;
                 Ok(meta)
             } else {
-                Ok(metadata_from_mem_fd(name, content, *times))
+                let backing = backing.lock();
+                Ok(metadata_from_mem_fd(name, &backing.content, backing.times))
             }
         }
         fd::FileDescriptor::MemDir {
@@ -2127,7 +2222,7 @@ pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo>
         return Ok(());
     }
     if old_tmpfs {
-        return Err(SysErrNo::ENOENT);
+        return Err(missing_path_errno(&old));
     }
     if ext4_vol::lookup_kind(&old).is_none() && path_exists_non_dir(&parent_path(&old)) {
         return Err(SysErrNo::ENOTDIR);
@@ -2186,8 +2281,7 @@ pub fn link_mem_file_fd(file: &mut fd::FileDescriptor, new: &str) -> Result<(), 
     match file {
         fd::FileDescriptor::MemFile {
             name,
-            content,
-            times,
+            backing,
             linked,
             node,
             ..
@@ -2197,7 +2291,7 @@ pub fn link_mem_file_fd(file: &mut fd::FileDescriptor, new: &str) -> Result<(), 
             } else if let Some(metadata) = *node {
                 MEM_FS
                     .lock()
-                    .add_file_with_metadata(&new, content.clone(), *times, metadata)?;
+                    .add_file_with_backing_and_metadata(&new, backing.clone(), metadata)?;
                 *name = new.clone();
                 *linked = true;
                 *node = None;
@@ -2740,15 +2834,10 @@ pub fn set_times_fd(
     }
     match file {
         fd::FileDescriptor::MemFile {
-            name,
-            times,
-            linked,
+            backing,
             ..
         } => {
-            if *linked {
-                let _ = MEM_FS.lock().set_file_times(name, atime, mtime);
-            }
-            times.set_access_modify(atime, mtime);
+            backing.lock().times.set_access_modify(atime, mtime);
             Ok(())
         }
         fd::FileDescriptor::MemDir { .. } => Ok(()),
@@ -3011,8 +3100,10 @@ fn open_char_device_descriptor(
     };
     Some(Ok(fd::FileDescriptor::MemFile {
         name: String::from(device_path),
-        content: fd::MemFileContent::new(),
-        times: super::FileTimes::now(),
+        backing: new_mem_file_backing(
+            fd::MemFileContent::new(),
+            super::FileTimes::now(),
+        ),
         offset: 0,
         ofd_owner: fd::new_open_file_description_owner(),
         readable: read_ok,
@@ -3039,8 +3130,10 @@ fn open_mem_tmpfile_descriptor(
     let name = alloc::format!("{}/.tmpfile-{:x}", dir, node.ino);
     Ok(fd::FileDescriptor::MemFile {
         name,
-        content: fd::MemFileContent::new(),
-        times: super::FileTimes::now(),
+        backing: new_mem_file_backing(
+            fd::MemFileContent::new(),
+            super::FileTimes::now(),
+        ),
         offset: 0,
         ofd_owner: fd::new_open_file_description_owner(),
         readable: read_ok,
@@ -3061,6 +3154,7 @@ pub fn open_path(
 
     let path_norm = normalize_path(host_path);
     let logical_norm = normalize_path(logical_path);
+    refresh_proc_pid_stat(&path_norm)?;
     let accmode = flags & O_ACCMODE;
     if accmode == O_ACCMODE {
         return Err(SysErrNo::EINVAL);
@@ -3148,8 +3242,10 @@ pub fn open_path(
         let data = volume.read_file(&backend_path)?;
         return Ok(fd::FileDescriptor::MemFile {
             name: open_norm,
-            content: fd::MemFileContent::from_slice(&data),
-            times: super::FileTimes::now(),
+            backing: new_mem_file_backing(
+                fd::MemFileContent::from_slice(&data),
+                super::FileTimes::now(),
+            ),
             offset: 0,
             ofd_owner: fd::new_open_file_description_owner(),
             readable: read_ok,
@@ -3197,25 +3293,19 @@ pub fn open_path(
             let meta = metadata(&open_norm, true)?;
             check_noatime_permission(&meta)?;
         }
-        let source = MEM_FS
-            .lock()
-            .get_file(&open_norm)
-            .map(|file| file.snapshot());
+        let backing = linked_mem_file_backing(&open_norm)?;
         let node = MEM_FS.lock().metadata(&open_norm);
-        let (mut content, mut times) =
-            source.unwrap_or_else(|| (fd::MemFileContent::new(), super::FileTimes::now()));
         if want_trunc && write_ok {
-            content.clear();
             MEM_FS.lock().truncate_file(&open_norm, 0)?;
-            if let Some(file) = MEM_FS.lock().get_file(&open_norm) {
-                times = file.times();
-            }
         }
-        let base_off = if append && write_ok { content.len() } else { 0 };
+        let base_off = if append && write_ok {
+            backing.lock().content.len()
+        } else {
+            0
+        };
         return Ok(fd::FileDescriptor::MemFile {
             name: open_norm,
-            content,
-            times,
+            backing,
             offset: base_off,
             ofd_owner: fd::new_open_file_description_owner(),
             readable: read_ok,
@@ -3326,16 +3416,11 @@ pub fn open_path(
                 .lock()
                 .add_file_with_mode(&open_norm, Vec::new(), mode);
             clear_whiteout(&open_norm);
-            let times = MEM_FS
-                .lock()
-                .get_file(&open_norm)
-                .map(|file| file.times())
-                .unwrap_or_else(super::FileTimes::now);
+            let backing = linked_mem_file_backing(&open_norm)?;
             let node = MEM_FS.lock().metadata(&open_norm);
             return Ok(fd::FileDescriptor::MemFile {
                 name: open_norm,
-                content: fd::MemFileContent::new(),
-                times,
+                backing,
                 offset: 0,
                 ofd_owner: fd::new_open_file_description_owner(),
                 readable: read_ok,
@@ -3364,16 +3449,11 @@ pub fn open_path(
                 .lock()
                 .add_file_with_mode(&open_norm, Vec::new(), mode);
             clear_whiteout(&open_norm);
-            let times = MEM_FS
-                .lock()
-                .get_file(&open_norm)
-                .map(|file| file.times())
-                .unwrap_or_else(super::FileTimes::now);
+            let backing = linked_mem_file_backing(&open_norm)?;
             let node = MEM_FS.lock().metadata(&open_norm);
             return Ok(fd::FileDescriptor::MemFile {
                 name: open_norm,
-                content: fd::MemFileContent::new(),
-                times,
+                backing,
                 offset: 0,
                 ofd_owner: fd::new_open_file_description_owner(),
                 readable: read_ok,

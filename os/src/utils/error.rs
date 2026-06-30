@@ -43,11 +43,13 @@ pub enum SysErrNo {
     ENODATA = 61,         // No data available
     ENOTSOCK = 88,        // Socket operation on non-socket
     EDESTADDRREQ = 89,    // Destination address required
+    EMSGSIZE = 90,        // Message too long
     ENOPROTOOPT = 92,     // Protocol not available
     EPROTONOSUPPORT = 93, // Protocol not supported
     EOPNOTSUPP = 95,      // Operation not supported
     EAFNOSUPPORT = 97,    // Address family not supported
     EADDRINUSE = 98,      // Address already in use
+    EADDRNOTAVAIL = 99,   // Cannot assign requested address
     EISCONN = 106,        // Transport endpoint is already connected
     ENOTCONN = 107,       // Transport endpoint is not connected
     ETIMEDOUT = 110,      // Connection timed out
