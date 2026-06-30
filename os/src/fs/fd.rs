@@ -12,8 +12,7 @@ use spin::Mutex;
 use crate::fs::block_dev;
 use crate::fs::ext4_vol;
 use crate::fs::vfs::VfsNodeKind;
-use crate::fs::MEM_FS;
-use crate::fs::{FileTimes, MemNodeMetadata};
+use crate::fs::{MemFileBacking, MemNodeMetadata};
 use crate::task::wait_queue::WaitKey;
 use crate::utils::error::SysErrNo;
 
@@ -270,33 +269,6 @@ impl MemFileContent {
     }
 }
 
-fn refresh_mem_file(
-    name: &str,
-    content: &mut MemFileContent,
-    times: &mut FileTimes,
-    linked: &mut bool,
-) -> bool {
-    if is_dev_null_path(name) || is_dev_zero_path(name) {
-        return true;
-    }
-    if !*linked {
-        return false;
-    }
-    if let Some(file) = MEM_FS.lock().get_file(name) {
-        let (snapshot, file_times) = file.snapshot();
-        *content = snapshot;
-        *times = file_times;
-        true
-    } else {
-        *linked = false;
-        false
-    }
-}
-
-fn write_mem_content(content: &mut MemFileContent, offset: usize, buf: &[u8]) -> usize {
-    content.write_at(offset, buf)
-}
-
 lazy_static! {
     static ref CONSOLE_LINE_BUFFERS: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
 }
@@ -373,8 +345,7 @@ pub enum FileDescriptor {
     /// 内存文件（预载只读 `writable=false`；`O_CREAT` 可走可写）
     MemFile {
         name: String,
-        content: MemFileContent,
-        times: FileTimes,
+        backing: Arc<Mutex<MemFileBacking>>,
         offset: FileOffset,
         ofd_owner: Arc<OpenFileDescriptionOwner>,
         readable: bool,
@@ -652,9 +623,9 @@ impl FileDescriptor {
     pub fn same_file_identity(&self, other: &Self) -> bool {
         match (self, other) {
             (
-                FileDescriptor::MemFile { name: left, .. },
-                FileDescriptor::MemFile { name: right, .. },
-            ) => left == right,
+                FileDescriptor::MemFile { backing: left, .. },
+                FileDescriptor::MemFile { backing: right, .. },
+            ) => Arc::ptr_eq(left, right),
             (
                 FileDescriptor::Ext4Regular { ino: left, .. },
                 FileDescriptor::Ext4Regular { ino: right, .. },
@@ -923,11 +894,9 @@ impl FileDescriptor {
             }
             FileDescriptor::MemFile {
                 name,
-                content,
-                times,
+                backing,
                 offset,
                 readable,
-                linked,
                 ..
             } => {
                 if !*readable {
@@ -941,11 +910,11 @@ impl FileDescriptor {
                     *offset = (*offset).saturating_add(buf.len());
                     return Ok(buf.len());
                 }
-                refresh_mem_file(name, content, times, linked);
-                if *offset >= content.len() {
+                let backing = backing.lock();
+                if *offset >= backing.content.len() {
                     return Ok(0);
                 }
-                let to_read = content.read_at(*offset, buf);
+                let to_read = backing.content.read_at(*offset, buf);
                 *offset += to_read;
                 Ok(to_read)
             }
@@ -1073,10 +1042,8 @@ impl FileDescriptor {
         match self {
             FileDescriptor::MemFile {
                 name,
-                content,
-                times,
+                backing,
                 readable,
-                linked,
                 ..
             } => {
                 if !*readable {
@@ -1089,11 +1056,11 @@ impl FileDescriptor {
                     buf.fill(0);
                     return Ok(buf.len());
                 }
-                refresh_mem_file(name, content, times, linked);
-                if offset >= content.len() {
+                let backing = backing.lock();
+                if offset >= backing.content.len() {
                     return Ok(0);
                 }
-                let to_read = content.read_at(offset, buf);
+                let to_read = backing.content.read_at(offset, buf);
                 Ok(to_read)
             }
             FileDescriptor::Ext4Regular { ino, readable, .. } => {
@@ -1125,10 +1092,8 @@ impl FileDescriptor {
         match self {
             FileDescriptor::MemFile {
                 name,
-                content,
-                times,
+                backing,
                 writable,
-                linked,
                 ..
             } => {
                 if !*writable {
@@ -1140,15 +1105,10 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                let mem_live = refresh_mem_file(name, content, times, linked);
                 Self::checked_file_end(offset, buf.len())?;
-                write_mem_content(content, offset, buf);
-                times.touch_modified();
-                if mem_live {
-                    MEM_FS
-                        .lock()
-                        .write_file_content(name, content.clone(), *times);
-                }
+                let mut backing = backing.lock();
+                backing.content.write_at(offset, buf);
+                backing.times.touch_modified();
                 Ok(buf.len())
             }
             FileDescriptor::Ext4Regular { ino, writable, .. } => {
@@ -1188,12 +1148,10 @@ impl FileDescriptor {
             FileDescriptor::MemDir { .. } => Err(SysErrNo::EISDIR),
             FileDescriptor::MemFile {
                 name,
-                content,
-                times,
+                backing,
                 offset,
                 writable,
                 append,
-                linked,
                 ..
             } => {
                 if !*writable {
@@ -1205,20 +1163,15 @@ impl FileDescriptor {
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                let mem_live = refresh_mem_file(name, content, times, linked);
+                let mut backing = backing.lock();
                 if *append {
-                    *offset = content.len();
+                    *offset = backing.content.len();
                 }
                 let start = *offset;
                 let end = Self::checked_file_end(start, buf.len())?;
-                write_mem_content(content, start, buf);
+                backing.content.write_at(start, buf);
                 *offset = end;
-                times.touch_modified();
-                if mem_live {
-                    MEM_FS
-                        .lock()
-                        .write_file_content(name, content.clone(), *times);
-                }
+                backing.times.touch_modified();
 
                 Ok(buf.len())
             }
@@ -1338,14 +1291,15 @@ impl FileDescriptor {
     pub fn seek_signed(&mut self, offset: isize, whence: usize) -> Result<FileOffset, SysErrNo> {
         match self {
             FileDescriptor::MemFile {
-                content,
+                backing,
                 offset: current_offset,
                 ..
             } => {
+                let size = backing.lock().content.len();
                 let new_off = match whence {
                     0 => Self::checked_seek_from(0, offset),
                     1 => Self::checked_seek_from(*current_offset, offset),
-                    2 => Self::checked_seek_from(content.len(), offset),
+                    2 => Self::checked_seek_from(size, offset),
                     _ => return Err(SysErrNo::EINVAL),
                 }?;
                 *current_offset = new_off;
@@ -1422,20 +1376,13 @@ impl FileDescriptor {
         match self {
             FileDescriptor::MemFile {
                 name,
-                content,
-                linked,
+                backing,
                 ..
             } => {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     0
-                } else if !*linked {
-                    content.len()
                 } else {
-                    MEM_FS
-                        .lock()
-                        .get_file(name)
-                        .map(|file| file.size())
-                        .unwrap_or(content.len())
+                    backing.lock().content.len()
                 }
             }
             FileDescriptor::MemDir { entries, .. } => entries.len(),
@@ -1464,10 +1411,8 @@ impl FileDescriptor {
         match self {
             FileDescriptor::MemFile {
                 name,
-                content,
-                times,
+                backing,
                 writable,
-                linked,
                 ..
             } => {
                 if !*writable {
@@ -1476,14 +1421,9 @@ impl FileDescriptor {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     return Ok(());
                 }
-                let mem_live = refresh_mem_file(name, content, times, linked);
-                content.resize(new_len);
-                times.touch_modified();
-                if mem_live {
-                    MEM_FS
-                        .lock()
-                        .write_file_content(name, content.clone(), *times);
-                }
+                let mut backing = backing.lock();
+                backing.content.resize(new_len);
+                backing.times.touch_modified();
                 Ok(())
             }
             FileDescriptor::Ext4Regular { ino, writable, .. } => {
@@ -1632,8 +1572,7 @@ impl Clone for FileDescriptor {
             FileDescriptor::Stderr => FileDescriptor::Stderr,
             FileDescriptor::MemFile {
                 name,
-                content,
-                times,
+                backing,
                 offset,
                 ofd_owner,
                 readable,
@@ -1643,8 +1582,7 @@ impl Clone for FileDescriptor {
                 node,
             } => FileDescriptor::MemFile {
                 name: name.clone(),
-                content: content.clone(),
-                times: *times,
+                backing: backing.clone(),
                 offset: *offset,
                 ofd_owner: ofd_owner.clone(),
                 readable: *readable,
