@@ -25,6 +25,7 @@ enum TestGroup {
     Ltp,
     Iperf,
     Netperf,
+    Cagent,
 }
 
 impl TestGroup {
@@ -42,6 +43,7 @@ impl TestGroup {
             TestGroup::Ltp => &["ltp"],
             TestGroup::Iperf => &["iperf"],
             TestGroup::Netperf => &["netperf"],
+            TestGroup::Cagent => &["cagent"],
         }
     }
 
@@ -59,6 +61,7 @@ impl TestGroup {
             TestGroup::Ltp => 70,
             TestGroup::Iperf => 80,
             TestGroup::Netperf => 81,
+            TestGroup::Cagent => 82,
         }
     }
 
@@ -76,6 +79,7 @@ impl TestGroup {
             TestGroup::Ltp,
             TestGroup::Iperf,
             TestGroup::Netperf,
+            TestGroup::Cagent,
         ];
 
         GROUPS
@@ -1306,6 +1310,10 @@ fn busybox_script_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
         String::from("LD_LIBRARY_PATH=/lib"),
         alloc::format!("SHELL={}", busybox_path),
     ];
+    if testcode_stem(&logical_script).and_then(TestGroup::from_stem) == Some(TestGroup::Cagent) {
+        envp.push(String::from("CAGENT_BUSYBOX=/busybox"));
+        envp.push(String::from("CAGENT_LUA=/lua"));
+    }
     let trace_commands = trace_test_commands_enabled_for(&logical_script);
     if trace_commands {
         envp.push(String::from("PS4=[harness] CMD "));

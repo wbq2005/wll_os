@@ -316,6 +316,15 @@ pub fn is_root_source(path: &str) -> bool {
     *ROOT_SOURCE.lock() == path
 }
 
+pub fn root_source_path() -> String {
+    ROOT_SOURCE.lock().clone()
+}
+
+pub fn root_device_numbers() -> Option<(u32, u32)> {
+    let path = root_source_path();
+    device_numbers_for_path(&path)
+}
+
 #[derive(Clone, Debug)]
 pub enum LoopBacking {
     MemFile { path: String },

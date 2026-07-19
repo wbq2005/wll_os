@@ -200,7 +200,20 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         TrapType::Timer => {
             // 定时器中断 - 设置下一次定时器并触发调度
             crate::timer::wake_expired_timers();
-            if timer_should_preempt_current_task() {
+            // run_user_task returns to the scheduler after every user trap.  If
+            // SPP-based classification routes a user timer here, the outer runner
+            // still owns saving and requeueing that task; scheduling recursively
+            // would enqueue it twice.
+            let user_runner_active = crate::task::current_task()
+                .map(|task| !task.is_kernel)
+                .unwrap_or(false);
+            if user_runner_active {
+                if foreground_driver_active() {
+                    crate::timer::set_next_foreground_trigger();
+                } else {
+                    set_next_trigger();
+                }
+            } else if timer_should_preempt_current_task() {
                 set_next_trigger();
                 suspend_current_and_run_next();
             } else {
@@ -239,15 +252,17 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             handle_syscall(ctx);
         }
         TrapType::Timer => {
-            // Foreground mode: don't suspend. Trap frame is unchanged, foreground
-            // loop will re-run the task immediately. Use a longer tick here so
-            // CPU-heavy static libc startup is not dominated by harness traps.
+            // The foreground runner owns saving the returned trap frame and
+            // requeueing the current task.  Calling suspend_current_and_run_next
+            // here as well would enqueue the same task twice and leave one queue
+            // entry without a trap frame.  Returning from run_user_task is enough
+            // to give the runner a scheduling boundary.
             crate::timer::wake_expired_timers();
-            if timer_should_preempt_current_task() {
-                set_next_trigger();
-                suspend_current_and_run_next();
-            } else {
+            if foreground_driver_active() {
                 crate::timer::set_next_foreground_trigger();
+                let _ = crate::syscall::signal::handle_pending_for_user(ctx);
+            } else {
+                set_next_trigger();
                 let _ = crate::syscall::signal::handle_pending_for_user(ctx);
             }
         }

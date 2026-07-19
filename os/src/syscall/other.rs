@@ -466,11 +466,27 @@ pub fn sys_gettimeofday(tv: usize, tz: usize) -> SyscallRet {
     Ok(0)
 }
 
-pub fn sys_clock_gettime(_clock_id: usize, tp: usize) -> SyscallRet {
+pub fn sys_clock_gettime(clock_id: usize, tp: usize) -> SyscallRet {
     if tp == 0 {
         return Err(SysErrNo::EFAULT);
     }
-    let time_us = timer::get_time_us();
+    const CLOCK_REALTIME: usize = 0;
+    const CLOCK_MONOTONIC: usize = 1;
+    const CLOCK_MONOTONIC_RAW: usize = 4;
+    const CLOCK_REALTIME_COARSE: usize = 5;
+    const CLOCK_MONOTONIC_COARSE: usize = 6;
+    const CLOCK_BOOTTIME: usize = 7;
+    const CLOCK_REALTIME_ALARM: usize = 8;
+    const CLOCK_BOOTTIME_ALARM: usize = 9;
+    let time_us = match clock_id {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM => timer::get_realtime_us(),
+        CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_BOOTTIME_ALARM => timer::get_time_us(),
+        _ => return Err(SysErrNo::EINVAL),
+    };
     copy_object_to_user(
         tp,
         &TimeSpec {
@@ -1106,13 +1122,18 @@ pub fn sys_sysinfo(info: usize) -> SyscallRet {
     let si = SysInfo {
         uptime: (timer::get_time_us() / 1_000_000) as isize,
         loads: [0; 3],
-        totalram: 128 * 1024 * 1024,
-        freeram: 64 * 1024 * 1024,
+        totalram: crate::platform::total_memory_bytes().max(
+            crate::mm::frame_allocator::total_frames().saturating_mul(crate::config::PAGE_SIZE),
+        ),
+        freeram: crate::mm::frame_allocator::remaining_frames()
+            .saturating_mul(crate::config::PAGE_SIZE),
         sharedram: 0,
         bufferram: 0,
         totalswap: 0,
         freeswap: 0,
-        procs: 1,
+        procs: crate::task::manager::all_user_tasks()
+            .len()
+            .min(u16::MAX as usize) as u16,
         pad: 0,
         pad2: 0,
         totalhigh: 0,
@@ -1225,7 +1246,10 @@ pub fn sys_getsid(pid: usize) -> SyscallRet {
     Ok(sid)
 }
 
-fn same_process(left: &Arc<crate::task::TaskControlBlock>, right: &Arc<crate::task::TaskControlBlock>) -> bool {
+fn same_process(
+    left: &Arc<crate::task::TaskControlBlock>,
+    right: &Arc<crate::task::TaskControlBlock>,
+) -> bool {
     left.thread_group.tgid() == right.thread_group.tgid()
 }
 

@@ -25,6 +25,7 @@ mod fs;
 mod lang_items;
 mod logging;
 mod mm;
+mod platform;
 mod syscall;
 mod task;
 mod timer;
@@ -182,7 +183,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
             wait_for_interrupt();
         }
     }
-
     #[cfg(target_arch = "loongarch64")]
     early_la_line(b"[DBG] C\n");
     logging::init(option_env!("LOG"));
@@ -194,6 +194,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     #[cfg(target_arch = "loongarch64")]
     early_la_line(b"[DBG] E\n");
     mm::init();
+    platform::init();
 
     #[cfg(target_arch = "riscv64")]
     {

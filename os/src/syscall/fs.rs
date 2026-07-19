@@ -966,11 +966,14 @@ fn parse_utimens_times(
 
 fn parse_utimens_times_with_permission(
     times: *const TimeSpec,
-) -> Result<(
-    Option<(isize, isize)>,
-    Option<(isize, isize)>,
-    crate::fs::TimesUpdatePermission,
-), SysErrNo> {
+) -> Result<
+    (
+        Option<(isize, isize)>,
+        Option<(isize, isize)>,
+        crate::fs::TimesUpdatePermission,
+    ),
+    SysErrNo,
+> {
     if times.is_null() {
         let now = current_time_pair();
         return Ok((
@@ -1166,7 +1169,9 @@ fn copy_open_how_from_user(how: *const OpenHow, size: usize) -> Result<OpenHow, 
         if extra_len > 4096 {
             return Err(SysErrNo::E2BIG);
         }
-        let extra_addr = (how as usize).checked_add(expected).ok_or(SysErrNo::EFAULT)?;
+        let extra_addr = (how as usize)
+            .checked_add(expected)
+            .ok_or(SysErrNo::EFAULT)?;
         let mut extra = Vec::new();
         extra.resize(extra_len, 0);
         super::user::copy_from_user(extra_addr, &mut extra)?;
@@ -1368,8 +1373,16 @@ fn decode_dev(dev: usize) -> Result<(u32, u32), SysErrNo> {
 }
 
 fn kstat_from_vfs(meta: crate::fs::VfsMetadata) -> KStat {
+    let st_dev = if let Some((major, minor)) = crate::fs::block_dev::root_device_numbers() {
+        encode_dev(major, minor)
+    } else {
+        // Linux reserves device 0 for nodes not associated with a device.
+        // Give the unified in-memory root a stable anonymous device identity so
+        // mount walkers can match a pathname to its root mount.
+        encode_dev(0, 1)
+    };
     KStat {
-        st_dev: 0,
+        st_dev,
         st_ino: meta.ino,
         st_mode: meta.mode,
         st_nlink: meta.nlink,
@@ -1676,7 +1689,11 @@ fn flock_kind(lock_type: i16) -> Result<Option<FileLockKind>, SysErrNo> {
     }
 }
 
-fn signed_lock_base(whence: i16, current_offset: usize, file_size: usize) -> Result<i128, SysErrNo> {
+fn signed_lock_base(
+    whence: i16,
+    current_offset: usize,
+    file_size: usize,
+) -> Result<i128, SysErrNo> {
     match whence {
         0 => Ok(0),
         1 => Ok(current_offset as i128),
@@ -1901,13 +1918,16 @@ fn apply_file_lock(
             return Ok(Some(conflict.owner));
         }
         apply_file_unlock(&mut locks, file, owner, range);
-        push_merged_file_lock(&mut locks, FileRecordLock {
-            file: file.clone(),
-            owner,
-            pid,
-            kind,
-            range,
-        });
+        push_merged_file_lock(
+            &mut locks,
+            FileRecordLock {
+                file: file.clone(),
+                owner,
+                pid,
+                kind,
+                range,
+            },
+        );
         Ok(None)
     } else {
         apply_file_unlock(&mut locks, file, owner, range);
@@ -2386,13 +2406,16 @@ fn read_xattr_value(value: *const u8, size: usize) -> Result<Vec<u8>, SysErrNo> 
     Ok(data)
 }
 
-fn validate_xattr_name_and_flags(key: &str, flags: usize, check_flags: bool) -> Result<(), SysErrNo> {
+fn validate_xattr_name_and_flags(
+    key: &str,
+    flags: usize,
+    check_flags: bool,
+) -> Result<(), SysErrNo> {
     const XATTR_CREATE: usize = 0x1;
     const XATTR_REPLACE: usize = 0x2;
     const XATTR_NAME_MAX: usize = 255;
     if check_flags
-        && (flags & !(XATTR_CREATE | XATTR_REPLACE) != 0
-            || flags == (XATTR_CREATE | XATTR_REPLACE))
+        && (flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == (XATTR_CREATE | XATTR_REPLACE))
     {
         return Err(SysErrNo::EINVAL);
     }
@@ -2500,11 +2523,7 @@ pub fn sys_flistxattr(fd: usize, list: *mut u8, size: usize) -> SyscallRet {
     copy_xattr_output(list, size, &data)
 }
 
-pub fn sys_removexattr(
-    pathname: *const u8,
-    name: *const u8,
-    follow_symlink: bool,
-) -> SyscallRet {
+pub fn sys_removexattr(pathname: *const u8, name: *const u8, follow_symlink: bool) -> SyscallRet {
     let path = read_user_path(pathname)?;
     let key = read_user_cstr(name)?;
     validate_xattr_name_and_flags(&key, 0, false)?;
@@ -2964,13 +2983,11 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
             let res = {
                 let mut fds = fd_table.lock();
                 match fds.get_mut(fd) {
-                    Some(file_desc) => {
-                        match direct_read_fd_to_user(file_desc, buf, count) {
-                            Ok(Some(n)) => return Ok(n),
-                            Ok(None) => read_fd_into_kernel(file_desc, &mut kbuf[..count]),
-                            Err(err) => Err(err),
-                        }
-                    }
+                    Some(file_desc) => match direct_read_fd_to_user(file_desc, buf, count) {
+                        Ok(Some(n)) => return Ok(n),
+                        Ok(None) => read_fd_into_kernel(file_desc, &mut kbuf[..count]),
+                        Err(err) => Err(err),
+                    },
                     None => Err(SysErrNo::EBADF),
                 }
             };
@@ -3300,7 +3317,10 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
         }
         F_GETLEASE => {
             let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
-            file_desc.lease().map(|lease| lease as usize).ok_or(SysErrNo::EINVAL)
+            file_desc
+                .lease()
+                .map(|lease| lease as usize)
+                .ok_or(SysErrNo::EINVAL)
         }
         // Linux reports EINVAL for fcntl commands outside the supported
         // command set.  ENOSYS is reserved for a missing syscall entry, not
@@ -3334,9 +3354,7 @@ fn sys_fcntl_file_lock(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
         if !getlk {
             match kind {
                 Some(FileLockKind::Read) if !file_desc.readable() => return Err(SysErrNo::EBADF),
-                Some(FileLockKind::Write) if !file_desc.writable() => {
-                    return Err(SysErrNo::EBADF)
-                }
+                Some(FileLockKind::Write) if !file_desc.writable() => return Err(SysErrNo::EBADF),
                 _ => {}
             }
         }
@@ -3568,7 +3586,8 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SyscallRet {
                 if argp == 0 {
                     return Err(SysErrNo::EFAULT);
                 }
-                let flags = super::with_kernel_page_table(|| crate::fs::file_flags_for_fd(file_desc))?;
+                let flags =
+                    super::with_kernel_page_table(|| crate::fs::file_flags_for_fd(file_desc))?;
                 let out = flags as i32;
                 super::user::copy_object_to_user(argp, &out)?;
                 Ok(0)
@@ -3583,7 +3602,9 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SyscallRet {
                 if !credentials.is_root_capable() && credentials.fsuid != meta.uid {
                     return Err(SysErrNo::EPERM);
                 }
-                super::with_kernel_page_table(|| crate::fs::set_file_flags_for_fd(file_desc, flags))?;
+                super::with_kernel_page_table(|| {
+                    crate::fs::set_file_flags_for_fd(file_desc, flags)
+                })?;
                 Ok(0)
             }
             _ => Err(SysErrNo::ENOTTY),
@@ -3773,7 +3794,9 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> S
     Ok(total)
 }
 
-fn epoll_state_for_fd(epfd: usize) -> Result<alloc::sync::Arc<spin::Mutex<fd::EpollState>>, SysErrNo> {
+fn epoll_state_for_fd(
+    epfd: usize,
+) -> Result<alloc::sync::Arc<spin::Mutex<fd::EpollState>>, SysErrNo> {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
     let fds = inner.fd_table.lock();
@@ -3902,7 +3925,8 @@ pub fn sys_epoll_create1(flags: usize) -> SyscallRet {
     };
     let inner = task.inner.lock();
     let mut fds = inner.fd_table.lock();
-    fds.alloc_with_flags(epoll, fd_flags).ok_or(SysErrNo::EMFILE)
+    fds.alloc_with_flags(epoll, fd_flags)
+        .ok_or(SysErrNo::EMFILE)
 }
 
 pub fn sys_epoll_ctl(
@@ -3991,7 +4015,9 @@ pub fn sys_epoll_pwait(
     let deadline = if timeout_ms < 0 {
         None
     } else {
-        Some(crate::timer::deadline_after_us((timeout_ms as usize).saturating_mul(1000)))
+        Some(crate::timer::deadline_after_us(
+            (timeout_ms as usize).saturating_mul(1000),
+        ))
     };
     sys_epoll_wait_deadline(epfd, events, maxevents, deadline)
 }
@@ -4347,7 +4373,8 @@ fn fd_is_regular_without_read(file_desc: &FileDescriptor) -> bool {
     matches!(
         file_desc,
         FileDescriptor::MemFile {
-            readable: false, ..
+            readable: false,
+            ..
         } | FileDescriptor::Ext4Regular {
             readable: false,
             ..
@@ -4359,7 +4386,8 @@ fn fd_is_regular_without_write(file_desc: &FileDescriptor) -> bool {
     matches!(
         file_desc,
         FileDescriptor::MemFile {
-            writable: false, ..
+            writable: false,
+            ..
         } | FileDescriptor::Ext4Regular {
             writable: false,
             ..
@@ -4403,7 +4431,9 @@ fn load_splice_offset(ptr: usize) -> Result<Option<usize>, SysErrNo> {
         return Ok(None);
     }
     let offset = super::user::copy_object_from_user::<i64>(ptr)?;
-    usize::try_from(offset).map(Some).map_err(|_| SysErrNo::EINVAL)
+    usize::try_from(offset)
+        .map(Some)
+        .map_err(|_| SysErrNo::EINVAL)
 }
 
 fn store_splice_offset(ptr: usize, offset: usize) -> Result<(), SysErrNo> {

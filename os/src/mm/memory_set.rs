@@ -348,6 +348,7 @@ impl MemorySet {
         {
             let device_flags = PTEFlags::R | PTEFlags::W | PTEFlags::V;
             for paddr in [
+                0x0010_1000usize,
                 0x0200_0000usize,
                 0x0c00_0000usize,
                 0x1000_0000usize,

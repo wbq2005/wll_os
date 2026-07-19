@@ -12,14 +12,14 @@ pub use vfs::{
     check_access, check_access_with_effective, check_fd_access, check_fd_access_with_effective,
     check_metadata_access, check_metadata_access_with_effective, create_dir, create_dir_with_mode,
     create_regular_file, create_special_node, create_symlink, dir_exists, file_exists,
-    file_flags_for_fd, filesystem_magic, is_removed, link_mem_file_fd, link_path, list_dir,
-    list_files, list_xattr_fd, list_xattr_path, metadata, metadata_for_fd, metadata_for_lookup,
-    mount_fs, open_path, path_contains_symlink, path_crosses_mountpoint, read_executable_file,
-    read_file, read_interpreter, read_link, refresh_block_device_nodes, remove_dir, remove_file,
-    remove_xattr_fd, remove_xattr_path, rename_exchange_path, rename_path, set_file_flags_for_fd,
-    set_mode_fd, set_mode_path, set_owner_fd, set_owner_path, set_times_fd, set_times_path,
-    set_xattr_fd, set_xattr_path, statfs_for_fd, statfs_for_path, sync_all, sync_fd, truncate_fd,
-    truncate_path, umount_fs, get_xattr_fd, get_xattr_path,
+    file_flags_for_fd, filesystem_magic, get_xattr_fd, get_xattr_path, is_removed,
+    link_mem_file_fd, link_path, list_dir, list_files, list_xattr_fd, list_xattr_path, metadata,
+    metadata_for_fd, metadata_for_lookup, mount_fs, open_path, path_contains_symlink,
+    path_crosses_mountpoint, read_executable_file, read_file, read_interpreter, read_link,
+    refresh_block_device_nodes, remove_dir, remove_file, remove_xattr_fd, remove_xattr_path,
+    rename_exchange_path, rename_path, set_file_flags_for_fd, set_mode_fd, set_mode_path,
+    set_owner_fd, set_owner_path, set_times_fd, set_times_path, set_xattr_fd, set_xattr_path,
+    statfs_for_fd, statfs_for_path, sync_all, sync_fd, truncate_fd, truncate_path, umount_fs,
     TimesUpdatePermission, VfsMetadata, VfsNodeKind, VfsStatFs,
 };
 
@@ -442,11 +442,8 @@ impl MemFileSystem {
         }
         self.symlinks.remove(&name);
         self.specials.remove(&name);
-        self.files.push(MemFile::with_backing(
-            &name,
-            backing,
-            String::from(&name),
-        ));
+        self.files
+            .push(MemFile::with_backing(&name, backing, String::from(&name)));
         self.metadata.insert(name, metadata);
         Ok(())
     }
@@ -635,7 +632,8 @@ impl MemFileSystem {
         let name = normalize_path(name);
         let set_allowed = self.files.iter().any(|file| file.name == name)
             || self.dirs.iter().any(|dir| dir == &name);
-        let exists = set_allowed || self.symlinks.contains_key(&name) || self.specials.contains_key(&name);
+        let exists =
+            set_allowed || self.symlinks.contains_key(&name) || self.specials.contains_key(&name);
         if !exists {
             return Err(SysErrNo::ENOENT);
         }
@@ -660,9 +658,7 @@ impl MemFileSystem {
         const XATTR_NAME_MAX: usize = 255;
         const XATTR_SIZE_MAX: usize = 65536;
 
-        if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0
-            || flags == (XATTR_CREATE | XATTR_REPLACE)
-        {
+        if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == (XATTR_CREATE | XATTR_REPLACE) {
             return Err(SysErrNo::EINVAL);
         }
         if key.is_empty() || key.as_bytes().len() > XATTR_NAME_MAX {
@@ -686,7 +682,11 @@ impl MemFileSystem {
             return Err(SysErrNo::ENODATA);
         }
         attrs.insert(String::from(key), value.to_vec());
-        if let Some(file) = self.files.iter().find(|file| file.name == normalize_path(name)) {
+        if let Some(file) = self
+            .files
+            .iter()
+            .find(|file| file.name == normalize_path(name))
+        {
             file.touch_ctime();
         }
         Ok(())
@@ -731,7 +731,11 @@ impl MemFileSystem {
         if attrs.is_empty() {
             self.xattrs.remove(&ino);
         }
-        if let Some(file) = self.files.iter().find(|file| file.name == normalize_path(name)) {
+        if let Some(file) = self
+            .files
+            .iter()
+            .find(|file| file.name == normalize_path(name))
+        {
             file.touch_ctime();
         }
         Ok(())
@@ -1292,9 +1296,9 @@ pub fn init() {
 
 fn init_pseudo_files() {
     let mounts = b"rootfs / ext4 rw 0 0\n";
-    let proc_version = b"Linux version 5.10.0 (wll_OS) #1 SMP PREEMPT\n";
-    let meminfo = b"MemTotal:       131072 kB\nMemFree:         65536 kB\nMemAvailable:    65536 kB\nBuffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\nSwapFree:            0 kB\n";
-    let cpuinfo = b"processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imac\n";
+    let proc_version = b"Linux version 5.10.0-wll_OS #1\n";
+    let meminfo = b"";
+    let cpuinfo = b"";
     let proc_self_status = b"Name:\twll_OS\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nMems_allowed:\t1\nMems_allowed_list:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n";
     let proc_self_maps =
         b"00010000-00020000 r-xp 00000000 00:00 0 /init\n00020000-00030000 rw-p 00000000 00:00 0 [heap]\n7fff0000-80000000 rw-p 00000000 00:00 0 [stack]\n";
@@ -1312,10 +1316,10 @@ fn init_pseudo_files() {
         0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x55,
         0x54, 0x43, 0x00, 0x0a, 0x55, 0x54, 0x43, 0x30, 0x0a,
     ];
-    let realtime = b"1\n";
+    let realtime = b"0\n";
     let cpu_list = b"0\n";
     let cpu_map = b"1\n";
-    let node_meminfo = b"Node 0 MemTotal:       131072 kB\nNode 0 MemFree:         65536 kB\n";
+    let node_meminfo = b"";
     let kernel_config = b"CONFIG_EVENTFD=y\n";
     let pid_max = b"4194304\n";
     let threads_max = b"32768\n";
@@ -1328,6 +1332,7 @@ fn init_pseudo_files() {
         fs.add_dir(&alloc::format!("{}/boot", root));
         fs.add_dir(&alloc::format!("{}/dev/shm", root));
         fs.add_dir(&alloc::format!("{}/proc", root));
+        fs.add_dir(&alloc::format!("{}/proc/net", root));
         fs.add_dir(&alloc::format!("{}/proc/self", root));
         fs.add_dir(&alloc::format!("{}/proc/sys", root));
         fs.add_dir(&alloc::format!("{}/proc/sys/kernel", root));
@@ -1352,6 +1357,11 @@ fn init_pseudo_files() {
             proc_self_maps.to_vec(),
         );
         fs.add_file(&alloc::format!("{}/proc/cpuinfo", root), cpuinfo.to_vec());
+        fs.add_file(&alloc::format!("{}/proc/uptime", root), Vec::new());
+        fs.add_file(&alloc::format!("{}/proc/loadavg", root), Vec::new());
+        for table in ["tcp", "tcp6", "udp", "udp6"] {
+            fs.add_file(&alloc::format!("{}/proc/net/{}", root, table), Vec::new());
+        }
         fs.add_file(
             &alloc::format!("{}/proc/sys/kernel/pid_max", root),
             pid_max.to_vec(),

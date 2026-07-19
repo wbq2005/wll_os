@@ -602,6 +602,92 @@ fn refresh_proc_pid_stat(path: &str) -> Result<(), SysErrNo> {
     Ok(())
 }
 
+fn cpu_list(count: usize) -> String {
+    if count <= 1 {
+        String::from("0\n")
+    } else {
+        alloc::format!("0-{}\n", count - 1)
+    }
+}
+
+fn runtime_pseudo_text(local: &str) -> Option<Vec<u8>> {
+    let total_bytes = crate::platform::total_memory_bytes()
+        .max(crate::mm::frame_allocator::total_frames().saturating_mul(crate::config::PAGE_SIZE));
+    let free_bytes = crate::mm::frame_allocator::remaining_frames()
+        .saturating_mul(crate::config::PAGE_SIZE)
+        .min(total_bytes);
+    let total_kib = total_bytes / 1024;
+    let free_kib = free_bytes / 1024;
+
+    let text = match local {
+        "/proc/version" => String::from("Linux version 5.10.0-wll_OS #1\n"),
+        "/proc/uptime" => {
+            let centiseconds = crate::timer::get_time_us() / 10_000;
+            alloc::format!(
+                "{}.{:02} 0.00\n",
+                centiseconds / 100,
+                centiseconds % 100
+            )
+        }
+        "/proc/loadavg" => {
+            let runnable = crate::task::manager::user_queue_len();
+            let tasks = crate::task::manager::all_user_tasks().len().max(1);
+            alloc::format!("0.00 0.00 0.00 {}/{} 1\n", runnable, tasks)
+        }
+        "/proc/meminfo" => alloc::format!(
+            "MemTotal:       {:>8} kB\nMemFree:        {:>8} kB\nMemAvailable:   {:>8} kB\nBuffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n",
+            total_kib, free_kib, free_kib
+        ),
+        "/proc/cpuinfo" => alloc::format!(
+            "processor\t: 0\nmodel name\t: {}\nhart\t\t: 0\nisa\t\t: {}\nphysical processors\t: {}\nonline processors\t: {}\n\n",
+            crate::platform::model_name(),
+            crate::platform::cpu_isa(),
+            crate::platform::physical_cpu_count(),
+            crate::platform::online_cpu_count()
+        ),
+        "/sys/kernel/realtime" => alloc::format!(
+            "{}\n",
+            usize::from(crate::platform::realtime_ns().is_some())
+        ),
+        "/sys/devices/system/cpu/online" => {
+            cpu_list(crate::platform::online_cpu_count())
+        }
+        "/sys/devices/system/cpu/possible" | "/sys/devices/system/cpu/present" => {
+            cpu_list(crate::platform::physical_cpu_count())
+        }
+        "/sys/devices/system/node/node0/cpulist" => {
+            cpu_list(crate::platform::online_cpu_count())
+        }
+        "/sys/devices/system/node/node0/cpumap" => alloc::format!(
+            "{:x}\n",
+            if crate::platform::online_cpu_count() >= usize::BITS as usize {
+                usize::MAX
+            } else {
+                (1usize << crate::platform::online_cpu_count()) - 1
+            }
+        ),
+        "/sys/devices/system/node/node0/meminfo" => alloc::format!(
+            "Node 0 MemTotal: {:>8} kB\nNode 0 MemFree:  {:>8} kB\n",
+            total_kib, free_kib
+        ),
+        _ => return crate::syscall::net::proc_net_table(local),
+    };
+    Some(text.into_bytes())
+}
+
+fn refresh_runtime_pseudo_file(path: &str) {
+    let norm = normalize_path(path);
+    let local = local_device_path(&norm);
+    let Some(data) = runtime_pseudo_text(local) else {
+        return;
+    };
+    let now = super::FileTimes::now();
+    let mut fs = MEM_FS.lock();
+    if !fs.write_file_content(&norm, fd::MemFileContent::from_slice(&data), now) {
+        fs.add_file_with_mode(&norm, data, 0o444);
+    }
+}
+
 pub fn path_crosses_mountpoint(path: &str) -> bool {
     let norm = normalize_path(path);
     if procfs_link_source(&norm) {
@@ -839,9 +925,7 @@ fn new_mem_file_backing(
     Arc::new(Mutex::new(super::MemFileBacking { content, times }))
 }
 
-fn linked_mem_file_backing(
-    path: &str,
-) -> Result<Arc<Mutex<super::MemFileBacking>>, SysErrNo> {
+fn linked_mem_file_backing(path: &str) -> Result<Arc<Mutex<super::MemFileBacking>>, SysErrNo> {
     MEM_FS
         .lock()
         .get_file(path)
@@ -1059,8 +1143,13 @@ pub fn init_mount_table() {
     } else {
         "tmpfs"
     };
+    let source = if ext4_vol::is_ext4_mounted() {
+        block_dev::root_source_path()
+    } else {
+        String::from("rootfs")
+    };
     mounts.push(MountEntry {
-        source: String::from("rootfs"),
+        source,
         logical_target: String::from("/"),
         host_target: String::from("/"),
         fstype: String::from(fstype),
@@ -1425,9 +1514,9 @@ pub fn file_flags_for_fd(file: &fd::FileDescriptor) -> Result<u32, SysErrNo> {
         }
         fd::FileDescriptor::MemFile { .. } => Ok(0),
         fd::FileDescriptor::Ext4Regular { ino, .. } => ext4_vol::file_flags_by_ino(*ino),
-        fd::FileDescriptor::Path { host_path, kind, .. } if *kind != VfsNodeKind::Directory => {
-            Ok(metadata(host_path, false)?.file_flags)
-        }
+        fd::FileDescriptor::Path {
+            host_path, kind, ..
+        } if *kind != VfsNodeKind::Directory => Ok(metadata(host_path, false)?.file_flags),
         _ => Err(SysErrNo::ENOTTY),
     }
 }
@@ -1439,7 +1528,9 @@ pub fn set_file_flags_for_fd(file: &fd::FileDescriptor, flags: u32) -> Result<()
         }
         fd::FileDescriptor::MemFile { .. } => Err(SysErrNo::ENOENT),
         fd::FileDescriptor::Ext4Regular { ino, .. } => ext4_vol::set_file_flags_ino(*ino, flags),
-        fd::FileDescriptor::Path { host_path, kind, .. } if *kind != VfsNodeKind::Directory => {
+        fd::FileDescriptor::Path {
+            host_path, kind, ..
+        } if *kind != VfsNodeKind::Directory => {
             let norm = normalize_path(host_path);
             if MEM_FS.lock().exists(&norm) {
                 return MEM_FS.lock().set_file_flags(&norm, flags);
@@ -1582,10 +1673,7 @@ fn check_delete_access(path: &str, target: &VfsMetadata) -> Result<(), SysErrNo>
         .map(|task| task.credentials.lock().clone())
         .unwrap_or_else(crate::task::Credentials::root);
     let uid = credentials.fsuid;
-    if uid != 0
-        && (parent_meta.mode & S_ISVTX) != 0
-        && uid != parent_meta.uid
-        && uid != target.uid
+    if uid != 0 && (parent_meta.mode & S_ISVTX) != 0 && uid != parent_meta.uid && uid != target.uid
     {
         return Err(SysErrNo::EPERM);
     }
@@ -2289,9 +2377,11 @@ pub fn link_mem_file_fd(file: &mut fd::FileDescriptor, new: &str) -> Result<(), 
             if *linked {
                 MEM_FS.lock().link_path(name, &new)?;
             } else if let Some(metadata) = *node {
-                MEM_FS
-                    .lock()
-                    .add_file_with_backing_and_metadata(&new, backing.clone(), metadata)?;
+                MEM_FS.lock().add_file_with_backing_and_metadata(
+                    &new,
+                    backing.clone(),
+                    metadata,
+                )?;
                 *name = new.clone();
                 *linked = true;
                 *node = None;
@@ -2465,11 +2555,7 @@ pub fn set_xattr_path(
     }
 }
 
-pub fn get_xattr_path(
-    path: &str,
-    follow_symlink: bool,
-    key: &str,
-) -> Result<Vec<u8>, SysErrNo> {
+pub fn get_xattr_path(path: &str, follow_symlink: bool, key: &str) -> Result<Vec<u8>, SysErrNo> {
     let target = resolve_xattr_path(path, follow_symlink)?;
     if let Some(meta) = vfat_metadata_for_path(&target) {
         meta?;
@@ -2505,11 +2591,7 @@ pub fn list_xattr_path(path: &str, follow_symlink: bool) -> Result<Vec<u8>, SysE
     }
 }
 
-pub fn remove_xattr_path(
-    path: &str,
-    follow_symlink: bool,
-    key: &str,
-) -> Result<(), SysErrNo> {
+pub fn remove_xattr_path(path: &str, follow_symlink: bool, key: &str) -> Result<(), SysErrNo> {
     let target = resolve_xattr_path(path, follow_symlink)?;
     if let Some(meta) = vfat_metadata_for_path(&target) {
         meta?;
@@ -2833,10 +2915,7 @@ pub fn set_times_fd(
         return Ok(());
     }
     match file {
-        fd::FileDescriptor::MemFile {
-            backing,
-            ..
-        } => {
+        fd::FileDescriptor::MemFile { backing, .. } => {
             backing.lock().times.set_access_modify(atime, mtime);
             Ok(())
         }
@@ -3100,10 +3179,7 @@ fn open_char_device_descriptor(
     };
     Some(Ok(fd::FileDescriptor::MemFile {
         name: String::from(device_path),
-        backing: new_mem_file_backing(
-            fd::MemFileContent::new(),
-            super::FileTimes::now(),
-        ),
+        backing: new_mem_file_backing(fd::MemFileContent::new(), super::FileTimes::now()),
         offset: 0,
         ofd_owner: fd::new_open_file_description_owner(),
         readable: read_ok,
@@ -3130,10 +3206,7 @@ fn open_mem_tmpfile_descriptor(
     let name = alloc::format!("{}/.tmpfile-{:x}", dir, node.ino);
     Ok(fd::FileDescriptor::MemFile {
         name,
-        backing: new_mem_file_backing(
-            fd::MemFileContent::new(),
-            super::FileTimes::now(),
-        ),
+        backing: new_mem_file_backing(fd::MemFileContent::new(), super::FileTimes::now()),
         offset: 0,
         ofd_owner: fd::new_open_file_description_owner(),
         readable: read_ok,
@@ -3154,6 +3227,7 @@ pub fn open_path(
 
     let path_norm = normalize_path(host_path);
     let logical_norm = normalize_path(logical_path);
+    refresh_runtime_pseudo_file(&path_norm);
     refresh_proc_pid_stat(&path_norm)?;
     let accmode = flags & O_ACCMODE;
     if accmode == O_ACCMODE {
@@ -3323,7 +3397,10 @@ pub fn open_path(
         if want_create && want_excl {
             return Err(SysErrNo::EEXIST);
         }
-        let special = MEM_FS.lock().get_special(&open_norm).ok_or(SysErrNo::ENOENT)?;
+        let special = MEM_FS
+            .lock()
+            .get_special(&open_norm)
+            .ok_or(SysErrNo::ENOENT)?;
         let meta = metadata(&open_norm, false)?;
         check_access_with_filesystem(&open_norm, false, open_access)?;
         if let MemSpecialKind::CharDevice { major, minor } = special {

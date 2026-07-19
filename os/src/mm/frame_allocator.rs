@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use buddy_system_allocator::FrameAllocator;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -78,6 +79,9 @@ lazy_static! {
     static ref MEM_REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 }
 
+static TOTAL_MANAGED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+static FREE_MANAGED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
 /// 初始化帧分配器
 pub fn init_frame_allocator() {
     // 将在启动时由main.rs添加内存区域
@@ -90,6 +94,9 @@ pub fn add_frames_range(start: usize, end: usize) {
     if start_ppn < end_ppn {
         FRAME_ALLOCATOR.lock().add_frame(start_ppn, end_ppn);
         MEM_REGIONS.lock().push((start_ppn, end_ppn));
+        let pages = end_ppn - start_ppn;
+        TOTAL_MANAGED_FRAMES.fetch_add(pages, Ordering::Relaxed);
+        FREE_MANAGED_FRAMES.fetch_add(pages, Ordering::Relaxed);
     }
 }
 
@@ -118,6 +125,7 @@ pub fn alloc_frame() -> Option<FrameTracker> {
             );
             continue;
         }
+        FREE_MANAGED_FRAMES.fetch_sub(1, Ordering::Relaxed);
         let tracker = FrameTracker::new(PhysPageNum(ppn));
         unsafe {
             let ptr = PhysPageNum(ppn).addr() as *mut u8;
@@ -136,6 +144,7 @@ pub fn alloc_contiguous_frames(pages: usize) -> Option<usize> {
     loop {
         let ppn = FRAME_ALLOCATOR.lock().alloc(pages)?;
         if is_managed_range(ppn, pages) {
+            FREE_MANAGED_FRAMES.fetch_sub(pages, Ordering::Relaxed);
             return Some(ppn);
         }
         log::warn!(
@@ -158,6 +167,7 @@ pub fn dealloc_contiguous_frames(start_ppn: usize, pages: usize) {
             return;
         }
         FRAME_ALLOCATOR.lock().dealloc(start_ppn, pages);
+        FREE_MANAGED_FRAMES.fetch_add(pages, Ordering::Relaxed);
     }
 }
 
@@ -172,12 +182,14 @@ pub fn dealloc_frame(ppn: PhysPageNum) {
         return;
     }
     FRAME_ALLOCATOR.lock().dealloc(ppn.0, 1);
+    FREE_MANAGED_FRAMES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// 获取剩余可用页帧数
 pub fn remaining_frames() -> usize {
-    let _allocator = FRAME_ALLOCATOR.lock();
-    // Buddy allocator doesn't have free_frames method, estimate from total - used
-    // For now return 0 as placeholder
-    0
+    FREE_MANAGED_FRAMES.load(Ordering::Relaxed)
+}
+
+pub fn total_frames() -> usize {
+    TOTAL_MANAGED_FRAMES.load(Ordering::Relaxed)
 }

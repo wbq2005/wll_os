@@ -642,7 +642,7 @@ pub fn add_initproc() {
     }
 
     let init_candidates = ["init", "/init"];
-    let elf_data = init_candidates
+    let elf_data = init_candidates//读取elf文件
         .iter()
         .find_map(|path| crate::fs::read_executable_file(path));
 
@@ -1153,8 +1153,8 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
 
     let mut orphans = Vec::new();
     for member in &members {
-        let mut inner = member.inner.lock();
-        orphans.extend(core::mem::take(&mut inner.children));
+        let mut inner = member.inner.lock();//获取任务的锁
+        orphans.extend(core::mem::take(&mut inner.children));//&mut inner.children 意思是：可变借用 children
     }
     if !orphans.is_empty() {
         if let Some(reaper) = orphan_reaper() {

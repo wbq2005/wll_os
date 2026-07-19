@@ -73,6 +73,94 @@ struct BoundSocket {
 
 lazy_static! {
     static ref SOCKET_BINDINGS: Mutex<Vec<BoundSocket>> = Mutex::new(Vec::new());
+    static ref SOCKET_STATES: Mutex<Vec<Weak<Mutex<SocketState>>>> = Mutex::new(Vec::new());
+}
+
+fn register_socket_state(state: &Arc<Mutex<SocketState>>) {
+    let mut states = SOCKET_STATES.lock();
+    states.retain(|entry| entry.upgrade().is_some());
+    states.push(Arc::downgrade(state));
+}
+
+fn proc_endpoint(domain: i32, addr: Option<&[u8]>) -> String {
+    let Some(addr) = addr else {
+        return if domain == AF_INET6 {
+            "00000000000000000000000000000000:0000".to_string()
+        } else {
+            "00000000:0000".to_string()
+        };
+    };
+    let port = sockaddr_port(addr).unwrap_or(0);
+    if domain == AF_INET6 {
+        let mut encoded = String::new();
+        if addr.len() >= 24 {
+            for chunk in addr[8..24].chunks_exact(4) {
+                let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                encoded.push_str(&alloc::format!("{:08X}", word));
+            }
+        } else {
+            encoded.push_str("00000000000000000000000000000000");
+        }
+        alloc::format!("{}:{:04X}", encoded, port)
+    } else {
+        let address = if addr.len() >= 8 {
+            u32::from_le_bytes([addr[4], addr[5], addr[6], addr[7]])
+        } else {
+            0
+        };
+        alloc::format!("{:08X}:{:04X}", address, port)
+    }
+}
+
+/// Render the modeled INET socket state using Linux `/proc/net/*` columns.
+/// This is an observation surface only; it does not claim external networking.
+pub fn proc_net_table(name: &str) -> Option<Vec<u8>> {
+    let (domain, sock_type) = match name {
+        "/proc/net/tcp" => (AF_INET, SOCK_STREAM),
+        "/proc/net/tcp6" => (AF_INET6, SOCK_STREAM),
+        "/proc/net/udp" => (AF_INET, SOCK_DGRAM),
+        "/proc/net/udp6" => (AF_INET6, SOCK_DGRAM),
+        _ => return None,
+    };
+
+    let mut text = String::from(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+    );
+    let mut states = SOCKET_STATES.lock();
+    states.retain(|entry| entry.upgrade().is_some());
+    let live: Vec<_> = states.iter().filter_map(Weak::upgrade).collect();
+    drop(states);
+
+    let mut slot = 0usize;
+    for state in live {
+        let socket = state.lock();
+        if socket.domain != domain || socket.sock_type != sock_type {
+            continue;
+        }
+        let status = if socket.listening {
+            0x0a
+        } else if socket.connected {
+            0x01
+        } else {
+            0x07
+        };
+        let local = proc_endpoint(domain, socket.local_addr.as_deref());
+        let peer = proc_endpoint(domain, socket.peer_addr.as_deref());
+        let rx_queue = socket.rx_buf.len().saturating_add(
+            socket
+                .dgram_queue
+                .iter()
+                .map(|packet| packet.data.len())
+                .sum::<usize>(),
+        );
+        let inode = Arc::as_ptr(&state) as usize;
+        text.push_str(&alloc::format!(
+            "{:4}: {} {} {:02X} 00000000:{:08X} 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0\n",
+            slot, local, peer, status, rx_queue, inode
+        ));
+        slot += 1;
+    }
+    Some(text.into_bytes())
 }
 
 fn socket_type(raw_type: usize) -> Result<(usize, bool, usize), SysErrNo> {
@@ -270,7 +358,10 @@ fn sockaddr_un_path(addr: &[u8]) -> Option<String> {
     if path.first().copied() == Some(0) {
         return None;
     }
-    let len = path.iter().position(|byte| *byte == 0).unwrap_or(path.len());
+    let len = path
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(path.len());
     if len == 0 {
         None
     } else {
@@ -465,11 +556,11 @@ pub fn sys_socket(domain: usize, raw_type: usize, protocol: usize) -> SyscallRet
     } else {
         0
     };
-    let socket = FileDescriptor::Socket {
-        state: Arc::new(Mutex::new(SocketState::new(
-            domain, sock_type, protocol, nonblock,
-        ))),
-    };
+    let state = Arc::new(Mutex::new(SocketState::new(
+        domain, sock_type, protocol, nonblock,
+    )));
+    register_socket_state(&state);
+    let socket = FileDescriptor::Socket { state };
     fds.alloc_with_flags_below(socket, fd_flags, nofile_limit)
         .ok_or(SysErrNo::EMFILE)
 }
@@ -493,6 +584,8 @@ pub fn sys_socketpair(domain: usize, raw_type: usize, protocol: usize, sv: usize
     let right = Arc::new(Mutex::new(SocketState::new(
         domain, sock_type, protocol, nonblock,
     )));
+    register_socket_state(&left);
+    register_socket_state(&right);
     {
         let mut left_socket = left.lock();
         left_socket.bound = true;
@@ -700,6 +793,7 @@ pub fn sys_connect(fd: usize, addr: usize, addrlen: usize) -> SyscallRet {
         IPPROTO_TCP,
         false,
     )));
+    register_socket_state(&accepted);
     {
         let mut accepted_socket = accepted.lock();
         accepted_socket.bound = true;

@@ -40,6 +40,13 @@ pub fn get_time_us() -> usize {
     current_time().as_micros() as usize
 }
 
+/// Unix wall-clock time when an RTC backend is available.
+pub fn get_realtime_us() -> usize {
+    crate::platform::realtime_ns()
+        .and_then(|ns| usize::try_from(ns / 1000).ok())
+        .unwrap_or_else(get_time_us)
+}
+
 fn next_timer_delay_us(now_us: usize, default_us: usize) -> usize {
     let waiter_deadline = TIMER_WAITERS
         .lock()
@@ -180,7 +187,7 @@ pub fn init() {
 ///
 /// 用于 gettimeofday 系统调用
 pub fn get_timeval() -> (usize, usize) {
-    let time_us = get_time_us();
+    let time_us = get_realtime_us();
     let sec = time_us / 1_000_000;
     let usec = time_us % 1_000_000;
     (sec, usec)
