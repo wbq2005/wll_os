@@ -1,4 +1,12 @@
 use core::arch::naked_asm;
+use loongArch64::register::euen;
+use polyhal::percpu::set_local_thread_pointer;
+use polyhal::{
+    consts::QEMU_DTB_ADDR,
+    ctor::{ph_init_iter, CtorType},
+    hart_id,
+    mem::{init_dtb_once, parse_system_info},
+};
 
 macro_rules! init_dwm {
     () => {
@@ -9,23 +17,20 @@ macro_rules! init_dwm {
         ori         $t0, $zero, 0x11    # CSR_DMW1_MAT | CSR_DMW1_PLV0
         lu52i.d     $t0, $t0, -1792     # CA, PLV0, 0x9000 xxxx xxxx xxxx
         csrwr       $t0, 0x181          # LOONGARCH_CSR_DMWIN1
-        ori         $t0, $zero, 0x11    # CA, PLV0, low identity window
-        csrwr       $t0, 0x182          # LOONGARCH_CSR_DMWIN2
         "
     };
 }
 
 /// The earliest entry point for the primary CPU.
+///
+/// We cannot use `bl` to jump to the higher-half address, so use `jirl`.
 #[naked]
 #[no_mangle]
 #[link_section = ".text.entry"]
 unsafe extern "C" fn _start() -> ! {
     naked_asm!(
         init_dwm!(),
-        "# Set PGDL to 0 (use DMW, not page tables)
-        li.d        $t0, 0x0
-        csrwr       $t0, 0x18        # LOONGARCH_CSR_PGDL = 0
-
+        "# Enable PG
         li.w        $t0, 0xb0       # PLV=0, IE=0, PG=1
         csrwr       $t0, 0x0        # LOONGARCH_CSR_CRMD
         li.w        $t0, 0x00       # PLV=0, PIE=0, PWE=0
@@ -34,7 +39,7 @@ unsafe extern "C" fn _start() -> ! {
         csrwr       $t0, 0x2        # LOONGARCH_CSR_EUEN
 
         la.global   $sp, bstack_top
-        csrrd       $a0, 0x20           # cpuid
+        csrrd       $a0, 0x20       # cpuid
         la.global   $t0, {entry}
         jirl        $zero,$t0,0
         ",
@@ -42,28 +47,48 @@ unsafe extern "C" fn _start() -> ! {
     )
 }
 
-/// Rust temporary entry point - MINIMAL TEST VERSION
-pub fn rust_tmp_main(_hart_id: usize) {
-    // UART at physical 0x1FE001E0 (ns16550-compatible, QEMU virt)
-    // LSR at offset 5, bit 5 = THR empty (ready to send)
-    let uart_lsr = 0x800000001FE001E5_u64 as *const u8;
-    let uart_thr = 0x800000001FE001E0_u64 as *mut u8;
-    
-    // Print "BOOT\n" to UART
-    let msg = b"BOOT\n";
-    for b in msg {
-        // Wait for TX empty
-        loop {
-            let lsr = unsafe { core::ptr::read_volatile(uart_lsr) };
-            if (lsr & 0x20) != 0 {
-                break;
-            }
-        }
-        unsafe { core::ptr::write_volatile(uart_thr, *b); }
-    }
-    
-    // Infinite loop to confirm we reached here
-    loop {
-        core::hint::spin_loop();
-    }
+/// The earliest entry point for a secondary CPU.
+#[naked]
+#[no_mangle]
+unsafe extern "C" fn _secondary_start() -> ! {
+    naked_asm!(
+        init_dwm!(),
+        "# Load stack pointer from the IOCSR message buffer
+        li.w         $t0, {MBUF1}
+        iocsrrd.d    $sp, $t0
+
+        csrrd        $a0, 0x20      # cpuid
+        la.global    $t0, {entry}
+        jirl         $zero, $t0, 0
+        ",
+        MBUF1 = const loongArch64::consts::LOONGARCH_CSR_MAIL_BUF1,
+        entry = sym _rust_secondary_main,
+    )
+}
+
+/// Continue primary-CPU initialization after the assembly entry stage.
+pub fn rust_tmp_main(hart_id: usize) {
+    super::clear_bss();
+    let _ = init_dtb_once(QEMU_DTB_ADDR);
+    set_local_thread_pointer(hart_id);
+
+    init_cpu();
+    ph_init_iter(CtorType::Cpu).for_each(|ctor| (ctor.func)());
+
+    parse_system_info();
+    ph_init_iter(CtorType::Platform).for_each(|ctor| (ctor.func)());
+    ph_init_iter(CtorType::HALDriver).for_each(|ctor| (ctor.func)());
+
+    super::call_real_main(hart_id);
+}
+
+fn init_cpu() {
+    euen::set_fpe(true);
+}
+
+/// Continue secondary-CPU initialization after the assembly entry stage.
+pub(crate) extern "C" fn _rust_secondary_main() {
+    set_local_thread_pointer(hart_id());
+    init_cpu();
+    super::call_real_main(hart_id());
 }

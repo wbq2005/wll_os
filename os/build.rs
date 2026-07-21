@@ -42,17 +42,15 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DEV_PRELOAD");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LIBCTEST");
     println!("cargo:rerun-if-env-changed=LOG");
-    println!("cargo:rerun-if-env-changed=LIBCTEST_FILTER");
-    println!("cargo:rerun-if-env-changed=LTP_CASES");
-    // 交互演示相关开关通过 option_env! 在内核代码中读取，属于编译期配置。
-    // 如果不声明 rerun-if-env-changed，切换 INTERACTIVE/输入自测/输入 trace 后
-    // Cargo 可能复用旧产物，导致 QEMU 里看到的行为和本次命令行不一致。
+    // Runtime selection switches are read through option_env! in the kernel.
+    // Track them so Cargo does not reuse an artifact built for another mode.
     println!("cargo:rerun-if-env-changed=WLL_INTERACTIVE");
-    println!("cargo:rerun-if-env-changed=WLL_INPUT_SELFTEST");
-    println!("cargo:rerun-if-env-changed=WLL_STDIN_TRACE");
     println!("cargo:rerun-if-env-changed=WLL_HARNESS_GROUPS");
-    println!("cargo:rerun-if-env-changed=WLL_TRACE_TEST_COMMANDS");
-    println!("cargo:rerun-if-env-changed=WLL_TRACE_TEST_GROUPS");
+    for key in ["WLL_INTERACTIVE", "WLL_HARNESS_GROUPS"] {
+        if let Ok(value) = env::var(key) {
+            println!("cargo:rustc-env={key}={value}");
+        }
+    }
     let dev_preload = env::var_os("CARGO_FEATURE_DEV_PRELOAD").is_some();
 
     let mut code = String::from("fn preload_generated_programs() {\n");

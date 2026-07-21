@@ -1,6 +1,6 @@
 //! 最薄 VFS：统一 MemFS + ext4 后端的查找与变更入口；`mount`/`umount2` 语义见 `syscall::fs`。
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -301,31 +301,95 @@ fn symlink_target_path(link_path: &str, target: &str) -> String {
     }
 }
 
-fn resolve_final_symlink(path: &str, nofollow: bool) -> Result<String, SysErrNo> {
-    let mut current = normalize_path(path);
-    for _ in 0..40 {
-        let ext_current = ext4_lookup_path(&current);
-        if mounted_ext4_backend_path(&current).is_none() {
-            if let Some(target) = MEM_FS.lock().get_symlink(&current) {
-                if nofollow {
-                    return Err(SysErrNo::ELOOP);
-                }
-                current = symlink_target_path(&current, &target);
-                continue;
-            }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinalSymlink {
+    Follow,
+    Preserve,
+    Reject,
+}
+
+fn path_components(path: &str) -> VecDeque<String> {
+    normalize_path(path)
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn path_from_components(components: &Vec<String>, next: Option<&str>) -> String {
+    let mut path = String::from("/");
+    for component in components {
+        if path.len() > 1 {
+            path.push('/');
         }
-        match ext4_vol::lookup_kind(&ext_current) {
-            Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if nofollow => {
+        path.push_str(component);
+    }
+    if let Some(component) = next {
+        if path.len() > 1 {
+            path.push('/');
+        }
+        path.push_str(component);
+    }
+    path
+}
+
+/// Resolve symbolic links one component at a time.  Requeueing the complete
+/// link target is important: a relative target may itself contain an
+/// intermediate symbolic link, and the unresolved suffix must then be walked
+/// under the resulting directory.
+fn resolve_path_symlinks(path: &str, final_symlink: FinalSymlink) -> Result<String, SysErrNo> {
+    let mut pending = path_components(path);
+    let mut resolved = Vec::new();
+    let mut followed = 0usize;
+
+    while let Some(component) = pending.pop_front() {
+        let is_final = pending.is_empty();
+        let candidate = path_from_components(&resolved, Some(&component));
+
+        if is_final && final_symlink == FinalSymlink::Preserve {
+            resolved.push(component);
+            break;
+        }
+
+        if let Some(target) = lookup_symlink_target(&candidate)? {
+            if is_final && final_symlink == FinalSymlink::Reject {
                 return Err(SysErrNo::ELOOP);
             }
-            Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => {
-                current = ext4_vol::resolve_symlinks(&ext_current)?;
-                continue;
+            followed += 1;
+            if followed > 40 {
+                return Err(SysErrNo::ELOOP);
             }
-            _ => return Ok(current),
+
+            let target_path = symlink_target_path(&candidate, &target);
+            let mut target_components = path_components(&target_path);
+            target_components.append(&mut pending);
+            pending = target_components;
+            resolved.clear();
+            continue;
         }
+
+        if !is_final {
+            let meta = metadata(&candidate, false)?;
+            if meta.kind != VfsNodeKind::Directory {
+                return Err(SysErrNo::ENOTDIR);
+            }
+        }
+        resolved.push(component);
     }
-    Err(SysErrNo::ELOOP)
+
+    Ok(path_from_components(&resolved, None))
+}
+
+fn resolve_final_symlink(path: &str, nofollow: bool) -> Result<String, SysErrNo> {
+    resolve_path_symlinks(
+        path,
+        if nofollow {
+            FinalSymlink::Reject
+        } else {
+            FinalSymlink::Follow
+        },
+    )
 }
 
 fn lookup_symlink_target(path: &str) -> Result<Option<String>, SysErrNo> {
@@ -350,54 +414,7 @@ fn lookup_symlink_target(path: &str) -> Result<Option<String>, SysErrNo> {
 }
 
 fn resolve_parent_symlinks_for_lookup(path: &str) -> Result<String, SysErrNo> {
-    let norm = normalize_path(path);
-    let tail = norm.trim_matches('/');
-    if tail.is_empty() {
-        return Ok(norm);
-    }
-
-    let parts: Vec<&str> = tail.split('/').filter(|part| !part.is_empty()).collect();
-    if parts.len() <= 1 {
-        return Ok(norm);
-    }
-
-    let final_name = parts[parts.len() - 1];
-    let mut current = String::from("/");
-    let mut index = 0usize;
-    let mut followed = 0usize;
-    while index + 1 < parts.len() {
-        if current != "/" {
-            current.push('/');
-        }
-        current.push_str(parts[index]);
-
-        loop {
-            match lookup_symlink_target(&current)? {
-                Some(target) => {
-                    followed += 1;
-                    if followed > 40 {
-                        return Err(SysErrNo::ELOOP);
-                    }
-                    current = symlink_target_path(&current, &target);
-                }
-                None => break,
-            }
-        }
-
-        let meta = metadata(&current, false)?;
-        if meta.kind != VfsNodeKind::Directory {
-            return Err(SysErrNo::ENOTDIR);
-        }
-        index += 1;
-    }
-
-    if current == "/" {
-        Ok(normalize_path(&alloc::format!("/{}", final_name)))
-    } else {
-        Ok(normalize_path(&alloc::format!(
-            "{}/{}", current, final_name
-        )))
-    }
+    resolve_path_symlinks(path, FinalSymlink::Preserve)
 }
 
 fn pseudo_inode(path: &str) -> u64 {
@@ -1720,10 +1737,10 @@ pub fn read_executable_file(name: &str) -> Option<Vec<u8>> {
     }
 
     if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
-        return volume
-            .read_file(&backend_path)
-            .ok()
-            .filter(|data| is_elf_image(data));
+        // execve must be able to inspect both ELF images and shebang scripts.
+        // Keep VFAT consistent with the ext4/tmpfs paths below; the caller
+        // performs the actual ELF/shebang validation.
+        return volume.read_file(&backend_path).ok();
     }
 
     let tmpfs_path = is_tmpfs_path(&norm);

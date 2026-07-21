@@ -65,7 +65,14 @@ def run_docker(repo: Path, arch: str, timeout: int, image: str) -> tuple[int, st
         "-lc",
         script,
     ]
-    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
     return proc.returncode, proc.stdout
 
 

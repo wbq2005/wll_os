@@ -19,6 +19,9 @@ pub struct TrapFrame {
     pub fcc: u64,
     /// Floating-point control and status register.
     pub fcsr: u64,
+    /// Full LSX register image.  LSX aliases the scalar FP registers; the
+    /// scalar fields above remain the Linux signal ABI view of their low lanes.
+    pub lsx: [[u64; 2]; 32],
 }
 
 impl TrapFrame {
@@ -41,6 +44,7 @@ impl TrapFrame {
         self.f = [0; 32];
         self.fcc = 0;
         self.fcsr = 0;
+        self.lsx = [[0; 2]; 32];
     }
 
     pub fn syscall_ok(&mut self) {

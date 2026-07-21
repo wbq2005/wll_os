@@ -525,7 +525,7 @@ fn direct_write_at_fd_from_user(
 }
 
 fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
-    let wait_key = {
+    let (wait_key, deadline) = {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
         if file_desc.is_pipe_read() {
@@ -535,7 +535,10 @@ fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, S
             if !file_desc.pipe_read_would_block() {
                 return Ok(false);
             }
-            file_desc.pipe_read_wait_key().ok_or(SysErrNo::EBADF)?
+            (
+                file_desc.pipe_read_wait_key().ok_or(SysErrNo::EBADF)?,
+                None,
+            )
         } else if let Some(wait_key) = file_desc.eventfd_read_wait_key() {
             if file_desc.eventfd_read_nonblocking() {
                 return Err(SysErrNo::EAGAIN);
@@ -543,12 +546,23 @@ fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, S
             if !file_desc.eventfd_read_would_block() {
                 return Ok(false);
             }
-            wait_key
+            (wait_key, None)
+        } else if let Some(wait_key) = file_desc.socket_read_wait_key() {
+            if file_desc.socket_read_nonblocking() {
+                return Err(SysErrNo::EAGAIN);
+            }
+            if !file_desc.socket_read_would_block() {
+                return Ok(false);
+            }
+            let deadline = file_desc
+                .socket_recv_timeout_us()
+                .map(|timeout| crate::timer::get_time_us().saturating_add(timeout));
+            (wait_key, deadline)
         } else {
             return Err(SysErrNo::EAGAIN);
         }
     };
-    let _ = sleep_on_io_key_if(wait_key, None, || {
+    let outcome = sleep_on_io_key_if(wait_key, deadline, || {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
         if file_desc.is_pipe_read() {
@@ -558,10 +572,15 @@ fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, S
             Ok(file_desc.pipe_read_would_block())
         } else if file_desc.eventfd_read_wait_key() == Some(wait_key) {
             Ok(file_desc.eventfd_read_would_block())
+        } else if file_desc.socket_read_wait_key() == Some(wait_key) {
+            Ok(file_desc.socket_read_would_block())
         } else {
             Ok(false)
         }
     })?;
+    if outcome == WaitOutcome::TimedOut {
+        return Err(SysErrNo::EAGAIN);
+    }
     Ok(true)
 }
 

@@ -1291,7 +1291,9 @@ pub fn init() {
     init_pseudo_files();
     vfs::refresh_block_device_nodes();
     vfs::init_mount_table();
-    install_busybox_shell_aliases();
+    if option_env!("WLL_INTERACTIVE") == Some("1") {
+        install_busybox_shell_aliases();
+    }
 }
 
 fn init_pseudo_files() {
@@ -1457,9 +1459,14 @@ fn install_busybox_shell_aliases() {
             continue;
         }
 
+        // A root filesystem that only ships a multi-call BusyBox binary still
+        // needs the conventional POSIX command names that shell scripts look
+        // up through PATH. Keep this to a practical base set: links are
+        // created on the snapshot-backed ext4 volume during boot.
         let applets = [
-            "sh", "ls", "cat", "pwd", "echo", "mount", "umount", "mkdir", "rmdir", "touch", "rm",
-            "cp", "mv", "sleep", "uname", "free", "ps",
+            "sh", "ls", "cat", "pwd", "echo", "printf", "env", "test", "mount", "umount", "mkdir",
+            "rmdir", "touch", "rm", "cp", "mv", "ln", "sleep", "timeout", "kill", "date", "uname",
+            "free", "ps", "df", "du", "find", "grep", "head", "tail", "sort", "seq", "tr", "wc",
         ];
 
         if source_in_memfs {

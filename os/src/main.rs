@@ -155,44 +155,22 @@ fn early_la_line(msg: &[u8]) {
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
-    // UART MMIO debug markers: track execution flow without ecall
-    // J=entry, K=init_dtb_once done, L=logging done, M=polyhal done
-    // N=mm done, O=memory regions added, P=page_table done, Q=kernel_space done
-    // R=trap init done, S=timer done, T=Hello printed, U=Memorry init, V=VirtIO done
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[EARLY] rust_main reached\n");
-
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] A\n");
-
     // Guard against recursive calls
     use core::sync::atomic::{AtomicBool, Ordering};
     static INIT_GUARD: AtomicBool = AtomicBool::new(false);
     if INIT_GUARD.swap(true, Ordering::SeqCst) {
-        #[cfg(target_arch = "loongarch64")]
-        early_la_line(b"[DBG] RECURSIVE CALL - halting\n");
         loop {
             wait_for_interrupt();
         }
     }
 
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] B\n");
     if let Err(_e) = polyhal::mem::init_dtb_once(PhysAddr::new(dtb_ptr)) {
         loop {
             wait_for_interrupt();
         }
     }
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] C\n");
     logging::init(option_env!("LOG"));
-
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] D\n");
     polyhal::common::init(&KernelPageAlloc);
-
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] E\n");
     mm::init();
     platform::init();
 
@@ -212,8 +190,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     }
 
     #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] F\n");
-    #[cfg(target_arch = "loongarch64")]
     {
         let mut count = 0;
         for &(start, len) in polyhal::mem::get_mem_areas() {
@@ -229,8 +205,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     }
 
     #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] G\n");
-    #[cfg(target_arch = "loongarch64")]
     mm::page_table::init_kernel_page_table();
     #[cfg(target_arch = "riscv64")]
     {
@@ -241,22 +215,14 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     }
 
     #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] H\n");
-    #[cfg(target_arch = "loongarch64")]
     mm::memory_set::init_kernel_space();
 
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] I\n");
     #[cfg(target_arch = "loongarch64")]
     trap::init();
 
     #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] J\n");
-    #[cfg(target_arch = "loongarch64")]
     timer::init();
 
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] K\n");
     putchar(b'[');
     putchar(b'k');
     putchar(b'e');
@@ -278,8 +244,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     putchar(b'!');
     putchar(b'\n');
 
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] L\n");
     putchar(b'[');
     putchar(b'k');
     putchar(b'e');
@@ -406,7 +370,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
     #[cfg(target_arch = "loongarch64")]
     {
-        early_la_line(b"[DBG] M\n");
         early_la_line(b"[VIRTIO] Probing...\n");
         if let Some(dev) = crate::drivers::virtio_pci_blk::probe_pci_virtio_blk() {
             early_la_line(b"[VIRTIO] found\n");
@@ -416,19 +379,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         } else {
             early_la_line(b"[VIRTIO] not found\n");
         }
-        early_la_line(b"[DBG] N\n");
     }
-
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] O\n");
     fs::init();
-
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] P\n");
     task::add_initproc();
-
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] Q\n");
     putchar(b'[');
     putchar(b'k');
     putchar(b'e');
@@ -455,8 +408,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     putchar(b'.');
     putchar(b'\n');
 
-    #[cfg(target_arch = "loongarch64")]
-    early_la_line(b"[DBG] R\n");
     task::run_tasks();
 
     // Should never reach here

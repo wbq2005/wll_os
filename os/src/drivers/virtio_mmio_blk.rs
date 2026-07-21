@@ -9,7 +9,7 @@ use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 use virtio_drivers::transport::{DeviceType, Transport};
 
-use crate::drivers::hal::VirtHal;
+use crate::drivers::hal::{phys_to_virt_mmio, VirtHal};
 use crate::fs::block_dev::RawBlockDevice;
 use crate::utils::error::SysErrNo;
 
@@ -33,9 +33,10 @@ unsafe impl Send for VirtioMmioBlock {}
 impl VirtioMmioBlock {
     /// 从给定物理起始地址（MMIO 窗口）附着 VirtIO blk 设备。
     pub unsafe fn attach(mmio_pa: usize) -> Option<Self> {
-        let header_ptr = NonNull::new(mmio_pa as *mut VirtIOHeader)?;
+        let mmio_va = phys_to_virt_mmio(mmio_pa);
+        let header_ptr = NonNull::new(mmio_va.cast::<VirtIOHeader>())?;
         // Debug: read VirtIO magic at offset 0 (should be 0x74726976 = "virt")
-        let magic_val = unsafe { core::ptr::read_volatile(mmio_pa as *const u32) };
+        let magic_val = unsafe { core::ptr::read_volatile(mmio_va.cast_const().cast::<u32>()) };
         log::info!(
             "[virtio] MMIO @{:#x}: magic = {:#x} (expect 0x74726976)",
             mmio_pa,

@@ -145,10 +145,11 @@ pub fn cpu_isa() -> &'static str {
 /// Real-board RTC backends are deliberately separate follow-up drivers.
 #[cfg(target_arch = "riscv64")]
 pub fn realtime_ns() -> Option<u64> {
-    let base = GOLDFISH_RTC_BASE.load(Ordering::Acquire);
-    if base == 0 {
+    let paddr = GOLDFISH_RTC_BASE.load(Ordering::Acquire);
+    if paddr == 0 {
         return None;
     }
+    let base = crate::drivers::hal::phys_to_virt_mmio(paddr) as usize;
     let (high, low) = unsafe {
         loop {
             let high_before = core::ptr::read_volatile((base + 4) as *const u32);

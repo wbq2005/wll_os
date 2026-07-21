@@ -26,8 +26,10 @@ pub fn copy_to_user(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EFAULT);
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let mut memory_set = task.memory_set.lock();
-    copy_to_user_in_memory_set(&mut memory_set, dst, src)
+    super::with_kernel_page_table(|| {
+        let mut memory_set = task.memory_set.lock();
+        copy_to_user_in_memory_set(&mut memory_set, dst, src)
+    })
 }
 
 pub fn copy_to_user_in_memory_set(
@@ -85,8 +87,10 @@ pub fn copy_from_user(src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EFAULT);
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let mut memory_set = task.memory_set.lock();
-    copy_from_user_in_memory_set(&mut memory_set, src, dst)
+    super::with_kernel_page_table(|| {
+        let mut memory_set = task.memory_set.lock();
+        copy_from_user_in_memory_set(&mut memory_set, src, dst)
+    })
 }
 
 pub fn check_user_readable(src: usize, len: usize) -> Result<(), SysErrNo> {
@@ -103,22 +107,24 @@ pub fn clear_user(dst: usize, len: usize) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EFAULT);
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let mut memory_set = task.memory_set.lock();
-    memory_set.prepare_write(dst, len)?;
-    let mut copied = 0usize;
-    while copied < len {
-        let va = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
-        let pa = memory_set
-            .translate(VirtAddr::new(va))
-            .ok_or(SysErrNo::EFAULT)?;
-        let page_left = PAGE_SIZE - va % PAGE_SIZE;
-        let n = page_left.min(len - copied);
-        unsafe {
-            core::ptr::write_bytes(pa.raw() as *mut u8, 0, n);
+    super::with_kernel_page_table(|| {
+        let mut memory_set = task.memory_set.lock();
+        memory_set.prepare_write(dst, len)?;
+        let mut copied = 0usize;
+        while copied < len {
+            let va = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
+            let pa = memory_set
+                .translate(VirtAddr::new(va))
+                .ok_or(SysErrNo::EFAULT)?;
+            let page_left = PAGE_SIZE - va % PAGE_SIZE;
+            let n = page_left.min(len - copied);
+            unsafe {
+                core::ptr::write_bytes(pa.raw() as *mut u8, 0, n);
+            }
+            copied += n;
         }
-        copied += n;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn copy_object_to_user<T>(dst: usize, obj: &T) -> Result<(), SysErrNo> {
@@ -164,26 +170,28 @@ fn read_cstr_inner(
         };
     }
 
-    let mut bytes = Vec::new();
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let mut memory_set = task.memory_set.lock();
-    let mut offset = 0usize;
-    while offset < MAX_CSTR_LEN {
-        let va = addr.checked_add(offset).ok_or(SysErrNo::EFAULT)?;
-        let page_left = PAGE_SIZE - va % PAGE_SIZE;
-        let span = page_left.min(MAX_CSTR_LEN - offset);
-        memory_set.prepare_read(va, span)?;
-        let pa = memory_set
-            .translate(VirtAddr::new(va))
-            .ok_or(SysErrNo::EFAULT)?;
-        let src = unsafe { core::slice::from_raw_parts(pa.raw() as *const u8, span) };
-        for &byte in src {
-            if byte == 0 {
-                return String::from_utf8(bytes).map_err(|_| SysErrNo::EINVAL);
+    super::with_kernel_page_table(|| {
+        let mut bytes = Vec::new();
+        let mut memory_set = task.memory_set.lock();
+        let mut offset = 0usize;
+        while offset < MAX_CSTR_LEN {
+            let va = addr.checked_add(offset).ok_or(SysErrNo::EFAULT)?;
+            let page_left = PAGE_SIZE - va % PAGE_SIZE;
+            let span = page_left.min(MAX_CSTR_LEN - offset);
+            memory_set.prepare_read(va, span)?;
+            let pa = memory_set
+                .translate(VirtAddr::new(va))
+                .ok_or(SysErrNo::EFAULT)?;
+            let src = unsafe { core::slice::from_raw_parts(pa.raw() as *const u8, span) };
+            for &byte in src {
+                if byte == 0 {
+                    return String::from_utf8(bytes).map_err(|_| SysErrNo::EINVAL);
+                }
+                bytes.push(byte);
             }
-            bytes.push(byte);
+            offset += span;
         }
-        offset += span;
-    }
-    Err(unterminated_err)
+        Err(unterminated_err)
+    })
 }

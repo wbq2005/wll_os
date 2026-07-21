@@ -340,29 +340,9 @@ impl MemorySet {
         Ok(())
     }
 
-    /// Build a user address space seeded with the kernel/device mappings needed
-    /// while the kernel runs on a user task's page table.
+    /// Build a user address space seeded with the shared kernel mappings.
     pub fn from_kernel() -> Self {
-        let mut ms = Self::new_bare();
-        #[cfg(target_arch = "riscv64")]
-        {
-            let device_flags = PTEFlags::R | PTEFlags::W | PTEFlags::V;
-            for paddr in [
-                0x0010_1000usize,
-                0x0200_0000usize,
-                0x0c00_0000usize,
-                0x1000_0000usize,
-                0x1000_1000usize,
-            ] {
-                ms.page_table.map_page(
-                    VirtAddr::new(paddr),
-                    PhysAddr::new(paddr),
-                    device_flags.into(),
-                    MappingSize::Page4KB,
-                );
-            }
-        }
-        ms
+        Self::new_bare()
     }
 
     pub fn activate(&self) {

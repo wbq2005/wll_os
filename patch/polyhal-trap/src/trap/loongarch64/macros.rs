@@ -8,7 +8,7 @@ macro_rules! includes_trap_macros {
         .macro FIXUP_EX from, to, fix
         .if \fix
             .section .fixup, "ax"
-        \to: 
+        \to:
             li.w	$a0, -1
             jr	$ra
             .previous
@@ -68,7 +68,7 @@ macro_rules! includes_trap_macros {
             csrrd	$t0, 0x1
             st.d	$t0, $sp, 8*32  // prmd
 
-            csrrd   $t0, 0x6        
+            csrrd   $t0, 0x6
             st.d    $t0, $sp, 8*33  // era
         .endm
 
@@ -126,6 +126,41 @@ macro_rules! includes_trap_macros {
 
             movfcsr2gr  $t0, $fcsr0
             st.d        $t0, $sp, 67*8
+
+            // LSX registers alias f0-f31 in their low 64-bit lanes.  Save the
+            // complete vector image after the scalar Linux signal ABI view.
+            vst         $vr0,  $sp, 544
+            vst         $vr1,  $sp, 560
+            vst         $vr2,  $sp, 576
+            vst         $vr3,  $sp, 592
+            vst         $vr4,  $sp, 608
+            vst         $vr5,  $sp, 624
+            vst         $vr6,  $sp, 640
+            vst         $vr7,  $sp, 656
+            vst         $vr8,  $sp, 672
+            vst         $vr9,  $sp, 688
+            vst         $vr10, $sp, 704
+            vst         $vr11, $sp, 720
+            vst         $vr12, $sp, 736
+            vst         $vr13, $sp, 752
+            vst         $vr14, $sp, 768
+            vst         $vr15, $sp, 784
+            vst         $vr16, $sp, 800
+            vst         $vr17, $sp, 816
+            vst         $vr18, $sp, 832
+            vst         $vr19, $sp, 848
+            vst         $vr20, $sp, 864
+            vst         $vr21, $sp, 880
+            vst         $vr22, $sp, 896
+            vst         $vr23, $sp, 912
+            vst         $vr24, $sp, 928
+            vst         $vr25, $sp, 944
+            vst         $vr26, $sp, 960
+            vst         $vr27, $sp, 976
+            vst         $vr28, $sp, 992
+            vst         $vr29, $sp, 1008
+            vst         $vr30, $sp, 1024
+            vst         $vr31, $sp, 1040
         .endm
 
         .macro LOAD_REGS
@@ -165,12 +200,47 @@ macro_rules! includes_trap_macros {
             ld.d    $s6, $sp, 29*8
             ld.d    $s7, $sp, 30*8
             ld.d    $s8, $sp, 31*8
-            
+
             // restore sp
             ld.d    $sp, $sp, 3*8
         .endm
 
         .macro LOAD_FP_REGS
+            // Restore LSX first, then apply the scalar low lanes below so a
+            // signal handler's FP-context edits take precedence.
+            vld         $vr0,  $sp, 544
+            vld         $vr1,  $sp, 560
+            vld         $vr2,  $sp, 576
+            vld         $vr3,  $sp, 592
+            vld         $vr4,  $sp, 608
+            vld         $vr5,  $sp, 624
+            vld         $vr6,  $sp, 640
+            vld         $vr7,  $sp, 656
+            vld         $vr8,  $sp, 672
+            vld         $vr9,  $sp, 688
+            vld         $vr10, $sp, 704
+            vld         $vr11, $sp, 720
+            vld         $vr12, $sp, 736
+            vld         $vr13, $sp, 752
+            vld         $vr14, $sp, 768
+            vld         $vr15, $sp, 784
+            vld         $vr16, $sp, 800
+            vld         $vr17, $sp, 816
+            vld         $vr18, $sp, 832
+            vld         $vr19, $sp, 848
+            vld         $vr20, $sp, 864
+            vld         $vr21, $sp, 880
+            vld         $vr22, $sp, 896
+            vld         $vr23, $sp, 912
+            vld         $vr24, $sp, 928
+            vld         $vr25, $sp, 944
+            vld         $vr26, $sp, 960
+            vld         $vr27, $sp, 976
+            vld         $vr28, $sp, 992
+            vld         $vr29, $sp, 1008
+            vld         $vr30, $sp, 1024
+            vld         $vr31, $sp, 1040
+
             fld.d   $f0,  $sp, 34*8
             fld.d   $f1,  $sp, 35*8
             fld.d   $f2,  $sp, 36*8

@@ -5,7 +5,7 @@
 //! - MMIO 寄存器需通过 DMW0 (0x8000..., uncached) 访问
 //! - 传给设备的 DMA 地址必须是物理地址（剥除 DMW 前缀）
 //!
-//! RISC-V 启动阶段无分页或有恒等映射，物理地址可直接使用。
+//! RISC-V 内核页表保留低位恒等映射，RAM 与 MMIO 物理地址可直接使用。
 //!
 //! 参考: T202510008995695-2720-master/os/src/drivers/virtio/mod.rs (VirtIoHalImpl)
 

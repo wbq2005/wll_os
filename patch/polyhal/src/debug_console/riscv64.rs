@@ -66,7 +66,9 @@ impl DebugConsole {
             // 下自旋等待用户输入。
             let lsr = core::ptr::read_volatile((UART_ADDR + UART_LSR) as *const u8);
             if (lsr & UART_LSR_DR) != 0 {
-                Some(core::ptr::read_volatile((UART_ADDR + UART_RBR) as *const u8))
+                Some(core::ptr::read_volatile(
+                    (UART_ADDR + UART_RBR) as *const u8,
+                ))
             } else {
                 None
             }

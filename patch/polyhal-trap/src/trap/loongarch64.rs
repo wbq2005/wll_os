@@ -103,18 +103,18 @@ pub unsafe extern "C" fn trap_vector_base() {
             csrwr   $sp, KSAVE_USP
             csrrd   $sp, 0x1
             andi    $sp, $sp, 0x3
-            bnez    $sp, {user_vec} 
-        
+            bnez    $sp, {user_vec}
+
             csrrd   $sp, KSAVE_USP
             addi.d  $sp, $sp, -{trapframe_size} // allocate space
-        
+
             // save the registers.
 
             SAVE_REGS
-        
+
             move    $a0, $sp
             bl      {trap_handler}
-        
+
             // Load registers from sp, include new sp
             LOAD_REGS
             ertn
@@ -233,8 +233,23 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
         | Trap::Exception(Exception::PageNonReadableFault) => {
             TrapType::LoadPageFault(badv::read().vaddr())
         }
-        Trap::MachineError(_) => todo!(),
-        Trap::Unknown => todo!(),
+        Trap::MachineError(error) => panic!(
+            "LoongArch machine error {:?}: ecode={:#x} esubcode={:#x} is={:#x} era={:#x} badv={:#x}",
+            error,
+            estat.ecode(),
+            estat.esubcode(),
+            estat.is(),
+            tf.era,
+            badv::read().vaddr()
+        ),
+        Trap::Unknown => panic!(
+            "LoongArch unknown trap: ecode={:#x} esubcode={:#x} is={:#x} era={:#x} badv={:#x}",
+            estat.ecode(),
+            estat.esubcode(),
+            estat.is(),
+            tf.era,
+            badv::read().vaddr()
+        ),
         _ => {
             panic!(
                 "Unhandled trap {:?} @ {:#x} BADV: {:#x}:\n{:#x?}",

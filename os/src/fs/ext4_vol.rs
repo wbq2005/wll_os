@@ -591,12 +591,7 @@ fn current_fs_ids() -> (u16, u16) {
     (uid, gid)
 }
 
-fn new_child_ids_and_mode(
-    fs: &Ext4,
-    parent_ino: u32,
-    mode: u32,
-    is_dir: bool,
-) -> (u16, u16, u16) {
+fn new_child_ids_and_mode(fs: &Ext4, parent_ino: u32, mode: u32, is_dir: bool) -> (u16, u16, u16) {
     let (uid, fsgid) = current_fs_ids();
     let parent_inode = fs.get_inode_ref(parent_ino).inode;
     let parent_setgid = (parent_inode.mode() & 0o2000) != 0;
@@ -2180,39 +2175,81 @@ pub fn readlink_ext4(path: &str) -> Result<String, SysErrNo> {
 
     let inode_ref = fs.get_inode_ref(ino);
     let size = inode_ref.inode.size() as usize;
-    let mut data = alloc::vec![0u8; size];
-    let read_ok = if size == 0 {
-        true
-    } else {
-        fs.read_at(ino, 0, &mut data)
-            .map(|n| n == size)
-            .unwrap_or(false)
-    };
-    if !read_ok && size <= 60 {
-        data.clear();
+    let mut data = Vec::new();
+    if size <= 60 && inode_ref.inode.blocks_count() == 0 {
         for word in inode_ref.inode.block() {
             data.extend_from_slice(&word.to_le_bytes());
         }
         data.truncate(size);
-    } else if !read_ok {
-        return Err(SysErrNo::EIO);
+    } else {
+        data.resize(size, 0);
+        if size != 0
+            && !fs
+                .read_at(ino, 0, &mut data)
+                .map(|n| n == size)
+                .unwrap_or(false)
+        {
+            return Err(SysErrNo::EIO);
+        }
     }
     String::from_utf8(data).map_err(|_| SysErrNo::EINVAL)
 }
 
 pub fn resolve_symlinks(path: &str) -> Result<String, SysErrNo> {
-    let mut current = normalize_path(path);
-    for _ in 0..8 {
-        let Some((_ino, kind)) = lookup_kind(&current) else {
+    let mut pending: VecDeque<String> = normalize_path(path)
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(String::from)
+        .collect();
+    let mut resolved: Vec<String> = Vec::new();
+    let mut followed = 0usize;
+
+    while let Some(component) = pending.pop_front() {
+        let mut candidate = String::from("/");
+        for part in &resolved {
+            if candidate.len() > 1 {
+                candidate.push('/');
+            }
+            candidate.push_str(part);
+        }
+        if candidate.len() > 1 {
+            candidate.push('/');
+        }
+        candidate.push_str(&component);
+
+        let Some((_ino, kind)) = lookup_kind(&candidate) else {
             return Err(SysErrNo::ENOENT);
         };
-        if kind != Ext4NodeKind::Symlink {
-            return Ok(current);
+        if kind == Ext4NodeKind::Symlink {
+            followed += 1;
+            if followed > 40 {
+                return Err(SysErrNo::ELOOP);
+            }
+            let target = readlink_ext4(&candidate)?;
+            let target_path = resolve_link_target(&candidate, &target);
+            let mut target_components: VecDeque<String> = target_path
+                .trim_matches('/')
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(String::from)
+                .collect();
+            target_components.append(&mut pending);
+            pending = target_components;
+            resolved.clear();
+            continue;
         }
-        let target = readlink_ext4(&current)?;
-        current = resolve_link_target(&current, &target);
+        if !pending.is_empty() && kind != Ext4NodeKind::Directory {
+            return Err(SysErrNo::ENOTDIR);
+        }
+        resolved.push(component);
     }
-    Err(SysErrNo::ELOOP)
+
+    if resolved.is_empty() {
+        Ok(String::from("/"))
+    } else {
+        Ok(format!("/{}", resolved.join("/")))
+    }
 }
 
 fn path_is_descendant(parent: &str, child: &str) -> bool {
@@ -2467,10 +2504,7 @@ pub fn exchange_ext4(old_path: &str, new_path: &str) -> Result<(), SysErrNo> {
     let mut temp = String::new();
     for attempt in 0..32usize {
         temp = if old_parent_path == "/" {
-            format!(
-                "/.wll_rename_exchange_{}_{}_{}",
-                old_ino, new_ino, attempt
-            )
+            format!("/.wll_rename_exchange_{}_{}_{}", old_ino, new_ino, attempt)
         } else {
             format!(
                 "{}/.wll_rename_exchange_{}_{}_{}",

@@ -81,6 +81,14 @@ pub fn set_next_foreground_trigger() {
     program_next_timer(FOREGROUND_TIME_SLICE_MS);
 }
 
+/// Rearm the hardware timer from supervisor interrupt context without taking
+/// scheduler locks. Deferred timeout processing runs at a safe task boundary.
+pub fn rearm_kernel_tick() {
+    polyhal::timer::set_next_timer(core::time::Duration::from_micros(
+        (TIME_SLICE_MS as u64).saturating_mul(1000),
+    ));
+}
+
 pub fn add_timeout(deadline_us: usize, task: Arc<TaskControlBlock>, token: usize) {
     TIMER_WAITERS.lock().push(TimerWaiter {
         deadline_us,

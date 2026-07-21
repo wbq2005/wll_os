@@ -592,7 +592,7 @@ pub fn sys_socketpair(domain: usize, raw_type: usize, protocol: usize, sv: usize
         left_socket.connected = true;
         left_socket.local_addr = Some(default_sockaddr(domain));
         left_socket.peer_addr = Some(default_sockaddr(domain));
-        left_socket.peer = Some(right.clone());
+        left_socket.peer = Some(Arc::downgrade(&right));
     }
     {
         let mut right_socket = right.lock();
@@ -600,7 +600,7 @@ pub fn sys_socketpair(domain: usize, raw_type: usize, protocol: usize, sv: usize
         right_socket.connected = true;
         right_socket.local_addr = Some(default_sockaddr(domain));
         right_socket.peer_addr = Some(default_sockaddr(domain));
-        right_socket.peer = Some(left.clone());
+        right_socket.peer = Some(Arc::downgrade(&left));
     }
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
@@ -717,44 +717,59 @@ pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: usize) -> Sysc
         return Err(SysErrNo::EINVAL);
     }
     let state = socket_state_for_fd(fd)?;
-    let mut socket = state.lock();
-    if !socket.is_stream() {
-        return Err(SysErrNo::EOPNOTSUPP);
-    }
-    if !socket.listening {
-        return Err(SysErrNo::EINVAL);
-    }
-    if let Some(accepted) = socket.pending.pop_front() {
-        if addr != 0 {
-            let peer_addr = accepted
-                .lock()
-                .peer_addr
-                .clone()
-                .unwrap_or_else(|| default_sockaddr(socket.domain));
-            copy_sockaddr_to_user(addr, addrlen, &peer_addr)?;
-        }
-        if (flags & SOCK_NONBLOCK) != 0 {
-            accepted.lock().nonblock = true;
-        }
-        let fd_flags = if (flags & SOCK_CLOEXEC) != 0 {
-            fd::FD_CLOEXEC
-        } else {
-            0
+    loop {
+        let (accepted, domain, nonblock) = {
+            let mut socket = state.lock();
+            if !socket.is_stream() {
+                return Err(SysErrNo::EOPNOTSUPP);
+            }
+            if !socket.listening {
+                return Err(SysErrNo::EINVAL);
+            }
+            (
+                socket.pending.pop_front(),
+                socket.domain,
+                socket.nonblock || (flags & SOCK_NONBLOCK) != 0,
+            )
         };
-        drop(socket);
-        let task = current_task().ok_or(SysErrNo::ESRCH)?;
-        let inner = task.inner.lock();
-        let nofile_limit = inner.rlimit_nofile;
-        let mut fds = inner.fd_table.lock();
-        let desc = FileDescriptor::Socket { state: accepted };
-        return fds
-            .alloc_with_flags_below(desc, fd_flags, nofile_limit)
-            .ok_or(SysErrNo::EMFILE);
+
+        if let Some(accepted) = accepted {
+            if addr != 0 {
+                let peer_addr = accepted
+                    .lock()
+                    .peer_addr
+                    .clone()
+                    .unwrap_or_else(|| default_sockaddr(domain));
+                copy_sockaddr_to_user(addr, addrlen, &peer_addr)?;
+            }
+            if (flags & SOCK_NONBLOCK) != 0 {
+                accepted.lock().nonblock = true;
+            }
+            let fd_flags = if (flags & SOCK_CLOEXEC) != 0 {
+                fd::FD_CLOEXEC
+            } else {
+                0
+            };
+            let task = current_task().ok_or(SysErrNo::ESRCH)?;
+            let inner = task.inner.lock();
+            let nofile_limit = inner.rlimit_nofile;
+            let mut fds = inner.fd_table.lock();
+            let desc = FileDescriptor::Socket { state: accepted };
+            return fds
+                .alloc_with_flags_below(desc, fd_flags, nofile_limit)
+                .ok_or(SysErrNo::EMFILE);
+        }
+        if nonblock {
+            return Err(SysErrNo::EAGAIN);
+        }
+
+        // Recheck while queued so a connection arriving between the first
+        // observation and sleep cannot be lost.
+        let _ = crate::task::wait_queue::sleep_on_io_if(None, || {
+            let socket = state.lock();
+            Ok(socket.listening && socket.pending.is_empty())
+        })?;
     }
-    if socket.nonblock || (flags & SOCK_NONBLOCK) != 0 {
-        return Err(SysErrNo::EAGAIN);
-    }
-    Err(SysErrNo::EOPNOTSUPP)
 }
 
 pub fn sys_connect(fd: usize, addr: usize, addrlen: usize) -> SyscallRet {
@@ -800,7 +815,7 @@ pub fn sys_connect(fd: usize, addr: usize, addrlen: usize) -> SyscallRet {
         accepted_socket.connected = true;
         accepted_socket.local_addr = Some(local_addr.clone());
         accepted_socket.peer_addr = Some(client_addr.clone());
-        accepted_socket.peer = Some(state.clone());
+        accepted_socket.peer = Some(Arc::downgrade(&state));
     }
     listener_socket.pending.push_back(accepted.clone());
     drop(listener_socket);
@@ -809,7 +824,7 @@ pub fn sys_connect(fd: usize, addr: usize, addrlen: usize) -> SyscallRet {
     client_socket.connected = true;
     client_socket.local_addr = Some(client_addr);
     client_socket.peer_addr = Some(local_addr);
-    client_socket.peer = Some(accepted);
+    client_socket.peer = Some(Arc::downgrade(&accepted));
     drop(client_socket);
     crate::task::wait_queue::wake_io_waiters();
     Ok(0)
@@ -890,13 +905,24 @@ pub fn sys_sendto(
             data,
             addr: source_addr,
         });
-        crate::task::wait_queue::wake_io_waiters();
+        fd::wake_socket_readers(&peer);
         return Ok(len);
     }
-    let peer = socket.peer.clone().ok_or(SysErrNo::ENOTCONN)?;
+    if socket.peer_read_closed {
+        send_sigpipe_if_needed(flags);
+        return Err(SysErrNo::EPIPE);
+    }
+    let peer = socket
+        .peer
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| {
+            send_sigpipe_if_needed(flags);
+            SysErrNo::EPIPE
+        })?;
     drop(socket);
     peer.lock().rx_buf.extend(data.iter().copied());
-    crate::task::wait_queue::wake_io_waiters();
+    fd::wake_socket_readers(&peer);
     Ok(len)
 }
 
@@ -922,42 +948,76 @@ pub fn sys_recvfrom(
         return Ok(0);
     }
     let state = socket_state_for_fd(fd)?;
-    let mut socket = state.lock();
-    if socket.shutdown_read {
-        return Ok(0);
-    }
-    if socket.is_stream() && !socket.connected {
-        return Err(SysErrNo::ENOTCONN);
-    }
-    if socket.is_datagram() {
-        let Some(packet) = socket.dgram_queue.pop_front() else {
+    let deadline = {
+        let socket = state.lock();
+        socket
+            .recv_timeout_us
+            .map(|timeout| crate::timer::get_time_us().saturating_add(timeout))
+    };
+    loop {
+        let mut socket = state.lock();
+        if socket.shutdown_read {
+            return Ok(0);
+        }
+        if socket.is_stream() && !socket.connected {
+            return Err(SysErrNo::ENOTCONN);
+        }
+        if socket.is_datagram() {
+            if let Some(packet) = socket.dgram_queue.pop_front() {
+                let n = len.min(packet.data.len());
+                drop(socket);
+                super::user::copy_to_user(buf, &packet.data[..n])?;
+                if src_addr != 0 {
+                    copy_sockaddr_to_user(src_addr, addrlen, &packet.addr)?;
+                }
+                return Ok(n);
+            }
+        } else if !socket.rx_buf.is_empty() {
+            let mut out = alloc::vec![0u8; len];
+            let mut n = 0usize;
+            while n < len {
+                if let Some(byte) = socket.rx_buf.pop_front() {
+                    out[n] = byte;
+                    n += 1;
+                } else {
+                    break;
+                }
+            }
+            drop(socket);
+            super::user::copy_to_user(buf, &out[..n])?;
+            return Ok(n);
+        } else if socket.is_stream()
+            && (socket.peer_write_closed
+                || socket.peer.as_ref().and_then(Weak::upgrade).is_none())
+        {
+            return Ok(0);
+        }
+
+        let nonblock = socket.nonblock || (flags & MSG_DONTWAIT) != 0;
+        drop(socket);
+        if nonblock {
             return Err(SysErrNo::EAGAIN);
-        };
-        let n = len.min(packet.data.len());
-        super::user::copy_to_user(buf, &packet.data[..n])?;
-        if src_addr != 0 {
-            copy_sockaddr_to_user(src_addr, addrlen, &packet.addr)?;
         }
-        crate::task::wait_queue::wake_io_waiters();
-        return Ok(n);
-    }
-    if socket.rx_buf.is_empty() {
-        return Err(SysErrNo::EAGAIN);
-    }
-    let mut out = alloc::vec![0u8; len];
-    let mut n = 0usize;
-    while n < len {
-        if let Some(byte) = socket.rx_buf.pop_front() {
-            out[n] = byte;
-            n += 1;
-        } else {
-            break;
+        let outcome = crate::task::wait_queue::sleep_on_io_key_if(
+            fd::socket_read_wait_key(&state),
+            deadline,
+            || {
+                let socket = state.lock();
+                Ok(!socket.shutdown_read
+                    && if socket.is_datagram() {
+                        socket.dgram_queue.is_empty()
+                    } else {
+                        socket.connected
+                            && socket.rx_buf.is_empty()
+                            && !socket.peer_write_closed
+                            && socket.peer.as_ref().and_then(Weak::upgrade).is_some()
+                    })
+            },
+        )?;
+        if outcome == crate::task::wait_queue::WaitOutcome::TimedOut {
+            return Err(SysErrNo::EAGAIN);
         }
     }
-    drop(socket);
-    super::user::copy_to_user(buf, &out[..n])?;
-    crate::task::wait_queue::wake_io_waiters();
-    Ok(n)
 }
 
 pub fn sys_setsockopt(
@@ -1052,16 +1112,26 @@ pub fn sys_getsockopt(
 pub fn sys_shutdown(fd: usize, how: usize) -> SyscallRet {
     let state = socket_state_for_fd(fd)?;
     let mut socket = state.lock();
-    match how {
-        SHUT_RD => socket.shutdown_read = true,
-        SHUT_WR => socket.shutdown_write = true,
+    let (close_read, close_write) = match how {
+        SHUT_RD => (true, false),
+        SHUT_WR => (false, true),
         SHUT_RDWR => {
-            socket.shutdown_read = true;
-            socket.shutdown_write = true;
+            (true, true)
         }
         _ => return Err(SysErrNo::EINVAL),
-    }
+    };
+    socket.shutdown_read |= close_read;
+    socket.shutdown_write |= close_write;
+    let peer = socket.peer.as_ref().and_then(Weak::upgrade);
     drop(socket);
+    if let Some(peer) = peer {
+        {
+            let mut peer_socket = peer.lock();
+            peer_socket.peer_read_closed |= close_read;
+            peer_socket.peer_write_closed |= close_write;
+        }
+        fd::wake_socket_readers(&peer);
+    }
     crate::task::wait_queue::wake_io_waiters();
     Ok(0)
 }

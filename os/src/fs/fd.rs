@@ -3,7 +3,7 @@ use alloc::collections::VecDeque;
 ///
 /// 管理进程打开的文件，实现 POSIX 风格的文件描述符表
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
@@ -39,6 +39,7 @@ const PIPE_WAIT_READABLE: usize = 1;
 const PIPE_WAIT_WRITABLE: usize = 2;
 const EVENTFD_WAIT_READABLE: usize = 1;
 const EVENTFD_WAIT_WRITABLE: usize = 2;
+const SOCKET_WAIT_READABLE: usize = 1;
 const PIPE_SMALL_COPY: usize = 64;
 static NEXT_OPEN_FILE_DESCRIPTION_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -103,6 +104,14 @@ fn wake_eventfd_readers(state: &Arc<Mutex<EventFdState>>) {
 
 fn wake_eventfd_writers(state: &Arc<Mutex<EventFdState>>) {
     crate::task::wait_queue::wake_io_keyed_waiters(eventfd_wait_key(state, EVENTFD_WAIT_WRITABLE));
+}
+
+pub(crate) fn socket_read_wait_key(state: &Arc<Mutex<SocketState>>) -> WaitKey {
+    WaitKey::new(Arc::as_ptr(state) as usize, SOCKET_WAIT_READABLE)
+}
+
+pub(crate) fn wake_socket_readers(state: &Arc<Mutex<SocketState>>) {
+    crate::task::wait_queue::wake_io_keyed_waiters(socket_read_wait_key(state));
 }
 
 fn is_dev_null_path(path: &str) -> bool {
@@ -492,7 +501,12 @@ pub struct SocketState {
     pub shutdown_write: bool,
     pub local_addr: Option<Vec<u8>>,
     pub peer_addr: Option<Vec<u8>>,
-    pub peer: Option<Arc<Mutex<SocketState>>>,
+    pub peer: Option<Weak<Mutex<SocketState>>>,
+    /// The remote endpoint has closed its write half.  Buffered bytes remain
+    /// readable, then stream reads return EOF.
+    pub peer_write_closed: bool,
+    /// The remote endpoint no longer accepts data from this write half.
+    pub peer_read_closed: bool,
     pub rx_buf: VecDeque<u8>,
     pub dgram_queue: VecDeque<SocketPacket>,
     pub pending: VecDeque<Arc<Mutex<SocketState>>>,
@@ -552,6 +566,8 @@ impl SocketState {
             local_addr: None,
             peer_addr: None,
             peer: None,
+            peer_write_closed: false,
+            peer_read_closed: false,
             rx_buf: VecDeque::new(),
             dgram_queue: VecDeque::new(),
             pending: VecDeque::new(),
@@ -575,6 +591,21 @@ impl SocketState {
 
     pub fn is_datagram(&self) -> bool {
         self.sock_type == SOCK_DGRAM
+    }
+}
+
+impl Drop for SocketState {
+    fn drop(&mut self) {
+        let Some(peer) = self.peer.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        {
+            let mut peer_socket = peer.lock();
+            peer_socket.peer_write_closed = true;
+            peer_socket.peer_read_closed = true;
+        }
+        wake_socket_readers(&peer);
+        crate::task::wait_queue::wake_io_waiters();
     }
 }
 
@@ -695,6 +726,44 @@ impl FileDescriptor {
         }
     }
 
+    pub fn socket_read_nonblocking(&self) -> bool {
+        matches!(self, FileDescriptor::Socket { state } if state.lock().nonblock)
+    }
+
+    pub fn socket_read_would_block(&self) -> bool {
+        match self {
+            FileDescriptor::Socket { state } => {
+                let socket = state.lock();
+                if socket.shutdown_read {
+                    return false;
+                }
+                if socket.is_datagram() {
+                    socket.dgram_queue.is_empty()
+                } else {
+                    socket.connected
+                        && socket.rx_buf.is_empty()
+                        && !socket.peer_write_closed
+                        && socket.peer.as_ref().and_then(Weak::upgrade).is_some()
+                }
+            }
+            _ => false,
+        }
+    }
+
+    pub fn socket_read_wait_key(&self) -> Option<WaitKey> {
+        match self {
+            FileDescriptor::Socket { state } => Some(socket_read_wait_key(state)),
+            _ => None,
+        }
+    }
+
+    pub fn socket_recv_timeout_us(&self) -> Option<usize> {
+        match self {
+            FileDescriptor::Socket { state } => state.lock().recv_timeout_us,
+            _ => None,
+        }
+    }
+
     pub fn pipe_read_would_block(&self) -> bool {
         match self {
             FileDescriptor::PipeRead { state, .. } => {
@@ -808,7 +877,10 @@ impl FileDescriptor {
             FileDescriptor::PipeRead { state, .. } => state.lock().writers == 0,
             FileDescriptor::Socket { state } => {
                 let socket = state.lock();
-                socket.shutdown_read && socket.shutdown_write
+                (socket.shutdown_read && socket.shutdown_write)
+                    || (socket.is_stream()
+                        && socket.connected
+                        && socket.peer.as_ref().and_then(Weak::upgrade).is_none())
             }
             _ => false,
         }
@@ -839,6 +911,10 @@ impl FileDescriptor {
                     || !socket.rx_buf.is_empty()
                     || !socket.dgram_queue.is_empty()
                     || !socket.pending.is_empty()
+                    || (socket.is_stream()
+                        && socket.connected
+                        && (socket.peer_write_closed
+                            || socket.peer.as_ref().and_then(Weak::upgrade).is_none()))
             }
             _ => false,
         }
@@ -859,6 +935,9 @@ impl FileDescriptor {
                 let socket = state.lock();
                 (socket.connected || socket.is_datagram())
                     && !socket.shutdown_write
+                    && !socket.peer_read_closed
+                    && (!socket.is_stream()
+                        || socket.peer.as_ref().and_then(Weak::upgrade).is_some())
                     && socket.error == 0
             }
             _ => false,
@@ -914,13 +993,11 @@ impl FileDescriptor {
                 if interactive_stdin_enabled() {
                     return read_interactive_stdin(buf);
                 }
-                trace_stdin("[stdin-trace] read enter\n");
                 let c = crate::console::getchar();
                 if let Some(c) = c {
                     if buf.is_empty() {
                         return Ok(0);
                     }
-                    trace_stdin_byte(c);
                     buf[0] = c;
                     Ok(1)
                 } else {
@@ -1052,6 +1129,11 @@ impl FileDescriptor {
                     n
                 } else {
                     if socket.rx_buf.is_empty() {
+                        if socket.peer_write_closed
+                            || socket.peer.as_ref().and_then(Weak::upgrade).is_none()
+                        {
+                            return Ok(0);
+                        }
                         return Err(SysErrNo::EAGAIN);
                     }
                     let mut n = 0usize;
@@ -1310,7 +1392,14 @@ impl FileDescriptor {
                 if socket.is_stream() && !socket.connected {
                     return Err(SysErrNo::ENOTCONN);
                 }
-                let peer = socket.peer.clone().ok_or(SysErrNo::ENOTCONN)?;
+                if socket.peer_read_closed {
+                    return Err(SysErrNo::EPIPE);
+                }
+                let peer = socket
+                    .peer
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .ok_or(SysErrNo::EPIPE)?;
                 drop(socket);
                 let mut peer_socket = peer.lock();
                 if peer_socket.shutdown_read {
@@ -1318,7 +1407,7 @@ impl FileDescriptor {
                 }
                 peer_socket.rx_buf.extend(buf.iter().copied());
                 drop(peer_socket);
-                crate::task::wait_queue::wake_io_waiters();
+                wake_socket_readers(&peer);
                 Ok(buf.len())
             }
             _ => Err(SysErrNo::EBADF),
@@ -1412,11 +1501,7 @@ impl FileDescriptor {
     /// 获取文件大小
     pub fn size(&self) -> usize {
         match self {
-            FileDescriptor::MemFile {
-                name,
-                backing,
-                ..
-            } => {
+            FileDescriptor::MemFile { name, backing, .. } => {
                 if is_dev_null_path(name) || is_dev_zero_path(name) {
                     0
                 } else {
@@ -2052,7 +2137,13 @@ impl Default for FileDescriptorTable {
 fn interactive_stdin_enabled() -> bool {
     matches!(
         option_env!("WLL_INTERACTIVE"),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on") | Some("ON")
+        Some("1")
+            | Some("true")
+            | Some("TRUE")
+            | Some("yes")
+            | Some("YES")
+            | Some("on")
+            | Some("ON")
     )
 }
 
@@ -2071,7 +2162,6 @@ fn read_interactive_stdin(buf: &mut [u8]) -> Result<usize, SysErrNo> {
         return Ok(0);
     }
 
-    trace_stdin("[stdin-trace] read interactive byte\n");
     let mut byte = loop {
         if let Some(byte) = crate::console::getchar() {
             break byte;
@@ -2082,37 +2172,10 @@ fn read_interactive_stdin(buf: &mut [u8]) -> Result<usize, SysErrNo> {
         // PowerShell/QEMU 串口通常把 Enter 传成 CR；BusyBox shell 期望 LF。
         byte = b'\n';
     }
-    trace_stdin_byte(byte);
     // 本内核没有完整 tty line discipline，这里做最小回显，保证录屏时能看见输入。
     crate::console::putchar(byte);
     buf[0] = byte;
     Ok(1)
-}
-
-fn stdin_trace_enabled() -> bool {
-    matches!(
-        option_env!("WLL_STDIN_TRACE"),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on") | Some("ON")
-    )
-}
-
-fn trace_stdin(msg: &str) {
-    if stdin_trace_enabled() {
-        for byte in msg.bytes() {
-            crate::console::putchar(byte);
-        }
-    }
-}
-
-fn trace_stdin_byte(byte: u8) {
-    if !stdin_trace_enabled() {
-        return;
-    }
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    trace_stdin("[stdin-trace] got 0x");
-    crate::console::putchar(HEX[(byte >> 4) as usize]);
-    crate::console::putchar(HEX[(byte & 0x0f) as usize]);
-    crate::console::putchar(b'\n');
 }
 
 /// 打开路径：`flags`/`mode` 语义对齐 Linux `openat` 子集。
@@ -2350,8 +2413,6 @@ pub fn create_pipe(nonblock: bool) -> (FileDescriptor, FileDescriptor) {
 
 pub fn create_eventfd(counter: u64, semaphore: bool, nonblock: bool) -> FileDescriptor {
     FileDescriptor::EventFd {
-        state: Arc::new(Mutex::new(EventFdState::new(
-            counter, semaphore, nonblock,
-        ))),
+        state: Arc::new(Mutex::new(EventFdState::new(counter, semaphore, nonblock))),
     }
 }

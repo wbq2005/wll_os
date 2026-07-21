@@ -6,8 +6,8 @@ use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 use spin::Mutex;
 
 use crate::syscall::syscall;
+use crate::task::exit_current_and_run_next;
 use crate::task::TaskStatus;
-use crate::task::{exit_current_and_run_next, suspend_current_and_run_next};
 use crate::timer::set_next_trigger;
 
 const SIGILL: i32 = 4;
@@ -60,18 +60,6 @@ fn take_syscall_parked() -> bool {
 
 fn exit_user_thread_group_for_signal(signum: i32) {
     crate::task::exit_thread_group_and_run_next(crate::task::signal_exit_code(signum));
-}
-
-pub fn timer_should_preempt_current_task() -> bool {
-    if !foreground_driver_active() {
-        return true;
-    }
-    if crate::task::foreground_deadline_expired() {
-        return true;
-    }
-    crate::task::current_task()
-        .map(|task| !task.is_kernel && crate::task::manager::user_queue_len() > 0)
-        .unwrap_or(false)
 }
 
 pub fn prepare_user_trapframe(tf: &mut TrapFrame) {
@@ -155,6 +143,10 @@ pub fn init() {
         // the base FPU enabled so user FP instructions do not trap as FPD after
         // libc has finished its integer-only startup path.
         loongArch64::register::euen::set_fpe(true);
+        // The official LoongArch glibc advertises and uses LSX.  Keep it
+        // enabled only because the user trap frame saves the complete 128-bit
+        // vector register file across every user/kernel transition.
+        loongArch64::register::euen::set_sxe(true);
         log::info!(
             "[trap] loongarch eentry={:#x}",
             loongArch64::register::eentry::read().eentry()
@@ -198,27 +190,7 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             exit_current_and_run_next(-2);
         }
         TrapType::Timer => {
-            // 定时器中断 - 设置下一次定时器并触发调度
-            crate::timer::wake_expired_timers();
-            // run_user_task returns to the scheduler after every user trap.  If
-            // SPP-based classification routes a user timer here, the outer runner
-            // still owns saving and requeueing that task; scheduling recursively
-            // would enqueue it twice.
-            let user_runner_active = crate::task::current_task()
-                .map(|task| !task.is_kernel)
-                .unwrap_or(false);
-            if user_runner_active {
-                if foreground_driver_active() {
-                    crate::timer::set_next_foreground_trigger();
-                } else {
-                    set_next_trigger();
-                }
-            } else if timer_should_preempt_current_task() {
-                set_next_trigger();
-                suspend_current_and_run_next();
-            } else {
-                crate::timer::set_next_foreground_trigger();
-            }
+            crate::timer::rearm_kernel_tick();
         }
         TrapType::IllegalInstruction(vaddr) => {
             log::error!("[trap] Illegal instruction at {:#x}", vaddr);
@@ -244,6 +216,13 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 ///
 /// 用户态陷入内核时的处理入口
 pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
+    // The low user address range may overlap platform MMIO.  Leave the user
+    // page table as soon as the assembly entry has saved the user context, so
+    // all syscall, VFS, timer, and driver work runs under the kernel mapping.
+    // User buffers are accessed through translated physical pages rather than
+    // by dereferencing user virtual addresses in this address space.
+    restore_kernel_page_table();
+
     // 获取当前任务的 trap 上下文
     // 对于用户态中断，需要保存用户上下文并处理
 

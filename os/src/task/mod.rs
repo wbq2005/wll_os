@@ -634,11 +634,17 @@ pub fn add_initproc() {
     // WLL_INTERACTIVE=1 才提前启动 BusyBox shell。这样可以避免把交互逻辑
     // 混入 judge 路径，也不会影响默认自动测试。
     if interactive_mode_enabled() {
-        run_input_selftest_if_enabled();
         if start_interactive_shell() {
             return;
         }
         console_write("[interactive] failed to start BusyBox shell; falling back to normal init/harness\n");
+    }
+
+    // A compile-time harness filter is an explicit test-runner request.  It
+    // must take precedence over an image-provided /init so official suites
+    // execute their selected script rather than the image's normal boot flow.
+    if harness::harness_filter_active() && harness::try_start_runtime_test_harness() {
+        return;
     }
 
     let init_candidates = ["init", "/init"];
@@ -673,41 +679,6 @@ fn interactive_mode_enabled() -> bool {
         option_env!("WLL_INTERACTIVE"),
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on") | Some("ON")
     )
-}
-
-fn input_selftest_enabled() -> bool {
-    matches!(
-        option_env!("WLL_INPUT_SELFTEST"),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on") | Some("ON")
-    )
-}
-
-fn console_write_hex_byte(byte: u8) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    putchar(HEX[(byte >> 4) as usize]);
-    putchar(HEX[(byte & 0x0f) as usize]);
-}
-
-fn run_input_selftest_if_enabled() {
-    if !input_selftest_enabled() {
-        return;
-    }
-
-    console_write("[input-test] press one key within 10 seconds...\n");
-    let deadline = crate::timer::deadline_after_us(10_000_000);
-    loop {
-        if let Some(byte) = crate::console::getchar() {
-            console_write("[input-test] got byte 0x");
-            console_write_hex_byte(byte);
-            console_write("\n");
-            return;
-        }
-        if crate::timer::get_time_us() >= deadline {
-            console_write("[input-test] timeout: no byte seen by kernel console\n");
-            return;
-        }
-        core::hint::spin_loop();
-    }
 }
 
 fn start_interactive_shell() -> bool {
@@ -1232,13 +1203,6 @@ pub(crate) fn run_next_task() {
             let ms = task.memory_set.clone();
             (has_user, tf, ms)
         };
-        if has_user_ctx {
-            {
-                let _ms_lock = ms_arc.lock();
-                _ms_lock.activate();
-            }
-        }
-
         if let Some(mut ctx) = tf_opt {
             // 恢复任务的 TrapFrame 并返回用户态
             log::debug!("[task] Restoring TrapFrame for task {}", task.pid.0);
@@ -1254,6 +1218,11 @@ pub(crate) fn run_next_task() {
                 }
                 run_next_task();
                 return;
+            }
+            // Keep all kernel metadata and signal work on the kernel page
+            // table. Switch immediately before entering user mode.
+            if has_user_ctx {
+                ms_arc.lock().activate();
             }
             crate::trap::prepare_user_trapframe(&mut ctx);
             enter_foreground_user_task(task.pid.0);
@@ -1374,10 +1343,6 @@ pub(crate) fn run_ready_task_once() -> bool {
         let ms = active.memory_set.clone();
         (has_user, tf, ms)
     };
-    if has_user_ctx {
-        ms_arc.lock().activate();
-    }
-
     if let Some(mut ctx) = tf_opt {
         if !crate::syscall::signal::handle_pending_for_user(&mut ctx) {
             crate::trap::restore_kernel_page_table();
@@ -1387,6 +1352,9 @@ pub(crate) fn run_ready_task_once() -> bool {
             requeue_after_user_run(active);
             *CURRENT_TASK.lock() = None;
             return true;
+        }
+        if has_user_ctx {
+            ms_arc.lock().activate();
         }
         crate::trap::prepare_user_trapframe(&mut ctx);
         enter_foreground_user_task(active.pid.0);
