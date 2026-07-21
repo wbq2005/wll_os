@@ -101,28 +101,6 @@ fn add_riscv_available_frames(start: usize, end: usize) -> usize {
     count
 }
 
-#[cfg(target_arch = "riscv64")]
-#[inline]
-fn early_sbi_putchar(c: u8) {
-    unsafe {
-        core::arch::asm!(
-            "li a7, 0x01",
-            "mv a0, {0}",
-            "ecall",
-            in(reg) c as usize,
-            out("a7") _,
-            out("a0") _
-        );
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-fn early_sbi_line(msg: &[u8]) {
-    for &b in msg {
-        early_sbi_putchar(b);
-    }
-}
-
 #[cfg(target_arch = "loongarch64")]
 const EARLY_LA_UART_BASE: usize = 0x8000_0000_1fe0_01e0;
 #[cfg(target_arch = "loongarch64")]

@@ -1,0 +1,641 @@
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 8
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 403 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 147 KB
+Firmware Heap Offset        : 0x54000
+Firmware Heap Size          : 67 KB (total), 4 KB (reserved), 12 KB (used), 50 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*,1*,2*,3*,4*,5*,6*,7*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region04            : 0x0000000080040000-0x000000008007ffff M: (R,W) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x000000027fe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+[DTB] raw ptr = 0x27fe00000
+[DTB] Using low addr direct mapping
+[DTB] ptr = 0x27fe00000
+[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+[kernel] Hello, OS!
+[kernel] Memory init
+[VIRTIO] Probing..
+[VIRTIO] mounting ext4..
+[EXT4] mounted successfully
+[kernel] Starting sched.
+[diag] starting generic compiler probe
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Ready block=None pc=0x11065a sp=0x7fffeba0 last_syscall=None exec=/bin/sh children=[]
++ export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
++ export HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true
++ rm -rf /tmp/compiler-probe
++ cargo new --vcs none /tmp/compiler-probe
+    Creating binary (application) `compiler-probe` package
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe2a0 last_syscall=Some((260, [18446744073709551615, 2147476188, 0, 0, 0, 0])) exec=/bin/sh children=[(4, Blocked, false)]
+[diag] pid=4 tgid=4 status=Blocked block=Some(Io) pc=0x40118292 sp=0x7fff9ec0 last_syscall=Some((73, [2147458840, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(6, Ready, false)]
+[diag] fd-table=0x80366790 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80366790 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80366790 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80366790 fd=4 flags=0x1 pipe-r key=0x80370990 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80366790 fd=6 flags=0x1 pipe-r key=0x80370a10 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=6 tgid=6 status=Ready block=None pc=0x10a3ba sp=0x7fffe6a0 last_syscall=Some((226, [1281789952, 4096, 1, 1281694544, 110048, 18446744073709547520])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustfmt children=[]
+note: see more `Cargo.toml` keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Ready block=None pc=0x40071292 sp=0x7fffe2a0 last_syscall=Some((260, [18446744073709551615, 2147476188, 0, 0, 0, 0])) exec=/bin/sh children=[(4, Zombie, true)]
+[diag] pid=4 tgid=4 status=Zombie block=None pc=0x0 sp=0x0 last_syscall=Some((94, [0, 0, 1075910984, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
++ echo PROBE_NEW=0
+PROBE_NEW=0
++ cd /tmp/compiler-probe
++ cargo build
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Blocked, false)]
+[diag] pid=8 tgid=8 status=Blocked block=Some(Io) pc=0x40118292 sp=0x7fff4420 last_syscall=Some((73, [2147435640, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(10, Ready, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=4 flags=0x1 pipe-r key=0x882b6d10 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=6 flags=0x1 pipe-r key=0x803b7f90 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=10 tgid=10 status=Ready block=None pc=0x10a3ba sp=0x7fffe640 last_syscall=Some((226, [1283149824, 4096, 1, 0, 7696, 18446744073709547520])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Blocked, false)]
+[diag] pid=8 tgid=8 status=Blocked block=Some(Io) pc=0x40118292 sp=0x7fff4450 last_syscall=Some((73, [2147435688, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(12, Ready, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=4 flags=0x1 pipe-r key=0x803bed10 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=6 flags=0x1 pipe-r key=0x803ae210 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=12 tgid=12 status=Ready block=None pc=0x4c6cfc80 sp=0x7fffe6c0 last_syscall=Some((98, [1281558788, 129, 2147483647, 0, 0, 2])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Blocked, false)]
+[diag] pid=8 tgid=8 status=Blocked block=Some(Io) pc=0x40118292 sp=0x7fff3710 last_syscall=Some((73, [2147432296, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(16, Ready, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 ext4 ino=139527
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-r key=0x882c1d90 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=7 flags=0x1 pipe-r key=0x80377310 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=16 tgid=16 status=Ready block=None pc=0x10a3ba sp=0x7fffe640 last_syscall=Some((226, [1283149824, 4096, 1, 0, 7696, 18446744073709547520])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Blocked, false)]
+[diag] pid=8 tgid=8 status=Blocked block=Some(Io) pc=0x40118292 sp=0x7fff3c40 last_syscall=Some((73, [2147433624, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(18, Ready, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 ext4 ino=139527
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=6 flags=0x1 pipe-r key=0x882eee10 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=8 flags=0x1 pipe-r key=0x882ee910 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=18 tgid=18 status=Ready block=None pc=0x107776 sp=0x7fffe530 last_syscall=Some((226, [1283149824, 4096, 1, 0, 7696, 18446744073709547520])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Blocked, false)]
+[diag] pid=8 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x7fff4a40 last_syscall=Some((73, [2147437208, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(21, Ready, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-r key=0x803a2990 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=7 flags=0x1 pipe-r key=0x8037d490 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=21 tgid=21 status=Ready block=None pc=0x42764f5c sp=0x7fffead0 last_syscall=Some((80, [2, 2147477552, 2147477552, 0, 29, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+   Compiling compiler-probe v0.1.0 (/tmp/compiler-probe)
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Ready block=None pc=0x47416044 sp=0x55262b40 last_syscall=Some((132, [0, 1428588016, 0, 268531128, 18446744073709551600, 24])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Ready block=None pc=0x468f867a sp=0x551dc130 last_syscall=Some((226, [1478299648, 12288, 3, 18446744073709547520, 67108864, 18446744073642442752])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Ready block=None pc=0x45d2e03a sp=0x551deb70 last_syscall=Some((226, [1481850880, 86016, 3, 18446744073709547520, 67108864, 18446744073642442752])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Ready block=None pc=0x431ccb96 sp=0x551dea00 last_syscall=Some((226, [1484136448, 8192, 3, 18446744073709547520, 67108864, 18446744073642442752])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x6c3734b0 last_syscall=Some((98, [1484004120, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x551e0760 last_syscall=Some((98, [268833640, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l.lock
+[diag] fd-table=0x80370610 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l-working/dep-graph.part.bin
+[diag] fd-table=0x80370610 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/deps/compiler_probe-bfe5920264bb8223.bbrt9jodjq4zsfjazfqdwlfzu.16omoc2.rcgu.o
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=31 tgid=25 status=Ready block=None pc=0x4c706cf8 sp=0x7c771600 last_syscall=Some((222, [0, 4096, 3, 34, 18446744073709551615, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x551e0760 last_syscall=Some((98, [268833640, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l.lock
+[diag] fd-table=0x80370610 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l-working/dep-graph.part.bin
+[diag] fd-table=0x80370610 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/deps/compiler_probe-bfe5920264bb8223.bbrt9jodjq4zsfjazfqdwlfzu.16omoc2.rcgu.o
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=31 tgid=25 status=Ready block=None pc=0x4c70739c sp=0x7c774550 last_syscall=Some((215, [2094161920, 4096, 15, 1283088700, 18446744073709547520, 1283088720])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x551e0760 last_syscall=Some((98, [268833640, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l.lock
+[diag] fd-table=0x80370610 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l-working/dep-graph.part.bin
+[diag] fd-table=0x80370610 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/deps/compiler_probe-bfe5920264bb8223.2i8hu7n13jp4mt4axyebsip62.16omoc2.rcgu.o
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=32 tgid=25 status=Ready block=None pc=0x4c70739c sp=0x7d0bd340 last_syscall=Some((215, [2102759424, 4096, 15, 1283088700, 18446744073709547520, 1283088720])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x551e0760 last_syscall=Some((98, [268833640, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l.lock
+[diag] fd-table=0x80370610 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l-working/dep-graph.part.bin
+[diag] fd-table=0x80370610 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/deps/compiler_probe-bfe5920264bb8223.6q3ikhsruj6jyvg2r3vtb8u9d.16omoc2.rcgu.o
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=33 tgid=25 status=Ready block=None pc=0x4c706cf8 sp=0x7d0bcd70 last_syscall=Some((222, [0, 4096, 3, 34, 18446744073709551615, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x551e0760 last_syscall=Some((98, [268833640, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l.lock
+[diag] fd-table=0x80370610 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l-working/dep-graph.part.bin
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=34 tgid=25 status=Ready block=None pc=0x4c70739c sp=0x7d0bbaa0 last_syscall=Some((215, [2108936192, 4096, 15, 1283088700, 18446744073709547520, 1283088720])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x551e0760 last_syscall=Some((98, [268833640, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l.lock
+[diag] fd-table=0x80370610 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l-working/dep-graph.part.bin
+[diag] fd-table=0x80370610 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/deps/compiler_probe-bfe5920264bb8223.cn6ue6lvskh5chcqpltnzx00r.16omoc2.rcgu.o
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=34 tgid=25 status=Ready block=None pc=0x4c70739c sp=0x7d0bd4c0 last_syscall=Some((215, [2114674688, 4096, 15, 1283088700, 18446744073709547520, 1283088720])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x551e0760 last_syscall=Some((98, [268833640, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l.lock
+[diag] fd-table=0x80370610 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l-working/dep-graph.part.bin
+[diag] fd-table=0x80370610 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/deps/compiler_probe-bfe5920264bb8223.43rw3vet2g36icb9ssddao27g.16omoc2.rcgu.o
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=35 tgid=25 status=Ready block=None pc=0x4c706cf8 sp=0x7d0bc980 last_syscall=Some((222, [0, 4096, 3, 34, 18446744073709551615, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x551e0760 last_syscall=Some((98, [268833640, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l.lock
+[diag] fd-table=0x80370610 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l-working/dep-graph.part.bin
+[diag] fd-table=0x80370610 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/deps/compiler_probe-bfe5920264bb8223.43rw3vet2g36icb9ssddao27g.16omoc2.rcgu.o
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=35 tgid=25 status=Ready block=None pc=0x4c70739c sp=0x7d0bd580 last_syscall=Some((215, [2117345280, 4096, 15, 1283088700, 18446744073709547520, 1283088720])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x551e05e0 last_syscall=Some((98, [268833640, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l.lock
+[diag] fd-table=0x80370610 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/incremental/compiler_probe-3syyhlb1q58gk/s-hklbphor6m-0dwcb7l-working/dep-graph.part.bin
+[diag] fd-table=0x80370610 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/deps/compiler_probe-bfe5920264bb8223.93s2eo2x4kcntfhagtapdc4l5.16omoc2.rcgu.o
+[diag] pid=30 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x74573830 last_syscall=Some((98, [1483995752, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=36 tgid=25 status=Ready block=None pc=0x4c70739c sp=0x7d0bd340 last_syscall=Some((215, [2127159296, 4096, 15, 1283088700, 18446744073709547520, 1283088720])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Ready block=None pc=0x4c703120 sp=0x55258c70 last_syscall=Some((78, [18446744073709551516, 1428524192, 1428526272, 1023, 4096, 1428526272])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=3 writers=3 bytes=0 nonblock=false
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Blocked block=Some(Io) pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Blocked, false)]
+[diag] fd-table=0x80362190 fd=0 flags=0x0 stdin
+[diag] fd-table=0x80362190 fd=1 flags=0x0 stdout
+[diag] fd-table=0x80362190 fd=2 flags=0x0 stderr
+[diag] fd-table=0x80362190 fd=3 flags=0x1 pipe-r key=0x803a0f90 readers=6 writers=6 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=4 flags=0x1 ext4 ino=139555
+[diag] fd-table=0x80362190 fd=5 flags=0x1 pipe-w key=0x803a0f90 readers=6 writers=6 bytes=0 nonblock=false
+[diag] fd-table=0x80362190 fd=6 flags=0x1 ext4 ino=139558
+[diag] fd-table=0x80362190 fd=7 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-build-lock
+[diag] fd-table=0x80362190 fd=8 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-lock
+[diag] fd-table=0x80362190 fd=9 flags=0x1 memfile /tmp/compiler-probe/target/debug/.cargo-artifact-lock
+[diag] fd-table=0x80362190 fd=11 flags=0x1 pipe-r key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=true
+[diag] fd-table=0x80362190 fd=13 flags=0x1 pipe-r key=0x88006810 readers=1 writers=1 bytes=0 nonblock=true
+[diag] pid=25 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x7fff6f60 last_syscall=Some((98, [1428590704, 265, 27, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=26 tgid=25 status=Blocked block=Some(Futex) pc=0x4c6c4308 sp=0x4ca67570 last_syscall=Some((98, [1280961304, 393, 0, 0, 0, 4294967295])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=27 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x55259d00 last_syscall=Some((73, [1428528472, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[(37, Blocked, false)]
+[diag] fd-table=0x80370610 fd=0 flags=0x0 memfile /dev/null
+[diag] fd-table=0x80370610 fd=1 flags=0x0 pipe-w key=0x8035f610 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=2 flags=0x0 pipe-w key=0x88006810 readers=1 writers=1 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=3 flags=0x0 pipe-r key=0x803a0f90 readers=6 writers=6 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=4 flags=0x1 pipe-r key=0x803a0f90 readers=6 writers=6 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=5 flags=0x0 pipe-w key=0x803a0f90 readers=6 writers=6 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=6 flags=0x1 pipe-w key=0x803a0f90 readers=6 writers=6 bytes=0 nonblock=false
+[diag] fd-table=0x80370610 fd=7 flags=0x1 pipe-r key=0x88051b90 readers=1 writers=3 bytes=0 nonblock=true
+[diag] fd-table=0x80370610 fd=9 flags=0x1 pipe-r key=0x8807fb90 readers=1 writers=3 bytes=0 nonblock=true
+[diag] pid=28 tgid=25 status=Blocked block=Some(Futex) pc=0x4c7081c2 sp=0x5d4694b0 last_syscall=Some((98, [1476491464, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=29 tgid=25 status=Blocked block=Some(Io) pc=0x4c6c4308 sp=0x6c3734c0 last_syscall=Some((63, [4, 1815557415, 1, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+[diag] pid=37 tgid=37 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffc070 last_syscall=Some((260, [38, 268647648, 0, 0, 0, 0])) exec=/usr/bin/cc children=[(38, Blocked, false)]
+[diag] pid=38 tgid=38 status=Blocked block=Some(ChildExit) pc=0x40071292 sp=0x7fffcbd0 last_syscall=Some((260, [39, 268530272, 0, 0, 0, 0])) exec=/usr/libexec/gcc/riscv64-linux-gnu/14/collect2 children=[(39, Ready, false)]
+[diag] pid=39 tgid=39 status=Ready block=None pc=0x4021d356 sp=0x7fffc7b0 last_syscall=Some((214, [284106752, 1076623672, 917504, 1076625828, 18446744073709547520, 284106752])) exec=/usr/bin/ld children=[]
+[diag] task snapshot
+[diag] pid=2 tgid=2 status=Ready block=None pc=0x40071292 sp=0x7fffe3f0 last_syscall=Some((260, [18446744073709551615, 2147476524, 0, 0, 0, 0])) exec=/bin/sh children=[(8, Ready, false)]
+[diag] pid=8 tgid=8 status=Ready block=None pc=0x401651c6 sp=0x7fff5b70 last_syscall=Some((98, [270066512, 137, 1, 2147441536, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=20 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x404362e0 last_syscall=Some((98, [270052376, 137, 18446744073709551615, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=23 tgid=8 status=Blocked block=Some(Futex) pc=0x401651c2 sp=0x486403f0 last_syscall=Some((98, [270085224, 137, 0, 0, 0, 18446744073709551615])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[]
+[diag] pid=24 tgid=8 status=Ready block=None pc=0x40121308 sp=0x50840910 last_syscall=Some((73, [1350830488, 2, 0, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/cargo children=[(25, Zombie, true)]
+[diag] pid=25 tgid=25 status=Zombie block=None pc=0x0 sp=0x0 last_syscall=Some((94, [0, 268438736, 1283871016, 0, 0, 0])) exec=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/bin/rustc children=[]
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 44s
++ echo PROBE_BUILD=0
+PROBE_BUILD=0
++ ls -l target/debug
+total 4148
+drwxr-xr-x 1 root root       0 Jul 21 05:44 build
+-rwxr-xr-x 2 root root 4246944 Jul 21 05:44 compiler-probe
+-rw-r--r-- 1 root root      81 Jul 21 05:44 compiler-probe.d
+drwxr-xr-x 1 root root       0 Jul 21 05:44 deps
+drwxr-xr-x 1 root root       0 Jul 21 05:44 examples
+drwxr-xr-x 1 root root       0 Jul 21 05:44 incremental
++ ./target/debug/compiler-probe
+Hello, world!
++ echo PROBE_RUN=0
+PROBE_RUN=0
+[diag] compiler probe exit=0
+[harness] ALL TESTS DONE, shutting down

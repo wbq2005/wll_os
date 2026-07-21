@@ -1,0 +1,16 @@
+[DTB] ptr = 0x9000000000100000
+[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+[kernel] Hello, OS!
+[kernel] Memory init
+[VIRTIO] Probing...
+[VIRTIO] found
+[EXT4] mounted successfully
+[kernel] Starting sched.
+[harness] SCRIPT /glibc/buildstorm_testcode.sh
+#### OS COMP TEST GROUP START buildstorm-glibc ####
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+rustc 1.98.0-nightly (57d06900f 2026-05-27)
+cargo 1.98.0-nightly (fbb61be30 2026-05-26)
+BUILDSTORM_TOOLCHAIN ok
+BUILDSTORM_MINIBUILD ok

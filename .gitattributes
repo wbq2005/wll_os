@@ -1,3 +1,7 @@
 *.sh text eol=lf
 *.py text eol=lf
 Makefile text eol=lf
+docs/evidence/buildstorm-stage1/*.json text eol=lf
+docs/evidence/buildstorm-stage1/*.txt text eol=lf
+docs/evidence/buildstorm-stage1/*.md text eol=lf
+docs/evidence/buildstorm-stage1/*.log binary

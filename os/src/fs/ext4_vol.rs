@@ -2541,14 +2541,17 @@ pub fn slurp_regular_file(path: &str) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Runtime exec paths must get the exact file image. Some ext4 backends do
-    // not make EOF detection by repeated read_at() robust enough for large
-    // static ELFs, so use the inode size as the authoritative bound.
+    // Runtime exec paths must get the exact file image. Use the inode size as
+    // the authoritative bound and the same extent-aware path as regular file
+    // I/O. The ext4_rs convenience reader repeatedly resolves each logical
+    // block through its legacy mapping helper, which can return incorrect data
+    // for files whose extent tree spans multiple nodes (large PIE executables
+    // commonly put their dynamic table near the end of the file).
     let size = inode_ref.inode.size() as usize;
     let mut out = alloc::vec![0u8; size];
     let mut off = 0usize;
     while off < size {
-        let n = fs.read_at(ino, off, &mut out[off..]).ok()?;
+        let n = extent_aware_read_at(ino, off, &mut out[off..]).ok()?;
         if n == 0 {
             return None;
         }

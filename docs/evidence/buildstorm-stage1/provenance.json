@@ -1,0 +1,105 @@
+{
+  "recorded_at": "2026-07-21T14:45:58.3113985+08:00",
+  "official_source": {
+    "repository": "https://github.com/oscomp/testsuits-for-oskernel",
+    "branch": "final-2026",
+    "commit": "d69becb811573aa789a788e2940fa5ed8f9388f3",
+    "commit_date": "2026-07-21T05:32:33+08:00",
+    "source_script_sha256": "446a3321f8d45f37637ac43b1b6bd66e09beb304969f8abac69ccd701252aa0b",
+    "image_script_sha256": "5bfbaa5bd99bec595ccd980fff0ebc002d42c0ce0a7e28af266f0ddad69b7189",
+    "judge_sha256": "586a30e260f39cf425c0960a2965d8684bc3a93b77842a68dfd80fa6ff3ee87b",
+    "known_release_difference": "image wrapper says buildstorm-glibc; source wrapper says buildstorm; scoring commands and markers are identical"
+  },
+  "kernel_source": {
+    "baseline_commit": "ac39d5b07f1a6d11b3d2cf68c46402a087a2b9f3",
+    "branch": "wbq_final_buildstorm",
+    "kernel_and_runner_diff_git_blob": "bdf8bd292919a903a17a2800cd3891c940a038d7"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 家庭版 中文版 10.0.26200 build 26200",
+    "cpu": "Intel(R) Core(TM) Ultra 7 255HX",
+    "physical_cores": 20,
+    "logical_processors": 20,
+    "total_visible_memory_kib": 16110108,
+    "qemu_version": "QEMU emulator version 11.0.0 (v11.0.0-12122-ga4bb4b10c9)"
+  },
+  "runs": [
+    {
+      "arch": "riscv64",
+      "image_path": "D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-rv-pub.img\\sdcard-rv-pub.img",
+      "image_bytes": 15032385536,
+      "image_sha256": "c03c6091eb1c400d4c1f400130d11810b00e18811d4e5c201e7f75802dfafde0",
+      "kernel_sha256": "6f90121a797a7cf2c5fef23db14628b8742361a1a5ff4bb952456122eb9f1eb1",
+      "host_elapsed_seconds": 150.53862220002338,
+      "memory": "8G",
+      "smp": 8,
+      "qemu_args": [
+        "C:\\Program Files\\qemu\\qemu-system-riscv64.exe",
+        "-snapshot",
+        "-kernel",
+        "D:\\wll_os-master1\\target\\riscv64gc-unknown-none-elf\\release\\wll_OS",
+        "-m",
+        "8G",
+        "-smp",
+        "8",
+        "-display",
+        "none",
+        "-monitor",
+        "none",
+        "-serial",
+        "stdio",
+        "-drive",
+        "file=D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-rv-pub.img\\sdcard-rv-pub.img,if=none,format=raw,id=x0",
+        "-no-reboot",
+        "-machine",
+        "virt",
+        "-bios",
+        "default",
+        "-device",
+        "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0"
+      ],
+      "markers": ["BUILDSTORM_TOOLCHAIN ok", "BUILDSTORM_MINIBUILD ok"],
+      "official_judge_scripted_score": 20.0
+    },
+    {
+      "arch": "loongarch64",
+      "image_path": "D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-la-pub.img\\sdcard-la-pub.img",
+      "image_bytes": 15032385536,
+      "image_sha256": "15b2cef4af8fcb0ba9ec44fdbe41973ee180b699454b57c630fdcfb5e6dfa550",
+      "kernel_sha256": "2106bf5e7845c4b87d764e0f9e52910cccf80827b6f57b815f666603b8156d44",
+      "host_elapsed_seconds": 67.05159740004456,
+      "memory": "8G",
+      "smp": 8,
+      "qemu_args": [
+        "C:\\Program Files\\qemu\\qemu-system-loongarch64.exe",
+        "-snapshot",
+        "-kernel",
+        "D:\\wll_os-master1\\target\\loongarch64-unknown-none\\release\\wll_OS",
+        "-m",
+        "8G",
+        "-smp",
+        "8",
+        "-display",
+        "none",
+        "-monitor",
+        "none",
+        "-serial",
+        "stdio",
+        "-drive",
+        "file=D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-la-pub.img\\sdcard-la-pub.img,if=none,format=raw,id=x0",
+        "-no-reboot",
+        "-device",
+        "virtio-blk-pci,drive=x0"
+      ],
+      "markers": ["BUILDSTORM_TOOLCHAIN ok", "BUILDSTORM_MINIBUILD ok"],
+      "official_judge_scripted_score": 20.0
+    }
+  ],
+  "not_measured": {
+    "full_guest_compile": true,
+    "guest_compile_elapsed": true,
+    "linux_baseline": true,
+    "speedup": true,
+    "real_smp": true
+  }
+}

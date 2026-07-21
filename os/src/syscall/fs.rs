@@ -42,6 +42,10 @@ const F_DUPFD_CLOEXEC: usize = 1030;
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
 const F_UNLCK: i16 = 2;
+const LOCK_SH: usize = 1;
+const LOCK_EX: usize = 2;
+const LOCK_NB: usize = 4;
+const LOCK_UN: usize = 8;
 const FIONREAD: usize = 0x541B;
 const FIONBIO: usize = 0x5421;
 const FS_IOC_GETFLAGS: usize = 0x8008_6601;
@@ -1577,6 +1581,13 @@ struct FileRecordLock {
     range: FileLockRange,
 }
 
+#[derive(Clone)]
+struct WholeFileLock {
+    file: FileLockKey,
+    owner: usize,
+    kind: FileLockKind,
+}
+
 #[derive(Clone, Copy)]
 struct FileLockWaiter {
     waiter: FileLockOwner,
@@ -1595,6 +1606,7 @@ struct UserFlock64 {
 lazy_static! {
     static ref FILE_RECORD_LOCKS: Mutex<Vec<FileRecordLock>> = Mutex::new(Vec::new());
     static ref FILE_LOCK_WAITERS: Mutex<Vec<FileLockWaiter>> = Mutex::new(Vec::new());
+    static ref WHOLE_FILE_LOCKS: Mutex<Vec<WholeFileLock>> = Mutex::new(Vec::new());
 }
 
 fn file_lock_hash_bytes(mut hash: usize, bytes: &[u8]) -> usize {
@@ -2017,6 +2029,16 @@ pub fn release_file_locks_for_ofd(id: usize) {
     let mut files = Vec::new();
     FILE_RECORD_LOCKS.lock().retain(|lock| {
         if lock.owner == owner {
+            if !files.iter().any(|file| file == &lock.file) {
+                files.push(lock.file.clone());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    WHOLE_FILE_LOCKS.lock().retain(|lock| {
+        if lock.owner == id {
             if !files.iter().any(|file| file == &lock.file) {
                 files.push(lock.file.clone());
             }
@@ -3273,6 +3295,82 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: usize) -> SyscallRet {
     Ok(new_fd)
 }
 
+fn whole_file_lock_conflicts(
+    locks: &[WholeFileLock],
+    file: &FileLockKey,
+    owner: usize,
+    kind: FileLockKind,
+) -> bool {
+    locks.iter().any(|lock| {
+        lock.file == *file && lock.owner != owner && lock_kinds_conflict(lock.kind, kind)
+    })
+}
+
+pub fn sys_flock(fd: usize, operation: usize) -> SyscallRet {
+    let nonblock = (operation & LOCK_NB) != 0;
+    if (operation & !(LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN)) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    let kind = match operation & !LOCK_NB {
+        LOCK_SH => Some(FileLockKind::Read),
+        LOCK_EX => Some(FileLockKind::Write),
+        LOCK_UN => None,
+        _ => return Err(SysErrNo::EINVAL),
+    };
+
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let (file_key, owner, wait_key) = {
+        let fd_table = task.inner.lock().fd_table.clone();
+        let fds = fd_table.lock();
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        let file_key = fd_lock_key(file_desc).ok_or(SysErrNo::EINVAL)?;
+        let owner = file_desc.ofd_owner_id().ok_or(SysErrNo::EINVAL)?;
+        let wait_key = file_lock_wait_key(&file_key);
+        (file_key, owner, wait_key)
+    };
+
+    if kind.is_none() {
+        let mut changed = false;
+        WHOLE_FILE_LOCKS.lock().retain(|lock| {
+            let remove = lock.file == file_key && lock.owner == owner;
+            changed |= remove;
+            !remove
+        });
+        if changed {
+            wake_file_lock_waiters(&file_key);
+        }
+        return Ok(0);
+    }
+
+    let kind = kind.unwrap();
+    let mut released_previous = false;
+    loop {
+        {
+            let mut locks = WHOLE_FILE_LOCKS.lock();
+            if !released_previous {
+                locks.retain(|lock| !(lock.file == file_key && lock.owner == owner));
+                released_previous = true;
+            }
+            if !whole_file_lock_conflicts(&locks, &file_key, owner, kind) {
+                locks.push(WholeFileLock {
+                    file: file_key.clone(),
+                    owner,
+                    kind,
+                });
+                return Ok(0);
+            }
+        }
+
+        if nonblock {
+            return Err(SysErrNo::EAGAIN);
+        }
+        sleep_on_io_key_if(wait_key, None, || {
+            let locks = WHOLE_FILE_LOCKS.lock();
+            Ok(whole_file_lock_conflicts(&locks, &file_key, owner, kind))
+        })?;
+    }
+}
+
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
     if matches!(
         cmd,
@@ -3588,7 +3686,32 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SyscallRet {
     let request = request as u32 as usize;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
-    let fds = inner.fd_table.lock();
+    let mut fds = inner.fd_table.lock();
+
+    if request == FIONBIO {
+        if argp == 0 {
+            return Err(SysErrNo::EFAULT);
+        }
+        let value = super::user::copy_object_from_user::<i32>(argp)?;
+        return fds
+            .get_mut(fd)
+            .ok_or(SysErrNo::EBADF)?
+            .ioctl_set_nonblocking(value != 0)
+            .map(|_| 0);
+    }
+
+    if request == FIONREAD {
+        if argp == 0 {
+            return Err(SysErrNo::EFAULT);
+        }
+        let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
+        if let Some(available) = file_desc.pipe_buffered_len() {
+            let available: i32 = available.min(i32::MAX as usize) as i32;
+            super::user::copy_object_to_user(argp, &available)?;
+            return Ok(0);
+        }
+    }
+
     let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
     match file_desc {
         FileDescriptor::LoopControl => match request {
@@ -3629,14 +3752,6 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SyscallRet {
             _ => Err(SysErrNo::ENOTTY),
         },
         FileDescriptor::Socket { state } => match request {
-            FIONBIO => {
-                if argp == 0 {
-                    return Err(SysErrNo::EFAULT);
-                }
-                let value = super::user::copy_object_from_user::<i32>(argp)?;
-                state.lock().nonblock = value != 0;
-                Ok(0)
-            }
             FIONREAD => {
                 if argp == 0 {
                     return Err(SysErrNo::EFAULT);

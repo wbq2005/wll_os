@@ -33,9 +33,13 @@ ARCHES = {
 }
 
 STAGE_MARKERS = {
-    "toolchain": "BUILDSTORM_TOOLCHAIN ",
-    "minibuild": "BUILDSTORM_MINIBUILD ",
-    "complete": "BUILDSTORM_COMPILE ",
+    "toolchain": ("BUILDSTORM_TOOLCHAIN ok",),
+    "minibuild": ("BUILDSTORM_TOOLCHAIN ok", "BUILDSTORM_MINIBUILD ok"),
+    "complete": (
+        "BUILDSTORM_TOOLCHAIN ok",
+        "BUILDSTORM_MINIBUILD ok",
+        "BUILDSTORM_COMPILE mode=multi ok=true",
+    ),
 }
 
 
@@ -101,7 +105,7 @@ def run(
         "-drive", f"file={image},if=none,format=raw,id=x0", "-no-reboot",
         *config["args"],
     ]
-    marker = STAGE_MARKERS[stage]
+    markers = STAGE_MARKERS[stage]
     deadline = time.monotonic() + timeout
     started = time.monotonic()
     reached = False
@@ -112,7 +116,7 @@ def run(
         try:
             while time.monotonic() < deadline and process.poll() is None:
                 text = read_output(log)
-                if marker in text:
+                if all(marker in text for marker in markers):
                     reached = True
                     break
                 if "Kernel panic" in text or "panicked at" in text:

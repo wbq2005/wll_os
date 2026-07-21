@@ -18,6 +18,7 @@ const AF_INET6: i32 = 10;
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
 const SOCK_RAW: usize = 3;
+const SOCK_SEQPACKET: usize = 5;
 const SOCK_NONBLOCK: usize = fd::pipe_flags::O_NONBLOCK;
 const SOCK_CLOEXEC: usize = fd::pipe_flags::O_CLOEXEC;
 const SOCK_FLAG_MASK: usize = SOCK_NONBLOCK | SOCK_CLOEXEC;
@@ -170,7 +171,9 @@ fn socket_type(raw_type: usize) -> Result<(usize, bool, usize), SysErrNo> {
     }
     let base = raw_type & !SOCK_FLAG_MASK;
     match base {
-        SOCK_STREAM | SOCK_DGRAM | SOCK_RAW => Ok((base, (flags & SOCK_NONBLOCK) != 0, flags)),
+        SOCK_STREAM | SOCK_DGRAM | SOCK_RAW | SOCK_SEQPACKET => {
+            Ok((base, (flags & SOCK_NONBLOCK) != 0, flags))
+        }
         0 => Err(SysErrNo::EINVAL),
         _ => Err(SysErrNo::EINVAL),
     }
@@ -187,12 +190,13 @@ fn validate_protocol(sock_type: usize, protocol: i32) -> Result<(), SysErrNo> {
     if sock_type == SOCK_RAW {
         return Err(SysErrNo::EPROTONOSUPPORT);
     }
-    if sock_type != SOCK_STREAM && sock_type != SOCK_DGRAM {
+    if sock_type != SOCK_STREAM && sock_type != SOCK_DGRAM && sock_type != SOCK_SEQPACKET {
         return Err(SysErrNo::EPROTONOSUPPORT);
     }
     match (sock_type, protocol) {
         (SOCK_STREAM, 0 | IPPROTO_TCP) => Ok(()),
         (SOCK_DGRAM, 0 | IPPROTO_UDP) => Ok(()),
+        (SOCK_SEQPACKET, 0) => Ok(()),
         _ => Err(SysErrNo::EPROTONOSUPPORT),
     }
 }
@@ -546,6 +550,9 @@ pub fn sys_socket(domain: usize, raw_type: usize, protocol: usize) -> SyscallRet
     let (sock_type, nonblock, flags) = socket_type(raw_type)?;
     let protocol = protocol as i32;
     validate_protocol(sock_type, protocol)?;
+    if sock_type == SOCK_SEQPACKET && domain != AF_UNIX {
+        return Err(SysErrNo::EPROTONOSUPPORT);
+    }
 
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let inner = task.inner.lock();
@@ -872,7 +879,7 @@ pub fn sys_sendto(
         send_sigpipe_if_needed(flags);
         return Err(SysErrNo::EPIPE);
     }
-    if socket.is_stream() && !socket.connected {
+    if socket.is_connection_oriented() && !socket.connected {
         send_sigpipe_if_needed(flags);
         return Err(SysErrNo::EPIPE);
     }
@@ -920,8 +927,21 @@ pub fn sys_sendto(
             send_sigpipe_if_needed(flags);
             SysErrNo::EPIPE
         })?;
+    let source_addr = socket
+        .local_addr
+        .clone()
+        .unwrap_or_else(|| default_sockaddr(socket.domain));
     drop(socket);
-    peer.lock().rx_buf.extend(data.iter().copied());
+    let mut peer_socket = peer.lock();
+    if peer_socket.is_seqpacket() {
+        peer_socket.dgram_queue.push_back(SocketPacket {
+            data,
+            addr: source_addr,
+        });
+    } else {
+        peer_socket.rx_buf.extend(data.iter().copied());
+    }
+    drop(peer_socket);
     fd::wake_socket_readers(&peer);
     Ok(len)
 }
@@ -959,10 +979,10 @@ pub fn sys_recvfrom(
         if socket.shutdown_read {
             return Ok(0);
         }
-        if socket.is_stream() && !socket.connected {
+        if socket.is_connection_oriented() && !socket.connected {
             return Err(SysErrNo::ENOTCONN);
         }
-        if socket.is_datagram() {
+        if socket.is_message_oriented() {
             if let Some(packet) = socket.dgram_queue.pop_front() {
                 let n = len.min(packet.data.len());
                 drop(socket);
@@ -971,6 +991,9 @@ pub fn sys_recvfrom(
                     copy_sockaddr_to_user(src_addr, addrlen, &packet.addr)?;
                 }
                 return Ok(n);
+            }
+            if socket.receive_eof() {
+                return Ok(0);
             }
         } else if !socket.rx_buf.is_empty() {
             let mut out = alloc::vec![0u8; len];
@@ -986,10 +1009,7 @@ pub fn sys_recvfrom(
             drop(socket);
             super::user::copy_to_user(buf, &out[..n])?;
             return Ok(n);
-        } else if socket.is_stream()
-            && (socket.peer_write_closed
-                || socket.peer.as_ref().and_then(Weak::upgrade).is_none())
-        {
+        } else if socket.receive_eof() {
             return Ok(0);
         }
 
@@ -1004,13 +1024,12 @@ pub fn sys_recvfrom(
             || {
                 let socket = state.lock();
                 Ok(!socket.shutdown_read
-                    && if socket.is_datagram() {
-                        socket.dgram_queue.is_empty()
+                    && if socket.is_message_oriented() {
+                        socket.dgram_queue.is_empty() && !socket.receive_eof()
                     } else {
                         socket.connected
                             && socket.rx_buf.is_empty()
-                            && !socket.peer_write_closed
-                            && socket.peer.as_ref().and_then(Weak::upgrade).is_some()
+                            && !socket.receive_eof()
                     })
             },
         )?;

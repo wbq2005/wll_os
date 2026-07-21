@@ -1,0 +1,22 @@
+[DTB] ptr = 0x9000000000100000
+[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+[kernel] Hello, OS!
+[kernel] Memory init
+[VIRTIO] Probing...
+[VIRTIO] found
+[EXT4] mounted successfully
+[kernel] Starting sched.
+[harness] SCRIPT /glibc/cagent_testcode.sh
+#### OS COMP TEST GROUP START cagent-glibc ####
+testcase cagent factorial pass 5048
+testcase cagent fs-create pass 5365
+testcase cagent date pass 6113
+testcase cagent cpu pass 6006
+testcase cagent kernel pass 5944
+testcase cagent fs-readwrite pass 6975
+testcase cagent fs-usage pass 6420
+testcase cagent network pass 8420
+testcase cagent fs-search pass 8555
+testcase cagent fs-directory pass 8500
+[harness] TIMEOUT pid=2
+[harness] ALL TESTS DONE, shutting down

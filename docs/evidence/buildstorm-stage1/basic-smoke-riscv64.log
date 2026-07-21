@@ -1,0 +1,1378 @@
+Building kernel for riscv64...
+make prepare-cargo-config
+make[1]: Entering directory '/workspace'
+cp oscargo/config.toml .cargo/config.toml
+make[1]: Leaving directory '/workspace'
+cd os && WLL_INTERACTIVE=0 WLL_HARNESS_GROUPS=basic  cargo +nightly-2025-01-18 build --locked --offline --release --target riscv64gc-unknown-none-elf    --features iozone --features lmbench 
+warning: `/root/.cargo/config` is deprecated in favor of `config.toml`
+note: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /workspace/os/Cargo.toml
+workspace: /workspace/Cargo.toml
+warning: patch for the non root package will be ignored, specify patch at the workspace root:
+package:   /workspace/os/Cargo.toml
+workspace: /workspace/Cargo.toml
+warning: /workspace/os/Cargo.toml: unused manifest key: target.loongarch64-unknown-none.rustflags
+warning: /workspace/os/Cargo.toml: unused manifest key: target.riscv64gc-unknown-none-elf.rustflags
+   Compiling scopeguard v1.2.0
+   Compiling embedded-hal v1.0.0
+   Compiling static_assertions v1.1.0
+   Compiling bitflags v2.11.1
+   Compiling critical-section v1.2.0
+   Compiling log v0.4.29
+   Compiling riscv-pac v0.2.0
+   Compiling lazyinit v0.2.2
+   Compiling cfg-if v1.0.4
+   Compiling fdt-parser v0.4.19
+   Compiling byteorder v1.5.0
+   Compiling flat_device_tree v3.1.1
+   Compiling wll_OS v0.1.0 (/workspace/os)
+   Compiling sbi-spec v0.0.4
+   Compiling lock_api v0.4.14
+   Compiling riscv v0.13.0
+   Compiling riscv v0.11.1
+   Compiling zerocopy v0.7.35
+   Compiling ext4_rs v1.3.3
+   Compiling sbi-rt v0.0.2
+   Compiling spin v0.10.0
+   Compiling spin v0.9.8
+   Compiling buddy_system_allocator v0.11.0
+   Compiling lazy_static v1.5.0
+   Compiling virtio-drivers v0.7.5
+   Compiling polyhal v0.4.0 (/workspace/patch/polyhal)
+warning: unknown lint: `function_casts_as_integer`
+  --> patch/polyhal/src/ctor.rs:69:9
+   |
+69 | #[allow(function_casts_as_integer)]
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unknown_lints)]` on by default
+
+warning: unknown lint: `function_casts_as_integer`
+  --> patch/polyhal/src/utils/percpu.rs:14:9
+   |
+14 | #[allow(function_casts_as_integer)]
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `function_casts_as_integer`
+ --> patch/polyhal/src/components/percpu/mod.rs:3:10
+  |
+3 | #![allow(function_casts_as_integer)]
+  |          ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `function_casts_as_integer`
+   --> patch/polyhal/src/mem.rs:380:9
+    |
+380 | #[allow(function_casts_as_integer)]
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Barrier` is never constructed
+ --> patch/polyhal/src/components/mem/mod.rs:8:12
+  |
+8 | pub struct Barrier;
+  |            ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` on by default
+
+warning: associated functions `complete_sync` and `ordering_sync` are never used
+ --> patch/polyhal/src/components/mem/riscv64.rs:5:12
+  |
+3 | impl Barrier {
+  | ------------ associated functions in this implementation
+4 |     #[inline]
+5 |     pub fn complete_sync() {}
+  |            ^^^^^^^^^^^^^
+...
+8 |     pub fn ordering_sync() {}
+  |            ^^^^^^^^^^^^^
+
+warning: associated constants `VADDR_BITS`, `USER_VADDR_END`, and `KERNEL_VADDR_START` are never used
+   --> patch/polyhal/src/pagetable/riscv64.rs:181:22
+    |
+171 | impl PageTable {
+    | -------------- associated constants in this implementation
+...
+181 |     pub(crate) const VADDR_BITS: usize = 39;
+    |                      ^^^^^^^^^^
+182 |     pub(crate) const USER_VADDR_END: usize = (1 << Self::VADDR_BITS) - 1;
+    |                      ^^^^^^^^^^^^^^
+183 |     pub(crate) const KERNEL_VADDR_START: usize = !Self::USER_VADDR_END;
+    |                      ^^^^^^^^^^^^^^^^^^
+
+   Compiling polyhal-trap v0.4.0 (/workspace/patch/polyhal-trap)
+   Compiling polyhal-boot v0.4.0 (/workspace/patch/polyhal-boot)
+warning: unused import: `arch::naked_asm`
+ --> patch/polyhal-boot/src/arch/riscv64.rs:1:12
+  |
+1 | use core::{arch::naked_asm, ptr::addr_of_mut};
+  |            ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `PhysAddr`, `consts::VIRT_ADDR_START`, `init_dtb_once`, and `parse_system_info`
+ --> patch/polyhal-boot/src/arch/riscv64.rs:3:5
+  |
+3 |     consts::VIRT_ADDR_START,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+4 |     ctor::{ph_init_iter, CtorType},
+5 |     mem::{init_dtb_once, parse_system_info},
+  |           ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+...
+8 |     PageTable, PhysAddr,
+  |                ^^^^^^^^
+
+warning: function `clear_bss` is never used
+  --> patch/polyhal-boot/src/arch/mod.rs:28:15
+   |
+28 | pub(crate) fn clear_bss() {
+   |               ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `call_real_main` is never used
+  --> patch/polyhal-boot/src/arch/mod.rs:42:4
+   |
+42 | fn call_real_main(hartid: usize) {
+   |    ^^^^^^^^^^^^^^
+
+warning: static `BOOT_PT` is never used
+  --> patch/polyhal-boot/src/arch/riscv64.rs:13:12
+   |
+13 | static mut BOOT_PT: [PTE; PageTable::PTE_NUM_IN_PAGE] = [PTE::empty(); PageTable::PTE_NUM_IN_PAGE];
+   |            ^^^^^^^
+
+warning: function `init_boot_page_table` is never used
+  --> patch/polyhal-boot/src/arch/riscv64.rs:15:22
+   |
+15 | unsafe extern "C" fn init_boot_page_table() {
+   |                      ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `init_mmu` is never used
+  --> patch/polyhal-boot/src/arch/riscv64.rs:28:22
+   |
+28 | unsafe extern "C" fn init_mmu() {
+   |                      ^^^^^^^^
+
+warning: function `rust_secondary_main` is never used
+   --> patch/polyhal-boot/src/arch/riscv64.rs:125:26
+    |
+125 | pub(crate) extern "C" fn rust_secondary_main(hartid: usize) {
+    |                          ^^^^^^^^^^^^^^^^^^^
+
+warning: function `init_cpu` is never used
+   --> patch/polyhal-boot/src/arch/riscv64.rs:141:4
+    |
+141 | fn init_cpu() {
+    |    ^^^^^^^^
+
+warning: static `TRAP_FRAME_PTR` is never used
+  --> patch/polyhal-trap/src/trap/riscv64.rs:24:12
+   |
+24 | static mut TRAP_FRAME_PTR: usize = 0;
+   |            ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: `polyhal-boot` (lib) generated 9 warnings (run `cargo fix --lib -p polyhal-boot` to apply 2 suggestions)
+warning: `polyhal-trap` (lib) generated 1 warning
+warning: `polyhal` (lib) generated 7 warnings
+warning: unused doc comment
+ --> os/src/mm/page_table.rs:7:1
+  |
+7 | /// 页表项标志位
+  | ^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+  |
+  = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+  = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: variable does not need to be mutable
+   --> os/src/syscall/process.rs:598:9
+    |
+598 |     let mut interp_path_opt = elf.interp_path();
+    |         ----^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: variable does not need to be mutable
+   --> os/src/task/task.rs:161:13
+    |
+161 |         let mut launch_argv = spec.argv.clone();
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> os/src/task/task.rs:163:13
+    |
+163 |         let mut interp_path_opt = target_elf.interp_path();
+    |             ----^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `elf_data`
+   --> os/src/task/task.rs:355:16
+    |
+355 |     pub fn new(elf_data: &[u8]) -> Arc<Self> {
+    |                ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_elf_data`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `hartid`
+   --> os/src/main.rs:157:29
+    |
+157 | pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
+    |                             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_hartid`
+
+warning: function `early_sbi_putchar` is never used
+   --> os/src/main.rs:106:4
+    |
+106 | fn early_sbi_putchar(c: u8) {
+    |    ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: function `early_sbi_line` is never used
+   --> os/src/main.rs:120:4
+    |
+120 | fn early_sbi_line(msg: &[u8]) {
+    |    ^^^^^^^^^^^^^^
+
+warning: constant `KERNEL_BASE` is never used
+ --> os/src/config/la.rs:2:11
+  |
+2 | pub const KERNEL_BASE: usize = 0x9000_0000_9000_0000;
+  |           ^^^^^^^^^^^
+
+warning: constant `PAGE_SIZE` is never used
+ --> os/src/config/la.rs:3:11
+  |
+3 | pub const PAGE_SIZE: usize = 4096;
+  |           ^^^^^^^^^
+
+warning: constant `PAGE_SIZE_BITS` is never used
+ --> os/src/config/la.rs:4:11
+  |
+4 | pub const PAGE_SIZE_BITS: usize = 12;
+  |           ^^^^^^^^^^^^^^
+
+warning: constant `VIRT_ADDR_START` is never used
+ --> os/src/config/la.rs:5:11
+  |
+5 | pub const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
+  |           ^^^^^^^^^^^^^^^
+
+warning: constant `USER_START_ADDR` is never used
+ --> os/src/config/la.rs:9:11
+  |
+9 | pub const USER_START_ADDR: usize = 0x1000;
+  |           ^^^^^^^^^^^^^^^
+
+warning: constant `USER_STACK_TOP` is never used
+  --> os/src/config/la.rs:11:11
+   |
+11 | pub const USER_STACK_TOP: usize = 0x8000_0000;
+   |           ^^^^^^^^^^^^^^
+
+warning: constant `USER_STACK_SIZE` is never used
+  --> os/src/config/la.rs:13:11
+   |
+13 | pub const USER_STACK_SIZE: usize = 0x8_0000;
+   |           ^^^^^^^^^^^^^^^
+
+warning: constant `USER_HEAP_START` is never used
+  --> os/src/config/la.rs:15:11
+   |
+15 | pub const USER_HEAP_START: usize = 0x1000_0000;
+   |           ^^^^^^^^^^^^^^^
+
+warning: constant `PAGE_SIZE_BITS` is never used
+ --> os/src/config/rv.rs:4:11
+  |
+4 | pub const PAGE_SIZE_BITS: usize = 12;
+  |           ^^^^^^^^^^^^^^
+
+warning: constant `VIRT_ADDR_START` is never used
+ --> os/src/config/rv.rs:8:11
+  |
+8 | pub const VIRT_ADDR_START: usize = 0xffff_ffff_8000_0000;
+  |           ^^^^^^^^^^^^^^^
+
+warning: constant `USER_VADDR_START` is never used
+  --> os/src/config/rv.rs:13:11
+   |
+13 | pub const USER_VADDR_START: usize = 0;
+   |           ^^^^^^^^^^^^^^^^
+
+warning: constant `USER_VADDR_END` is never used
+  --> os/src/config/rv.rs:14:11
+   |
+14 | pub const USER_VADDR_END: usize = 0x0000_7fff_ffff_ffff;
+   |           ^^^^^^^^^^^^^^
+
+warning: constant `KERNEL_VADDR_START` is never used
+  --> os/src/config/rv.rs:15:11
+   |
+15 | pub const KERNEL_VADDR_START: usize = 0xffff_ffff_8000_0000;
+   |           ^^^^^^^^^^^^^^^^^^
+
+warning: constant `KERNEL_VADDR_END` is never used
+  --> os/src/config/rv.rs:16:11
+   |
+16 | pub const KERNEL_VADDR_END: usize = 0xffff_ffff_ffffffff;
+   |           ^^^^^^^^^^^^^^^^
+
+warning: constant `USER_START_ADDR` is never used
+  --> os/src/config/rv.rs:20:11
+   |
+20 | pub const USER_START_ADDR: usize = 0x1000;
+   |           ^^^^^^^^^^^^^^^
+
+warning: associated items `with_times` and `snapshot` are never used
+   --> os/src/fs/mod.rs:212:12
+    |
+202 | impl MemFile {
+    | ------------ associated items in this implementation
+...
+212 |     pub fn with_times(name: &str, content: Vec<u8>, times: FileTimes) -> Self {
+    |            ^^^^^^^^^^
+...
+257 |     pub fn snapshot(&self) -> (FileContent, FileTimes) {
+    |            ^^^^^^^^
+
+warning: methods `add_file_with_metadata`, `list_files`, and `list_file_names` are never used
+   --> os/src/fs/mod.rs:402:12
+    |
+312 | impl MemFileSystem {
+    | ------------------ methods in this implementation
+...
+402 |     pub fn add_file_with_metadata(
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+781 |     pub fn list_files(&self) -> Vec<&str> {
+    |            ^^^^^^^^^^
+...
+785 |     pub fn list_file_names(&self) -> Vec<String> {
+    |            ^^^^^^^^^^^^^^^
+
+warning: function `minor_for_path` is never used
+   --> os/src/fs/block_dev.rs:291:8
+    |
+291 | pub fn minor_for_path(path: &str) -> Option<u32> {
+    |        ^^^^^^^^^^^^^^
+
+warning: constant `DEFAULT_WRITEBACK_WORKER_ENABLED` is never used
+  --> os/src/fs/ext4_vol.rs:24:7
+   |
+24 | const DEFAULT_WRITEBACK_WORKER_ENABLED: bool = false;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `WRITEBACK_WORKER_STARTED` is never used
+  --> os/src/fs/ext4_vol.rs:25:8
+   |
+25 | static WRITEBACK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `pop` and `has_work` are never used
+   --> os/src/fs/ext4_vol.rs:99:8
+    |
+85  | impl WritebackQueue {
+    | ------------------- methods in this implementation
+...
+99  |     fn pop(&mut self) -> Option<u32> {
+    |        ^^^
+...
+112 |     fn has_work(&self) -> bool {
+    |        ^^^^^^^^
+
+warning: function `start_writeback_worker_explicit` is never used
+   --> os/src/fs/ext4_vol.rs:682:8
+    |
+682 | pub fn start_writeback_worker_explicit() -> Result<(), SysErrNo> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `writeback_worker_main` is never used
+   --> os/src/fs/ext4_vol.rs:711:4
+    |
+711 | fn writeback_worker_main() -> ! {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `opportunistic_drain_one_queued_writeback` is never used
+   --> os/src/fs/ext4_vol.rs:727:4
+    |
+727 | fn opportunistic_drain_one_queued_writeback() {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `opportunistic_drain_queued_writeback_ino` is never used
+   --> os/src/fs/ext4_vol.rs:734:4
+    |
+734 | fn opportunistic_drain_queued_writeback_ino(ino: u32) {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `drain_queued_writeback_ino` is never used
+    --> os/src/fs/ext4_vol.rs:1460:4
+     |
+1460 | fn drain_queued_writeback_ino(ino: u32) -> Result<(), SysErrNo> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `unmount_root` is never used
+    --> os/src/fs/ext4_vol.rs:1672:8
+     |
+1672 | pub fn unmount_root() {
+     |        ^^^^^^^^^^^^
+
+warning: function `unlink_regular_file` is never used
+    --> os/src/fs/ext4_vol.rs:1756:8
+     |
+1756 | pub fn unlink_regular_file(path: &str) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_regular_ext4` is never used
+    --> os/src/fs/ext4_vol.rs:1876:8
+     |
+1876 | pub fn create_regular_ext4(path: &str) -> Result<u32, SysErrNo> {
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `merged_list_all_file_paths` is never used
+    --> os/src/fs/ext4_vol.rs:2641:8
+     |
+2641 | pub fn merged_list_all_file_paths(mem_paths: Vec<String>) -> Vec<String> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `STDIN_FD` is never used
+  --> os/src/fs/fd.rs:23:11
+   |
+23 | pub const STDIN_FD: usize = 0;
+   |           ^^^^^^^^
+
+warning: constant `STDOUT_FD` is never used
+  --> os/src/fs/fd.rs:24:11
+   |
+24 | pub const STDOUT_FD: usize = 1;
+   |           ^^^^^^^^^
+
+warning: constant `STDERR_FD` is never used
+  --> os/src/fs/fd.rs:25:11
+   |
+25 | pub const STDERR_FD: usize = 2;
+   |           ^^^^^^^^^
+
+warning: method `clear` is never used
+   --> os/src/fs/fd.rs:165:12
+    |
+135 | impl MemFileContent {
+    | ------------------- method in this implementation
+...
+165 |     pub fn clear(&mut self) {
+    |            ^^^^^
+
+warning: method `seek` is never used
+    --> os/src/fs/fd.rs:1557:12
+     |
+647  | impl FileDescriptor {
+     | ------------------- method in this implementation
+...
+1557 |     pub fn seek(&mut self, offset: FileOffset, whence: usize) -> Result<FileOffset, SysErrNo> {
+     |            ^^^^
+
+warning: methods `alloc`, `alloc_from`, `alloc_from_with_flags`, `alloc_at`, `dup`, and `dup2` are never used
+    --> os/src/fs/fd.rs:2022:12
+     |
+1930 | impl FileDescriptorTable {
+     | ------------------------ methods in this implementation
+...
+2022 |     pub fn alloc(&mut self, fd: FileDescriptor) -> Option<usize> {
+     |            ^^^^^
+...
+2039 |     pub fn alloc_from(&mut self, start: usize, fd: FileDescriptor) -> Option<usize> {
+     |            ^^^^^^^^^^
+...
+2043 |     pub fn alloc_from_with_flags(
+     |            ^^^^^^^^^^^^^^^^^^^^^
+...
+2062 |     pub fn alloc_at(&mut self, index: usize, fd: FileDescriptor) -> Result<(), SysErrNo> {
+     |            ^^^^^^^^
+...
+2147 |     pub fn dup(&mut self, old_fd: usize) -> Result<usize, SysErrNo> {
+     |            ^^^
+...
+2162 |     pub fn dup2(&mut self, old_fd: usize, new_fd: usize) -> Result<usize, SysErrNo> {
+     |            ^^^^
+
+warning: function `open_file` is never used
+    --> os/src/fs/fd.rs:2245:8
+     |
+2245 | pub fn open_file(
+     |        ^^^^^^^^^
+
+warning: function `block_device_minor` is never used
+   --> os/src/fs/vfs.rs:542:4
+    |
+542 | fn block_device_minor(path: &str) -> Option<u32> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `metadata_for_block_device` is never used
+   --> os/src/fs/vfs.rs:745:4
+    |
+745 | fn metadata_for_block_device(path: &str, minor: u32) -> VfsMetadata {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `check_metadata_access` is never used
+    --> os/src/fs/vfs.rs:1404:8
+     |
+1404 | pub fn check_metadata_access(meta: &VfsMetadata, access_mode: usize) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `check_metadata_access_with_effective` is never used
+    --> os/src/fs/vfs.rs:1408:8
+     |
+1408 | pub fn check_metadata_access_with_effective(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `check_access` is never used
+    --> os/src/fs/vfs.rs:1467:8
+     |
+1467 | pub fn check_access(path: &str, follow_symlink: bool, access_mode: usize) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^^^
+
+warning: function `check_fd_access` is never used
+    --> os/src/fs/vfs.rs:1509:8
+     |
+1509 | pub fn check_fd_access(file: &fd::FileDescriptor, access_mode: usize) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^^^^^^
+
+warning: function `read_interpreter_host` is never used
+    --> os/src/fs/vfs.rs:1789:4
+     |
+1789 | fn read_interpreter_host(logical: &str, host: &str) -> Option<(String, String, Vec<u8>)> {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `filesystem_magic` is never used
+    --> os/src/fs/vfs.rs:1885:8
+     |
+1885 | pub fn filesystem_magic() -> usize {
+     |        ^^^^^^^^^^^^^^^^
+
+warning: function `create_dir` is never used
+    --> os/src/fs/vfs.rs:2984:8
+     |
+2984 | pub fn create_dir(path: &str) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^
+
+warning: function `list_files` is never used
+    --> os/src/fs/vfs.rs:3619:8
+     |
+3619 | pub fn list_files() -> Vec<String> {
+     |        ^^^^^^^^^^
+
+warning: constant `PT_NULL` is never used
+   --> os/src/mm/elf_loader.rs:108:11
+    |
+108 | pub const PT_NULL: u32 = 0; // 忽略
+    |           ^^^^^^^
+
+warning: constant `PT_DYNAMIC` is never used
+   --> os/src/mm/elf_loader.rs:110:11
+    |
+110 | pub const PT_DYNAMIC: u32 = 2; // 动态链接信息
+    |           ^^^^^^^^^^
+
+warning: constant `PT_NOTE` is never used
+   --> os/src/mm/elf_loader.rs:112:11
+    |
+112 | pub const PT_NOTE: u32 = 4; // 辅助信息
+    |           ^^^^^^^
+
+warning: constant `PT_SHLIB` is never used
+   --> os/src/mm/elf_loader.rs:113:11
+    |
+113 | pub const PT_SHLIB: u32 = 5; // 保留
+    |           ^^^^^^^^
+
+warning: struct `DynamicEntry` is never constructed
+   --> os/src/mm/elf_loader.rs:127:8
+    |
+127 | struct DynamicEntry {
+    |        ^^^^^^^^^^^^
+
+warning: method `can_enter_without_interpreter` is never used
+   --> os/src/mm/elf_loader.rs:316:12
+    |
+132 | impl<'a> ElfFile<'a> {
+    | -------------------- method in this implementation
+...
+316 |     pub fn can_enter_without_interpreter(&self) -> bool {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_elf_file` is never used
+   --> os/src/mm/elf_loader.rs:573:8
+    |
+573 | pub fn is_elf_file(data: &[u8]) -> bool {
+    |        ^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> os/src/mm/map_area.rs:101:12
+    |
+100 | impl MapArea {
+    | ------------ associated function in this implementation
+101 |     pub fn new(start_va: VirtAddr, end_va: VirtAddr, flags: PTEFlags) -> Self {
+    |            ^^^
+
+warning: methods `insert_framed_area_with_frames`, `satp_token`, `remove_area`, and `unmap_area` are never used
+   --> os/src/mm/memory_set.rs:269:12
+    |
+167 | impl MemorySet {
+    | -------------- methods in this implementation
+...
+269 |     pub fn insert_framed_area_with_frames(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+352 |     pub fn satp_token(&self) -> usize {
+    |            ^^^^^^^^^^
+...
+357 |     pub fn remove_area(&mut self, start_va: VirtAddr) {
+    |            ^^^^^^^^^^^
+...
+362 |     pub fn unmap_area(&mut self, start_va: VirtAddr) {
+    |            ^^^^^^^^^^
+
+warning: function `map_page` is never used
+  --> os/src/mm/page_table.rs:60:8
+   |
+60 | pub fn map_page(vpn: usize, ppn: crate::mm::frame_allocator::PhysPageNum, flags: PTEFlags) {
+   |        ^^^^^^^^
+
+warning: function `unmap_page` is never used
+  --> os/src/mm/page_table.rs:70:8
+   |
+70 | pub fn unmap_page(vpn: usize) {
+   |        ^^^^^^^^^^
+
+warning: function `translate` is never used
+  --> os/src/mm/page_table.rs:78:8
+   |
+78 | pub fn translate(vaddr: VirtAddr) -> Option<PhysAddr> {
+   |        ^^^^^^^^^
+
+warning: constant `SYSCALL_CLOCK_SETTIME` is never used
+   --> os/src/syscall/mod.rs:105:11
+    |
+105 | pub const SYSCALL_CLOCK_SETTIME: usize = 112;
+    |           ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FD_STDOUT` is never used
+  --> os/src/syscall/fs.rs:14:7
+   |
+14 | const FD_STDOUT: usize = 1;
+   |       ^^^^^^^^^
+
+warning: constant `FD_STDERR` is never used
+  --> os/src/syscall/fs.rs:15:7
+   |
+15 | const FD_STDERR: usize = 2;
+   |       ^^^^^^^^^
+
+warning: function `parse_utimens_times` is never used
+   --> os/src/syscall/fs.rs:965:4
+    |
+965 | fn parse_utimens_times(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `sys_write_kernel` is never used
+    --> os/src/syscall/fs.rs:5037:8
+     |
+5037 | pub fn sys_write_kernel(fd: usize, buf: &[u8]) -> SyscallRet {
+     |        ^^^^^^^^^^^^^^^^
+
+warning: constant `SIGCANCEL` is never used
+  --> os/src/syscall/signal.rs:36:7
+   |
+36 | const SIGCANCEL: i32 = 32;
+   |       ^^^^^^^^^
+
+warning: constant `SIGSETXID` is never used
+  --> os/src/syscall/signal.rs:37:7
+   |
+37 | const SIGSETXID: i32 = 33;
+   |       ^^^^^^^^^
+
+warning: static `RUNNING_FROM_ECANCELED` is never used
+  --> os/src/task/mod.rs:43:19
+   |
+43 | pub(crate) static RUNNING_FROM_ECANCELED: AtomicUsize = AtomicUsize::new(0);
+   |                   ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `marker_name` is never read
+  --> os/src/task/mod.rs:74:9
+   |
+62 | pub struct UserProgramSpec {
+   |            --------------- field in this struct
+...
+74 |     pub marker_name: Option<String>,
+   |         ^^^^^^^^^^^
+
+warning: method `marker` is never used
+  --> os/src/task/mod.rs:95:12
+   |
+93 | impl UserProgramSpec {
+   | -------------------- method in this implementation
+94 |     /// Returns the marker name: explicit marker_name or argv[0]
+95 |     pub fn marker(&self) -> String {
+   |            ^^^^^^
+
+warning: function `block_current_for_reason` is never used
+   --> os/src/task/mod.rs:573:8
+    |
+573 | pub fn block_current_for_reason(reason: wait_queue::BlockReason) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `init_kernel_page` is never used
+   --> os/src/task/mod.rs:624:8
+    |
+624 | pub fn init_kernel_page() {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: function `return_to_user` is never used
+    --> os/src/task/mod.rs:1276:11
+     |
+1276 | unsafe fn return_to_user(_ctx: TrapFrame) {
+     |           ^^^^^^^^^^^^^^
+
+warning: fields `clone_flags` and `root` are never read
+    --> os/src/task/mod.rs:1503:9
+     |
+1501 | pub struct TaskControlBlockInner {
+     |            --------------------- fields in this struct
+1502 |     pub exit_code: i32,
+1503 |     pub clone_flags: usize,
+     |         ^^^^^^^^^^^
+...
+1508 |     pub root: String,
+     |         ^^^^
+
+warning: associated function `goto_restore` is never used
+  --> os/src/task/context.rs:26:12
+   |
+13 | impl TaskContext {
+   | ---------------- associated function in this implementation
+...
+26 |     pub fn goto_restore() -> Self {
+   |            ^^^^^^^^^^^^
+
+warning: function `fetch_task` is never used
+   --> os/src/task/manager.rs:103:8
+    |
+103 | pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
+    |        ^^^^^^^^^^
+
+warning: function `remove_task` is never used
+   --> os/src/task/manager.rs:197:8
+    |
+197 | pub fn remove_task(pid: usize) -> Option<Arc<TaskControlBlock>> {
+    |        ^^^^^^^^^^^
+
+warning: function `remove_task_from_queue` is never used
+   --> os/src/task/manager.rs:202:4
+    |
+202 | fn remove_task_from_queue(queue: &Mutex<ReadyQueue>, pid: usize) -> Option<Arc<TaskControlBlock>> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `retain_tasks` is never used
+   --> os/src/task/manager.rs:232:8
+    |
+232 | pub fn retain_tasks(mut keep: impl FnMut(&Arc<TaskControlBlock>) -> bool) {
+    |        ^^^^^^^^^^^^
+
+warning: function `retain_queue` is never used
+   --> os/src/task/manager.rs:237:4
+    |
+237 | fn retain_queue(queue: &Mutex<ReadyQueue>, keep: &mut impl FnMut(&Arc<TaskControlBlock>) -> bool) {
+    |    ^^^^^^^^^^^^
+
+warning: function `queue_len` is never used
+   --> os/src/task/manager.rs:298:8
+    |
+298 | pub fn queue_len() -> usize {
+    |        ^^^^^^^^^
+
+warning: function `kernel_queue_len` is never used
+   --> os/src/task/manager.rs:306:8
+    |
+306 | pub fn kernel_queue_len() -> usize {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: field `current` is never read
+ --> os/src/task/processor.rs:8:5
+  |
+7 | pub struct Processor {
+  |            --------- field in this struct
+8 |     current: Option<Arc<TaskControlBlock>>,
+  |     ^^^^^^^
+
+warning: methods `take_current`, `current`, and `set_current` are never used
+  --> os/src/task/processor.rs:16:12
+   |
+11 | impl Processor {
+   | -------------- methods in this implementation
+...
+16 |     pub fn take_current(&mut self) -> Option<Arc<TaskControlBlock>> {
+   |            ^^^^^^^^^^^^
+...
+20 |     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
+   |            ^^^^^^^
+...
+24 |     pub fn set_current(&mut self, task: Arc<TaskControlBlock>) {
+   |            ^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> os/src/task/task.rs:355:12
+    |
+33  | impl TaskControlBlock {
+    | --------------------- associated items in this implementation
+...
+355 |     pub fn new(elf_data: &[u8]) -> Arc<Self> {
+    |            ^^^
+...
+513 |     pub fn task_ctx(&self) -> super::context::TaskContext {
+    |            ^^^^^^^^
+...
+518 |     pub fn set_task_ctx(&self, ctx: super::context::TaskContext) {
+    |            ^^^^^^^^^^^^
+...
+525 |     pub fn exit_code(&self) -> i32 {
+    |            ^^^^^^^^^
+...
+536 |     pub fn take_trap_frame(&self) -> polyhal_trap::trapframe::TrapFrame {
+    |            ^^^^^^^^^^^^^^^
+...
+544 |     pub fn put_trap_frame(&self, ctx: polyhal_trap::trapframe::TrapFrame) {
+    |            ^^^^^^^^^^^^^^
+...
+549 |     pub fn has_trap_frame(&self) -> bool {
+    |            ^^^^^^^^^^^^^^
+
+warning: methods `wake_one`, `wake_n`, and `wake_key_n` are never used
+   --> os/src/task/wait_queue.rs:142:12
+    |
+49  | impl WaitQueue {
+    | -------------- methods in this implementation
+...
+142 |     pub fn wake_one(&self) -> usize {
+    |            ^^^^^^^^
+...
+146 |     pub fn wake_n(&self, n: usize) -> usize {
+    |            ^^^^^^
+...
+178 |     pub fn wake_key_n(&self, key: WaitKey, n: usize) -> usize {
+    |            ^^^^^^^^^^
+
+warning: function `sleep_on_io` is never used
+   --> os/src/task/wait_queue.rs:272:8
+    |
+272 | pub fn sleep_on_io(deadline_us: Option<usize>) -> Result<WaitOutcome, SysErrNo> {
+    |        ^^^^^^^^^^^
+
+warning: function `wake_io_keyed_waiter` is never used
+   --> os/src/task/wait_queue.rs:305:8
+    |
+305 | pub fn wake_io_keyed_waiter(key: WaitKey) -> usize {
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `sleep_ms` is never used
+   --> os/src/timer.rs:205:8
+    |
+205 | pub fn sleep_ms(ms: usize) {
+    |        ^^^^^^^^
+
+warning: function `save_current_trapframe` is never used
+  --> os/src/trap/mod.rs:99:8
+   |
+99 | pub fn save_current_trapframe(tf: &TrapFrame) {
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `handle_exit` is never used
+   --> os/src/trap/mod.rs:371:8
+    |
+371 | pub fn handle_exit(exit_code: i32) {
+    |        ^^^^^^^^^^^
+
+warning: function `enable_interrupt` is never used
+  --> os/src/trap/interrupts.rs:36:8
+   |
+36 | pub fn enable_interrupt() {
+   |        ^^^^^^^^^^^^^^^^
+
+warning: function `is_interrupt_enabled` is never used
+  --> os/src/trap/interrupts.rs:66:8
+   |
+66 | pub fn is_interrupt_enabled() -> bool {
+   |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `str_from_raw_ptr` is never used
+ --> os/src/utils/mod.rs:4:8
+  |
+4 | pub fn str_from_raw_ptr(ptr: *const u8) -> &'static str {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: variants `ENFILE`, `ETXTBSY`, `EDOM`, `ECANCELED`, `EALREADY`, and `EINPROGRESS` are never constructed
+  --> os/src/utils/error.rs:26:5
+   |
+3  | pub enum SysErrNo {
+   |          -------- variants in this enum
+...
+26 |     ENFILE = 23,          // File table overflow
+   |     ^^^^^^
+...
+29 |     ETXTBSY = 26,         // Text file busy
+   |     ^^^^^^^
+...
+36 |     EDOM = 33,            // Math argument out of domain of func
+   |     ^^^^
+...
+42 |     ECANCELED = 47,       // Operation canceled (used by exit in foreground mode)
+   |     ^^^^^^^^^
+...
+57 |     EALREADY = 114,       // Operation already in progress
+   |     ^^^^^^^^
+58 |     EINPROGRESS = 115,    // Operation now in progress
+   |     ^^^^^^^^^^^
+   |
+   = note: `SysErrNo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `wll_OS` (bin "wll_OS") generated 102 warnings (run `cargo fix --bin "wll_OS"` to apply 3 suggestions)
+    Finished `release` profile [optimized] target(s) in 20.99s
+
+OpenSBI v1.5.1
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name             : riscv-virtio,qemu
+Platform Features         : medeleg
+Platform HART Count       : 1
+Platform IPI Device       : aclint-mswi
+Platform Timer Device     : aclint-mtimer @ 10000000Hz
+Platform Console Device   : uart8250
+Platform HSM Device       : ---
+Platform PMU Device       : ---
+Platform Reboot Device    : syscon-reboot
+Platform Shutdown Device  : syscon-poweroff
+Platform Suspend Device   : ---
+Platform CPPC Device      : ---
+Firmware Base             : 0x80000000
+Firmware Size             : 327 KB
+Firmware RW Offset        : 0x40000
+Firmware RW Size          : 71 KB
+Firmware Heap Offset      : 0x49000
+Firmware Heap Size        : 35 KB (total), 2 KB (reserved), 11 KB (used), 21 KB (free)
+Firmware Scratch Size     : 4096 B (total), 416 B (used), 3680 B (free)
+Runtime SBI Version       : 2.0
+
+Domain0 Name              : root
+Domain0 Boot HART         : 0
+Domain0 HARTs             : 0*
+Domain0 Region00          : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01          : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02          : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03          : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04          : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05          : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06          : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07          : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address      : 0x0000000080200000
+Domain0 Next Arg1         : 0x00000000bfe00000
+Domain0 Next Mode         : S-mode
+Domain0 SysReset          : yes
+Domain0 SysSuspend        : yes
+
+Boot HART ID              : 0
+Boot HART Domain          : root
+Boot HART Priv Version    : v1.12
+Boot HART Base ISA        : rv64imafdch
+Boot HART ISA Extensions  : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count       : 16
+Boot HART PMP Granularity : 2 bits
+Boot HART PMP Address Bits: 54
+Boot HART MHPM Info       : 16 (0x0007fff8)
+Boot HART Debug Triggers  : 2 triggers
+Boot HART MIDELEG         : 0x0000000000001666
+Boot HART MEDELEG         : 0x0000000000f0b509
+[DTB] raw ptr = 0xbfe00000
+[DTB] Using low addr direct mapping
+[DTB] ptr = 0xbfe00000
+[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+[kernel] Hello, OS!
+[kernel] Memory init
+[VIRTIO] Probing..
+[VIRTIO] mounting ext4..
+[EXT4] mounted successfully
+[kernel] Starting sched.
+[harness] SCRIPT /glibc/basic_testcode.sh
+#### OS COMP TEST GROUP START basic-glibc ####
+Testing brk :
+========== START test_brk ==========
+Before alloc,heap pos: 268435456
+After alloc,heap pos: 268435520
+Alloc again,heap pos: 268435584
+========== END test_brk ==========
+Testing chdir :
+========== START test_chdir ==========
+chdir ret: 0
+  current working dir : /basic/test_chdir
+========== END test_chdir ==========
+Testing clone :
+========== START test_clone ==========
+  Child says successfully!
+clone process successfully.
+pid:8
+========== END test_clone ==========
+Testing close :
+========== START test_close ==========
+  close 3 success.
+========== END test_close ==========
+Testing dup2 :
+========== START test_dup2 ==========
+  from fd 100
+========== END test_dup2 ==========
+Testing dup :
+========== START test_dup ==========
+  new fd is 3.
+========== END test_dup ==========
+Testing execve :
+========== START test_execve ==========
+  I am test_echo.
+execve success.
+========== END main ==========
+Testing exit :
+========== START test_exit ==========
+exit OK.
+========== END test_exit ==========
+Testing fork :
+========== START test_fork ==========
+  child process.
+  parent process. wstatus:0
+========== END test_fork ==========
+Testing fstat :
+========== START test_fstat ==========
+fstat ret: 0
+fstat: dev: 65024, inode: 131106, mode: 33188, nlink: 1, size: 52, atime: 1749913917, mtime: 1749913917, ctime: 1749913917
+========== END test_fstat ==========
+Testing getcwd :
+========== START test_getcwd ==========
+getcwd: /basic successfully!
+========== END test_getcwd ==========
+Testing getdents :
+========== START test_getdents ==========
+open fd:3
+getdents fd:496
+getdents success.
+brk
+
+========== END test_getdents ==========
+Testing getpid :
+========== START test_getpid ==========
+getpid success.
+pid = 20
+========== END test_getpid ==========
+Testing getppid :
+========== START test_getppid ==========
+  getppid success. ppid : 4
+========== END test_getppid ==========
+Testing gettimeofday :
+========== START test_gettimeofday ==========
+gettimeofday success.
+start:3894319, end:3894345
+interval: 26
+========== END test_gettimeofday ==========
+Testing mkdir_ :
+========== START test_mkdir ==========
+mkdir ret: -17
+  mkdir success.
+========== END test_mkdir ==========
+Testing mmap :
+========== START test_mmap ==========
+file len: 4096
+mmap content:   Hello, mmap successfully!
+========== END test_mmap ==========
+Testing mount :
+========== START test_mount ==========
+Mounting dev:/dev/vda2 to ./mnt
+mount return: -19
+
+ --- Assert Fatal ! ---
+Testing munmap :
+========== START test_munmap ==========
+file len: 4096
+munmap return: 0
+munmap successfully!
+========== END test_munmap ==========
+Testing openat :
+========== START test_openat ==========
+open dir fd: 3
+openat fd: 4
+openat success.
+========== END test_openat ==========
+Testing open :
+========== START test_open ==========
+Hi, this is a text file.
+syscalls testing success!
+
+========== END test_open ==========
+Testing pipe :
+========== START test_pipe ==========
+cpid: 30
+cpid: 0
+  Write to pipe successfully.
+
+========== END test_pipe ==========
+Testing read :
+========== START test_read ==========
+Hi, this is a text file.
+syscalls testing success!
+
+========== END test_read ==========
+Testing sleep :
+========== START test_sleep ==========
+sleep success.
+========== END test_sleep ==========
+Testing times :
+========== START test_times ==========
+mytimes success
+{tms_utime:7063, tms_stime:0, tms_cutime:0, tms_cstime:0}
+========== END test_times ==========
+Testing umount :
+========== START test_umount ==========
+Mounting dev:/dev/vda2 to ./mnt
+mount return: -19
+========== END test_umount ==========
+Testing uname :
+========== START test_uname ==========
+Uname: wll_OS os-contest 5.10.0 2026 riscv64 localdomain
+========== END test_uname ==========
+Testing unlink :
+========== START test_unlink ==========
+  unlink success!
+========== END test_unlink ==========
+Testing wait :
+========== START test_wait ==========
+This is child process
+wait child success.
+wstatus: 0
+========== END test_wait ==========
+Testing waitpid :
+========== START test_waitpid ==========
+This is child process
+waitpid successfully.
+wstatus: 3
+========== END test_waitpid ==========
+Testing write :
+========== START test_write ==========
+Hello operating system contest.
+========== END test_write ==========
+Testing yield :
+========== START test_yield ==========
+  I am child process: 43. iteration 0.
+  I am child process: 44. iteration 1.
+  I am child process: 45. iteration 2.
+  I am child process: 43. iteration 0.
+  I am child process: 44. iteration 1.
+  I am child process: 45. iteration 2.
+  I am child process: 43. iteration 0.
+  I am child process: 44. iteration 1.
+  I am child process: 45. iteration 2.
+  I am child process: 43. iteration 0.
+  I am child process: 44. iteration 1.
+  I am child process: 45. iteration 2.
+  I am child process: 43. iteration 0.
+  I am child process: 44. iteration 1.
+  I am child process: 45. iteration 2.
+========== END test_yield ==========
+#### OS COMP TEST GROUP END basic-glibc ####
+[harness] SCRIPT /musl/basic_testcode.sh
+#### OS COMP TEST GROUP START basic-musl ####
+Testing brk :
+========== START test_brk ==========
+Before alloc,heap pos: 268435456
+After alloc,heap pos: 268435520
+Alloc again,heap pos: 268435584
+========== END test_brk ==========
+Testing chdir :
+========== START test_chdir ==========
+chdir ret: 0
+  current working dir : /basic/test_chdir
+========== END test_chdir ==========
+Testing clone :
+========== START test_clone ==========
+  Child says successfully!
+clone process successfully.
+pid:53
+========== END test_clone ==========
+Testing close :
+========== START test_close ==========
+  close 3 success.
+========== END test_close ==========
+Testing dup2 :
+========== START test_dup2 ==========
+  from fd 100
+========== END test_dup2 ==========
+Testing dup :
+========== START test_dup ==========
+  new fd is 3.
+========== END test_dup ==========
+Testing execve :
+========== START test_execve ==========
+  I am test_echo.
+execve success.
+========== END main ==========
+Testing exit :
+========== START test_exit ==========
+exit OK.
+========== END test_exit ==========
+Testing fork :
+========== START test_fork ==========
+  child process.
+  parent process. wstatus:0
+========== END test_fork ==========
+Testing fstat :
+========== START test_fstat ==========
+fstat ret: 0
+fstat: dev: 65024, inode: 45, mode: 33188, nlink: 1, size: 52, atime: 1749913918, mtime: 1749913918, ctime: 1749913918
+========== END test_fstat ==========
+Testing getcwd :
+========== START test_getcwd ==========
+getcwd: /basic successfully!
+========== END test_getcwd ==========
+Testing getdents :
+========== START test_getdents ==========
+open fd:3
+getdents fd:496
+getdents success.
+brk
+
+========== END test_getdents ==========
+Testing getpid :
+========== START test_getpid ==========
+getpid success.
+pid = 65
+========== END test_getpid ==========
+Testing getppid :
+========== START test_getppid ==========
+  getppid success. ppid : 49
+========== END test_getppid ==========
+Testing gettimeofday :
+========== START test_gettimeofday ==========
+gettimeofday success.
+start:3903174, end:3903197
+interval: 23
+========== END test_gettimeofday ==========
+Testing mkdir_ :
+========== START test_mkdir ==========
+mkdir ret: -17
+  mkdir success.
+========== END test_mkdir ==========
+Testing mmap :
+========== START test_mmap ==========
+file len: 4096
+mmap content:   Hello, mmap successfully!
+========== END test_mmap ==========
+Testing mount :
+========== START test_mount ==========
+Mounting dev:/dev/vda2 to ./mnt
+mount return: -19
+
+ --- Assert Fatal ! ---
+Testing munmap :
+========== START test_munmap ==========
+file len: 4096
+munmap return: 0
+munmap successfully!
+========== END test_munmap ==========
+Testing openat :
+========== START test_openat ==========
+open dir fd: 3
+openat fd: 4
+openat success.
+========== END test_openat ==========
+Testing open :
+========== START test_open ==========
+Hi, this is a text file.
+syscalls testing success!
+
+========== END test_open ==========
+Testing pipe :
+========== START test_pipe ==========
+cpid: 75
+cpid: 0
+  Write to pipe successfully.
+
+========== END test_pipe ==========
+Testing read :
+========== START test_read ==========
+Hi, this is a text file.
+syscalls testing success!
+
+========== END test_read ==========
+Testing sleep :
+========== START test_sleep ==========
+sleep success.
+========== END test_sleep ==========
+Testing times :
+========== START test_times ==========
+mytimes success
+{tms_utime:17574, tms_stime:0, tms_cutime:0, tms_cstime:0}
+========== END test_times ==========
+Testing umount :
+========== START test_umount ==========
+Mounting dev:/dev/vda2 to ./mnt
+mount return: -19
+========== END test_umount ==========
+Testing uname :
+========== START test_uname ==========
+Uname: wll_OS os-contest 5.10.0 2026 riscv64 localdomain
+========== END test_uname ==========
+Testing unlink :
+========== START test_unlink ==========
+  unlink success!
+========== END test_unlink ==========
+Testing wait :
+========== START test_wait ==========
+This is child process
+wait child success.
+wstatus: 0
+========== END test_wait ==========
+Testing waitpid :
+========== START test_waitpid ==========
+This is child process
+waitpid successfully.
+wstatus: 3
+========== END test_waitpid ==========
+Testing write :
+========== START test_write ==========
+Hello operating system contest.
+========== END test_write ==========
+Testing yield :
+========== START test_yield ==========
+  I am child process: 88. iteration 0.
+  I am child process: 89. iteration 1.
+  I am child process: 90. iteration 2.
+  I am child process: 88. iteration 0.
+  I am child process: 89. iteration 1.
+  I am child process: 90. iteration 2.
+  I am child process: 88. iteration 0.
+  I am child process: 89. iteration 1.
+  I am child process: 90. iteration 2.
+  I am child process: 88. iteration 0.
+  I am child process: 89. iteration 1.
+  I am child process: 90. iteration 2.
+  I am child process: 88. iteration 0.
+  I am child process: 89. iteration 1.
+  I am child process: 90. iteration 2.
+========== END test_yield ==========
+#### OS COMP TEST GROUP END basic-musl ####
+[harness] ALL TESTS DONE, shutting down

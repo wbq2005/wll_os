@@ -1165,7 +1165,6 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
 /// 从就绪队列中获取下一个任务并切换到它。
 /// 在 foreground driver 下，如果没有可运行任务则返回，由前台驱动继续执行。
 pub(crate) fn run_next_task() {
-    // UART marker: 'S' = scheduler entry
 
     if let Some(task) = fetch_dispatchable_task() {
         if matches!(
@@ -1189,7 +1188,6 @@ pub(crate) fn run_next_task() {
             switch_to_kernel_task(&task);
             return;
         }
-        // UART marker: 'T' = about to get trap_frame
         // 获取任务的 TrapFrame（用户态上下文）
         // 如果任务有保存的 TrapFrame，从那里恢复
         // 否则这是一个新任务，需要初始化

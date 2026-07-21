@@ -35,6 +35,7 @@ const MEM_FILE_INLINE_LIMIT: usize = 1024 * 1024;
 const MEM_FILE_CHUNK_SIZE: usize = 64 * 1024;
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
+const SOCK_SEQPACKET: usize = 5;
 const PIPE_WAIT_READABLE: usize = 1;
 const PIPE_WAIT_WRITABLE: usize = 2;
 const EVENTFD_WAIT_READABLE: usize = 1;
@@ -592,6 +593,24 @@ impl SocketState {
     pub fn is_datagram(&self) -> bool {
         self.sock_type == SOCK_DGRAM
     }
+
+    pub fn is_seqpacket(&self) -> bool {
+        self.sock_type == SOCK_SEQPACKET
+    }
+
+    pub fn is_connection_oriented(&self) -> bool {
+        self.is_stream() || self.is_seqpacket()
+    }
+
+    pub fn is_message_oriented(&self) -> bool {
+        self.is_datagram() || self.is_seqpacket()
+    }
+
+    pub fn receive_eof(&self) -> bool {
+        self.is_connection_oriented()
+            && self.connected
+            && (self.peer_write_closed || self.peer.as_ref().and_then(Weak::upgrade).is_none())
+    }
 }
 
 impl Drop for SocketState {
@@ -661,6 +680,43 @@ impl FileDescriptor {
 
     pub fn is_pipe_write(&self) -> bool {
         matches!(self, FileDescriptor::PipeWrite { .. })
+    }
+
+    /// Apply the Linux `FIONBIO` state to descriptor types that support it.
+    /// Pipes keep this on the descriptor because their read and write ends are
+    /// separate open-file descriptions, while sockets and eventfds keep it in
+    /// their shared state.
+    pub fn ioctl_set_nonblocking(&mut self, nonblock: bool) -> Result<(), SysErrNo> {
+        match self {
+            FileDescriptor::PipeRead {
+                nonblock: current, ..
+            }
+            | FileDescriptor::PipeWrite {
+                nonblock: current, ..
+            } => {
+                *current = nonblock;
+                Ok(())
+            }
+            FileDescriptor::Socket { state } => {
+                state.lock().nonblock = nonblock;
+                Ok(())
+            }
+            FileDescriptor::EventFd { state } => {
+                state.lock().nonblock = nonblock;
+                Ok(())
+            }
+            _ => Err(SysErrNo::ENOTTY),
+        }
+    }
+
+    /// Bytes immediately readable through `FIONREAD` for pipe endpoints.
+    pub fn pipe_buffered_len(&self) -> Option<usize> {
+        match self {
+            FileDescriptor::PipeRead { state, .. } | FileDescriptor::PipeWrite { state, .. } => {
+                Some(state.lock().buf.len())
+            }
+            _ => None,
+        }
     }
 
     pub fn same_file_identity(&self, other: &Self) -> bool {
@@ -737,13 +793,12 @@ impl FileDescriptor {
                 if socket.shutdown_read {
                     return false;
                 }
-                if socket.is_datagram() {
-                    socket.dgram_queue.is_empty()
+                if socket.is_message_oriented() {
+                    socket.dgram_queue.is_empty() && !socket.receive_eof()
                 } else {
                     socket.connected
                         && socket.rx_buf.is_empty()
-                        && !socket.peer_write_closed
-                        && socket.peer.as_ref().and_then(Weak::upgrade).is_some()
+                        && !socket.receive_eof()
                 }
             }
             _ => false,
@@ -878,7 +933,7 @@ impl FileDescriptor {
             FileDescriptor::Socket { state } => {
                 let socket = state.lock();
                 (socket.shutdown_read && socket.shutdown_write)
-                    || (socket.is_stream()
+                    || (socket.is_connection_oriented()
                         && socket.connected
                         && socket.peer.as_ref().and_then(Weak::upgrade).is_none())
             }
@@ -911,7 +966,7 @@ impl FileDescriptor {
                     || !socket.rx_buf.is_empty()
                     || !socket.dgram_queue.is_empty()
                     || !socket.pending.is_empty()
-                    || (socket.is_stream()
+                    || (socket.is_connection_oriented()
                         && socket.connected
                         && (socket.peer_write_closed
                             || socket.peer.as_ref().and_then(Weak::upgrade).is_none()))
@@ -936,7 +991,7 @@ impl FileDescriptor {
                 (socket.connected || socket.is_datagram())
                     && !socket.shutdown_write
                     && !socket.peer_read_closed
-                    && (!socket.is_stream()
+                    && (!socket.is_connection_oriented()
                         || socket.peer.as_ref().and_then(Weak::upgrade).is_some())
                     && socket.error == 0
             }
@@ -1117,21 +1172,22 @@ impl FileDescriptor {
                 if socket.shutdown_read {
                     return Ok(0);
                 }
-                if socket.is_stream() && !socket.connected {
+                if socket.is_connection_oriented() && !socket.connected {
                     return Err(SysErrNo::ENOTCONN);
                 }
-                let n = if socket.is_datagram() {
-                    let Some(packet) = socket.dgram_queue.pop_front() else {
+                let n = if socket.is_message_oriented() {
+                    if let Some(packet) = socket.dgram_queue.pop_front() {
+                        let n = buf.len().min(packet.data.len());
+                        buf[..n].copy_from_slice(&packet.data[..n]);
+                        n
+                    } else if socket.receive_eof() {
+                        return Ok(0);
+                    } else {
                         return Err(SysErrNo::EAGAIN);
-                    };
-                    let n = buf.len().min(packet.data.len());
-                    buf[..n].copy_from_slice(&packet.data[..n]);
-                    n
+                    }
                 } else {
                     if socket.rx_buf.is_empty() {
-                        if socket.peer_write_closed
-                            || socket.peer.as_ref().and_then(Weak::upgrade).is_none()
-                        {
+                        if socket.receive_eof() {
                             return Ok(0);
                         }
                         return Err(SysErrNo::EAGAIN);
@@ -1389,7 +1445,7 @@ impl FileDescriptor {
                 if socket.shutdown_write {
                     return Err(SysErrNo::EPIPE);
                 }
-                if socket.is_stream() && !socket.connected {
+                if socket.is_connection_oriented() && !socket.connected {
                     return Err(SysErrNo::ENOTCONN);
                 }
                 if socket.peer_read_closed {
@@ -1405,7 +1461,14 @@ impl FileDescriptor {
                 if peer_socket.shutdown_read {
                     return Err(SysErrNo::EPIPE);
                 }
-                peer_socket.rx_buf.extend(buf.iter().copied());
+                if peer_socket.is_message_oriented() {
+                    peer_socket.dgram_queue.push_back(SocketPacket {
+                        data: buf.to_vec(),
+                        addr: Vec::new(),
+                    });
+                } else {
+                    peer_socket.rx_buf.extend(buf.iter().copied());
+                }
                 drop(peer_socket);
                 wake_socket_readers(&peer);
                 Ok(buf.len())

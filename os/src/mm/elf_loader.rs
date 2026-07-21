@@ -434,7 +434,6 @@ impl<'a> ElfFile<'a> {
     }
 
     pub fn load(&self) -> Result<(MemorySet, usize, usize), SysErrNo> {
-        // UART marker: 'A' = elf.load() entry
         // Keep the original entry stable across segment copy/zero-fill work.
         let entry = self.entry();
         let mut memory_set = MemorySet::from_kernel();
@@ -467,10 +466,7 @@ impl<'a> ElfFile<'a> {
                 }
 
                 // 为段分配物理页帧并建立映射
-                // UART marker: 'C' = before insert_framed_area
                 memory_set.insert_framed_area(start_va, end_va, flags)?;
-                // UART marker: 'D' = after insert_framed_area
-                // UART marker: 'F' = after all segment processing
                 // 复制文件内容到内存（按页批量复制，避免逐字节翻译）
                 if ph.p_filesz > 0 {
                     let src_start = ph.p_offset;
@@ -564,7 +560,6 @@ impl<'a> ElfFile<'a> {
             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
         )?;
 
-        // UART marker: 'E' = all load done
         Ok((memory_set, user_stack_top, entry))
     }
 }

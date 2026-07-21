@@ -15,14 +15,14 @@ const AT_FDCWD: isize = -100;
 pub type SyscallRet = Result<usize, SysErrNo>;
 
 pub(crate) fn with_kernel_page_table<T>(f: impl FnOnce() -> T) -> T {
+    // A user trap returns from `run_user_task()` to the scheduler instead of
+    // resuming user mode directly.  Keep the complete syscall on the kernel
+    // page table; the scheduler activates the task address space immediately
+    // before the next `run_user_task()` call.  Restoring the user page table
+    // here is both premature and unsafe for nested VFS/block operations because
+    // low user mappings can overlap platform MMIO.
     crate::trap::restore_kernel_page_table();
-    let result = f();
-    if let Some(task) = crate::task::current_task() {
-        if !task.is_kernel {
-            task.memory_set.lock().activate();
-        }
-    }
-    result
+    f()
 }
 
 /// 系统调用号定义
@@ -47,6 +47,7 @@ pub const SYSCALL_DUP: usize = 23;
 pub const SYSCALL_DUP3: usize = 24;
 pub const SYSCALL_FCNTL: usize = 25;
 pub const SYSCALL_IOCTL: usize = 29;
+pub const SYSCALL_FLOCK: usize = 32;
 pub const SYSCALL_MKNODAT: usize = 33;
 pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
@@ -361,6 +362,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_DUP3 => fs::sys_dup3(args[0], args[1], args[2]),
         SYSCALL_FCNTL => fs::sys_fcntl(args[0], args[1], args[2]),
         SYSCALL_IOCTL => fs::sys_ioctl(args[0], args[1], args[2]),
+        SYSCALL_FLOCK => fs::sys_flock(args[0], args[1]),
         SYSCALL_SOCKET => net::sys_socket(args[0], args[1], args[2]),
         SYSCALL_SOCKETPAIR => net::sys_socketpair(args[0], args[1], args[2], args[3]),
         SYSCALL_BIND => net::sys_bind(args[0], args[1], args[2]),
