@@ -36,6 +36,8 @@ ARCHES = {
         "args": [
             "-machine", "virt", "-bios", "default",
             "-device", "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
+            "-device", "virtio-net-device,netdev=net",
+            "-netdev", "user,id=net",
         ],
     },
     "loongarch64": {
@@ -43,7 +45,11 @@ ARCHES = {
         "features": ["--no-default-features", "--features", "loongarch"],
         "qemu": "qemu-system-loongarch64",
         "windows_qemu": r"C:\Program Files\qemu\qemu-system-loongarch64.exe",
-        "args": ["-device", "virtio-blk-pci,drive=x0"],
+        "args": [
+            "-device", "virtio-blk-pci,drive=x0",
+            "-device", "virtio-net-pci,netdev=net0",
+            "-netdev", "user,id=net0",
+        ],
     },
 }
 

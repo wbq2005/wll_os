@@ -49,7 +49,12 @@ bss_done:
     # ---- Enable MMU: satp = (8<<60) | (boot_pt_phys>>12) ----
     la t0, boot_page_table
     srli t0, t0, 12       # PPN of boot_page_table
-    lui t1, 0x80000        # 8 << 60
+    # RV64 LUI sign-extends bit 31, so `lui t1, 0x80000` produces
+    # 0xffff_ffff_8000_0000 and requests a reserved SATP mode.  QEMU applies
+    # the WARL rule by leaving SATP bare.  Build the Sv39 mode field with a
+    # full-width shift instead.
+    li t1, 8
+    slli t1, t1, 60        # SATP.MODE = Sv39
     or t0, t0, t1
     csrw satp, t0
     sfence.vma
