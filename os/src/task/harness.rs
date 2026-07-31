@@ -1,15 +1,14 @@
+use super::{
+    current_task, manager, purge_exited_user_task_for_foreground, requeue_after_user_run,
+    run_current_user_task_until_reschedule, set_orphan_reaper, TaskControlBlock, TaskStatus,
+    UserProgramSpec, CURRENT_TASK,
+};
+use crate::console::putchar;
+use crate::utils::error::SysErrNo;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use polyhal_trap::trap::run_user_task;
-
-use super::{
-    current_task, manager, purge_exited_user_task_for_foreground, requeue_after_user_run,
-    set_orphan_reaper, TaskControlBlock, TaskStatus, UserProgramSpec, CURRENT_TASK,
-};
-use crate::console::putchar;
-use crate::utils::error::SysErrNo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestGroup {
@@ -271,6 +270,14 @@ fn is_enabled_script(path: &str) -> bool {
     let Some(group) = testcode_stem(path).and_then(TestGroup::from_stem) else {
         return false;
     };
+    let libc_enabled = match option_env!("WLL_HARNESS_LIBC") {
+        Some("glibc") => path.starts_with("/glibc/"),
+        Some("musl") => path.starts_with("/musl/"),
+        Some(_) | None => true,
+    };
+    if !libc_enabled {
+        return false;
+    }
     if harness_filter_active() {
         group.enabled_by_filter()
     } else {
@@ -945,8 +952,9 @@ fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
     const BUSYBOX_RUN_TIMEOUT_US: usize = 240_000_000;
     const IOZONE_RUN_TIMEOUT_US: usize = 240_000_000;
     const LMBENCH_RUN_TIMEOUT_US: usize = 600_000_000;
-    // BuildStorm is given a real one-hour in-kernel deadline.
-    const BUILDSTORM_RUN_TIMEOUT_US: usize = 3_600_000_000;
+    // The official compile command has a 14,400-second timeout. Keep the
+    // in-kernel harness outside that window so it cannot kill a valid run.
+    const BUILDSTORM_RUN_TIMEOUT_US: usize = 18_000_000_000;
 
     if spec
         .argv
@@ -1061,8 +1069,10 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
         ) {
             continue;
         }
+        if !active.try_start_running() {
+            continue;
+        }
 
-        active.set_status(TaskStatus::Running);
         *CURRENT_TASK.lock() = Some(active.clone());
 
         let mut tf_guard = active.trap_frame.lock();
@@ -1073,33 +1083,24 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
                     active.pid.0
                 );
                 *CURRENT_TASK.lock() = None;
+                active.release_running_cpu();
                 continue;
             }
             Some(_) => tf_guard.take().unwrap(),
         };
         drop(tf_guard);
-        if !crate::syscall::signal::handle_pending_for_user(&mut ctx) {
-            if active.status() != TaskStatus::Zombie {
-                *active.trap_frame.lock() = Some(ctx);
-            }
-            requeue_after_user_run(active);
-            continue;
-        }
-        crate::task::enter_foreground_user_task(active.pid.0);
-        {
-            let ms = active.memory_set.lock();
-            ms.activate();
-        }
-
-        crate::trap::prepare_user_trapframe(&mut ctx);
-        let _reason = run_user_task(&mut ctx);
-        crate::task::leave_foreground_user_task(active.pid.0);
-        crate::trap::restore_kernel_page_table();
+        run_current_user_task_until_reschedule(&active, &mut ctx);
 
         if active.status() != TaskStatus::Zombie {
             *active.trap_frame.lock() = Some(ctx);
         }
 
+        // The foreground driver is also a scheduler CPU. Clear its per-CPU
+        // current slot before handing the TCB to the shared queue; otherwise a
+        // secondary CPU can start the same task while it is still recorded as
+        // running here.
+        *CURRENT_TASK.lock() = None;
+        active.release_running_cpu();
         requeue_after_user_run(active);
     }
 
@@ -1183,9 +1184,10 @@ fn prepare_lmbench_helpers(root: &str) {
     }
 
     let helper_host = crate::fs::apply_root(root, "/code/lmbench_src/bin/build/lmbench_all");
-    let mut fs = crate::fs::MEM_FS.lock();
-    fs.add_dir(&crate::fs::apply_root(root, "/code/lmbench_src/bin/build"));
-    let _ = fs.add_symlink(&helper_host, "../../../../lmbench_all");
+    crate::fs::MEM_FS
+        .lock()
+        .add_dir(&crate::fs::apply_root(root, "/code/lmbench_src/bin/build"));
+    let _ = crate::fs::vfs::create_symlink("../../../../lmbench_all", &helper_host);
 }
 
 fn script_program_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunchError> {

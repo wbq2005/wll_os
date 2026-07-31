@@ -1,0 +1,8 @@
+timestamp=20260731-194737
+reason=manual stop after official-style stall at signal-hook-registry
+command=python scripts\run_buildstorm.py --arch riscv64 --image D:\BaiduNetdiskDownload\2026OSImage-Pub\sdcard-rv-pub.img\sdcard-rv-pub.img --stage complete --timeout 6250 --memory 16G --smp 8
+repo=D:\wll_os-master1
+branch=wbq_final_buildstorm_compile
+head=2fb4254e24cdba11d2d408be4c2657449c6923e9
+testsuits_head=1eac61d3becaa592c8ef12a7535f0ec6bb9e3e36
+rv_image_sha256=C03C6091EB1C400D4C1F400130D11810B00E18811D4E5C201E7F75802DFAFDE0

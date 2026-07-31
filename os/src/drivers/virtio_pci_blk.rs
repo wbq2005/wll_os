@@ -101,6 +101,7 @@ impl VirtioPciBlock {
 /// 参考: os_contest/os/src/drivers/virtio_mmio_blk.rs (riscv64 接口形状)
 impl RawBlockDevice for VirtioPciBlock {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), SysErrNo> {
+        crate::perf_counters::note_block_read(offset, buf.len());
         self.read_phys(offset, buf).map_err(|_| SysErrNo::EIO)
     }
 

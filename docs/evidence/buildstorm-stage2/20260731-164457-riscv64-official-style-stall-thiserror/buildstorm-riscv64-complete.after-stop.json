@@ -1,0 +1,53 @@
+{
+  "arch": "riscv64",
+  "stage": "complete",
+  "image": "D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-rv-pub.img\\sdcard-rv-pub.img",
+  "image_bytes": 15032385536,
+  "memory": "16G",
+  "smp": 8,
+  "build_command": [
+    "cargo",
+    "+nightly-2025-01-18",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--target",
+    "riscv64gc-unknown-none-elf"
+  ],
+  "build_elapsed_seconds": 11.979121799929999,
+  "build_log": "D:\\wll_os-master1\\_tmp\\release-build-riscv64.log",
+  "kernel_sha256": "ae2a31e2d0aeae6103f739f47216fdd63e3c21bb0b2123f6007900c93a203581",
+  "qemu_version": "QEMU emulator version 11.0.0 (v11.0.0-12122-ga4bb4b10c9)",
+  "host_elapsed_seconds": 1024.2827191000106,
+  "reached_stage_marker": false,
+  "result_lines": [
+    "BUILDSTORM_TOOLCHAIN ok",
+    "BUILDSTORM_MINIBUILD ok"
+  ],
+  "qemu_args": [
+    "C:\\Program Files\\qemu\\qemu-system-riscv64.exe",
+    "-snapshot",
+    "-kernel",
+    "D:\\wll_os-master1\\target\\riscv64gc-unknown-none-elf\\release\\wll_OS",
+    "-m",
+    "16G",
+    "-smp",
+    "8",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "stdio",
+    "-drive",
+    "file=D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-rv-pub.img\\sdcard-rv-pub.img,if=none,format=raw,id=x0",
+    "-no-reboot",
+    "-machine",
+    "virt",
+    "-bios",
+    "default",
+    "-device",
+    "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0"
+  ]
+}

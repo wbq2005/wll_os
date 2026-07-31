@@ -5,13 +5,13 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 
 use crate::utils::error::SysErrNo;
 
 use super::fd;
 use super::{block_dev, ext4_vol, vfat};
-use super::{normalize_path, MemNodeMetadata, MemSpecialKind, MEM_FS};
+use super::{normalize_path, MemNodeMetadata, MemNodeSnapshot, MemSpecialKind, MEM_FS};
 
 const S_IFDIR: u32 = 0o040000;
 const S_IFMT: u32 = 0o170000;
@@ -34,6 +34,111 @@ const MS_REMOUNT: usize = 32;
 lazy_static! {
     static ref WHITEOUTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
     static ref MOUNT_TABLE: Mutex<Vec<MountEntry>> = Mutex::new(Vec::new());
+    static ref SYMLINK_PROBE_CACHE: RwLock<BTreeMap<String, Option<String>>> =
+        RwLock::new(BTreeMap::new());
+    static ref READLINK_RESULT_CACHE: RwLock<BTreeMap<String, Result<String, SysErrNo>>> =
+        RwLock::new(BTreeMap::new());
+    static ref RESOLVED_DIRECTORY_CACHE: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
+    static ref RESOLVED_PARENT_CACHE: RwLock<BTreeMap<String, String>> =
+        RwLock::new(BTreeMap::new());
+}
+
+const RESOLVED_PARENT_CACHE_LIMIT: usize = 16 * 1024;
+const READLINK_RESULT_CACHE_LIMIT: usize = 16 * 1024;
+
+fn invalidate_symlink_probe(path: &str, subtree: bool) {
+    let path = normalize_path(path);
+    {
+        let mut cache = SYMLINK_PROBE_CACHE.write();
+        if !subtree {
+            cache.remove(&path);
+        } else {
+            cache.retain(|cached, _| {
+                cached != &path
+                    && !cached
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            });
+        }
+    }
+    {
+        let mut cache = READLINK_RESULT_CACHE.write();
+        if !subtree {
+            cache.remove(&path);
+        } else {
+            cache.retain(|cached, _| {
+                cached != &path
+                    && !cached
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            });
+        }
+    }
+    let mut directories = RESOLVED_DIRECTORY_CACHE.write();
+    if !subtree {
+        directories.remove(&path);
+    } else {
+        directories.retain(|cached| {
+            cached != &path
+                && !cached
+                    .strip_prefix(path.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        });
+    }
+    {
+        let mut cache = RESOLVED_PARENT_CACHE.write();
+        if !subtree {
+            cache.remove(&path);
+        } else {
+            cache.retain(|cached, _| {
+                cached != &path
+                    && !cached
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            });
+        }
+    }
+}
+
+fn clear_symlink_probe_cache() {
+    SYMLINK_PROBE_CACHE.write().clear();
+    READLINK_RESULT_CACHE.write().clear();
+    RESOLVED_DIRECTORY_CACHE.write().clear();
+    RESOLVED_PARENT_CACHE.write().clear();
+}
+
+struct NamespaceCacheGuard {
+    path: String,
+    subtree: bool,
+}
+
+impl NamespaceCacheGuard {
+    fn path(path: &str, subtree: bool) -> Self {
+        let path = normalize_path(path);
+        invalidate_symlink_probe(&path, subtree);
+        Self { path, subtree }
+    }
+}
+
+impl Drop for NamespaceCacheGuard {
+    fn drop(&mut self) {
+        invalidate_symlink_probe(&self.path, self.subtree);
+    }
+}
+
+struct MountCacheGuard;
+
+impl MountCacheGuard {
+    fn begin() -> Self {
+        clear_symlink_probe_cache();
+        Self
+    }
+}
+
+impl Drop for MountCacheGuard {
+    fn drop(&mut self) {
+        clear_symlink_probe_cache();
+    }
 }
 
 #[derive(Clone)]
@@ -317,42 +422,27 @@ fn path_components(path: &str) -> VecDeque<String> {
         .collect()
 }
 
-fn path_from_components(components: &Vec<String>, next: Option<&str>) -> String {
-    let mut path = String::from("/");
-    for component in components {
-        if path.len() > 1 {
-            path.push('/');
-        }
-        path.push_str(component);
-    }
-    if let Some(component) = next {
-        if path.len() > 1 {
-            path.push('/');
-        }
-        path.push_str(component);
-    }
-    path
-}
-
 /// Resolve symbolic links one component at a time.  Requeueing the complete
 /// link target is important: a relative target may itself contain an
 /// intermediate symbolic link, and the unresolved suffix must then be walked
 /// under the resulting directory.
 fn resolve_path_symlinks(path: &str, final_symlink: FinalSymlink) -> Result<String, SysErrNo> {
     let mut pending = path_components(path);
-    let mut resolved = Vec::new();
+    let mut resolved_path = String::from("/");
     let mut followed = 0usize;
 
     while let Some(component) = pending.pop_front() {
         let is_final = pending.is_empty();
-        let candidate = path_from_components(&resolved, Some(&component));
+        if resolved_path.len() > 1 {
+            resolved_path.push('/');
+        }
+        resolved_path.push_str(&component);
 
         if is_final && final_symlink == FinalSymlink::Preserve {
-            resolved.push(component);
             break;
         }
 
-        if let Some(target) = lookup_symlink_target(&candidate)? {
+        if let Some(target) = lookup_symlink_target(&resolved_path)? {
             if is_final && final_symlink == FinalSymlink::Reject {
                 return Err(SysErrNo::ELOOP);
             }
@@ -361,24 +451,28 @@ fn resolve_path_symlinks(path: &str, final_symlink: FinalSymlink) -> Result<Stri
                 return Err(SysErrNo::ELOOP);
             }
 
-            let target_path = symlink_target_path(&candidate, &target);
+            let target_path = symlink_target_path(&resolved_path, &target);
             let mut target_components = path_components(&target_path);
             target_components.append(&mut pending);
             pending = target_components;
-            resolved.clear();
+            resolved_path.truncate(1);
             continue;
         }
 
         if !is_final {
-            let meta = metadata(&candidate, false)?;
-            if meta.kind != VfsNodeKind::Directory {
-                return Err(SysErrNo::ENOTDIR);
+            if !RESOLVED_DIRECTORY_CACHE.read().contains(&resolved_path) {
+                let meta = metadata(&resolved_path, false)?;
+                if meta.kind != VfsNodeKind::Directory {
+                    return Err(SysErrNo::ENOTDIR);
+                }
+                RESOLVED_DIRECTORY_CACHE
+                    .write()
+                    .insert(resolved_path.clone());
             }
         }
-        resolved.push(component);
     }
 
-    Ok(path_from_components(&resolved, None))
+    Ok(resolved_path)
 }
 
 fn resolve_final_symlink(path: &str, nofollow: bool) -> Result<String, SysErrNo> {
@@ -392,29 +486,94 @@ fn resolve_final_symlink(path: &str, nofollow: bool) -> Result<String, SysErrNo>
     )
 }
 
+fn resolve_final_component_symlink(path: &str, nofollow: bool) -> Result<String, SysErrNo> {
+    let norm = normalize_path(path);
+    let Some(target) = lookup_symlink_target(&norm)? else {
+        return Ok(norm);
+    };
+    if nofollow {
+        return Err(SysErrNo::ELOOP);
+    }
+    resolve_path_symlinks(&symlink_target_path(&norm, &target), FinalSymlink::Follow)
+}
+
 fn lookup_symlink_target(path: &str) -> Result<Option<String>, SysErrNo> {
     let norm = normalize_path(path);
     if is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
     }
+    if let Some(cached) = SYMLINK_PROBE_CACHE.read().get(&norm).cloned() {
+        return Ok(cached);
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     if mounted_ext4_backend_path(&norm).is_none() {
         if let Some(target) = MEM_FS.lock().get_symlink(&norm) {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(
+                15,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
+            SYMLINK_PROBE_CACHE
+                .write()
+                .insert(norm, Some(target.clone()));
             return Ok(Some(target));
         }
         if is_tmpfs_path(&norm) {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(
+                15,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
+            SYMLINK_PROBE_CACHE.write().insert(norm, None);
             return Ok(None);
         }
     }
-    match ext4_vol::lookup_kind(&ext4_lookup_path(&norm)) {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        15,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let result = match ext4_vol::lookup_kind(&ext4_lookup_path(&norm)) {
         Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => {
             ext4_vol::readlink_ext4(&ext4_lookup_path(&norm)).map(Some)
         }
         _ => Ok(None),
+    };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        16,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    if let Ok(target) = &result {
+        SYMLINK_PROBE_CACHE.write().insert(norm, target.clone());
     }
+    result
 }
 
 fn resolve_parent_symlinks_for_lookup(path: &str) -> Result<String, SysErrNo> {
-    resolve_path_symlinks(path, FinalSymlink::Preserve)
+    let normalized = normalize_path(path);
+    if let Some(resolved) = RESOLVED_PARENT_CACHE.read().get(&normalized).cloned() {
+        return Ok(resolved);
+    }
+    let parent = parent_path(&normalized);
+    if parent == "/" || RESOLVED_DIRECTORY_CACHE.read().contains(&parent) {
+        let mut cache = RESOLVED_PARENT_CACHE.write();
+        if cache.len() >= RESOLVED_PARENT_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(normalized.clone(), normalized.clone());
+        return Ok(normalized);
+    }
+    let resolved = resolve_path_symlinks(&normalized, FinalSymlink::Preserve)?;
+    let mut cache = RESOLVED_PARENT_CACHE.write();
+    if cache.len() >= RESOLVED_PARENT_CACHE_LIMIT {
+        cache.clear();
+    }
+    cache.insert(normalized, resolved.clone());
+    Ok(resolved)
 }
 
 fn pseudo_inode(path: &str) -> u64 {
@@ -627,6 +786,26 @@ fn cpu_list(count: usize) -> String {
     }
 }
 
+fn cpu_mask_list(mask: usize) -> String {
+    let mut text = String::new();
+    let mut first = true;
+    for cpu in 0..crate::config::MAX_CPUS {
+        if mask & (1usize << cpu) == 0 {
+            continue;
+        }
+        if !first {
+            text.push(',');
+        }
+        first = false;
+        text.push_str(&alloc::format!("{}", cpu));
+    }
+    if first {
+        text.push('0');
+    }
+    text.push('\n');
+    text
+}
+
 fn runtime_pseudo_text(local: &str) -> Option<Vec<u8>> {
     let total_bytes = crate::platform::total_memory_bytes()
         .max(crate::mm::frame_allocator::total_frames().saturating_mul(crate::config::PAGE_SIZE));
@@ -655,33 +834,40 @@ fn runtime_pseudo_text(local: &str) -> Option<Vec<u8>> {
             "MemTotal:       {:>8} kB\nMemFree:        {:>8} kB\nMemAvailable:   {:>8} kB\nBuffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n",
             total_kib, free_kib, free_kib
         ),
-        "/proc/cpuinfo" => alloc::format!(
-            "processor\t: 0\nmodel name\t: {}\nhart\t\t: 0\nisa\t\t: {}\nphysical processors\t: {}\nonline processors\t: {}\n\n",
-            crate::platform::model_name(),
-            crate::platform::cpu_isa(),
-            crate::platform::physical_cpu_count(),
-            crate::platform::online_cpu_count()
-        ),
+        "/proc/cpuinfo" => {
+            let mut info = String::new();
+            for cpu in 0..crate::config::MAX_CPUS {
+                if crate::platform::online_cpu_mask() & (1usize << cpu) == 0 {
+                    continue;
+                }
+                info.push_str(&alloc::format!(
+                    "processor\t: {}\nmodel name\t: {}\nhart\t\t: {}\nisa\t\t: {}\nphysical processors\t: {}\nonline processors\t: {}\n\n",
+                    cpu,
+                    crate::platform::model_name(),
+                    crate::platform::cpu_hardware_id(cpu).unwrap_or(cpu),
+                    crate::platform::cpu_isa(),
+                    crate::platform::physical_cpu_count(),
+                    crate::platform::online_cpu_count()
+                ));
+            }
+            info
+        }
         "/sys/kernel/realtime" => alloc::format!(
             "{}\n",
             usize::from(crate::platform::realtime_ns().is_some())
         ),
         "/sys/devices/system/cpu/online" => {
-            cpu_list(crate::platform::online_cpu_count())
+            cpu_mask_list(crate::platform::online_cpu_mask())
         }
         "/sys/devices/system/cpu/possible" | "/sys/devices/system/cpu/present" => {
-            cpu_list(crate::platform::physical_cpu_count())
+            cpu_mask_list(crate::platform::possible_cpu_mask())
         }
         "/sys/devices/system/node/node0/cpulist" => {
-            cpu_list(crate::platform::online_cpu_count())
+            cpu_mask_list(crate::platform::online_cpu_mask())
         }
         "/sys/devices/system/node/node0/cpumap" => alloc::format!(
             "{:x}\n",
-            if crate::platform::online_cpu_count() >= usize::BITS as usize {
-                usize::MAX
-            } else {
-                (1usize << crate::platform::online_cpu_count()) - 1
-            }
+            crate::platform::online_cpu_mask()
         ),
         "/sys/devices/system/node/node0/meminfo" => alloc::format!(
             "Node 0 MemTotal: {:>8} kB\nNode 0 MemFree:  {:>8} kB\n",
@@ -904,6 +1090,25 @@ fn metadata_from_mem_file(
     meta
 }
 
+fn metadata_from_mem_snapshot(
+    name: &str,
+    len: usize,
+    is_elf: bool,
+    times: super::FileTimes,
+    node: MemNodeMetadata,
+    nlink: u32,
+    ino_key: &str,
+) -> VfsMetadata {
+    let mut meta = metadata_for_mem_file(name, len, is_elf, node, nlink, ino_key);
+    meta.atime_sec = times.atime_sec;
+    meta.atime_nsec = times.atime_nsec;
+    meta.mtime_sec = times.mtime_sec;
+    meta.mtime_nsec = times.mtime_nsec;
+    meta.ctime_sec = times.ctime_sec;
+    meta.ctime_nsec = times.ctime_nsec;
+    meta
+}
+
 fn metadata_from_mem_fd(
     name: &str,
     content: &fd::MemFileContent,
@@ -955,7 +1160,15 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
     if is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
     }
-    if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let vfat_backend = mounted_vfat_backend(&norm);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        26,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    if let Some((volume, backend_path)) = vfat_backend {
         return volume
             .metadata(&backend_path)
             .map(|meta| metadata_from_vfat(&norm, meta));
@@ -964,87 +1177,145 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
     let ext_norm = ext4_lookup_path(&norm);
     let mounted_ext4 = mounted_ext4_backend_path(&norm).is_some();
 
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     if tmpfs_path || !mounted_ext4 {
-        let mem = MEM_FS.lock();
-        if mem.is_dir(&norm) {
-            let (sec, nsec) = current_times();
-            let node = mem
-                .metadata(&norm)
-                .unwrap_or_else(|| default_mem_metadata(0o755));
-            return Ok(VfsMetadata {
-                ino: mem_inode(node, &norm),
-                kind: VfsNodeKind::Directory,
-                mode: S_IFDIR | (node.mode & 0o7777),
-                nlink: 1,
-                uid: node.uid,
-                gid: node.gid,
-                rdev_major: 0,
-                rdev_minor: 0,
-                // Directory st_size is filesystem-defined. Avoid constructing
-                // and sorting the full directory listing on every metadata or
-                // permission lookup; getdents remains the authoritative view.
-                size: 0,
-                blocks: 0,
-                atime_sec: sec,
-                atime_nsec: nsec,
-                mtime_sec: sec,
-                mtime_nsec: nsec,
-                ctime_sec: sec,
-                ctime_nsec: nsec,
-                file_flags: node.flags,
-            });
-        }
-        if let Some(file) = mem.get_file(&norm) {
-            let node = mem.metadata(&norm).unwrap_or_else(|| {
-                default_mem_metadata(if file.is_elf_image() { 0o777 } else { 0o666 })
-            });
-            let nlink = mem.file_link_count(&norm);
-            let link_key = mem.file_link_key(&norm).unwrap_or_else(|| norm.clone());
-            return Ok(metadata_from_mem_file(file, node, nlink, &link_key));
-        }
-        if let Some(target) = mem.get_symlink(&norm) {
-            if follow_symlink {
-                drop(mem);
-                let resolved = resolve_final_symlink(&norm, false)?;
-                return metadata(&resolved, true);
-            }
-            let node = mem
-                .metadata(&norm)
-                .unwrap_or_else(|| default_mem_metadata(0o777));
-            return Ok(metadata_for_mem_symlink(&norm, &target, node));
-        }
-        if let Some(kind) = mem.get_special(&norm) {
-            let node = mem
-                .metadata(&norm)
-                .unwrap_or_else(|| default_mem_metadata(0o666));
-            return Ok(metadata_for_mem_special(&norm, kind, node));
+        let snapshot = MEM_FS.lock().node_snapshot(&norm);
+        if let Some(snapshot) = snapshot {
+            let result = match snapshot {
+                MemNodeSnapshot::Directory { metadata: node } => {
+                    let (sec, nsec) = current_times();
+                    Ok(VfsMetadata {
+                        ino: mem_inode(node, &norm),
+                        kind: VfsNodeKind::Directory,
+                        mode: S_IFDIR | (node.mode & 0o7777),
+                        nlink: 1,
+                        uid: node.uid,
+                        gid: node.gid,
+                        rdev_major: 0,
+                        rdev_minor: 0,
+                        // Directory st_size is filesystem-defined. Avoid constructing
+                        // and sorting the full directory listing on every metadata or
+                        // permission lookup; getdents remains the authoritative view.
+                        size: 0,
+                        blocks: 0,
+                        atime_sec: sec,
+                        atime_nsec: nsec,
+                        mtime_sec: sec,
+                        mtime_nsec: nsec,
+                        ctime_sec: sec,
+                        ctime_nsec: nsec,
+                        file_flags: node.flags,
+                    })
+                }
+                MemNodeSnapshot::File {
+                    len,
+                    is_elf,
+                    times,
+                    metadata: node,
+                    nlink,
+                    link_key,
+                } => Ok(metadata_from_mem_snapshot(
+                    &norm, len, is_elf, times, node, nlink, &link_key,
+                )),
+                MemNodeSnapshot::Symlink {
+                    target,
+                    metadata: node,
+                } => {
+                    if follow_symlink {
+                        let resolved = resolve_final_symlink(&norm, false)?;
+                        return metadata(&resolved, true);
+                    }
+                    Ok(metadata_for_mem_symlink(&norm, &target, node))
+                }
+                MemNodeSnapshot::Special {
+                    kind,
+                    metadata: node,
+                } => Ok(metadata_for_mem_special(&norm, kind, node)),
+            };
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(
+                27,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
+            return result;
         }
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        27,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
 
     if tmpfs_path {
         return Err(missing_path_errno(&norm));
     }
 
-    let ext_path = match ext4_vol::lookup_kind(&ext_norm) {
-        Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) if follow_symlink => {
-            ext4_vol::resolve_symlinks(&ext_norm)?
-        }
-        Some((_ino, kind)) => {
-            let meta = ext4_vol::metadata(&ext_norm)?;
-            let mut out = metadata_from_ext4(meta);
-            out.kind = kind_from_ext4(kind);
-            return Ok(out);
-        }
-        None => return Err(missing_path_errno(&norm)),
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let ext_metadata = ext4_vol::metadata_with_kind(&ext_norm);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        28,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    let (ext_meta, ext_kind) = match ext_metadata {
+        Ok(result) => result,
+        Err(SysErrNo::ENOENT) => return Err(missing_path_errno(&norm)),
+        Err(error) => return Err(error),
     };
-
-    ext4_vol::metadata(&ext_path).map(metadata_from_ext4)
+    if ext_kind == ext4_vol::Ext4NodeKind::Symlink && follow_symlink {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let started_at = crate::timer::get_time_us();
+        let ext_path = ext4_vol::resolve_symlinks(&ext_norm)?;
+        let result = ext4_vol::metadata(&ext_path).map(metadata_from_ext4);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(
+            29,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
+        return result;
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let mut out = metadata_from_ext4(ext_meta);
+    out.kind = kind_from_ext4(ext_kind);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        30,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    Ok(out)
 }
 
 pub fn metadata_for_lookup(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrNo> {
-    let norm = resolve_parent_symlinks_for_lookup(path)?;
-    check_search_access(&norm, CredentialIdentity::Filesystem)?;
-    metadata(&norm, follow_symlink)
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let norm = resolve_parent_symlinks_for_lookup(path);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        23,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    let norm = norm?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let access = check_search_access(&norm, CredentialIdentity::Filesystem);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        24,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    access?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let result = metadata(&norm, follow_symlink);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        25,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    result
 }
 
 fn mount_record_line(entry: &MountEntry) -> String {
@@ -1153,6 +1424,7 @@ fn resolve_mount_backend(source: &str, fstype: &str) -> Result<(String, MountBac
 }
 
 pub fn init_mount_table() {
+    clear_symlink_probe_cache();
     let mut mounts = MOUNT_TABLE.lock();
     mounts.clear();
     let fstype = if ext4_vol::is_ext4_mounted() {
@@ -1184,6 +1456,7 @@ pub fn mount_fs(
     fstype: &str,
     flags: usize,
 ) -> Result<(), SysErrNo> {
+    let _cache_guard = MountCacheGuard::begin();
     let source = normalize_path(source);
     let logical_target = normalize_path(logical_target);
     let host_target = normalize_path(host_target);
@@ -1239,6 +1512,7 @@ pub fn mount_fs(
 }
 
 pub fn umount_fs(logical_target: &str, host_target: &str, flags: usize) -> Result<(), SysErrNo> {
+    let _cache_guard = MountCacheGuard::begin();
     const MNT_FORCE: usize = 1;
     const MNT_DETACH: usize = 2;
     const MNT_EXPIRE: usize = 4;
@@ -1495,6 +1769,15 @@ fn check_access_with_filesystem(
     )
 }
 
+fn check_access_with_filesystem_metadata(
+    path: &str,
+    meta: &VfsMetadata,
+    access_mode: usize,
+) -> Result<(), SysErrNo> {
+    check_search_access(path, CredentialIdentity::Filesystem)?;
+    check_metadata_access_with_identity(meta, access_mode, CredentialIdentity::Filesystem)
+}
+
 fn check_access_with_identity(
     path: &str,
     follow_symlink: bool,
@@ -1645,6 +1928,13 @@ fn check_chown_permission(
 
 fn check_search_access(path: &str, identity: CredentialIdentity) -> Result<(), SysErrNo> {
     const X_OK: usize = 1;
+    // Root bypasses directory DAC search checks in
+    // check_metadata_access_with_identity(). Avoid loading metadata for every
+    // parent only to reach the same result, which is especially costly for
+    // repeated canonicalization of deep toolchain paths.
+    if identity.uid(&current_credentials()) == 0 {
+        return Ok(());
+    }
     let norm = normalize_path(path);
     let components: Vec<&str> = norm.split('/').filter(|part| !part.is_empty()).collect();
     if components.len() <= 1 {
@@ -1726,7 +2016,7 @@ fn is_elf_image(data: &[u8]) -> bool {
     data.len() >= 4 && &data[..4] == b"\x7fELF"
 }
 
-pub fn read_executable_file(name: &str) -> Option<Vec<u8>> {
+pub fn read_executable_file(name: &str) -> Option<Arc<Vec<u8>>> {
     let original = normalize_path(name);
     if is_removed(&original) {
         return None;
@@ -1740,12 +2030,15 @@ pub fn read_executable_file(name: &str) -> Option<Vec<u8>> {
         // execve must be able to inspect both ELF images and shebang scripts.
         // Keep VFAT consistent with the ext4/tmpfs paths below; the caller
         // performs the actual ELF/shebang validation.
-        return volume.read_file(&backend_path).ok();
+        return volume.read_file(&backend_path).ok().map(Arc::new);
     }
 
     let tmpfs_path = is_tmpfs_path(&norm);
     let mem_data = if tmpfs_path || mounted_ext4_backend_path(&norm).is_none() {
-        MEM_FS.lock().get_file(&norm).map(|f| f.to_vec())
+        MEM_FS
+            .lock()
+            .get_file(&norm)
+            .map(|f| Arc::new(f.to_vec()))
     } else {
         None
     };
@@ -1757,7 +2050,7 @@ pub fn read_executable_file(name: &str) -> Option<Vec<u8>> {
         return mem_data;
     }
 
-    let ext4_data = ext4_vol::slurp_regular_file(&ext4_lookup_path(&norm));
+    let ext4_data = ext4_vol::slurp_regular_file_shared(&ext4_lookup_path(&norm));
     if let Some(data) = ext4_data {
         if is_elf_image(&data) {
             if mem_data.is_some() {
@@ -1780,19 +2073,28 @@ fn basename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-fn read_interpreter_logical(root: &str, logical: &str) -> Option<(String, String, Vec<u8>)> {
+fn read_interpreter_logical(
+    root: &str,
+    logical: &str,
+) -> Option<(String, String, Arc<Vec<u8>>)> {
     let logical = normalize_path(logical);
     let host = super::apply_root(root, &logical);
     read_executable_file(&host).map(|data| (logical, host, data))
 }
 
-fn read_interpreter_host(logical: &str, host: &str) -> Option<(String, String, Vec<u8>)> {
+fn read_interpreter_host(
+    logical: &str,
+    host: &str,
+) -> Option<(String, String, Arc<Vec<u8>>)> {
     let logical = normalize_path(logical);
     let host = normalize_path(host);
     read_executable_file(&host).map(|data| (logical, host, data))
 }
 
-pub fn read_interpreter(root: &str, interp: &str) -> Option<(String, String, Vec<u8>)> {
+pub fn read_interpreter(
+    root: &str,
+    interp: &str,
+) -> Option<(String, String, Arc<Vec<u8>>)> {
     let interp = normalize_path(interp);
     if let Some(found) = read_interpreter_logical(root, &interp) {
         return Some(found);
@@ -2010,6 +2312,7 @@ pub fn sync_all() -> Result<(), SysErrNo> {
 
 pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
     let norm = normalize_path(path);
+    let _cache_guard = NamespaceCacheGuard::path(&norm, false);
     if is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
     }
@@ -2062,6 +2365,7 @@ pub fn remove_file(path: &str) -> Result<(), SysErrNo> {
 }
 
 pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
+    let _cache_guard = NamespaceCacheGuard::path(path, true);
     let norm = resolve_parent_symlinks_for_lookup(path)?;
     if is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
@@ -2122,6 +2426,8 @@ pub fn remove_dir(path: &str) -> Result<(), SysErrNo> {
 pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrNo> {
     let old = normalize_path(old);
     let new = normalize_path(new);
+    let _old_cache_guard = NamespaceCacheGuard::path(&old, true);
+    let _new_cache_guard = NamespaceCacheGuard::path(&new, true);
     if is_removed(&old) {
         return Err(SysErrNo::ENOENT);
     }
@@ -2221,6 +2527,8 @@ pub fn rename_path(old: &str, new: &str, no_replace: bool) -> Result<(), SysErrN
 pub fn rename_exchange_path(old: &str, new: &str) -> Result<(), SysErrNo> {
     let old = normalize_path(old);
     let new = normalize_path(new);
+    let _old_cache_guard = NamespaceCacheGuard::path(&old, true);
+    let _new_cache_guard = NamespaceCacheGuard::path(&new, true);
     if old == new {
         return Ok(());
     }
@@ -2277,6 +2585,7 @@ pub fn rename_exchange_path(old: &str, new: &str) -> Result<(), SysErrNo> {
 pub fn link_path(old: &str, new: &str, follow_old: bool) -> Result<(), SysErrNo> {
     let old = normalize_path(old);
     let new = normalize_path(new);
+    let _cache_guard = NamespaceCacheGuard::path(&new, false);
     if is_removed(&old) {
         return Err(SysErrNo::ENOENT);
     }
@@ -2414,6 +2723,7 @@ pub fn link_mem_file_fd(file: &mut fd::FileDescriptor, new: &str) -> Result<(), 
 
 pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
     let norm = normalize_path(link_path);
+    let _cache_guard = NamespaceCacheGuard::path(&norm, false);
     if file_exists(&norm) || dir_exists(&norm) {
         return Err(SysErrNo::EEXIST);
     }
@@ -2453,30 +2763,87 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
     Err(SysErrNo::ENOENT)
 }
 
+fn cache_readlink_result(path: &str, result: &Result<String, SysErrNo>) {
+    let mut cache = READLINK_RESULT_CACHE.write();
+    if cache.len() >= READLINK_RESULT_CACHE_LIMIT {
+        cache.clear();
+    }
+    cache.insert(path.into(), result.clone());
+}
+
 pub fn read_link(path: &str) -> Result<String, SysErrNo> {
-    let norm = resolve_parent_symlinks_for_lookup(path)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let norm = resolve_parent_symlinks_for_lookup(path);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        11,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    let norm = norm?;
     if is_removed(&norm) {
         return Err(SysErrNo::ENOENT);
     }
-    check_search_access(&norm, CredentialIdentity::Filesystem)?;
+    if current_credentials().fsuid == 0 {
+        if let Some(cached) = READLINK_RESULT_CACHE.read().get(&norm).cloned() {
+            return cached;
+        }
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let access = check_search_access(&norm, CredentialIdentity::Filesystem);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        12,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    access?;
     if let Some(meta) = vfat_metadata_for_path(&norm) {
         meta?;
         return Err(SysErrNo::EINVAL);
     }
-    if MEM_FS.lock().exists(&norm) {
-        if let Some(target) = MEM_FS.lock().get_symlink(&norm) {
-            return Ok(target);
+    if let Some(cached) = READLINK_RESULT_CACHE.read().get(&norm).cloned() {
+        return cached;
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let mem_result = {
+        let mem = MEM_FS.lock();
+        if mem.exists(&norm) {
+            Some(mem.get_symlink(&norm))
+        } else {
+            None
         }
-        return Err(SysErrNo::EINVAL);
+    };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        13,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    if let Some(target) = mem_result {
+        let result = target.ok_or(SysErrNo::EINVAL);
+        cache_readlink_result(&norm, &result);
+        return result;
     }
     if is_tmpfs_path(&norm) {
-        return Err(missing_path_errno(&norm));
+        let result = Err(missing_path_errno(&norm));
+        cache_readlink_result(&norm, &result);
+        return result;
     }
-    match ext4_vol::lookup_kind(&norm) {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let result = match ext4_vol::lookup_kind(&norm) {
         Some((_ino, ext4_vol::Ext4NodeKind::Symlink)) => ext4_vol::readlink_ext4(&norm),
         Some(_) => Err(SysErrNo::EINVAL),
         None => Err(missing_path_errno(&norm)),
-    }
+    };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        14,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    cache_readlink_result(&norm, &result);
+    result
 }
 
 pub fn truncate_path(path: &str, size: u64) -> Result<(), SysErrNo> {
@@ -2946,6 +3313,7 @@ pub fn set_times_fd(
 
 pub fn create_dir_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
     let norm = resolve_parent_symlinks_for_lookup(path)?;
+    let _cache_guard = NamespaceCacheGuard::path(&norm, false);
     if file_exists(&norm) || dir_exists(&norm) {
         return Err(SysErrNo::EEXIST);
     }
@@ -2987,6 +3355,7 @@ pub fn create_dir(path: &str) -> Result<(), SysErrNo> {
 
 pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
     let norm = normalize_path(path);
+    let _cache_guard = NamespaceCacheGuard::path(&norm, false);
     if file_exists(&norm) || dir_exists(&norm) {
         return Err(SysErrNo::EEXIST);
     }
@@ -3023,6 +3392,7 @@ pub fn create_regular_file(path: &str, mode: u32) -> Result<u32, SysErrNo> {
 
 pub fn create_special_node(path: &str, kind: MemSpecialKind, mode: u32) -> Result<u32, SysErrNo> {
     let norm = normalize_path(path);
+    let _cache_guard = NamespaceCacheGuard::path(&norm, false);
     if file_exists(&norm) || dir_exists(&norm) {
         return Err(SysErrNo::EEXIST);
     }
@@ -3244,8 +3614,15 @@ pub fn open_path(
 
     let path_norm = normalize_path(host_path);
     let logical_norm = normalize_path(logical_path);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     refresh_runtime_pseudo_file(&path_norm);
     refresh_proc_pid_stat(&path_norm)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        31,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
     let accmode = flags & O_ACCMODE;
     if accmode == O_ACCMODE {
         return Err(SysErrNo::EINVAL);
@@ -3281,11 +3658,18 @@ pub fn open_path(
         return Err(SysErrNo::ENOENT);
     }
 
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     let lookup_norm = if !removed {
         resolve_parent_symlinks_for_lookup(&path_norm)?
     } else {
         path_norm.clone()
     };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        32,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
 
     if path_only {
         if want_create || want_trunc {
@@ -3294,11 +3678,18 @@ pub fn open_path(
         return open_path_descriptor(&lookup_norm, &logical_norm, flags, !nofollow);
     }
 
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     let open_norm = if !removed {
-        resolve_final_symlink(&lookup_norm, nofollow)?
+        resolve_final_component_symlink(&lookup_norm, nofollow)?
     } else {
         lookup_norm
     };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        33,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
     if (want_create || want_trunc || write_ok) && is_readonly_mount_path(&open_norm) {
         return Err(SysErrNo::EROFS);
     }
@@ -3347,10 +3738,17 @@ pub fn open_path(
         });
     }
     let tmpfs_path = is_tmpfs_path(&open_norm);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     let mounted_ext4 = !tmpfs_path && mounted_ext4_backend_path(&open_norm).is_some();
     let mem_has_file = !mounted_ext4 && MEM_FS.lock().get_file(&open_norm).is_some();
     let mem_has_special = !mounted_ext4 && MEM_FS.lock().get_special(&open_norm).is_some();
     let ext_path_norm = ext4_lookup_path(&open_norm);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        34,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
 
     if want_tmpfile {
         if want_create {
@@ -3437,13 +3835,20 @@ pub fn open_path(
         return Err(SysErrNo::ENXIO);
     }
 
-    if (!mounted_ext4 && MEM_FS.lock().is_dir(&open_norm))
-        || (!tmpfs_path && ext4_vol::ext4_dir_path_exists(&ext_path_norm))
-    {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let mem_is_dir = !mounted_ext4 && MEM_FS.lock().is_dir(&open_norm);
+    let ext_is_dir = !tmpfs_path && ext4_vol::ext4_dir_path_exists(&ext_path_norm);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        35,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    if mem_is_dir || ext_is_dir {
         if write_ok || want_trunc || want_create {
             return Err(SysErrNo::EISDIR);
         }
-        let open_path = if !mounted_ext4 && MEM_FS.lock().is_dir(&open_norm) {
+        let open_path = if mem_is_dir {
             open_norm.clone()
         } else {
             ext_path_norm.clone()
@@ -3461,57 +3866,82 @@ pub fn open_path(
         return Err(missing_path_errno(&open_norm));
     }
 
-    if !tmpfs_path && !removed && ext4_vol::ext4_regular_file_exists(&ext_path_norm) {
-        if want_excl && want_create {
-            return Err(SysErrNo::EEXIST);
+    if !tmpfs_path && !removed {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let started_at = crate::timer::get_time_us();
+        if let Some((ino, ext4_vol::Ext4NodeKind::Regular)) =
+            ext4_vol::lookup_kind(&ext_path_norm)
+        {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(
+                36,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
+            if want_excl && want_create {
+                return Err(SysErrNo::EEXIST);
+            }
+            let mut meta = metadata_from_ext4(ext4_vol::metadata_by_ino(ino)?);
+            meta.kind = VfsNodeKind::Regular;
+            check_access_with_filesystem_metadata(&ext_path_norm, &meta, open_access)?;
+            if noatime {
+                check_noatime_permission(&meta)?;
+            }
+            if want_trunc && write_ok {
+                ext4_vol::truncate_regular_ext4(&ext_path_norm, 0)?;
+            }
+            let base_off = if append && write_ok {
+                ext4_vol::regular_file_size(ino)?
+            } else {
+                0
+            };
+            ext4_vol::open_regular_ino(ino);
+            return Ok(fd::FileDescriptor::Ext4Regular {
+                ino,
+                offset: base_off,
+                ofd_owner: fd::new_open_file_description_owner(),
+                readable: read_ok,
+                writable: write_ok,
+                append,
+            });
         }
-        let Some((ino, is_dir)) = ext4_vol::lookup_path(&ext_path_norm) else {
-            return Err(SysErrNo::ENOENT);
-        };
-        if is_dir {
-            return Err(SysErrNo::EISDIR);
-        }
-        check_access_with_filesystem(&ext_path_norm, true, open_access)?;
-        if noatime {
-            let meta = metadata(&ext_path_norm, true)?;
-            check_noatime_permission(&meta)?;
-        }
-        if want_trunc && write_ok {
-            ext4_vol::truncate_regular_ext4(&ext_path_norm, 0)?;
-        }
-        let base_off = if append && write_ok {
-            ext4_vol::regular_file_size(ino)?
-        } else {
-            0
-        };
-        ext4_vol::open_regular_ino(ino);
-        return Ok(fd::FileDescriptor::Ext4Regular {
-            ino,
-            offset: base_off,
-            ofd_owner: fd::new_open_file_description_owner(),
-            readable: read_ok,
-            writable: write_ok,
-            append,
-        });
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(
+            36,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
     }
 
     if want_create {
         let parent = parent_path(&open_norm);
         let parent_tmpfs = is_tmpfs_path(&parent);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let started_at = crate::timer::get_time_us();
         let parent_mounted_ext4 = !parent_tmpfs && mounted_ext4_backend_path(&parent).is_some();
         let mem_parent = !parent_mounted_ext4 && MEM_FS.lock().is_dir(&parent);
         let ext_parent =
             !parent_tmpfs && ext4_vol::ext4_dir_path_exists(&ext4_lookup_path(&parent));
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(
+            37,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
         if mem_parent || ext_parent {
             check_create_access(&parent)?;
         }
         if mem_parent && (super::is_memfs_overlay_create_dir(&parent) || !ext_parent) {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let started_at = crate::timer::get_time_us();
             MEM_FS
                 .lock()
                 .add_file_with_mode(&open_norm, Vec::new(), mode);
             clear_whiteout(&open_norm);
             let backing = linked_mem_file_backing(&open_norm)?;
             let node = MEM_FS.lock().metadata(&open_norm);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(
+                38,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
             return Ok(fd::FileDescriptor::MemFile {
                 name: open_norm,
                 backing,
@@ -3526,9 +3956,16 @@ pub fn open_path(
         }
         if ext_parent {
             let create_path = ext4_lookup_path(&open_norm);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let started_at = crate::timer::get_time_us();
             let ino = ext4_vol::create_regular_ext4_with_mode(&create_path, mode)?;
             clear_whiteout(&open_norm);
             ext4_vol::open_regular_ino(ino);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(
+                38,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
             return Ok(fd::FileDescriptor::Ext4Regular {
                 ino,
                 offset: 0,
@@ -3539,12 +3976,19 @@ pub fn open_path(
             });
         }
         if mem_parent {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let started_at = crate::timer::get_time_us();
             MEM_FS
                 .lock()
                 .add_file_with_mode(&open_norm, Vec::new(), mode);
             clear_whiteout(&open_norm);
             let backing = linked_mem_file_backing(&open_norm)?;
             let node = MEM_FS.lock().metadata(&open_norm);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(
+                38,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
             return Ok(fd::FileDescriptor::MemFile {
                 name: open_norm,
                 backing,
@@ -3557,10 +4001,26 @@ pub fn open_path(
                 node,
             });
         }
-        return Err(missing_path_errno(&open_norm));
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let started_at = crate::timer::get_time_us();
+        let err = missing_path_errno(&open_norm);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(
+            39,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
+        return Err(err);
     }
 
-    Err(missing_path_errno(&open_norm))
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let err = missing_path_errno(&open_norm);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        39,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    Err(err)
 }
 
 pub fn list_dir(path: &str) -> Result<Vec<fd::DirEntryRecord>, SysErrNo> {

@@ -1,0 +1,9 @@
+
+
+Algorithm : SHA256
+Hash      : A9B216E09653702E597E9CCCEEC56594A18E5A5591FCD29E6BE24F9A5D3062AE
+Path      : D:\wll_os-master1\target\riscv64gc-unknown-none-elf\release\wll_OS
+
+
+
+

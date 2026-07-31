@@ -27,11 +27,22 @@ _boot_trampoline_stack:
     .globl _boot_trampoline_stack_top
 _boot_trampoline_stack_top:
 
+    .section .bss.smp_stacks, "aw", @nobits
+    .globl _smp_boot_stacks
+    .balign 16
+_smp_boot_stacks:
+    .space 1048576
+    .globl _smp_boot_stacks_end
+_smp_boot_stacks_end:
+
     .section .text.entry, "ax", @progbits
     .globl _start
     .type _start, @function
     .p2align 4
 _start:
+    # Keep a stable kernel CPU identifier in tp. user_restore/uservec preserve
+    # the kernel tp value across every user transition.
+    addi tp, a0, 1
     # ---- Clear BSS ----
     la t0, _sbss
     la t1, _ebss
@@ -76,3 +87,22 @@ bss_done:
     # rust_main is -> !, should not return
 hang:
     j hang
+
+    .globl _secondary_start
+    .type _secondary_start, @function
+    .p2align 4
+_secondary_start:
+    addi tp, a0, 1
+    mv sp, a1
+
+    la t0, boot_page_table
+    srli t0, t0, 12
+    li t1, 8
+    slli t1, t1, 60
+    or t0, t0, t1
+    csrw satp, t0
+    sfence.vma
+    csrw sscratch, zero
+
+    la t1, rust_secondary_main
+    jalr x0, t1

@@ -1,0 +1,35 @@
+{
+  "arch": "loongarch64",
+  "stage": "complete",
+  "image": "D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-la-pub.img\\sdcard-la-pub.img",
+  "image_bytes": 15032385536,
+  "memory": "8G",
+  "smp": 8,
+  "host_elapsed_seconds": 929.518490699993,
+  "reached_stage_marker": false,
+  "result_lines": [
+    "BUILDSTORM_TOOLCHAIN ok",
+    "BUILDSTORM_MINIBUILD ok"
+  ],
+  "qemu_args": [
+    "C:\\Program Files\\qemu\\qemu-system-loongarch64.exe",
+    "-snapshot",
+    "-kernel",
+    "D:\\wll_os-master1\\target\\loongarch64-unknown-none\\release\\wll_OS",
+    "-m",
+    "8G",
+    "-smp",
+    "8",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "stdio",
+    "-drive",
+    "file=D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-la-pub.img\\sdcard-la-pub.img,if=none,format=raw,id=x0",
+    "-no-reboot",
+    "-device",
+    "virtio-blk-pci,drive=x0"
+  ]
+}

@@ -1,0 +1,5 @@
+timestamp=20260731-200138
+reason=diagnostic stopped after VFS hotspot snapshots before fastpath rerun
+command=python scripts\run_buildstorm.py --arch riscv64 --image D:\BaiduNetdiskDownload\2026OSImage-Pub\sdcard-rv-pub.img\sdcard-rv-pub.img --stage complete --timeout 1800 --memory 16G --smp 8 --build-features buildstorm-diagnostics,perf-counters
+branch=wbq_final_buildstorm_compile
+head=2fb4254e24cdba11d2d408be4c2657449c6923e9

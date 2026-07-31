@@ -768,6 +768,10 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         }
 
         {
+            // The syscall runs under the outgoing user page table. Switch to
+            // the stable kernel root before replacing it so PageTableWrapper
+            // can release the old root and all of its user page-table frames.
+            crate::trap::restore_kernel_page_table();
             let mut ms = task.memory_set.lock();
             log::info!("[syscall] execve: replacing memory set");
             *ms = new_memory_set;
@@ -1127,17 +1131,10 @@ pub fn sys_clone(
     let memory_set = if share_vm {
         parent.memory_set.clone()
     } else {
-        // fork_cow copies backing frames through their physical mappings. The
-        // syscall arrived with the parent's user page table active, so perform
-        // that copy under the kernel page table and always restore the parent
-        // mapping before returning, including on allocation failure.
-        crate::trap::restore_kernel_page_table();
-        let child_memory = {
-            let mut parent_memory = parent.memory_set.lock();
-            let result = parent_memory.fork_cow();
-            parent_memory.activate();
-            result
-        }?;
+        // fork_cow copies backing frames through physical mappings while the
+        // syscall remains on the kernel page table.  The parent address space
+        // is reactivated by the scheduler before its next user-mode entry.
+        let child_memory = parent.memory_set.lock().fork_cow()?;
         new_shared_memory_set(child_memory)
     };
     let mm = if share_vm {
@@ -1264,6 +1261,9 @@ pub fn sys_clone(
         wait_token: AtomicUsize::new(0),
         sched_policy: AtomicUsize::new(parent.sched_policy.load(Ordering::Relaxed)),
         sched_priority: AtomicUsize::new(parent.sched_priority.load(Ordering::Relaxed)),
+        affinity_mask: AtomicUsize::new(parent.affinity_mask.load(Ordering::Acquire)),
+        blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
+        running_cpu: AtomicUsize::new(crate::task::NO_CPU),
     });
     crate::task::manager::register_task(&child);
     thread_group.add_member(&child);

@@ -1,0 +1,51 @@
+{
+  "classification": "capability-pass",
+  "arch": "loongarch64",
+  "image": "D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-la-pub.img\\sdcard-la-pub.img",
+  "image_bytes": 15032385536,
+  "memory": "8G",
+  "smp": 8,
+  "build_command": [
+    "cargo",
+    "+nightly-2025-01-18",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--target",
+    "loongarch64-unknown-none",
+    "--no-default-features",
+    "--features",
+    "loongarch,smp-regression"
+  ],
+  "build_elapsed_seconds": 10.171999999998661,
+  "build_log": "D:\\wll_os-master1\\_tmp\\smp-regression-build-loongarch64.log",
+  "kernel_sha256": "b01d2505dd3c98ffb3df6157b38ab3bbafa88f1b9eabf7a7562e7cf8a5a88b4b",
+  "qemu_version": "QEMU emulator version 11.0.0 (v11.0.0-12122-ga4bb4b10c9)",
+  "host_elapsed_seconds": 0.375,
+  "passed": true,
+  "result_lines": [
+    "[smp-regression] pass cpus=8 mask=0xff dispatch=0xff tlb_targets=0x7f asid_pair=1/2 reused_asid=1 asid_check=root-csr isolation_iters=64 heap_stress_mib=160 checksum=90"
+  ],
+  "qemu_args": [
+    "C:\\Program Files\\qemu\\qemu-system-loongarch64.exe",
+    "-snapshot",
+    "-kernel",
+    "D:\\wll_os-master1\\target\\loongarch64-unknown-none\\release\\wll_OS",
+    "-m",
+    "8G",
+    "-smp",
+    "8",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "stdio",
+    "-drive",
+    "file=D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-la-pub.img\\sdcard-la-pub.img,if=none,format=raw,id=x0",
+    "-no-reboot",
+    "-device",
+    "virtio-blk-pci,drive=x0"
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "arch": "loongarch64",
+  "stage": "minibuild",
+  "image": "D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-la-pub.img\\sdcard-la-pub.img",
+  "image_bytes": 15032385536,
+  "memory": "8G",
+  "smp": 8,
+  "build_command": [
+    "cargo",
+    "+nightly-2025-01-18",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--target",
+    "loongarch64-unknown-none",
+    "--no-default-features",
+    "--features",
+    "loongarch"
+  ],
+  "build_elapsed_seconds": 0.23500000000058208,
+  "build_log": "D:\\wll_os-master1\\_tmp\\release-build-loongarch64.log",
+  "kernel_sha256": "8a976994e5032ef794deacde4004ad5f139733abe93901165f5dd7106867f88e",
+  "qemu_version": "QEMU emulator version 11.0.0 (v11.0.0-12122-ga4bb4b10c9)",
+  "host_elapsed_seconds": 27.139999999999418,
+  "reached_stage_marker": true,
+  "result_lines": [
+    "BUILDSTORM_TOOLCHAIN ok",
+    "BUILDSTORM_MINIBUILD ok"
+  ],
+  "qemu_args": [
+    "C:\\Program Files\\qemu\\qemu-system-loongarch64.exe",
+    "-snapshot",
+    "-kernel",
+    "D:\\wll_os-master1\\target\\loongarch64-unknown-none\\release\\wll_OS",
+    "-m",
+    "8G",
+    "-smp",
+    "8",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "stdio",
+    "-drive",
+    "file=D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-la-pub.img\\sdcard-la-pub.img,if=none,format=raw,id=x0",
+    "-no-reboot",
+    "-device",
+    "virtio-blk-pci,drive=x0"
+  ]
+}

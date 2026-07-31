@@ -1,0 +1,497 @@
+diff --git a/os/src/syscall/fs.rs b/os/src/syscall/fs.rs
+index fcb7e8f..1584626 100644
+--- a/os/src/syscall/fs.rs
++++ b/os/src/syscall/fs.rs
+@@ -1,6 +1,8 @@
+ use super::SyscallRet;
+ use crate::console::putchar;
+-use crate::task::wait_queue::{sleep_on_io_if, sleep_on_io_key_if, WaitKey, WaitOutcome};
++use crate::task::wait_queue::{
++    sleep_on_io_if, sleep_on_io_key_if, sleep_on_io_keys_if, WaitKey, WaitOutcome,
++};
+ use crate::task::{current_task, SharedFdTable};
+ use crate::utils::error::SysErrNo;
+ use alloc::string::String;
+@@ -2177,8 +2179,24 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
+ /// - flags: 打开标志
+ /// - mode: 文件模式
+ pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> SyscallRet {
+-    let (logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+-    open_resolved_path(logical_path, host_path, flags, mode)
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let started_at = crate::timer::get_time_us();
++    let resolved = resolve_host_path(dirfd, pathname);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_phase(
++        3,
++        crate::timer::get_time_us().saturating_sub(started_at),
++    );
++    let (logical_path, host_path) = resolved?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let started_at = crate::timer::get_time_us();
++    let result = open_resolved_path(logical_path, host_path, flags, mode);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_phase(
++        4,
++        crate::timer::get_time_us().saturating_sub(started_at),
++    );
++    result
+ }
+ 
+ fn open_resolved_path(
+@@ -2805,11 +2823,35 @@ pub fn sys_readlinkat(
+         return Err(SysErrNo::EINVAL);
+     }
+ 
+-    let path = read_user_path(pathname)?;
+-    let target = readlink_target_at(dirfd, &path)?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let started_at = crate::timer::get_time_us();
++    let path = read_user_path(pathname);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_phase(
++        0,
++        crate::timer::get_time_us().saturating_sub(started_at),
++    );
++    let path = path?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let started_at = crate::timer::get_time_us();
++    let target = readlink_target_at(dirfd, &path);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_phase(
++        1,
++        crate::timer::get_time_us().saturating_sub(started_at),
++    );
++    let target = target?;
+     let bytes = target.as_bytes();
+     let n = bytes.len().min(bufsiz);
+-    copy_to_user(buf, &bytes[..n])?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let started_at = crate::timer::get_time_us();
++    let copied = copy_to_user(buf, &bytes[..n]);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_phase(
++        2,
++        crate::timer::get_time_us().saturating_sub(started_at),
++    );
++    copied?;
+     Ok(n)
+ }
+ 
+@@ -2966,6 +3008,8 @@ pub fn sys_close(fd: usize) -> SyscallRet {
+ 
+     // 获取当前任务的文件描述符表
+     if let Some(task) = current_task() {
++        #[cfg(feature = "buildstorm-diagnostics")]
++        let started_at = crate::timer::get_time_us();
+         let old = {
+             let inner = task.inner.lock();
+             let fd_table = inner.fd_table.clone();
+@@ -2973,10 +3017,22 @@ pub fn sys_close(fd: usize) -> SyscallRet {
+             let mut fds = fd_table.lock();
+             fds.remove(fd)?
+         };
++        #[cfg(feature = "buildstorm-diagnostics")]
++        crate::buildstorm_diagnostics::note_phase(
++            5,
++            crate::timer::get_time_us().saturating_sub(started_at),
++        );
+         if let Some(file_key) = fd_lock_key(&old) {
+             release_posix_locks_for_file(task.thread_group.tgid(), &file_key);
+         }
++        #[cfg(feature = "buildstorm-diagnostics")]
++        let started_at = crate::timer::get_time_us();
+         super::with_kernel_page_table(|| drop(old));
++        #[cfg(feature = "buildstorm-diagnostics")]
++        crate::buildstorm_diagnostics::note_phase(
++            6,
++            crate::timer::get_time_us().saturating_sub(started_at),
++        );
+         Ok(0)
+     } else {
+         Err(SysErrNo::ESRCH)
+@@ -4221,6 +4277,66 @@ fn poll_once(fds: *mut PollFd, nfds: usize) -> Result<usize, SysErrNo> {
+     Ok(ready)
+ }
+ 
++fn push_unique_wait_key(keys: &mut Vec<WaitKey>, key: WaitKey) {
++    if !keys.contains(&key) {
++        keys.push(key);
++    }
++}
++
++fn poll_wait_keys(fds: *mut PollFd, nfds: usize) -> Result<Vec<WaitKey>, SysErrNo> {
++    let task = current_task().ok_or(SysErrNo::ESRCH)?;
++    let inner = task.inner.lock();
++    let fd_table = inner.fd_table.lock();
++
++    let mut keys = Vec::new();
++    for i in 0..nfds {
++        let pfd = copy_object_from_user::<PollFd>(unsafe { fds.add(i) })?;
++        if pfd.fd < 0 {
++            continue;
++        }
++        let Some(file_desc) = fd_table.get(pfd.fd as usize) else {
++            return Ok(Vec::new());
++        };
++        if super::with_kernel_page_table(|| file_desc.poll_error())
++            || super::with_kernel_page_table(|| file_desc.poll_hup())
++        {
++            return Ok(Vec::new());
++        }
++
++        let wants_read = (pfd.events & POLL_READ_EVENTS) != 0;
++        let wants_write = (pfd.events & POLL_WRITE_EVENTS) != 0;
++        if wants_read && !super::with_kernel_page_table(|| file_desc.poll_read_ready()) {
++            if let Some(key) = file_desc.pipe_read_wait_key() {
++                push_unique_wait_key(&mut keys, key);
++            } else if let Some(key) = file_desc.eventfd_read_wait_key() {
++                push_unique_wait_key(&mut keys, key);
++            } else if !wants_write {
++                if let Some(key) = file_desc.socket_read_wait_key() {
++                    push_unique_wait_key(&mut keys, key);
++                } else {
++                    return Ok(Vec::new());
++                }
++            } else {
++                return Ok(Vec::new());
++            }
++        }
++        if wants_write && !super::with_kernel_page_table(|| file_desc.poll_write_ready()) {
++            if let Some(key) = file_desc.pipe_write_wait_key() {
++                push_unique_wait_key(&mut keys, key);
++            } else if let Some(key) = file_desc.eventfd_write_wait_key() {
++                push_unique_wait_key(&mut keys, key);
++            } else {
++                return Ok(Vec::new());
++            }
++        }
++        if !wants_read && !wants_write {
++            return Ok(Vec::new());
++        }
++    }
++
++    Ok(keys)
++}
++
+ pub fn sys_ppoll(
+     fds: *mut PollFd,
+     nfds: usize,
+@@ -4228,6 +4344,8 @@ pub fn sys_ppoll(
+     _sigmask: usize,
+     _sigsetsize: usize,
+ ) -> SyscallRet {
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_ppoll_call(nfds);
+     let deadline = deadline_from_timespec_ptr(timeout)?;
+     if nfds == 0 {
+         if let Some(deadline) = deadline {
+@@ -4244,17 +4362,33 @@ pub fn sys_ppoll(
+         if ready != 0 {
+             return Ok(ready);
+         }
++        let wait_keys = poll_wait_keys(fds, nfds)?;
+         if let Some(deadline) = deadline {
+             if crate::timer::get_time_us() >= deadline {
+                 return Ok(0);
+             }
+-            if sleep_on_io_if(Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
+-                == WaitOutcome::TimedOut
+-            {
+-                return Ok(0);
++            let outcome = if !wait_keys.is_empty() {
++                #[cfg(feature = "buildstorm-diagnostics")]
++                crate::buildstorm_diagnostics::note_ppoll_sleep(true);
++                sleep_on_io_keys_if(&wait_keys, Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
++            } else {
++                #[cfg(feature = "buildstorm-diagnostics")]
++                crate::buildstorm_diagnostics::note_ppoll_sleep(false);
++                sleep_on_io_if(Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
++            };
++            if outcome == WaitOutcome::TimedOut {
++                return Ok(poll_once(fds, nfds)?);
+             }
+         } else {
+-            let _ = sleep_on_io_if(None, || Ok(poll_once(fds, nfds)? == 0))?;
++            if !wait_keys.is_empty() {
++                #[cfg(feature = "buildstorm-diagnostics")]
++                crate::buildstorm_diagnostics::note_ppoll_sleep(true);
++                let _ = sleep_on_io_keys_if(&wait_keys, None, || Ok(poll_once(fds, nfds)? == 0))?;
++            } else {
++                #[cfg(feature = "buildstorm-diagnostics")]
++                crate::buildstorm_diagnostics::note_ppoll_sleep(false);
++                let _ = sleep_on_io_if(None, || Ok(poll_once(fds, nfds)? == 0))?;
++            }
+         }
+     }
+ }
+@@ -4938,20 +5072,52 @@ pub fn sys_statx(
+     check_statx_flags(flags)?;
+     check_statx_mask(mask)?;
+ 
+-    let path = read_user_path(pathname)?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let started_at = crate::timer::get_time_us();
++    let path = read_user_path(pathname);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_phase(
++        7,
++        crate::timer::get_time_us().saturating_sub(started_at),
++    );
++    let path = path?;
+     let st = if path.is_empty() {
+         if flags & AT_EMPTY_PATH == 0 {
+             return Err(SysErrNo::ENOENT);
+         }
+         stat_empty_path(dirfd)?
+     } else {
+-        let (_logical_path, host_path) = resolve_host_path_str(dirfd, &path)?;
++        #[cfg(feature = "buildstorm-diagnostics")]
++        let started_at = crate::timer::get_time_us();
++        let resolved = resolve_host_path_str(dirfd, &path);
++        #[cfg(feature = "buildstorm-diagnostics")]
++        crate::buildstorm_diagnostics::note_phase(
++            8,
++            crate::timer::get_time_us().saturating_sub(started_at),
++        );
++        let (_logical_path, host_path) = resolved?;
+         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+-        super::with_kernel_page_table(|| stat_for_path(&host_path, follow))?
++        #[cfg(feature = "buildstorm-diagnostics")]
++        let started_at = crate::timer::get_time_us();
++        let result = super::with_kernel_page_table(|| stat_for_path(&host_path, follow));
++        #[cfg(feature = "buildstorm-diagnostics")]
++        crate::buildstorm_diagnostics::note_phase(
++            9,
++            crate::timer::get_time_us().saturating_sub(started_at),
++        );
++        result?
+     };
+ 
+     let statx = make_statx(&st, mask);
+-    copy_statx_out(statxbuf, &statx)?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let started_at = crate::timer::get_time_us();
++    let copied = copy_statx_out(statxbuf, &statx);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_phase(
++        10,
++        crate::timer::get_time_us().saturating_sub(started_at),
++    );
++    copied?;
+     Ok(0)
+ }
+ 
+diff --git a/os/src/task/wait_queue.rs b/os/src/task/wait_queue.rs
+index 4b67d16..a503a0e 100644
+--- a/os/src/task/wait_queue.rs
++++ b/os/src/task/wait_queue.rs
+@@ -79,41 +79,91 @@ impl WaitQueue {
+         deadline_us: Option<usize>,
+         should_sleep: F,
+     ) -> Result<WaitOutcome, SysErrNo>
++    where
++        F: FnOnce() -> Result<bool, SysErrNo>,
++    {
++        match key {
++            Some(key) => self.sleep_until_keys_if(&[key], deadline_us, should_sleep),
++            None => self.sleep_until_keys_if(&[], deadline_us, should_sleep),
++        }
++    }
++
++    pub fn sleep_until_keys_if<F>(
++        &self,
++        keys: &[WaitKey],
++        deadline_us: Option<usize>,
++        should_sleep: F,
++    ) -> Result<WaitOutcome, SysErrNo>
+     where
+         F: FnOnce() -> Result<bool, SysErrNo>,
+     {
+         let task = current_task().ok_or(SysErrNo::ESRCH)?;
+ 
++        // Foreground scheduling parks a blocking syscall and resumes it by
++        // re-entering at the same PC.  The waker records the completed wait in
++        // wait_outcome; consume that result before registering a new token.
++        // Timer wakeups do not remove the queue entry themselves, so also
++        // retire the old waiter/timeout here.
++        let resumed_outcome = task.wait_outcome.lock().take();
++        if let Some(outcome) = resumed_outcome {
++            let token = task.current_wait_token();
++            self.remove_waiters(task.pid.0, token);
++            crate::timer::remove_timeout(task.pid.0, token);
++            *task.block_reason.lock() = None;
++            return match outcome {
++                WaitOutcome::Interrupted => Err(SysErrNo::EINTR),
++                outcome => Ok(outcome),
++            };
++        }
++
+         if let Some(deadline) = deadline_us {
+             if crate::timer::get_time_us() >= deadline {
+                 return Ok(WaitOutcome::TimedOut);
+             }
+         }
+ 
++        // A TCB can execute only one blocking syscall at a time.  Bound the
++        // queue to one registration per task even if an earlier restart path
++        // was interrupted before it could perform normal cleanup.
++        self.remove_task_waiters(&task);
++        crate::timer::remove_task_timeouts(&task);
+         let token = task.next_wait_token();
+         *task.wait_outcome.lock() = None;
+         *task.block_reason.lock() = Some(self.reason);
+-        self.waiters.lock().push_back(WaitEntry {
+-            task: task.clone(),
+-            token,
+-            key,
+-        });
++        {
++            let mut waiters = self.waiters.lock();
++            if keys.is_empty() {
++                waiters.push_back(WaitEntry {
++                    task: task.clone(),
++                    token,
++                    key: None,
++                });
++            } else {
++                for key in keys {
++                    waiters.push_back(WaitEntry {
++                        task: task.clone(),
++                        token,
++                        key: Some(*key),
++                    });
++                }
++            }
++        }
+ 
+         let sleep = match should_sleep() {
+             Ok(sleep) => sleep,
+             Err(err) => {
+-                self.remove_waiter(task.pid.0, token);
++                self.remove_waiters(task.pid.0, token);
+                 *task.block_reason.lock() = None;
+                 return Err(err);
+             }
+         };
+         if !sleep {
+-            self.remove_waiter(task.pid.0, token);
++            self.remove_waiters(task.pid.0, token);
+             *task.block_reason.lock() = None;
+             return Ok(WaitOutcome::Woken);
+         }
+         if crate::syscall::signal::current_has_unblocked_pending() {
+-            self.remove_waiter(task.pid.0, token);
++            self.remove_waiters(task.pid.0, token);
+             *task.block_reason.lock() = None;
+             return Err(SysErrNo::EINTR);
+         }
+@@ -129,7 +179,7 @@ impl WaitQueue {
+         }
+ 
+         *task.block_reason.lock() = None;
+-        let still_waiting = self.remove_waiter(task.pid.0, token);
++        let still_waiting = self.remove_waiters(task.pid.0, token);
+         if deadline_us.is_some() {
+             crate::timer::remove_timeout(task.pid.0, token);
+         }
+@@ -219,17 +269,40 @@ impl WaitQueue {
+     }
+ 
+     fn remove_waiter(&self, pid: usize, token: usize) -> bool {
++        self.remove_waiters(pid, token)
++    }
++
++    fn remove_waiters(&self, pid: usize, token: usize) -> bool {
+         let mut waiters = self.waiters.lock();
+-        if let Some(index) = waiters
+-            .iter()
+-            .position(|entry| entry.task.pid.0 == pid && entry.token == token)
+-        {
+-            waiters.remove(index);
+-            true
+-        } else {
+-            false
++        let mut removed = false;
++        let mut index = 0usize;
++        while index < waiters.len() {
++            if waiters[index].task.pid.0 == pid && waiters[index].token == token {
++                waiters.remove(index);
++                removed = true;
++            } else {
++                index += 1;
++            }
+         }
++        removed
+     }
++
++    #[cfg(feature = "buildstorm-diagnostics")]
++    fn diagnostic_snapshot(&self) -> alloc::vec::Vec<(usize, usize, usize, Option<WaitKey>)> {
++        self.waiters
++            .lock()
++            .iter()
++            .map(|entry| {
++                (
++                    entry.task.pid.0,
++                    entry.task.thread_group.tgid(),
++                    entry.token,
++                    entry.key,
++                )
++            })
++            .collect()
++    }
++
+ }
+ 
+ impl Default for WaitQueue {
+@@ -294,6 +367,17 @@ where
+     IO_WAIT_QUEUE.sleep_until_key_if(Some(key), deadline_us, should_sleep)
+ }
+ 
++pub fn sleep_on_io_keys_if<F>(
++    keys: &[WaitKey],
++    deadline_us: Option<usize>,
++    should_sleep: F,
++) -> Result<WaitOutcome, SysErrNo>
++where
++    F: FnOnce() -> Result<bool, SysErrNo>,
++{
++    IO_WAIT_QUEUE.sleep_until_keys_if(keys, deadline_us, should_sleep)
++}
++
+ pub fn wake_io_waiters() -> usize {
+     IO_WAIT_QUEUE.wake_unkeyed()
+ }
+@@ -317,3 +401,32 @@ pub fn wake_child_waiters() -> usize {
+ pub(crate) fn remove_core_waiters_for_task(task: &Arc<TaskControlBlock>) -> usize {
+     IO_WAIT_QUEUE.remove_task_waiters(task) + CHILD_WAIT_QUEUE.remove_task_waiters(task)
+ }
++
++#[cfg(feature = "buildstorm-diagnostics")]
++pub(crate) fn diagnostic_dump_waiters() {
++    let io = IO_WAIT_QUEUE.diagnostic_snapshot();
++    let child = CHILD_WAIT_QUEUE.diagnostic_snapshot();
++    crate::println!(
++        "[buildstorm-diag] wait-queues io={} child={}",
++        io.len(),
++        child.len()
++    );
++    for (pid, tgid, token, key) in io {
++        crate::println!(
++            "[buildstorm-diag] io-wait pid={} tgid={} token={} key={:?}",
++            pid,
++            tgid,
++            token,
++            key
++        );
++    }
++    for (pid, tgid, token, key) in child {
++        crate::println!(
++            "[buildstorm-diag] child-wait pid={} tgid={} token={} key={:?}",
++            pid,
++            tgid,
++            token,
++            key
++        );
++    }
++}

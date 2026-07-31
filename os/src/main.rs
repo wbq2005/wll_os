@@ -11,6 +11,11 @@ use crate::console::putchar;
 use polyhal::common::PageAlloc;
 use polyhal::PhysAddr;
 
+extern "C" {
+    fn _secondary_start();
+    static _smp_boot_stacks: u8;
+}
+
 #[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("entry_riscv64.asm"));
 
@@ -19,13 +24,19 @@ global_asm!(include_str!("entry_loongarch64.asm"));
 
 // 模块声明
 mod config;
+#[cfg(feature = "buildstorm-diagnostics")]
+mod buildstorm_diagnostics;
 mod console;
+mod cpu;
 mod drivers;
 mod fs;
 mod lang_items;
 mod logging;
 mod mm;
+mod perf_counters;
 mod platform;
+#[cfg(feature = "smp-regression")]
+mod smp_regression;
 mod syscall;
 mod task;
 mod timer;
@@ -67,13 +78,13 @@ fn wait_for_interrupt() {
     }
 }
 
-#[cfg(target_arch = "riscv64")]
-fn add_riscv_available_frames(start: usize, end: usize) -> usize {
+fn add_available_frames(start: usize, end: usize) -> usize {
     extern "C" {
+        fn _start();
         fn _end();
     }
 
-    let kernel_start = crate::config::KERNEL_BASE;
+    let kernel_start = _start as usize;
     // The linker _end includes .bss, including the static kernel heap. The DTB
     // memory list may only exclude a conservative image range, so clip it again
     // before handing pages to the frame allocator.
@@ -150,7 +161,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     logging::init(option_env!("LOG"));
     polyhal::common::init(&KernelPageAlloc);
     mm::init();
-    platform::init();
+    platform::init(hartid);
 
     #[cfg(target_arch = "riscv64")]
     {
@@ -161,7 +172,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         for &(start, len) in polyhal::mem::get_mem_areas() {
             if len > 0 {
                 let end = start.saturating_add(len);
-                count += add_riscv_available_frames(start, end);
+                count += add_available_frames(start, end);
             }
         }
         log::info!("[mm] Memory regions added to frame allocator: {}", count);
@@ -173,14 +184,20 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         for &(start, len) in polyhal::mem::get_mem_areas() {
             if len > 0 {
                 let end = start.saturating_add(len);
-                if end > start {
-                    mm::frame_allocator::add_frames_range(start, end);
-                    count += 1;
-                }
+                count += add_available_frames(start, end);
             }
         }
         log::info!("[mm] Memory regions added: {}", count);
     }
+
+    // The heap allocator converts physical frames through the architecture's
+    // normal RAM mapping (LoongArch DMW1 or RISC-V identity mapping).
+    let heap_growth =
+        mm::heap_allocator::grow_from_frame_allocator(platform::total_memory_bytes());
+    log::info!(
+        "[heap] dynamic extension={} MiB",
+        heap_growth / 1024 / 1024
+    );
 
     #[cfg(target_arch = "loongarch64")]
     mm::page_table::init_kernel_page_table();
@@ -200,6 +217,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
     #[cfg(target_arch = "loongarch64")]
     timer::init();
+
+    platform::init_local_ipi();
+    trap::interrupts::enable_interrupt();
+    platform::mark_current_online();
 
     putchar(b'[');
     putchar(b'k');
@@ -359,6 +380,15 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         }
     }
     fs::init();
+    let secondary_stack_base = core::ptr::addr_of!(_smp_boot_stacks) as usize;
+    platform::start_secondary_cpus(
+        hartid,
+        _secondary_start as usize,
+        secondary_stack_base,
+        crate::config::SMP_BOOT_STACK_SIZE,
+    );
+    #[cfg(feature = "smp-regression")]
+    smp_regression::run();
     task::add_initproc();
     putchar(b'[');
     putchar(b'k');
@@ -392,4 +422,21 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     loop {
         wait_for_interrupt();
     }
+}
+
+/// Entry used only after the platform boot protocol has started a secondary
+/// CPU with its own stack. Global memory, drivers and the kernel page table are
+/// already initialized by the boot CPU.
+#[no_mangle]
+pub extern "C" fn rust_secondary_main(_hardware_id: usize) -> ! {
+    while !platform::secondary_released() {
+        core::hint::spin_loop();
+    }
+    trap::restore_kernel_page_table();
+    trap::init();
+    timer::init();
+    platform::init_local_ipi();
+    trap::interrupts::enable_interrupt();
+    platform::mark_current_online();
+    task::run_secondary_tasks()
 }

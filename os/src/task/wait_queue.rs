@@ -82,7 +82,39 @@ impl WaitQueue {
     where
         F: FnOnce() -> Result<bool, SysErrNo>,
     {
+        match key {
+            Some(key) => self.sleep_until_keys_if(&[key], deadline_us, should_sleep),
+            None => self.sleep_until_keys_if(&[], deadline_us, should_sleep),
+        }
+    }
+
+    pub fn sleep_until_keys_if<F>(
+        &self,
+        keys: &[WaitKey],
+        deadline_us: Option<usize>,
+        should_sleep: F,
+    ) -> Result<WaitOutcome, SysErrNo>
+    where
+        F: FnOnce() -> Result<bool, SysErrNo>,
+    {
         let task = current_task().ok_or(SysErrNo::ESRCH)?;
+
+        // Foreground scheduling parks a blocking syscall and resumes it by
+        // re-entering at the same PC.  The waker records the completed wait in
+        // wait_outcome; consume that result before registering a new token.
+        // Timer wakeups do not remove the queue entry themselves, so also
+        // retire the old waiter/timeout here.
+        let resumed_outcome = task.wait_outcome.lock().take();
+        if let Some(outcome) = resumed_outcome {
+            let token = task.current_wait_token();
+            self.remove_waiters(task.pid.0, token);
+            crate::timer::remove_timeout(task.pid.0, token);
+            *task.block_reason.lock() = None;
+            return match outcome {
+                WaitOutcome::Interrupted => Err(SysErrNo::EINTR),
+                outcome => Ok(outcome),
+            };
+        }
 
         if let Some(deadline) = deadline_us {
             if crate::timer::get_time_us() >= deadline {
@@ -90,30 +122,48 @@ impl WaitQueue {
             }
         }
 
+        // A TCB can execute only one blocking syscall at a time.  Bound the
+        // queue to one registration per task even if an earlier restart path
+        // was interrupted before it could perform normal cleanup.
+        self.remove_task_waiters(&task);
+        crate::timer::remove_task_timeouts(&task);
         let token = task.next_wait_token();
         *task.wait_outcome.lock() = None;
         *task.block_reason.lock() = Some(self.reason);
-        self.waiters.lock().push_back(WaitEntry {
-            task: task.clone(),
-            token,
-            key,
-        });
+        {
+            let mut waiters = self.waiters.lock();
+            if keys.is_empty() {
+                waiters.push_back(WaitEntry {
+                    task: task.clone(),
+                    token,
+                    key: None,
+                });
+            } else {
+                for key in keys {
+                    waiters.push_back(WaitEntry {
+                        task: task.clone(),
+                        token,
+                        key: Some(*key),
+                    });
+                }
+            }
+        }
 
         let sleep = match should_sleep() {
             Ok(sleep) => sleep,
             Err(err) => {
-                self.remove_waiter(task.pid.0, token);
+                self.remove_waiters(task.pid.0, token);
                 *task.block_reason.lock() = None;
                 return Err(err);
             }
         };
         if !sleep {
-            self.remove_waiter(task.pid.0, token);
+            self.remove_waiters(task.pid.0, token);
             *task.block_reason.lock() = None;
             return Ok(WaitOutcome::Woken);
         }
         if crate::syscall::signal::current_has_unblocked_pending() {
-            self.remove_waiter(task.pid.0, token);
+            self.remove_waiters(task.pid.0, token);
             *task.block_reason.lock() = None;
             return Err(SysErrNo::EINTR);
         }
@@ -129,7 +179,7 @@ impl WaitQueue {
         }
 
         *task.block_reason.lock() = None;
-        let still_waiting = self.remove_waiter(task.pid.0, token);
+        let still_waiting = self.remove_waiters(task.pid.0, token);
         if deadline_us.is_some() {
             crate::timer::remove_timeout(task.pid.0, token);
         }
@@ -219,17 +269,40 @@ impl WaitQueue {
     }
 
     fn remove_waiter(&self, pid: usize, token: usize) -> bool {
-        let mut waiters = self.waiters.lock();
-        if let Some(index) = waiters
-            .iter()
-            .position(|entry| entry.task.pid.0 == pid && entry.token == token)
-        {
-            waiters.remove(index);
-            true
-        } else {
-            false
-        }
+        self.remove_waiters(pid, token)
     }
+
+    fn remove_waiters(&self, pid: usize, token: usize) -> bool {
+        let mut waiters = self.waiters.lock();
+        let mut removed = false;
+        let mut index = 0usize;
+        while index < waiters.len() {
+            if waiters[index].task.pid.0 == pid && waiters[index].token == token {
+                waiters.remove(index);
+                removed = true;
+            } else {
+                index += 1;
+            }
+        }
+        removed
+    }
+
+    #[cfg(feature = "buildstorm-diagnostics")]
+    fn diagnostic_snapshot(&self) -> alloc::vec::Vec<(usize, usize, usize, Option<WaitKey>)> {
+        self.waiters
+            .lock()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.task.pid.0,
+                    entry.task.thread_group.tgid(),
+                    entry.token,
+                    entry.key,
+                )
+            })
+            .collect()
+    }
+
 }
 
 impl Default for WaitQueue {
@@ -294,6 +367,17 @@ where
     IO_WAIT_QUEUE.sleep_until_key_if(Some(key), deadline_us, should_sleep)
 }
 
+pub fn sleep_on_io_keys_if<F>(
+    keys: &[WaitKey],
+    deadline_us: Option<usize>,
+    should_sleep: F,
+) -> Result<WaitOutcome, SysErrNo>
+where
+    F: FnOnce() -> Result<bool, SysErrNo>,
+{
+    IO_WAIT_QUEUE.sleep_until_keys_if(keys, deadline_us, should_sleep)
+}
+
 pub fn wake_io_waiters() -> usize {
     IO_WAIT_QUEUE.wake_unkeyed()
 }
@@ -316,4 +400,33 @@ pub fn wake_child_waiters() -> usize {
 
 pub(crate) fn remove_core_waiters_for_task(task: &Arc<TaskControlBlock>) -> usize {
     IO_WAIT_QUEUE.remove_task_waiters(task) + CHILD_WAIT_QUEUE.remove_task_waiters(task)
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+pub(crate) fn diagnostic_dump_waiters() {
+    let io = IO_WAIT_QUEUE.diagnostic_snapshot();
+    let child = CHILD_WAIT_QUEUE.diagnostic_snapshot();
+    crate::println!(
+        "[buildstorm-diag] wait-queues io={} child={}",
+        io.len(),
+        child.len()
+    );
+    for (pid, tgid, token, key) in io {
+        crate::println!(
+            "[buildstorm-diag] io-wait pid={} tgid={} token={} key={:?}",
+            pid,
+            tgid,
+            token,
+            key
+        );
+    }
+    for (pid, tgid, token, key) in child {
+        crate::println!(
+            "[buildstorm-diag] child-wait pid={} tgid={} token={} key={:?}",
+            pid,
+            tgid,
+            token,
+            key
+        );
+    }
 }

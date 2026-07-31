@@ -2,7 +2,6 @@ use crate::prelude::*;
 use crate::return_errno_with_message;
 use crate::utils::path_check;
 use crate::ext4_defs::*;
-use core::cmp::max;
 // use std::time::{Duration, Instant};
 
 impl Ext4 {
@@ -321,7 +320,11 @@ impl Ext4 {
         let blocks_to_allocate = if iblk_idx >= ifile_blocks as usize {
             total_blocks_needed
         } else {
-            max(0, total_blocks_needed - (ifile_blocks as usize - iblk_idx))
+            // An overwrite can be fully covered by blocks that already belong
+            // to the inode.  Plain `usize` subtraction wraps in release builds
+            // when the covered suffix is larger than this write, turning a
+            // zero-block allocation into an enormous request.
+            total_blocks_needed.saturating_sub(ifile_blocks as usize - iblk_idx)
         };
 
         if blocks_to_allocate > 0 {

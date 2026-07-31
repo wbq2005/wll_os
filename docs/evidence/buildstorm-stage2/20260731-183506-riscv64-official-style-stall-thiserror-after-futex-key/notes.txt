@@ -1,0 +1,3 @@
+﻿command: powershell -File scripts\supervise_buildstorm.ps1 -Arch riscv64 -Image D:\BaiduNetdiskDownload\2026OSImage-Pub\sdcard-rv-pub.img\sdcard-rv-pub.img -TimeoutSeconds 6250 -Repo D:\wll_os-master1
+stopped manually for diagnosis after same thiserror stall; no BUILDSTORM_COMPILE marker
+date: 2026-07-31T18:35:09.4238796+08:00

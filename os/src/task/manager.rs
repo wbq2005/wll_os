@@ -85,7 +85,11 @@ pub fn add_kernel_task(task: Arc<TaskControlBlock>) {
 }
 
 fn push_task_back(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
+    if task.status() != TaskStatus::Ready {
+        return;
+    }
     queue.lock().push_back(task);
+    crate::platform::notify_runnable();
 }
 
 pub fn add_task_front(task: Arc<TaskControlBlock>) {
@@ -97,7 +101,11 @@ pub fn add_task_front(task: Arc<TaskControlBlock>) {
 }
 
 fn push_task_front(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
+    if task.status() != TaskStatus::Ready {
+        return;
+    }
     queue.lock().push_front(task);
+    crate::platform::notify_runnable();
 }
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
@@ -114,6 +122,7 @@ pub fn fetch_kernel_task() -> Option<Arc<TaskControlBlock>> {
 
 fn fetch_from_queue(queue: &Mutex<ReadyQueue>) -> Option<Arc<TaskControlBlock>> {
     let mut queue = queue.lock();
+    let current_cpu = crate::platform::current_cpu_index();
     let mut best_index = None;
     let mut best_priority = 0;
     let mut lower_rt_index = None;
@@ -121,11 +130,12 @@ fn fetch_from_queue(queue: &Mutex<ReadyQueue>) -> Option<Arc<TaskControlBlock>> 
     let mut index = 0;
     while index < queue.tasks.len() {
         let task = &queue.tasks[index];
-        if matches!(
-            task.status(),
-            TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
-        ) {
+        if task.status() != TaskStatus::Ready {
             queue.remove_at(index);
+            continue;
+        }
+        if !task.can_run_on_cpu(current_cpu) {
+            index += 1;
             continue;
         }
         // Scheduling attributes may change while a task is queued, so choose
@@ -182,14 +192,18 @@ pub fn has_kernel_task() -> bool {
 
 fn has_runnable_task(queue: &Mutex<ReadyQueue>) -> bool {
     let mut queue = queue.lock();
-    while let Some(task) = queue.tasks.front() {
-        if !matches!(
-            task.status(),
-            TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
-        ) {
+    let current_cpu = crate::platform::current_cpu_index();
+    let mut index = 0;
+    while index < queue.tasks.len() {
+        let task = &queue.tasks[index];
+        if task.status() != TaskStatus::Ready {
+            queue.remove_at(index);
+            continue;
+        }
+        if task.can_run_on_cpu(current_cpu) {
             return true;
         }
-        queue.remove_at(0);
+        index += 1;
     }
     false
 }

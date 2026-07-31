@@ -17,6 +17,10 @@ const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
 const PROT_EXEC: i32 = 0x4;
 const PROT_MASK: i32 = PROT_READ | PROT_WRITE | PROT_EXEC;
+// Keep a guard above the traditional brk base while allowing large sparse
+// reservations (thread stacks and allocator arenas) to reuse the otherwise
+// empty lower half of the 2 GiB user window.
+const MMAP_BASE: usize = 0x2000_0000;
 
 const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
@@ -90,6 +94,24 @@ fn align_up(value: usize) -> Result<usize, SysErrNo> {
         .checked_add(PAGE_SIZE - 1)
         .map(|value| value / PAGE_SIZE * PAGE_SIZE)
         .ok_or(SysErrNo::EINVAL)
+}
+
+fn find_mmap_area(
+    memory_set: &crate::mm::memory_set::MemorySet,
+    hint: usize,
+    length: usize,
+) -> Option<usize> {
+    let search_start = hint.max(MMAP_BASE);
+    memory_set
+        .find_free_area(search_start, length, USER_STACK_TOP)
+        .or_else(|| {
+            let wrap_limit = search_start.min(USER_STACK_TOP);
+            if MMAP_BASE < wrap_limit {
+                memory_set.find_free_area(MMAP_BASE, length, wrap_limit)
+            } else {
+                None
+            }
+        })
 }
 
 fn current_time_sec() -> isize {
@@ -407,10 +429,11 @@ pub fn sys_brk(new_brk: usize) -> SyscallRet {
                 return Ok(current_break);
             }
             if ms
-                .insert_framed_area(
+                .insert_lazy_area_with_backing(
                     VirtAddr::new(mapped_break),
                     VirtAddr::new(new_mapped_end),
                     PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
+                    MapAreaBacking::Anonymous,
                 )
                 .is_err()
             {
@@ -422,7 +445,6 @@ pub fn sys_brk(new_brk: usize) -> SyscallRet {
         {
             return Ok(current_break);
         }
-        ms.activate();
     }
 
     let mut mm = task.mm.lock();
@@ -498,7 +520,7 @@ pub fn sys_mmap(
     }
 
     let next_hint = task.mm.lock().next_mmap;
-    let start = {
+    let mut start = {
         let ms = task.memory_set.lock();
         if fixed_addr {
             addr
@@ -508,15 +530,13 @@ pub fn sys_mmap(
             if end <= USER_STACK_TOP && !ms.range_overlaps(hint, end) {
                 hint
             } else {
-                ms.find_free_area(next_hint, map_len, USER_STACK_TOP)
-                    .ok_or(SysErrNo::ENOMEM)?
+                find_mmap_area(&ms, next_hint, map_len).ok_or(SysErrNo::ENOMEM)?
             }
         } else {
-            ms.find_free_area(next_hint, map_len, USER_STACK_TOP)
-                .ok_or(SysErrNo::ENOMEM)?
+            find_mmap_area(&ms, next_hint, map_len).ok_or(SysErrNo::ENOMEM)?
         }
     };
-    let end = start.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
+    let mut end = start.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
     if start < PAGE_SIZE {
         return Err(SysErrNo::EPERM);
     }
@@ -578,10 +598,17 @@ pub fn sys_mmap(
         if map_fixed && !no_replace {
             ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
         } else if !fixed_addr && ms.range_overlaps(start, end) {
-            return Err(SysErrNo::ENOMEM);
+            start = find_mmap_area(&ms, MMAP_BASE, map_len).ok_or(SysErrNo::ENOMEM)?;
+            end = start.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
+            if end > USER_STACK_TOP || ms.range_overlaps(start, end) {
+                return Err(SysErrNo::ENOMEM);
+            }
         }
 
-        if lazy_clean_mmap {
+        let lazy_private_anonymous = anonymous
+            && !shared
+            && (flags & (MAP_POPULATE | MAP_LOCKED)) == 0;
+        if lazy_clean_mmap || lazy_private_anonymous {
             ms.insert_lazy_area_with_backing(
                 VirtAddr::new(start),
                 VirtAddr::new(end),
@@ -599,7 +626,6 @@ pub fn sys_mmap(
                 ms.write_bytes(start, &data)?;
             }
         }
-        ms.activate();
     }
 
     let mut mm = task.mm.lock();
@@ -627,7 +653,6 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallRet {
     {
         let mut ms = task.memory_set.lock();
         ms.protect_range(VirtAddr::new(start), VirtAddr::new(end), pte_flags)?;
-        ms.activate();
     }
     Ok(0)
 }
@@ -647,7 +672,6 @@ pub fn sys_munmap(addr: usize, length: usize) -> SyscallRet {
     {
         let mut ms = task.memory_set.lock();
         ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
-        ms.activate();
     }
     Ok(0)
 }
@@ -683,7 +707,6 @@ pub fn sys_msync(addr: usize, length: usize, flags: usize) -> SyscallRet {
     if (flags & MS_INVALIDATE) != 0 {
         let mut ms = task.memory_set.lock();
         ms.invalidate_file_range(VirtAddr::new(start), VirtAddr::new(end))?;
-        ms.activate();
     }
     Ok(0)
 }
@@ -777,8 +800,7 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SyscallRet {
         let start = if shmaddr == 0 {
             let next_hint = task.mm.lock().next_mmap;
             let ms = task.memory_set.lock();
-            ms.find_free_area(next_hint, map_len, USER_STACK_TOP)
-                .ok_or(SysErrNo::ENOMEM)?
+            find_mmap_area(&ms, next_hint, map_len).ok_or(SysErrNo::ENOMEM)?
         } else if (shmflg & SHM_RND) != 0 {
             align_down(shmaddr)
         } else {
@@ -829,7 +851,6 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SyscallRet {
                 },
                 &frames,
             )?;
-            ms.activate();
         }
         {
             let mut mm = task.mm.lock();
@@ -893,7 +914,6 @@ pub fn sys_shmdt(shmaddr: usize) -> SyscallRet {
         for (start, end) in ranges {
             ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
         }
-        ms.activate();
     }
     {
         let mut segments = SHM_SEGMENTS.lock();

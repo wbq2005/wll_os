@@ -1,6 +1,8 @@
 use super::SyscallRet;
 use crate::console::putchar;
-use crate::task::wait_queue::{sleep_on_io_if, sleep_on_io_key_if, WaitKey, WaitOutcome};
+use crate::task::wait_queue::{
+    sleep_on_io_if, sleep_on_io_key_if, sleep_on_io_keys_if, WaitKey, WaitOutcome,
+};
 use crate::task::{current_task, SharedFdTable};
 use crate::utils::error::SysErrNo;
 use alloc::string::String;
@@ -2177,8 +2179,24 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
 /// - flags: 打开标志
 /// - mode: 文件模式
 pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> SyscallRet {
-    let (logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
-    open_resolved_path(logical_path, host_path, flags, mode)
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let resolved = resolve_host_path(dirfd, pathname);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        3,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    let (logical_path, host_path) = resolved?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let result = open_resolved_path(logical_path, host_path, flags, mode);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        4,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    result
 }
 
 fn open_resolved_path(
@@ -2805,11 +2823,35 @@ pub fn sys_readlinkat(
         return Err(SysErrNo::EINVAL);
     }
 
-    let path = read_user_path(pathname)?;
-    let target = readlink_target_at(dirfd, &path)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let path = read_user_path(pathname);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        0,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    let path = path?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let target = readlink_target_at(dirfd, &path);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        1,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    let target = target?;
     let bytes = target.as_bytes();
     let n = bytes.len().min(bufsiz);
-    copy_to_user(buf, &bytes[..n])?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let copied = copy_to_user(buf, &bytes[..n]);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        2,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    copied?;
     Ok(n)
 }
 
@@ -2966,6 +3008,8 @@ pub fn sys_close(fd: usize) -> SyscallRet {
 
     // 获取当前任务的文件描述符表
     if let Some(task) = current_task() {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let started_at = crate::timer::get_time_us();
         let old = {
             let inner = task.inner.lock();
             let fd_table = inner.fd_table.clone();
@@ -2973,10 +3017,22 @@ pub fn sys_close(fd: usize) -> SyscallRet {
             let mut fds = fd_table.lock();
             fds.remove(fd)?
         };
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(
+            5,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
         if let Some(file_key) = fd_lock_key(&old) {
             release_posix_locks_for_file(task.thread_group.tgid(), &file_key);
         }
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let started_at = crate::timer::get_time_us();
         super::with_kernel_page_table(|| drop(old));
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(
+            6,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
         Ok(0)
     } else {
         Err(SysErrNo::ESRCH)
@@ -4221,6 +4277,66 @@ fn poll_once(fds: *mut PollFd, nfds: usize) -> Result<usize, SysErrNo> {
     Ok(ready)
 }
 
+fn push_unique_wait_key(keys: &mut Vec<WaitKey>, key: WaitKey) {
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+fn poll_wait_keys(fds: *mut PollFd, nfds: usize) -> Result<Vec<WaitKey>, SysErrNo> {
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let inner = task.inner.lock();
+    let fd_table = inner.fd_table.lock();
+
+    let mut keys = Vec::new();
+    for i in 0..nfds {
+        let pfd = copy_object_from_user::<PollFd>(unsafe { fds.add(i) })?;
+        if pfd.fd < 0 {
+            continue;
+        }
+        let Some(file_desc) = fd_table.get(pfd.fd as usize) else {
+            return Ok(Vec::new());
+        };
+        if super::with_kernel_page_table(|| file_desc.poll_error())
+            || super::with_kernel_page_table(|| file_desc.poll_hup())
+        {
+            return Ok(Vec::new());
+        }
+
+        let wants_read = (pfd.events & POLL_READ_EVENTS) != 0;
+        let wants_write = (pfd.events & POLL_WRITE_EVENTS) != 0;
+        if wants_read && !super::with_kernel_page_table(|| file_desc.poll_read_ready()) {
+            if let Some(key) = file_desc.pipe_read_wait_key() {
+                push_unique_wait_key(&mut keys, key);
+            } else if let Some(key) = file_desc.eventfd_read_wait_key() {
+                push_unique_wait_key(&mut keys, key);
+            } else if !wants_write {
+                if let Some(key) = file_desc.socket_read_wait_key() {
+                    push_unique_wait_key(&mut keys, key);
+                } else {
+                    return Ok(Vec::new());
+                }
+            } else {
+                return Ok(Vec::new());
+            }
+        }
+        if wants_write && !super::with_kernel_page_table(|| file_desc.poll_write_ready()) {
+            if let Some(key) = file_desc.pipe_write_wait_key() {
+                push_unique_wait_key(&mut keys, key);
+            } else if let Some(key) = file_desc.eventfd_write_wait_key() {
+                push_unique_wait_key(&mut keys, key);
+            } else {
+                return Ok(Vec::new());
+            }
+        }
+        if !wants_read && !wants_write {
+            return Ok(Vec::new());
+        }
+    }
+
+    Ok(keys)
+}
+
 pub fn sys_ppoll(
     fds: *mut PollFd,
     nfds: usize,
@@ -4228,6 +4344,8 @@ pub fn sys_ppoll(
     _sigmask: usize,
     _sigsetsize: usize,
 ) -> SyscallRet {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_ppoll_call(nfds);
     let deadline = deadline_from_timespec_ptr(timeout)?;
     if nfds == 0 {
         if let Some(deadline) = deadline {
@@ -4244,17 +4362,33 @@ pub fn sys_ppoll(
         if ready != 0 {
             return Ok(ready);
         }
+        let wait_keys = poll_wait_keys(fds, nfds)?;
         if let Some(deadline) = deadline {
             if crate::timer::get_time_us() >= deadline {
                 return Ok(0);
             }
-            if sleep_on_io_if(Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
-                == WaitOutcome::TimedOut
-            {
-                return Ok(0);
+            let outcome = if !wait_keys.is_empty() {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_ppoll_sleep(true);
+                sleep_on_io_keys_if(&wait_keys, Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
+            } else {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_ppoll_sleep(false);
+                sleep_on_io_if(Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
+            };
+            if outcome == WaitOutcome::TimedOut {
+                return Ok(poll_once(fds, nfds)?);
             }
         } else {
-            let _ = sleep_on_io_if(None, || Ok(poll_once(fds, nfds)? == 0))?;
+            if !wait_keys.is_empty() {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_ppoll_sleep(true);
+                let _ = sleep_on_io_keys_if(&wait_keys, None, || Ok(poll_once(fds, nfds)? == 0))?;
+            } else {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_ppoll_sleep(false);
+                let _ = sleep_on_io_if(None, || Ok(poll_once(fds, nfds)? == 0))?;
+            }
         }
     }
 }
@@ -4938,20 +5072,52 @@ pub fn sys_statx(
     check_statx_flags(flags)?;
     check_statx_mask(mask)?;
 
-    let path = read_user_path(pathname)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let path = read_user_path(pathname);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        7,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    let path = path?;
     let st = if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(SysErrNo::ENOENT);
         }
         stat_empty_path(dirfd)?
     } else {
-        let (_logical_path, host_path) = resolve_host_path_str(dirfd, &path)?;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let started_at = crate::timer::get_time_us();
+        let resolved = resolve_host_path_str(dirfd, &path);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(
+            8,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
+        let (_logical_path, host_path) = resolved?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        super::with_kernel_page_table(|| stat_for_path(&host_path, follow))?
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let started_at = crate::timer::get_time_us();
+        let result = super::with_kernel_page_table(|| stat_for_path(&host_path, follow));
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(
+            9,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
+        result?
     };
 
     let statx = make_statx(&st, mask);
-    copy_statx_out(statxbuf, &statx)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
+    let copied = copy_statx_out(statxbuf, &statx);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        10,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    copied?;
     Ok(0)
 }
 

@@ -1,0 +1,3 @@
+[riscv64] stage=complete reached=False log=D:\wll_os-master1\_tmp\buildstorm-riscv64-complete.log
+BUILDSTORM_TOOLCHAIN ok
+BUILDSTORM_MINIBUILD ok

@@ -218,3 +218,372 @@ Get-FileHash -Algorithm SHA256 `
 - 尚未获得 `BUILDSTORM_COMPILE ... ok=true`，完整编译成功分和性能分均未锁定。
 - 尚未实现或证明真实 SMP；DTB/OpenSBI 显示 8 个 HART 不能替代调度、IPI、跨核唤醒和 TLB shootdown 验证。
 - 后续优化必须继续保持共享 ABI/VFS/MM 逻辑与 RISC-V、LoongArch 平台层边界，避免为 QEMU 固化实现。
+
+## 10. Stage 2 continuation (2026-07-26)
+
+### Evidence and current gate
+
+- Official suite checkout: `final-2026` commit
+  `2f6ea561af35c36f4d1bf0dad5ab2eb312839ccc`.
+- Official script SHA-256:
+  `446A3321F8D45F37637AC43B1B6BD66E09BEB304969F8ABAC69CCD701252AA0B`.
+- Official judge SHA-256:
+  `586A30E260F39CF425C0960A2965D8684BC3A93B77842A68DFD80FA6FF3EE87B`.
+- RISC-V64 and LoongArch64 release builds completed successfully. The
+  unmodified official images were launched independently with
+  `-snapshot -smp 8 -m 8G`; both produced `BUILDSTORM_TOOLCHAIN ok` and
+  `BUILDSTORM_MINIBUILD ok`. The official judge reports 20.0/180 scripted
+  points for these two environment gates. This is `official-pass` evidence
+  only for toolchain and minibuild, not for full compile or timing.
+- Independent eight-core SMP regressions passed on both architectures.
+  RISC-V64 reported `asid_check=translation`; LoongArch64 reported
+  `asid_check=root-csr`. Both exercised eight dispatching CPUs, TLB
+  transport, separate address spaces, ASID reuse after a global flush, and
+  160 MiB allocator stress. This is `capability-pass`, not contest score
+  evidence.
+- Raw serial logs, runner JSON, build logs, and official judge output are in
+  `docs/evidence/buildstorm-stage2/20260726-asid-vfs-metadata/`. The runner
+  JSON records exact QEMU arguments, kernel hashes, build commands, and host
+  elapsed time.
+
+### Bottleneck and design
+
+The 600-second RISC-V64 diagnostic is `unverified` performance evidence,
+but identifies the next general bottleneck. At the 480-second snapshot,
+parent symlink resolution had fallen to 41.2 seconds after the resolved-path
+cache, while `statx_vfs` consumed 92.9 seconds and `open_vfs_and_fd`
+consumed 99.0 seconds.
+
+`metadata_with_kind()` resolves an ext4 path once and returns the inode kind
+and metadata together. `vfs::metadata()` uses the combined result, preserving
+the existing symlink follow behavior and the `ENOTDIR` versus `ENOENT`
+distinction. This removes a duplicate path resolution from the normal
+non-symlink metadata path without adding a stale metadata cache or making
+behavior depend on workload names, paths, command lines, output, CPU count,
+or elapsed time.
+
+The follow-up 600-second diagnostic is also `unverified`, but supports this
+specific change: at its 480-second snapshot `statx_vfs` averaged 7.14 ms
+(63.65 s / 8,910 calls), compared with 9.47 ms (92.87 s / 9,808 calls) in
+the preceding parent-cache sample. `open_vfs_and_fd` did not improve, so it
+remains the first performance blocker and no full-build speedup is claimed.
+
+Comparable full compile time: not measured. Guest full-compile elapsed,
+speedup, and score remain not measured until the original complete workload
+ends with `BUILDSTORM_COMPILE mode=multi ok=true` under the official judge.
+
+### Review, AI disclosure, and reproduction
+
+AI assisted with log aggregation, call-path inspection, and the small
+interface change. Developer verification consisted of reviewing the
+path/error behavior, running both release builds, both official minibuild
+runs, both official judge inputs, and both SMP regressions. The anti-cheat
+audit searched kernel and runner sources for BuildStorm/tgoskits/output/time
+conditionals; production behavior is not specialized for the workload.
+
+Reproduce with `scripts/run_buildstorm.py --stage minibuild` and
+`scripts/run_smp_regression.py` for each architecture, using the image paths
+and `-smp 8 -m 8G` values recorded in the evidence JSON. Before claiming the
+remaining 160 scripted points, run the original `complete` stage sequentially
+for RISC-V64 and LoongArch64, preserve both serial logs, and apply the
+unmodified official judge.
+
+## 11. Stage 2 final campaign update (2026-07-26)
+
+### Updated official authority and gate
+
+- The official `final-2026` branch was fetched again immediately before the
+  scoring campaign. The current commit is
+  `1eac61d3becaa592c8ef12a7535f0ec6bb9e3e36` (2026-07-25), which updates the
+  official BuildStorm judge baselines and expected core counts.
+- The current candidate runner has been restored to the original shared
+  configuration: RISC-V64 and LoongArch64 both use `-m 8G -smp 8`; the
+  external complete-run timeout remains 6250 seconds.
+- The official self-check baselines are 4655.23 seconds for RISC-V64 and
+  6223.00 seconds for LoongArch64.
+- Per the updated submission gate, one architecture completing one unmodified
+  official run is sufficient to commit. No complete or timing score is claimed
+  until the raw serial log contains
+  `BUILDSTORM_COMPILE mode=multi ok=true` and the unmodified official judge
+  accepts that log.
+
+### First measured blocker and root cause
+
+The page-table audit identified syscall 226 (`mprotect`) as the first current
+performance blocker. In the pre-fix 240-second RISC-V64 diagnostic snapshot,
+23,763 calls consumed 54,839,219 guest microseconds, or 2,307.8 us/call.
+The code rewrote mapped PTEs and issued a remote RISC-V RFENCE to each of the
+other seven harts individually, including harts that were not executing the
+modified address space.
+
+The root cause was not the required TLB invalidation itself. It was the
+shootdown transport and target policy: seven SBI round trips were used for one
+logical invalidation, and inactive CPUs were synchronously flushed even though
+ASID-tagged translations cannot be consumed until that address space is
+activated there.
+
+### Architecture-neutral design and platform boundary
+
+`MemorySet::protect_range()` now skips permission-identical areas, overwrites
+existing leaf PTEs instead of unmapping and rebuilding them, and performs one
+remote shootdown per syscall. The RISC-V platform transport combines all
+representable hardware hart IDs into one SBI hart mask.
+
+For non-global RISC-V invalidations, the platform first publishes a pending TLB
+generation to every remote CPU and only then samples each CPU's active address
+space. CPUs currently running the modified root are synchronously RFENCE'd.
+Inactive CPUs defer the flush until `mark_current_address_space()` runs before
+their next user entry. Publishing the request before sampling the active root
+covers both directions of the task-migration race. ASID recycling continues to
+use an immediate all-CPU flush.
+
+The final source review found a narrower activation race in that first
+implementation: the CPU sampled its pending generation before publishing its
+active root. A shootdown between those two operations could classify the CPU
+as inactive after it had already sampled the old generation. The corrected
+path publishes the root inside `MemorySet::activate()` while the caller still
+holds the shared memory-set lock, then changes the hardware page table before
+releasing that lock. An editor of the same page table therefore either
+finishes first and leaves a generation consumed during activation, or starts
+after the new root is live and includes that CPU in the synchronous remote
+flush. The later user-entry publication was removed. This is a general
+page-table ownership fix and is not tied to BuildStorm.
+
+The shared memory-management policy remains architecture neutral. RISC-V uses
+SBI RFENCE and deferred generation checks; LoongArch keeps its IOCSR IPI and
+acknowledgement path. No behavior depends on a test name, executable path,
+crate, command line, expected output, elapsed time, or score marker.
+
+### Measured effect and capability evidence
+
+In the post-fix 240-second RISC-V64 diagnostic snapshot, 23,516 `mprotect`
+calls consumed 44,536,947 guest microseconds, or 1,893.9 us/call. The measured
+per-call reduction is 17.9%. This is diagnostic evidence, not a full-build
+speedup claim; the crate mix and total call counts differ between runs.
+
+The final RISC-V64 independent SMP regression passed at 8G/8 with all eight
+CPUs dispatching work, remote TLB targets, ASID translation/isolation and
+reuse, 64 isolation iterations, and 160 MiB heap stress. The LoongArch64 SMP
+regression also uses the restored 8G/8 configuration.
+
+Both default production release builds passed after the final code change:
+RISC-V64 completed in 9.52 host seconds and LoongArch64 in 10.38 host seconds.
+These are incremental kernel build times, not guest BuildStorm compile times.
+The raw logs and JSON are under
+`docs/evidence/buildstorm-stage2/20260726-final-release-and-smp/` and
+`docs/evidence/buildstorm-stage2/20260726-riscv64-mprotect-deferred-shootdown/`.
+
+### Anti-cheat audit and AI disclosure
+
+The production audit confirmed that `/proc/uptime`, `clock_gettime`, and
+`sysinfo.uptime` derive from the same monotonic kernel timer, and CPU reporting
+derives from the actual online mask. The runner only builds, launches, scans
+for official success markers, times, hashes, and records the run. It does not
+modify the image, official script, judge, guest clock, artifacts, or output.
+BuildStorm diagnostics are compile-time disabled in production builds.
+
+The first frozen production launch exposed two same-stem candidates,
+`/glibc/buildstorm_testcode.sh` and `/musl/buildstorm_testcode.sh`. The harness
+group filter did not encode the requested userspace ABI, so an early return
+from the first script allowed the stale musl script and its non-official
+markers to run. The generic harness selector now accepts the compile-time
+`WLL_HARNESS_LIBC` dimension; the official finals runners select `glibc`.
+A follow-up 16G/8 minibuild log contains only the glibc script and both current
+official environment markers. This selection does not inspect script contents
+or expected output.
+
+AI assisted with aggregating diagnostic counters, reviewing page-table and SBI
+ordering, proposing the bounded shootdown change, and organizing evidence.
+Developer verification consists of source/diff review, both release builds,
+the independent SMP runs, unmodified-image execution, raw-log inspection, and
+the official judge. The abandoned lazy-ELF and shared-readlink-cache
+experiments were removed from production after they failed performance or
+locking validation; their negative evidence remains archived.
+
+### Exact reproduction
+
+```powershell
+python scripts/run_smp_regression.py --arch riscv64 `
+  --image 'D:\BaiduNetdiskDownload\2026OSImage-Pub\sdcard-rv-pub.img\sdcard-rv-pub.img' `
+  --timeout 45
+
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/supervise_buildstorm.ps1 `
+  -Arch riscv64 `
+  -Image 'D:\BaiduNetdiskDownload\2026OSImage-Pub\sdcard-rv-pub.img\sdcard-rv-pub.img' `
+  -TimeoutSeconds 6250 `
+  -Repo 'D:\wll_os-master1' `
+  -PythonExe 'C:\Users\22478\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+
+python _tmp/testsuits-for-oskernel-final-2026/judge/judge_buildstorm-glibc.py `
+  _tmp/buildstorm-riscv64-complete.log
+```
+
+### Final complete-run result
+
+The post-race-fix RISC-V64 production run used the unmodified official image
+with `-m 16G -smp 8` and stopped at the 6250-second external limit. It passed
+the toolchain and minibuild gates but never reached `BUILDSTORM_BEGIN` or
+`BUILDSTORM_COMPILE`; the last serial line was in the untimed `tg-xtask`
+pre-build at `Compiling hashbrown v0.17.1`. The runner recorded
+`host_elapsed_seconds=6250.391`, kernel SHA-256
+`1ca1dd2811acd36a11ed5fed39a2e6f5ccebb45a1dac84f4696ad81523db8857`,
+and `reached_stage_marker=false`. The unmodified official judge reports
+20.0/180 scripted points. This is `unverified`, not an official complete
+pass, so the submission commit and push gate remains closed.
+
+Raw evidence is in
+`docs/evidence/buildstorm-stage2/20260726-riscv64-official-timeout-racefix/`.
+
+## 12. Heap and contiguous-block campaign (2026-07-28)
+
+### First real blocker and general fix
+
+The first post-mprotect production run failed at 1332.75 host seconds while
+compiling `typenum`. The kernel allocator reported a 9,548,636-byte request
+failing with `heap_actual=382407824` and `heap_total=402653184`. The dynamic
+heap policy reserved only 1/32 of guest RAM, capped at 256 MiB, so the 16G
+RISC-V64 guest had 384 MiB total kernel heap including the fixed 128 MiB
+early heap. The raw panic and runner metadata are in
+`docs/evidence/buildstorm-stage2/20260727-riscv64-mprotect-presplit-production-heap-blocker/`.
+
+The architecture-neutral policy now reserves 1/16 of detected guest RAM,
+capped at 1 GiB, from the contiguous frame allocator. The existing
+architecture boundary still converts the reserved physical range through
+RISC-V identity RAM or the LoongArch DMW mapping. RISC-V64 16G and
+LoongArch64 36G therefore both request a bounded 1 GiB extension, leaving
+the remaining frames available to userspace. The independent RISC-V64 SMP
+regression passed with eight online CPUs, ASID isolation/reuse, remote TLB
+targets and 160 MiB simultaneous kernel-heap stress. A production probe ran
+1800.36 seconds without reproducing the heap panic, and a later production
+run remained stable for 4303.281 seconds. These are capability and stability
+evidence, not an official complete pass.
+
+The fixed per-CPU resource bound was also raised from eight to twelve, so the
+scheduler, TLB, diagnostic and CPU-state arrays remain able to represent a
+wider machine even though the candidate runner now uses `-smp 8`. Both
+production release builds pass. The prior local LoongArch64 36G/12 QEMU
+regression remains unverified because the
+host had about 1.7 GiB available physical memory and QEMU failed before boot
+with `cannot set up guest memory 'loongarch.ram'`.
+
+### Contiguous reads and bounded cache
+
+The clean-file fault path reads ahead up to sixteen 4 KiB pages. Previously
+each cache miss issued an independent synchronous virtio request even when
+ext4 mapped the pages to consecutive physical blocks. `BlockRange` now
+accepts a list of root-device block offsets, serves existing cache entries,
+and merges each consecutive miss run into one raw request under the existing
+I/O lock. The ext4 clean-page path resolves physical blocks first and submits
+the batch only for the standard 4 KiB block/page case. Non-standard block
+sizes, sparse extents, short data and allocation errors retain the original
+per-page path. The optimization is based on extents and offsets, not names,
+commands, crate identities or expected output.
+
+The block cache remains bounded but was increased from 4096 blocks (16 MiB)
+to 32768 blocks (128 MiB). This fits within the new 1 GiB dynamic heap while
+the separate clean-page and executable caches remain independently capped.
+At the 480-second diagnostic snapshot, the 128 MiB candidate had completed
+more open, readlink, statx and mprotect operations and reached
+`pin-project-lite`; the 16 MiB batched-read candidate had reached `bytes`.
+Raw reads were similar (54,587 versus 54,539), so a full-build speedup is not
+claimed. Both results are `unverified` diagnostic evidence under
+`docs/evidence/buildstorm-stage2/20260728-riscv64-batched-block-600s/` and
+`docs/evidence/buildstorm-stage2/20260728-riscv64-block-cache-128m-600s/`.
+
+### Final official run and judge
+
+The final production candidate used the unmodified public image and glibc
+script with `-m 16G -smp 8` and the 6250-second external timeout. QEMU was
+`11.0.0 (v11.0.0-12122-ga4bb4b10c9)`. The runner recorded host elapsed
+`6250.391` seconds and production kernel SHA-256
+`c00b66613f76511abd7696b4d4bf08daf8d7a91bf467c1b31d254e6e61940526`.
+The log contains `BUILDSTORM_TOOLCHAIN ok` and `BUILDSTORM_MINIBUILD ok`,
+but remained in the untimed `tg-xtask` build and never emitted
+`BUILDSTORM_COMPILE mode=multi ok=true`.
+
+The unmodified official judge reports 20.0/180 scripted points:
+toolchain 8, minibuild 12, compile success 0 and compile time 0. This is
+`unverified`, not `official-pass`, and does not satisfy the commit/push gate.
+Raw serial output, runner JSON, build log, SMP result, supervisor records and
+judge output are in
+`docs/evidence/buildstorm-stage2/20260728-riscv64-block-cache-128m-official-6250-timeout/`.
+
+### Provenance, anti-cheat audit and AI disclosure
+
+The saved official authority remains suite commit
+`1eac61d3becaa592c8ef12a7535f0ec6bb9e3e36`, script SHA-256
+`446A3321F8D45F37637AC43B1B6BD66E09BEB304969F8ABAC69CCD701252AA0B`,
+judge SHA-256
+`CE4F78D56FB1DB5FAC4588DE57DBA314B0EAA7CF8D3E3ED2FE4F60CF1329EB99`,
+and RISC-V64 image SHA-256
+`C03C6091EB1C400D4C1F400130D11810B00E18811D4E5C201E7F75802DFAFDE0`.
+The remote branch could not be refreshed during this campaign because the
+Windows TLS provider returned `SEC_E_NO_CREDENTIALS`; no local authority,
+image, script or judge was replaced.
+
+The production source audit found no branching on BuildStorm output, crate
+names, compiler command lines, expected artifacts, score markers or elapsed
+time. `/proc/uptime`, `clock_gettime` and `sysinfo.uptime` continue to use
+the kernel monotonic timer, and online CPU reporting uses the actual platform
+mask. The runner only builds, launches with `-snapshot`, scans official
+markers, times, hashes and records. Diagnostic counters are behind explicit
+`buildstorm-diagnostics,perf-counters` features and were absent from the
+final production hash.
+
+AI assisted with log aggregation, heap sizing analysis, block-I/O design,
+diagnostic comparison and evidence organization. Developer verification
+consisted of source/diff review, both production release builds, the RISC-V64
+independent SMP regression, repeated unmodified-image runs, raw serial-log
+inspection and execution of the unmodified official judge. No complete time
+or speedup is reported because the required success marker is missing.
+
+Reproduce the final run and judge with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/supervise_buildstorm.ps1 `
+  -Arch riscv64 `
+  -Image 'D:\BaiduNetdiskDownload\2026OSImage-Pub\sdcard-rv-pub.img\sdcard-rv-pub.img' `
+  -TimeoutSeconds 6250 `
+  -Repo 'D:\wll_os-master1' `
+  -PythonExe 'C:\Users\22478\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+
+& 'C:\Users\22478\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' `
+  '_tmp\testsuits-for-oskernel-final-2026\judge\judge_buildstorm-glibc.py' `
+  '_tmp\buildstorm-riscv64-complete.log'
+```
+
+### SATP boundary and exec page-table lifetime candidate
+
+The 2026-07-31 diagnostic run identified repeated address-space transitions as
+the next general hot path after the VFS lookup cache: at approximately
+360 seconds, user page-table activation and kernel page-table restoration were
+each recorded about 47,000 times. The user roots already contain the shared
+kernel mappings, so the scheduler can retain the active RISC-V user root across
+ordinary syscall/page-fault boundaries and only restore the kernel root when a
+task leaves the user-run loop. `MemorySet::activate` now also avoids rewriting
+`satp` when the requested root and ASID are already active. These changes are
+architecture-neutral at the scheduler boundary; the RISC-V ASID check is kept
+inside the page-table implementation, while LoongArch retains its conservative
+activation invalidation.
+
+The same audit found that `execve` replaced a `MemorySet` while the outgoing
+user root could still be current. `PageTableWrapper::drop` intentionally
+protects the current root, so this leaked the old root frame and delayed ASID
+reuse. `execve` now restores the stable kernel root before replacing the address
+space, preserving the existing ownership and isolation rules without matching
+test names or paths.
+
+The candidate compiles for RISC-V64 and LoongArch64 in release mode. The
+independent RISC-V SMP regression passed with eight CPUs and ASID/TLB checks;
+the LoongArch regression passed with the same kernel and official image at the
+restored `-m 8G -smp 8` configuration. The source and runtime evidence for this
+candidate is under
+`docs/evidence/buildstorm-stage2/20260731-203301-riscv64-official-pre-satp-hotpath/`.
+
+Measured complete-build speedup is not yet applicable: the prior production
+run was stopped before `BUILDSTORM_BEGIN`, and the official compile success
+marker remains unverified. Host memory pressure was recorded separately (about
+1.6 GiB free physical memory while a 16-GiB RV guest was running), so timing
+comparisons from that run are not presented as kernel speedups.

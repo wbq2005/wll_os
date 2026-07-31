@@ -12,11 +12,17 @@ pub enum TrapType {
     Breakpoint,
     SysCall,
     Timer,
+    Ipi(usize),
     Unknown,
     SupervisorExternal,
     StorePageFault(usize),
     LoadPageFault(usize),
     InstructionPageFault(usize),
+    /// LoongArch reports a present mapping whose PLV does not permit the
+    /// current access as a distinct exception.  Keep it distinct from a
+    /// not-present fault so the OS can inspect the mapping before deciding
+    /// whether to retry or terminate the task.
+    PagePrivilegeFault(usize),
     IllegalInstruction(usize),
     Irq(IRQVector),
 }
@@ -35,6 +41,7 @@ impl From<TrapType> for EscapeReason {
         match value {
             TrapType::SysCall => EscapeReason::SysCall,
             TrapType::Timer => EscapeReason::Timer,
+            TrapType::Ipi(_) => EscapeReason::IRQ,
             TrapType::Irq(_) => EscapeReason::IRQ,
             _ => EscapeReason::NoReason,
         }

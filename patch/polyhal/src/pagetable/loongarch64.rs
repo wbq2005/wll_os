@@ -1,4 +1,4 @@
-use loongArch64::register::pgdl;
+use loongArch64::register::{asid, pgdl};
 
 use super::{MappingFlags, PageTable, PTE, TLB};
 use crate::{PhysAddr, VirtAddr};
@@ -147,8 +147,35 @@ impl PageTable {
 
     #[inline]
     pub fn change(&self) {
-        pgdl::set_base(self.0.raw());
+        self.change_with_asid(0);
         TLB::flush_all();
+    }
+
+    /// Activate this root under an address-space identifier.
+    ///
+    /// The caller owns ASID allocation and must invalidate stale entries
+    /// before reusing an ASID for another root.
+    #[inline]
+    pub fn change_with_asid(&self, address_space_id: usize) {
+        pgdl::set_base(self.0.raw());
+        if Self::current_asid() != address_space_id {
+            asid::set_asid(address_space_id);
+        }
+        unsafe { core::arch::asm!("dbar 0") }
+    }
+
+    #[inline]
+    pub fn current_asid() -> usize {
+        asid::read().asid()
+    }
+
+    pub fn max_asid() -> usize {
+        let width = asid::read().asid_width().min(10);
+        if width == 0 {
+            0
+        } else {
+            (1usize << width) - 1
+        }
     }
 }
 
@@ -161,7 +188,11 @@ impl TLB {
     #[inline]
     pub fn flush_vaddr(vaddr: VirtAddr) {
         unsafe {
-            core::arch::asm!("dbar 0; invtlb 0x05, $r0, {reg}", reg = in(reg) vaddr.raw());
+            // Page-table edits happen while the kernel uses ASID 0, but the
+            // changed leaf can belong to a nonzero user ASID. Operation 0x06
+            // invalidates this virtual address for both global and non-global
+            // entries regardless of the current ASID.
+            core::arch::asm!("dbar 0; invtlb 0x06, $r0, {reg}", reg = in(reg) vaddr.raw());
         }
     }
 

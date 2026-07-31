@@ -1,3 +1,4 @@
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -14,6 +15,7 @@ pub const DEV_LOOP_CONTROL_MAJOR: u32 = 10;
 pub const DEV_LOOP_CONTROL_MINOR: u32 = 237;
 pub const LOOP_DEVICE_COUNT: usize = 4;
 const SECTOR_SIZE: usize = 512;
+const BLOCK_CACHE_LIMIT: usize = 32 * 1024;
 const ROOT_DISK: &str = "/dev/vda";
 const LOOP_CONTROL: &str = "/dev/loop-control";
 
@@ -23,16 +25,108 @@ pub trait RawBlockDevice: Send + Sync {
     fn size_bytes(&self) -> Option<usize>;
 }
 
+struct BlockCacheEntry {
+    data: Vec<u8>,
+    last_used: u64,
+}
+
+struct BlockCache {
+    blocks: BTreeMap<usize, BlockCacheEntry>,
+    ages: BTreeSet<(u64, usize)>,
+    next_age: u64,
+}
+
+impl BlockCache {
+    fn new() -> Self {
+        Self {
+            blocks: BTreeMap::new(),
+            ages: BTreeSet::new(),
+            next_age: 1,
+        }
+    }
+
+    fn bump_age(&mut self) -> u64 {
+        let age = self.next_age;
+        self.next_age = self.next_age.wrapping_add(1).max(1);
+        age
+    }
+
+    fn get(&mut self, block: usize) -> Option<Vec<u8>> {
+        let age = self.bump_age();
+        let entry = self.blocks.get_mut(&block)?;
+        self.ages.remove(&(entry.last_used, block));
+        entry.last_used = age;
+        self.ages.insert((age, block));
+        Some(entry.data.clone())
+    }
+
+    fn insert(&mut self, block: usize, data: Vec<u8>) {
+        let age = self.bump_age();
+        if let Some(entry) = self.blocks.get_mut(&block) {
+            self.ages.remove(&(entry.last_used, block));
+            entry.data = data;
+            entry.last_used = age;
+            self.ages.insert((age, block));
+            return;
+        }
+        if self.blocks.len() >= BLOCK_CACHE_LIMIT {
+            if let Some((old_age, old_block)) = self.ages.iter().next().copied() {
+                self.ages.remove(&(old_age, old_block));
+                self.blocks.remove(&old_block);
+            }
+        }
+        self.blocks.insert(
+            block,
+            BlockCacheEntry {
+                data,
+                last_used: age,
+            },
+        );
+        self.ages.insert((age, block));
+    }
+
+    fn invalidate_range(&mut self, start: usize, len: usize) {
+        let Some(end) = start.checked_add(len) else {
+            self.blocks.clear();
+            self.ages.clear();
+            return;
+        };
+        if start >= end {
+            return;
+        }
+        let first = (start / EXT4_BLOCK_SIZE) * EXT4_BLOCK_SIZE;
+        let last = ((end - 1) / EXT4_BLOCK_SIZE) * EXT4_BLOCK_SIZE;
+        let mut block = first;
+        loop {
+            if let Some(entry) = self.blocks.remove(&block) {
+                self.ages.remove(&(entry.last_used, block));
+            }
+            if block == last {
+                break;
+            }
+            block = block.saturating_add(EXT4_BLOCK_SIZE);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BlockRange {
     raw: Arc<dyn RawBlockDevice>,
     start: usize,
     len: Option<usize>,
+    cache: Arc<Mutex<BlockCache>>,
+    io_lock: Arc<Mutex<()>>,
 }
 
 impl BlockRange {
     fn new(raw: Arc<dyn RawBlockDevice>, start: usize, len: Option<usize>) -> Self {
-        Self { raw, start, len }
+        Self {
+            raw,
+            start,
+            len,
+            cache: Arc::new(Mutex::new(BlockCache::new())),
+            io_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     fn checked_abs_range(&self, offset: usize, len: usize) -> Result<usize, SysErrNo> {
@@ -45,24 +139,129 @@ impl BlockRange {
         self.start.checked_add(offset).ok_or(SysErrNo::EINVAL)
     }
 
-    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), SysErrNo> {
+    fn read_raw_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), SysErrNo> {
         let abs = self.checked_abs_range(offset, buf.len())?;
         self.raw.read_at(abs, buf)
     }
 
-    pub fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), SysErrNo> {
+    fn write_raw_at(&self, offset: usize, data: &[u8]) -> Result<(), SysErrNo> {
         let abs = self.checked_abs_range(offset, data.len())?;
         self.raw.write_at(abs, data)
+    }
+
+    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), SysErrNo> {
+        let _io = self.io_lock.lock();
+        self.read_raw_at(offset, buf)
+    }
+
+    pub fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), SysErrNo> {
+        let _io = self.io_lock.lock();
+        self.cache.lock().invalidate_range(offset, data.len());
+        self.write_raw_at(offset, data)
+    }
+
+    fn read_cached_block(&self, offset: usize) -> Vec<u8> {
+        if let Some(data) = self.cache.lock().get(offset) {
+            return data;
+        }
+
+        let _io = self.io_lock.lock();
+        if let Some(data) = self.cache.lock().get(offset) {
+            return data;
+        }
+        let mut data = vec![0u8; EXT4_BLOCK_SIZE];
+        if self.read_raw_at(offset, &mut data).is_err() {
+            log::warn!("[block] read_offset failed @{:#x}", offset);
+            return data;
+        }
+        self.cache.lock().insert(offset, data.clone());
+        data
+    }
+
+    fn read_cached_blocks(&self, offsets: &[usize]) -> Result<Vec<Vec<u8>>, SysErrNo> {
+        let mut blocks: Vec<Option<Vec<u8>>> = vec![None; offsets.len()];
+        {
+            let mut cache = self.cache.lock();
+            for (index, offset) in offsets.iter().copied().enumerate() {
+                blocks[index] = cache.get(offset);
+            }
+        }
+        if blocks.iter().all(Option::is_some) {
+            return Ok(blocks.into_iter().flatten().collect());
+        }
+
+        let _io = self.io_lock.lock();
+        {
+            let mut cache = self.cache.lock();
+            for (index, offset) in offsets.iter().copied().enumerate() {
+                if blocks[index].is_none() {
+                    blocks[index] = cache.get(offset);
+                }
+            }
+        }
+
+        let mut index = 0usize;
+        while index < offsets.len() {
+            if blocks[index].is_some() {
+                index += 1;
+                continue;
+            }
+            let run_start = index;
+            let mut run_end = index + 1;
+            while run_end < offsets.len()
+                && blocks[run_end].is_none()
+                && offsets[run_end - 1].checked_add(EXT4_BLOCK_SIZE) == Some(offsets[run_end])
+            {
+                run_end += 1;
+            }
+
+            let run_bytes = (run_end - run_start)
+                .checked_mul(EXT4_BLOCK_SIZE)
+                .ok_or(SysErrNo::EFBIG)?;
+            let mut data = vec![0u8; run_bytes];
+            self.read_raw_at(offsets[run_start], &mut data)?;
+            let mut cache = self.cache.lock();
+            for block_index in run_start..run_end {
+                let data_start = (block_index - run_start) * EXT4_BLOCK_SIZE;
+                let block = data[data_start..data_start + EXT4_BLOCK_SIZE].to_vec();
+                cache.insert(offsets[block_index], block.clone());
+                blocks[block_index] = Some(block);
+            }
+            index = run_end;
+        }
+
+        blocks.into_iter().collect::<Option<Vec<_>>>().ok_or(SysErrNo::EIO)
     }
 }
 
 impl BlockDevice for BlockRange {
     fn read_offset(&self, offset: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; EXT4_BLOCK_SIZE];
-        if self.read_at(offset, &mut buf).is_err() {
-            log::warn!("[block] read_offset failed @{:#x}", offset);
+        if offset % EXT4_BLOCK_SIZE == 0 {
+            return self.read_cached_block(offset);
         }
-        buf
+
+        let end = offset.saturating_add(EXT4_BLOCK_SIZE);
+        let first = (offset / EXT4_BLOCK_SIZE) * EXT4_BLOCK_SIZE;
+        let mut out = vec![0u8; EXT4_BLOCK_SIZE];
+        let mut copied = 0usize;
+        let mut block = first;
+        while copied < EXT4_BLOCK_SIZE {
+            let data = self.read_cached_block(block);
+            let block_offset = offset.saturating_add(copied).saturating_sub(block);
+            let available = EXT4_BLOCK_SIZE.saturating_sub(block_offset);
+            let count = available.min(EXT4_BLOCK_SIZE - copied);
+            if count == 0 {
+                break;
+            }
+            out[copied..copied + count]
+                .copy_from_slice(&data[block_offset..block_offset + count]);
+            copied += count;
+            block = block.saturating_add(EXT4_BLOCK_SIZE);
+            if block >= end && copied < EXT4_BLOCK_SIZE {
+                break;
+            }
+        }
+        out
     }
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
@@ -323,6 +522,12 @@ pub fn root_source_path() -> String {
 pub fn root_device_numbers() -> Option<(u32, u32)> {
     let path = root_source_path();
     device_numbers_for_path(&path)
+}
+
+pub fn read_root_blocks(offsets: &[usize]) -> Result<Vec<Vec<u8>>, SysErrNo> {
+    let path = root_source_path();
+    let range = range_for_path(&path).ok_or(SysErrNo::ENODEV)?;
+    range.read_cached_blocks(offsets)
 }
 
 #[derive(Clone, Debug)]

@@ -102,6 +102,7 @@ impl VirtioMmioBlock {
 
 impl RawBlockDevice for VirtioMmioBlock {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), SysErrNo> {
+        crate::perf_counters::note_block_read(offset, buf.len());
         self.read_phys(offset, buf).map_err(|_| SysErrNo::EIO)
     }
 

@@ -15,13 +15,10 @@ const AT_FDCWD: isize = -100;
 pub type SyscallRet = Result<usize, SysErrNo>;
 
 pub(crate) fn with_kernel_page_table<T>(f: impl FnOnce() -> T) -> T {
-    // A user trap returns from `run_user_task()` to the scheduler instead of
-    // resuming user mode directly.  Keep the complete syscall on the kernel
-    // page table; the scheduler activates the task address space immediately
-    // before the next `run_user_task()` call.  Restoring the user page table
-    // here is both premature and unsafe for nested VFS/block operations because
-    // low user mappings can overlap platform MMIO.
-    crate::trap::restore_kernel_page_table();
+    // user_interrupt() establishes the kernel page table before dispatching a
+    // syscall, and blocking paths preserve it when they resume.  Keep this
+    // wrapper as the VFS/driver boundary without flushing the same address
+    // space for every nested operation.
     f()
 }
 

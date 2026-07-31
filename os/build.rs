@@ -46,7 +46,12 @@ fn emit_preloaded_apps(manifest_dir: &PathBuf, target: &str) {
     // Track them so Cargo does not reuse an artifact built for another mode.
     println!("cargo:rerun-if-env-changed=WLL_INTERACTIVE");
     println!("cargo:rerun-if-env-changed=WLL_HARNESS_GROUPS");
-    for key in ["WLL_INTERACTIVE", "WLL_HARNESS_GROUPS"] {
+    println!("cargo:rerun-if-env-changed=WLL_HARNESS_LIBC");
+    for key in [
+        "WLL_INTERACTIVE",
+        "WLL_HARNESS_GROUPS",
+        "WLL_HARNESS_LIBC",
+    ] {
         if let Ok(value) = env::var(key) {
             println!("cargo:rustc-env={key}={value}");
         }

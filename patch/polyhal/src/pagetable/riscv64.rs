@@ -1,7 +1,7 @@
 use core::arch::riscv64::sfence_vma;
 
 use bitflags::bitflags;
-use riscv::register::satp::{self, Satp};
+use riscv::register::satp::{self, Mode};
 
 use super::{MappingFlags, PageTable, PTE, TLB};
 use crate::{PhysAddr, VirtAddr};
@@ -218,13 +218,39 @@ impl PageTable {
 
     #[inline]
     pub fn change(&self) {
-        let satp_val = if self.0.raw() == 0 {
-            0
-        } else {
-            (8usize << 60) | (self.0.raw() >> 12)
-        };
-        unsafe { satp::write(Satp::from_bits(satp_val)) }
+        self.change_with_asid(0);
         TLB::flush_all();
+    }
+
+    /// Activate this root under an address-space identifier.
+    ///
+    /// The caller owns ASID allocation and must invalidate stale entries
+    /// before reusing an ASID for another root.
+    #[inline]
+    pub fn change_with_asid(&self, asid: usize) {
+        if self.0.raw() == 0 {
+            unsafe { satp::set(Mode::Bare, 0, 0) }
+        } else {
+            unsafe { satp::set(Mode::Sv39, asid, self.0.raw() >> 12) }
+        }
+    }
+
+    #[inline]
+    pub fn current_asid() -> usize {
+        satp::read().asid()
+    }
+
+    /// Probe the implemented Sv39 ASID width through the WARL satp field.
+    pub fn max_asid() -> usize {
+        let original = satp::read();
+        if original.mode() == Mode::Bare {
+            return 0;
+        }
+        unsafe { satp::set(original.mode(), u16::MAX as usize, original.ppn()) }
+        let max_asid = satp::read().asid();
+        unsafe { satp::write(original) }
+        TLB::flush_all();
+        max_asid
     }
 }
 

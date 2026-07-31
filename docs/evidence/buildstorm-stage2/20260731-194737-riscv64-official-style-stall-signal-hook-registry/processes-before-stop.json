@@ -1,0 +1,12 @@
+[
+    {
+        "Id":  22280,
+        "ProcessName":  "python",
+        "Path":  "C:\\Users\\22478\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"
+    },
+    {
+        "Id":  42000,
+        "ProcessName":  "qemu-system-riscv64",
+        "Path":  "C:\\Program Files\\qemu\\qemu-system-riscv64.exe"
+    }
+]

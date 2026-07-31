@@ -96,7 +96,7 @@ impl TaskControlBlock {
                 sid: pgid,
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
-                next_mmap: 0x4000_0000,
+                next_mmap: 0x2000_0000,
                 rlimit_nofile: crate::fs::fd::MAX_FD_NUM,
                 rlimit_nofile_max: crate::fs::fd::MAX_FD_NUM,
                 rlimit_fsize: usize::MAX,
@@ -129,6 +129,9 @@ impl TaskControlBlock {
             wait_token: AtomicUsize::new(0),
             sched_policy: AtomicUsize::new(crate::task::SCHED_OTHER),
             sched_priority: AtomicUsize::new(0),
+            affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
+            blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            running_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -302,7 +305,7 @@ impl TaskControlBlock {
                 sid: pgid,
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
-                next_mmap: 0x4000_0000,
+                next_mmap: 0x2000_0000,
                 rlimit_nofile: crate::fs::fd::MAX_FD_NUM,
                 rlimit_nofile_max: crate::fs::fd::MAX_FD_NUM,
                 rlimit_fsize: usize::MAX,
@@ -335,6 +338,9 @@ impl TaskControlBlock {
             wait_token: AtomicUsize::new(0),
             sched_policy: AtomicUsize::new(crate::task::SCHED_OTHER),
             sched_priority: AtomicUsize::new(0),
+            affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
+            blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            running_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -377,7 +383,7 @@ impl TaskControlBlock {
                 sid: pgid,
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
-                next_mmap: 0x4000_0000,
+                next_mmap: 0x2000_0000,
                 rlimit_nofile: crate::fs::fd::MAX_FD_NUM,
                 rlimit_nofile_max: crate::fs::fd::MAX_FD_NUM,
                 rlimit_fsize: usize::MAX,
@@ -410,6 +416,9 @@ impl TaskControlBlock {
             wait_token: AtomicUsize::new(0),
             sched_policy: AtomicUsize::new(crate::task::SCHED_OTHER),
             sched_priority: AtomicUsize::new(0),
+            affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
+            blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            running_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -450,7 +459,7 @@ impl TaskControlBlock {
                 sid: pgid,
                 program_break: crate::config::USER_HEAP_START,
                 mapped_break: crate::config::USER_HEAP_START,
-                next_mmap: 0x4000_0000,
+                next_mmap: 0x2000_0000,
                 rlimit_nofile: crate::fs::fd::MAX_FD_NUM,
                 rlimit_nofile_max: crate::fs::fd::MAX_FD_NUM,
                 rlimit_fsize: usize::MAX,
@@ -483,6 +492,9 @@ impl TaskControlBlock {
             wait_token: AtomicUsize::new(0),
             sched_policy: AtomicUsize::new(crate::task::SCHED_OTHER),
             sched_priority: AtomicUsize::new(0),
+            affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
+            blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            running_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -497,6 +509,37 @@ impl TaskControlBlock {
     /// 设置任务状态
     pub fn set_status(&self, status: TaskStatus) {
         *self.status.lock() = status;
+    }
+
+    pub(crate) fn set_status_if(&self, expected: TaskStatus, next: TaskStatus) -> bool {
+        let mut status = self.status.lock();
+        if *status != expected {
+            return false;
+        }
+        *status = next;
+        true
+    }
+
+    pub(crate) fn try_start_running(&self) -> bool {
+        let mut status = self.status.lock();
+        if *status != TaskStatus::Ready {
+            return false;
+        }
+        let cpu = crate::platform::current_cpu_index();
+        if self
+            .running_cpu
+            .compare_exchange(
+                crate::task::NO_CPU,
+                cpu,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        *status = TaskStatus::Running;
+        true
     }
 
     pub fn next_wait_token(&self) -> usize {

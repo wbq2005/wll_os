@@ -1,0 +1,22 @@
+
+
+TotalVisibleMemorySize : 16110108
+FreePhysicalMemory     : 1665236
+TotalVirtualMemorySize : 54805012
+FreeVirtualMemory      : 5384196
+
+
+
+
+
+
+Id                  : 41324
+ProcessName         : qemu-system-riscv64
+CPU                 : 19611.015625
+StartTime           : 2026/7/31 20:33:12
+WorkingSet64        : 582062080
+PrivateMemorySize64 : 18498535424
+
+
+
+

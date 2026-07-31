@@ -9,7 +9,7 @@ use polyhal::consts::VIRT_ADDR_START;
 use riscv::{
     interrupt::{Exception, Interrupt},
     register::{
-        scause::{self, Trap},
+        scause::{self, Trap}, sip,
         stval,
         stvec::{self, Stvec},
     },
@@ -68,6 +68,10 @@ fn kernel_callback(context: &mut TrapFrame) -> TrapType {
         Trap::Exception(Exception::UserEnvCall) => TrapType::SysCall,
         // 时钟中断
         Trap::Interrupt(Interrupt::SupervisorTimer) => TrapType::Timer,
+        Trap::Interrupt(Interrupt::SupervisorSoft) => {
+            unsafe { sip::clear_ssoft() };
+            TrapType::Ipi(0)
+        }
         Trap::Exception(Exception::StorePageFault) => TrapType::StorePageFault(stval),
         Trap::Exception(Exception::StoreFault) => TrapType::StorePageFault(stval),
         Trap::Exception(Exception::InstructionPageFault) => TrapType::InstructionPageFault(stval),

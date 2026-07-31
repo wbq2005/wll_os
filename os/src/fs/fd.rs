@@ -2082,13 +2082,7 @@ impl FileDescriptorTable {
     }
 
     pub fn free(&mut self, fd: usize) -> Result<(), SysErrNo> {
-        crate::trap::restore_kernel_page_table();
         drop(self.remove(fd)?);
-        if let Some(task) = crate::task::current_task() {
-            if !task.is_kernel {
-                task.memory_set.lock().activate();
-            }
-        }
         Ok(())
     }
 

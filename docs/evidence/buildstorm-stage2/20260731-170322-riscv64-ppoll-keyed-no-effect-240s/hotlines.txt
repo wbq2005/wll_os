@@ -1,0 +1,20 @@
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:74:[harness] SCRIPT /glibc/buildstorm_testcode.sh
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:78:BUILDSTORM_TOOLCHAIN ok
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:79:BUILDSTORM_MINIBUILD ok
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:81:   Compiling unicode-ident v1.0.24
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:82:   Compiling quote v1.0.46
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:83:   Compiling proc-macro2 v1.0.106
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:84:   Compiling libc v0.2.186
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:85:   Compiling cfg-if v1.0.4
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:86:   Compiling log v0.4.33
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:87:   Compiling find-msvc-tools v0.1.9
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:88:   Compiling shlex v2.0.1
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:89:   Compiling itoa v1.0.18
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:90:   Compiling pkg-config v0.3.33
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:91:   Compiling smallvec v1.15.2
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:92:   Compiling memchr v2.8.2
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:93:   Compiling serde_core v1.0.228
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:94:   Compiling bitflags v2.13.0
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:95:   Compiling scopeguard v1.2.0
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:128:[buildstorm-diag] syscall id=73 count=33236 total_us=8113 max_us=4409 samples=133
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-170322-riscv64-ppoll-keyed-no-effect-240s\buildstorm-riscv64-complete.partial.log:220:[buildstorm-diag] perf faults=115377 clean_faults=45533 user_pt=340805 kernel_pt=340805 block_reads=52590 block_bytes=353010178 block_same=1241 block_seq=33916 block_random=17425

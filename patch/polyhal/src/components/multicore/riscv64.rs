@@ -1,7 +1,7 @@
 use crate::consts::VIRT_ADDR_START;
 
 // Boot a core with top pointer of the stack
-pub fn boot_core(cpuid: usize, addr: usize, sp_top: usize) {
+pub fn boot_core(cpuid: usize, addr: usize, sp_top: usize) -> bool {
     // PERCPU DATA ADDRESS RANGE END
     let aux_core_func = addr & !VIRT_ADDR_START;
 
@@ -11,4 +11,5 @@ pub fn boot_core(cpuid: usize, addr: usize, sp_top: usize) {
         true => log::info!("hart {} Startting successfully", cpuid),
         false => log::warn!("hart {} Startting failed", cpuid),
     }
+    ret.is_ok()
 }

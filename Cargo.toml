@@ -9,6 +9,7 @@ opt-level = 2
 
 # 本地 patch 修复 polyhal 的 naked 属性问题
 [patch.crates-io]
+ext4_rs = { path = "vendor/ext4_rs" }
 polyhal = { path = "patch/polyhal" }
 polyhal-boot = { path = "patch/polyhal-boot" }
 polyhal-trap = { path = "patch/polyhal-trap" }

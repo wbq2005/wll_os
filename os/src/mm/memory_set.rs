@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use core::mem;
-use polyhal::pagetable::{MappingFlags, MappingSize, PageTableWrapper};
+use polyhal::pagetable::{MappingFlags, MappingSize, PageTable, PageTableWrapper, TLB};
 use polyhal::{PhysAddr, VirtAddr};
 
 use super::frame_allocator::{self, FrameTracker};
@@ -10,6 +10,10 @@ use crate::config::PAGE_SIZE;
 use crate::fs::fd::FileDescriptor;
 use crate::utils::error::SysErrNo;
 
+const CLEAN_FILE_FAULT_WINDOW_PAGES: usize = 64;
+const CLEAN_FILE_FAULT_READ_AHEAD_PAGES: usize = 16;
+const ANONYMOUS_FAULT_WINDOW_PAGES: usize = 8;
+const COW_FAULT_WINDOW_PAGES: usize = 8;
 fn align_down(value: usize) -> usize {
     value / PAGE_SIZE * PAGE_SIZE
 }
@@ -90,7 +94,11 @@ fn map_area_page_window(
     }
 }
 
-fn unmap_area_pages(page_table: &PageTableWrapper, area: &MapArea, flags: PTEFlags) {
+fn unmap_area_pages_without_shootdown(
+    page_table: &PageTableWrapper,
+    area: &MapArea,
+    flags: PTEFlags,
+) {
     if !has_leaf_permission(flags) || !area.has_frames() {
         return;
     }
@@ -101,30 +109,22 @@ fn unmap_area_pages(page_table: &PageTableWrapper, area: &MapArea, flags: PTEFla
     }
 }
 
+fn unmap_area_pages(page_table: &PageTableWrapper, area: &MapArea, flags: PTEFlags) {
+    unmap_area_pages_without_shootdown(page_table, area, flags);
+    if !has_leaf_permission(flags) || !area.has_frames() {
+        return;
+    }
+    crate::platform::tlb_shootdown(page_table.root().raw());
+}
+
 fn remap_area_pages(page_table: &PageTableWrapper, area: &MapArea, old_flags: PTEFlags) {
     unmap_area_pages(page_table, area, old_flags);
     map_area_pages(page_table, area);
 }
 
-fn populate_area_frames(area: &mut MapArea) -> Result<(), SysErrNo> {
-    if area.has_frames() {
-        return Ok(());
-    }
-
-    let mut frames = Vec::new();
-    for _ in 0..area.page_count() {
-        let Some(frame) = frame_allocator::alloc_frame() else {
-            return Err(SysErrNo::ENOMEM);
-        };
-        frames.push(frame);
-    }
-    area.frames = frames;
-    Ok(())
-}
-
-fn copy_area_frames(area: &mut MapArea) -> Result<(), SysErrNo> {
+fn copy_area_frames(area: &mut MapArea) -> Result<Vec<FrameTracker>, SysErrNo> {
     if area.frames.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut frames = Vec::new();
@@ -141,25 +141,25 @@ fn copy_area_frames(area: &mut MapArea) -> Result<(), SysErrNo> {
         }
         frames.push(frame);
     }
-    area.frames = frames;
-    Ok(())
+    Ok(mem::replace(&mut area.frames, frames))
 }
 
-fn read_file_page(backing: &MapAreaBacking) -> Result<Vec<u8>, SysErrNo> {
-    let MapAreaBacking::File { file, offset, .. } = backing else {
-        return Ok(alloc::vec![0u8; PAGE_SIZE]);
-    };
-
+fn read_backing_page(backing: &MapAreaBacking, _page_start: usize) -> Result<Vec<u8>, SysErrNo> {
     let mut data = alloc::vec![0u8; PAGE_SIZE];
-    let mut file = file.clone();
-    crate::trap::restore_kernel_page_table();
-    let _ = file.read_at(*offset, &mut data)?;
+    match backing {
+        MapAreaBacking::File { file, offset, .. } => {
+            let mut file = file.clone();
+            let _ = file.read_at(*offset, &mut data)?;
+        }
+        MapAreaBacking::Anonymous | MapAreaBacking::SharedMemory { .. } => {}
+    }
     Ok(data)
 }
 
 /// Per-process address space.
 pub struct MemorySet {
     pub page_table: PageTableWrapper,
+    address_space_id: usize,
     /// User VMAs. Framed areas own their user data frames through `MapArea`.
     pub areas: Vec<MapArea>,
 }
@@ -169,6 +169,7 @@ impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
             page_table: PageTableWrapper::alloc_new(),
+            address_space_id: allocate_address_space_id(),
             areas: Vec::new(),
         }
     }
@@ -346,12 +347,39 @@ impl MemorySet {
     }
 
     pub fn activate(&self) {
-        self.page_table.change();
+        crate::perf_counters::note_user_page_table_activation();
+        // Callers hold the shared MemorySet lock while activating. Publishing
+        // the root before changing the hardware page table makes a concurrent
+        // page-table editor observe this CPU only after the new root is live;
+        // an editor that finished earlier leaves a generation handled here.
+        crate::platform::mark_current_address_space(self.address_space_root());
+        #[cfg(target_arch = "riscv64")]
+        let already_active = PageTable::current().root() == self.page_table.root()
+            && PageTable::current_asid() == self.address_space_id;
+        #[cfg(not(target_arch = "riscv64"))]
+        let already_active = false;
+        if !already_active {
+            self.page_table.change_with_asid(self.address_space_id);
+        }
+        // LoongArch page-table edits currently occur under kernel ASID 0 and
+        // need a conservative local invalidation before re-entering user mode.
+        // RISC-V can retain its ASID-tagged entries across the transition.
+        if self.address_space_id == 0 || cfg!(target_arch = "loongarch64") {
+            TLB::flush_all();
+        }
+    }
+
+    pub fn address_space_id(&self) -> usize {
+        self.address_space_id
+    }
+
+    pub fn address_space_root(&self) -> usize {
+        self.page_table.root().raw()
     }
 
     pub fn satp_token(&self) -> usize {
         let root_ppn = self.page_table.root().raw() >> 12;
-        (8usize << 60) | root_ppn
+        (8usize << 60) | (self.address_space_id << 44) | root_ppn
     }
 
     pub fn remove_area(&mut self, start_va: VirtAddr) {
@@ -377,6 +405,12 @@ impl MemorySet {
 
     pub fn is_mapped(&self, vaddr: VirtAddr) -> bool {
         self.translate(vaddr).is_some()
+    }
+
+    pub fn is_shared_mapping_at(&self, addr: usize) -> bool {
+        self.area_index_containing(addr)
+            .map(|index| is_shared_mapping(&self.areas[index]))
+            .unwrap_or(false)
     }
 
     pub fn range_overlaps(&self, start: usize, end: usize) -> bool {
@@ -468,96 +502,155 @@ impl MemorySet {
             return Err(SysErrNo::ENOMEM);
         }
 
+        let mut index = self.first_area_ending_after(start);
+        let mut already_protected = true;
+        while index < self.areas.len() && self.areas[index].start_va.raw() < end {
+            if self.areas[index]
+                .flags
+                .difference(PTEFlags::COW)
+                .bits()
+                != flags.bits()
+            {
+                already_protected = false;
+                break;
+            }
+            index += 1;
+        }
+        if already_protected {
+            return Ok(());
+        }
+
         self.split_area_at(start);
         self.split_area_at(end);
 
+        let mut changed_mappings = false;
         for area in &mut self.areas {
             if area.start_va.raw() >= start && area.end_va.raw() <= end {
                 let old_flags = area.flags;
-                let file_backed = matches!(area.backing, MapAreaBacking::File { .. });
+                if old_flags.difference(PTEFlags::COW).bits() == flags.bits() {
+                    continue;
+                }
+                let private_file_backed =
+                    matches!(area.backing, MapAreaBacking::File { shared: false, .. });
                 let anonymous = matches!(area.backing, MapAreaBacking::Anonymous);
                 let mut new_flags = flags;
-                if file_backed && flags.contains(PTEFlags::W) && area.has_frames() {
-                    copy_area_frames(area)?;
-                }
-                if anonymous
+                if (anonymous || private_file_backed)
                     && flags.contains(PTEFlags::W)
                     && area.has_frames()
-                    && area.flags.contains(PTEFlags::COW)
+                    && (area.flags.contains(PTEFlags::COW)
+                        || area.frames.iter().any(|frame| frame.ref_count() > 1))
                 {
+                    // Linux does not eagerly duplicate a whole private mapping
+                    // merely because mprotect made it writable.  Keep shared
+                    // clean/COW frames read-only and resolve at the first
+                    // store fault; otherwise one mprotect over a large rustc
+                    // mapping can monopolize the kernel for seconds/minutes.
                     new_flags |= PTEFlags::COW;
-                } else if anonymous
-                    && flags.contains(PTEFlags::W)
-                    && area.has_frames()
-                    && area.frames.iter().any(|frame| frame.ref_count() > 1)
-                {
-                    copy_area_frames(area)?;
-                }
-                if has_leaf_permission(new_flags) && !file_backed {
-                    populate_area_frames(area)?;
                 }
                 area.flags = new_flags;
-                remap_area_pages(&self.page_table, area, old_flags);
+                if area.has_frames()
+                    && (has_leaf_permission(old_flags) || has_leaf_permission(new_flags))
+                {
+                    if has_leaf_permission(new_flags) {
+                        // map_page overwrites the existing leaf and performs
+                        // the required local invalidation.
+                        map_area_pages(&self.page_table, area);
+                    } else {
+                        unmap_area_pages_without_shootdown(
+                            &self.page_table,
+                            area,
+                            old_flags,
+                        );
+                    }
+                    changed_mappings = true;
+                }
             }
+        }
+        if changed_mappings {
+            crate::platform::tlb_shootdown(self.page_table.root().raw());
         }
         self.coalesce_areas();
         Ok(())
     }
 
     fn resolve_cow_page(&mut self, page_start: usize) -> Result<(), SysErrNo> {
-        let page_end = page_start.checked_add(PAGE_SIZE).ok_or(SysErrNo::EFAULT)?;
-        self.split_area_at(page_start);
-        self.split_area_at(page_end);
-
-        let Some(index) = self.area_index_containing(page_start) else {
+        let Some(source_index) = self.area_index_containing(page_start) else {
             return Err(SysErrNo::EFAULT);
         };
-        if self.areas[index].start_va.raw() != page_start
-            || self.areas[index].end_va.raw() != page_end
-        {
-            return Err(SysErrNo::EFAULT);
-        }
-
-        let old_flags = self.areas[index].flags;
+        let source = &self.areas[source_index];
+        let old_flags = source.flags;
         if !matches!(
-            self.areas[index].backing,
+            source.backing,
             MapAreaBacking::Anonymous | MapAreaBacking::File { shared: false, .. }
         ) || !old_flags.contains(PTEFlags::COW)
             || !old_flags.contains(PTEFlags::W)
         {
             return Err(SysErrNo::EFAULT);
         }
-        let shared = self.areas[index]
-            .frames
-            .first()
-            .map(|frame| frame.ref_count() > 1)
+        let first_frame = (page_start - source.start_va.raw()) / PAGE_SIZE;
+        let Some(available_pages) = source.frames.len().checked_sub(first_frame) else {
+            return Err(SysErrNo::EFAULT);
+        };
+        let max_pages = available_pages.min(COW_FAULT_WINDOW_PAGES);
+        if max_pages == 0 {
+            return Err(SysErrNo::EFAULT);
+        }
+
+        let mut replacements = Vec::new();
+        for relative in 0..max_pages {
+            let source_frame = &source.frames[first_frame + relative];
+            if source_frame.ref_count() > 1 {
+                let Some(frame) = frame_allocator::alloc_frame() else {
+                    if relative == 0 {
+                        return Err(SysErrNo::ENOMEM);
+                    }
+                    break;
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        source_frame.ppn().addr() as *const u8,
+                        frame.ppn().addr() as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+                replacements.push(Some(frame));
+            } else {
+                replacements.push(None);
+            }
+        }
+        let window_bytes = replacements
+            .len()
+            .checked_mul(PAGE_SIZE)
+            .ok_or(SysErrNo::EFAULT)?;
+        let window_end = page_start
+            .checked_add(window_bytes)
             .ok_or(SysErrNo::EFAULT)?;
 
-        let replacement = if shared {
-            let src_frame = self.areas[index].frames[0].clone();
-            let Some(frame) = frame_allocator::alloc_frame() else {
-                return Err(SysErrNo::ENOMEM);
-            };
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src_frame.ppn().addr() as *const u8,
-                    frame.ppn().addr() as *mut u8,
-                    PAGE_SIZE,
-                );
-            }
-            Some(frame)
-        } else {
-            None
+        self.split_area_at(page_start);
+        self.split_area_at(window_end);
+        let Some(index) = self.area_index_containing(page_start) else {
+            return Err(SysErrNo::EFAULT);
         };
+        if self.areas[index].start_va.raw() != page_start
+            || self.areas[index].end_va.raw() != window_end
+            || self.areas[index].frames.len() != replacements.len()
+        {
+            return Err(SysErrNo::EFAULT);
+        }
 
+        let mut old_frames = Vec::new();
         {
             let area = &mut self.areas[index];
-            if let Some(frame) = replacement {
-                area.frames[0] = frame;
+            for (frame_index, replacement) in replacements.into_iter().enumerate() {
+                if let Some(frame) = replacement {
+                    old_frames.push(mem::replace(&mut area.frames[frame_index], frame));
+                }
             }
             area.flags.remove(PTEFlags::COW);
         }
         remap_area_pages(&self.page_table, &self.areas[index], old_flags);
+        drop(old_frames);
+        self.coalesce_areas();
         Ok(())
     }
 
@@ -669,6 +762,7 @@ impl MemorySet {
         is_store: bool,
         is_exec: bool,
     ) -> Result<(), SysErrNo> {
+        crate::perf_counters::note_page_fault();
         let page_start = align_down(fault_addr);
         let page_end = page_start.checked_add(PAGE_SIZE).ok_or(SysErrNo::EFAULT)?;
         let Some(area_index) = self.area_index_containing(fault_addr) else {
@@ -692,7 +786,6 @@ impl MemorySet {
         }
         if is_store && area.flags.contains(PTEFlags::COW) {
             self.resolve_cow_page(page_start)?;
-            self.activate();
             return Ok(());
         }
         let clean_cache_page = if !is_store && !area.flags.contains(PTEFlags::W) {
@@ -711,13 +804,85 @@ impl MemorySet {
             None
         };
         if self.translate(VirtAddr::new(page_start)).is_some() {
-            self.activate();
             return Ok(());
         }
         if matches!(area.backing, MapAreaBacking::File { .. }) && area.has_frames() {
             let page_idx = (page_start - area.start_va.raw()) / PAGE_SIZE;
             map_area_page_window(&self.page_table, area, page_idx, 1);
-            self.activate();
+            return Ok(());
+        }
+
+        if matches!(area.backing, MapAreaBacking::Anonymous)
+            && !area.has_frames()
+            && !area.flags.contains(PTEFlags::COW)
+            && !area.flags.contains(PTEFlags::X)
+        {
+            let pages_to_end = (area.end_va.raw() - page_start) / PAGE_SIZE;
+            let window_pages = pages_to_end.min(ANONYMOUS_FAULT_WINDOW_PAGES);
+            let mut frames = Vec::new();
+            for page in 0..window_pages {
+                match frame_allocator::alloc_frame() {
+                    Some(frame) => frames.push(frame),
+                    None if page == 0 => return Err(SysErrNo::ENOMEM),
+                    None => break,
+                }
+            }
+            let window_bytes = frames
+                .len()
+                .checked_mul(PAGE_SIZE)
+                .ok_or(SysErrNo::EFAULT)?;
+            let window_end = page_start
+                .checked_add(window_bytes)
+                .ok_or(SysErrNo::EFAULT)?;
+
+            self.split_area_at(page_start);
+            self.split_area_at(window_end);
+            let Some(idx) = self.area_index_containing(page_start) else {
+                return Err(SysErrNo::EFAULT);
+            };
+            if self.areas[idx].start_va.raw() != page_start
+                || self.areas[idx].end_va.raw() != window_end
+                || self.areas[idx].has_frames()
+            {
+                return Err(SysErrNo::EFAULT);
+            }
+            self.areas[idx].frames = frames;
+            map_area_pages(&self.page_table, &self.areas[idx]);
+            self.coalesce_areas();
+            return Ok(());
+        }
+
+        if let Some((ino, file_offset)) = clean_cache_page {
+            crate::perf_counters::note_clean_file_fault();
+            let pages_to_end = (area.end_va.raw() - page_start) / PAGE_SIZE;
+            let window_pages = pages_to_end.min(CLEAN_FILE_FAULT_WINDOW_PAGES);
+            let cache_frames = crate::fs::ext4_vol::clean_page_cache_frames(
+                ino,
+                file_offset,
+                window_pages,
+                CLEAN_FILE_FAULT_READ_AHEAD_PAGES,
+            )?;
+            if cache_frames.is_empty() {
+                return Err(SysErrNo::ENOMEM);
+            }
+            let window_end = page_start
+                .checked_add(cache_frames.len() * PAGE_SIZE)
+                .ok_or(SysErrNo::EFAULT)?;
+
+            self.split_area_at(page_start);
+            self.split_area_at(window_end);
+            let Some(idx) = self.area_index_containing(page_start) else {
+                return Err(SysErrNo::EFAULT);
+            };
+            if self.areas[idx].start_va.raw() != page_start
+                || self.areas[idx].end_va.raw() != window_end
+                || self.areas[idx].has_frames()
+            {
+                return Err(SysErrNo::EFAULT);
+            }
+            self.areas[idx].frames = cache_frames;
+            map_area_pages(&self.page_table, &self.areas[idx]);
+            self.coalesce_areas();
             return Ok(());
         }
 
@@ -734,38 +899,18 @@ impl MemorySet {
 
         if self.areas[idx].has_frames() {
             map_area_pages(&self.page_table, &self.areas[idx]);
-            self.activate();
-            return Ok(());
-        }
-
-        if let Some((ino, file_offset)) = clean_cache_page {
-            crate::trap::restore_kernel_page_table();
-            let cache_frame_result = crate::fs::ext4_vol::clean_page_cache_frame(ino, file_offset);
-            if cache_frame_result.is_err() {
-                self.activate();
-            }
-            let cache_frame = cache_frame_result?;
-            self.areas[idx].frames.push(cache_frame);
-            map_area_pages(&self.page_table, &self.areas[idx]);
-            self.activate();
             return Ok(());
         }
 
         let Some(frame) = frame_allocator::alloc_frame() else {
             return Err(SysErrNo::ENOMEM);
         };
-        crate::trap::restore_kernel_page_table();
-        let data_result = read_file_page(&self.areas[idx].backing);
-        if data_result.is_err() {
-            self.activate();
-        }
-        let data = data_result?;
+        let data = read_backing_page(&self.areas[idx].backing, page_start)?;
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), frame.ppn().addr() as *mut u8, PAGE_SIZE);
         }
         self.areas[idx].frames.push(frame);
         map_area_pages(&self.page_table, &self.areas[idx]);
-        self.activate();
         Ok(())
     }
 
@@ -898,6 +1043,12 @@ impl MemorySet {
     }
 }
 
+impl Drop for MemorySet {
+    fn drop(&mut self) {
+        retire_address_space_id(self.address_space_id);
+    }
+}
+
 impl Clone for MemorySet {
     fn clone(&self) -> Self {
         let mut new_ms = Self::from_kernel();
@@ -948,8 +1099,70 @@ impl Clone for MemorySet {
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+struct AsidAllocator {
+    max_asid: usize,
+    next_asid: usize,
+    reusable: Vec<usize>,
+    retired: Vec<usize>,
+}
+
+impl AsidAllocator {
+    fn new() -> Self {
+        let hardware_max_asid = PageTable::max_asid();
+        #[cfg(feature = "smp-regression")]
+        let hardware_max_asid = hardware_max_asid.min(8);
+        Self {
+            max_asid: hardware_max_asid,
+            next_asid: 1,
+            reusable: Vec::new(),
+            retired: Vec::new(),
+        }
+    }
+
+    fn allocate_without_recycling(&mut self) -> Option<usize> {
+        if let Some(asid) = self.reusable.pop() {
+            return Some(asid);
+        }
+        if self.next_asid <= self.max_asid {
+            let asid = self.next_asid;
+            self.next_asid += 1;
+            return Some(asid);
+        }
+        None
+    }
+}
+
 lazy_static! {
+    static ref ASID_ALLOCATOR: Mutex<AsidAllocator> = Mutex::new(AsidAllocator::new());
     pub static ref KERNEL_SPACE: Mutex<MemorySet> = Mutex::new(MemorySet::new_bare());
+}
+
+fn allocate_address_space_id() -> usize {
+    let retired = {
+        let mut allocator = ASID_ALLOCATOR.lock();
+        if let Some(asid) = allocator.allocate_without_recycling() {
+            return asid;
+        }
+        mem::take(&mut allocator.retired)
+    };
+
+    if retired.is_empty() {
+        // ASID 0 is shared with the kernel and therefore requires a full
+        // local flush on every activation. This preserves correctness if the
+        // implementation exposes no ASID bits or all live IDs are occupied.
+        return 0;
+    }
+
+    crate::platform::flush_tlb_all_cpus();
+    let mut allocator = ASID_ALLOCATOR.lock();
+    allocator.reusable.extend(retired);
+    allocator.allocate_without_recycling().unwrap_or(0)
+}
+
+fn retire_address_space_id(asid: usize) {
+    if asid != 0 {
+        ASID_ALLOCATOR.lock().retired.push(asid);
+    }
 }
 
 pub fn init_kernel_space() {

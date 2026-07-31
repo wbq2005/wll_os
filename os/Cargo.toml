@@ -27,6 +27,7 @@ virtio-drivers = { version = "0.7.4", default-features = false, features = ["all
 
 # 架构特定库 - RISC-V
 riscv = { version = "0.11" }
+sbi-rt = { version = "0.0.2", features = ["legacy"], optional = true }
 
 # 架构特定库 - LoongArch
 loongArch64 = { version = "0.2", optional = true }
@@ -36,7 +37,7 @@ panic = "abort"
 
 [features]
 default = ["riscv"]
-riscv = []
+riscv = ["dep:sbi-rt"]
 loongarch = ["dep:loongArch64"]
 no-init-idle = []
 dev-preload = []
@@ -44,6 +45,9 @@ libctest = []
 iozone = []
 lmbench = []
 ltp = []
+perf-counters = []
+smp-regression = []
+buildstorm-diagnostics = []
 
 [[bin]]
 name = "wll_OS"

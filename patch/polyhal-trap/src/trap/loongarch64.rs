@@ -133,9 +133,24 @@ pub unsafe extern "C" fn tlb_fill() {
             csrwr   $t0, LA_CSR_TLBRSAVE
             csrrd   $t0, LA_CSR_PGD
             lddir   $t0, $t0, 3
+            beqz    $t0, 1f
             lddir   $t0, $t0, 1
+            beqz    $t0, 1f
             ldpte   $t0, 0
             ldpte   $t0, 1
+            b       2f
+        1:
+            // A missing directory entry represents an unmapped page.  Do not
+            // continue the hardware walk from physical address zero: install
+            // an invalid 4 KiB entry so the retried access raises the normal
+            // page-invalid exception handled by the kernel's lazy pager.
+            csrwr   $zero, LA_CSR_TLBRELO0
+            csrwr   $zero, LA_CSR_TLBRELO1
+            csrrd   $t0, LA_CSR_TLBREHI
+            bstrins.d $t0, $zero, 5, 0
+            ori     $t0, $t0, 0x0c
+            csrwr   $t0, LA_CSR_TLBREHI
+        2:
             tlbfill
             csrrd   $t0, LA_CSR_TLBRSAVE
             ertn
@@ -214,6 +229,7 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
                     ticlr::clear_timer_interrupt();
                     TrapType::Timer
                 }
+                12 => TrapType::Ipi(0),
                 _ => panic!("unknown interrupt: {}", irq_num),
             }
         }
@@ -232,6 +248,9 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
         Trap::Exception(Exception::LoadPageFault)
         | Trap::Exception(Exception::PageNonReadableFault) => {
             TrapType::LoadPageFault(badv::read().vaddr())
+        }
+        Trap::Exception(Exception::PagePrivilegeIllegal) => {
+            TrapType::PagePrivilegeFault(badv::read().vaddr())
         }
         Trap::MachineError(error) => panic!(
             "LoongArch machine error {:?}: ecode={:#x} esubcode={:#x} is={:#x} era={:#x} badv={:#x}",

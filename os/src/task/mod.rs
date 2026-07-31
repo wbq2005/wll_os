@@ -10,24 +10,41 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
-use polyhal_trap::trap::run_user_task;
+use polyhal_trap::trap::{run_user_task, EscapeReason};
 use polyhal_trap::trapframe::TrapFrame;
 use spin::Mutex;
 
 use crate::console::putchar;
+use crate::cpu::CpuLocal;
 use crate::fs::fd::FileDescriptorTable;
 use crate::mm::memory_set::MemorySet;
 use crate::task::context::TaskContext;
 use crate::task::processor::Processor;
 
-static mut SCHEDULER_CONTEXT: TaskContext = TaskContext {
-    ra: 0,
-    sp: 0,
-    s: [0; 12],
-};
-static SCHEDULER_CONTEXT_PTR: AtomicUsize = AtomicUsize::new(0);
+struct SchedulerSlot {
+    context: core::cell::UnsafeCell<TaskContext>,
+    active: AtomicUsize,
+}
+
+impl SchedulerSlot {
+    const fn new() -> Self {
+        Self {
+            context: core::cell::UnsafeCell::new(TaskContext {
+                ra: 0,
+                sp: 0,
+                s: [0; 12],
+            }),
+            active: AtomicUsize::new(0),
+        }
+    }
+}
+
+unsafe impl Sync for SchedulerSlot {}
+
+static SCHEDULER_SLOTS: [SchedulerSlot; crate::config::MAX_CPUS] =
+    [const { SchedulerSlot::new() }; crate::config::MAX_CPUS];
 pub(crate) const SIGNAL_EXIT_CODE_BASE: i32 = -0x1000;
 pub const SCHED_OTHER: usize = 0;
 pub const SCHED_FIFO: usize = 1;
@@ -35,6 +52,7 @@ pub const SCHED_RR: usize = 2;
 pub const SCHED_BATCH: usize = 3;
 pub const SCHED_IDLE: usize = 5;
 pub const SCHED_DEADLINE: usize = 6;
+pub const NO_CPU: usize = usize::MAX;
 
 /// Flag set when the scheduler is context-switching FROM a user task that called exit()
 /// (via ECANCELED in the trap handler). When this flag is set, kernel_task_return()
@@ -45,10 +63,11 @@ static FOREGROUND_DEADLINE_US: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     /// 当前运行的任务
-    pub static ref CURRENT_TASK: Mutex<Option<Arc<TaskControlBlock>>> = Mutex::new(None);
+    pub static ref CURRENT_TASK: CpuLocal<Option<Arc<TaskControlBlock>>> =
+        CpuLocal::new_with(|_| None);
 
     /// CPU 处理器状态
-    pub static ref PROCESSOR: Mutex<Processor> = Mutex::new(Processor::new());
+    pub static ref PROCESSOR: CpuLocal<Processor> = CpuLocal::new_with(|_| Processor::new());
 
     /// 孤儿进程收养者：`/init` 或预载入 harness（无 init 时），供父退出时移交子进程
     pub static ref ORPHAN_REAPER: Mutex<Option<Arc<TaskControlBlock>>> = Mutex::new(None);
@@ -556,11 +575,33 @@ fn task_ctx_ptr(task: &Arc<TaskControlBlock>) -> *mut TaskContext {
 }
 
 pub(crate) fn requeue_after_user_run(task: Arc<TaskControlBlock>) {
-    match task.status() {
-        TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped => {}
+    let status = *task.status.lock();
+    match status {
+        TaskStatus::Zombie | TaskStatus::Stopped => {
+            task.blocking_cpu.store(NO_CPU, Ordering::Release);
+        }
+        TaskStatus::Blocked => {
+            // The syscall path kept ownership while unwinding out of
+            // run_user_task(), so a racing waker could publish Ready without
+            // enqueueing the task. Hand ownership to the global scheduler only
+            // after CURRENT_TASK has been cleared, then compensate either side
+            // of the handoff. ReadyQueue deduplication makes the overlap safe.
+            task.blocking_cpu.store(NO_CPU, Ordering::Release);
+            fence(Ordering::SeqCst);
+            if task.status() == TaskStatus::Ready {
+                manager::add_task(task);
+            }
+        }
         TaskStatus::Running | TaskStatus::Ready => {
+            task.blocking_cpu.store(NO_CPU, Ordering::Release);
             *task.block_reason.lock() = None;
-            task.set_status(TaskStatus::Ready);
+            {
+                let mut status = task.status.lock();
+                if !matches!(*status, TaskStatus::Running | TaskStatus::Ready) {
+                    return;
+                }
+                *status = TaskStatus::Ready;
+            }
             if take_foreground_requeue_front(task.pid.0) {
                 manager::add_task_front(task);
             } else {
@@ -568,6 +609,83 @@ pub(crate) fn requeue_after_user_run(task: Arc<TaskControlBlock>) {
             }
         }
     }
+}
+
+fn current_cpu_owns_running_user_task(task: &Arc<TaskControlBlock>) -> bool {
+    if task.status() != TaskStatus::Running {
+        return false;
+    }
+
+    let cpu = crate::platform::current_cpu_index();
+    if task.running_cpu.load(Ordering::Acquire) != cpu
+        || task.blocking_cpu.load(Ordering::Acquire) != NO_CPU
+    {
+        return false;
+    }
+
+    CURRENT_TASK
+        .lock()
+        .as_ref()
+        .map(|current| Arc::ptr_eq(current, task))
+        .unwrap_or(false)
+}
+
+/// Keep running the current user task across traps that do not require a
+/// scheduling decision.  A normal syscall and a successfully handled page
+/// fault preserve the task's CPU ownership; timer/IPI traps, yield, blocking,
+/// stop, and exit return to the scheduler.
+pub(crate) fn run_current_user_task_until_reschedule(
+    task: &Arc<TaskControlBlock>,
+    ctx: &mut TrapFrame,
+) {
+    loop {
+        if !current_cpu_owns_running_user_task(task) {
+            crate::trap::restore_kernel_page_table();
+            break;
+        }
+        if !crate::syscall::signal::handle_pending_for_user(ctx) {
+            crate::trap::restore_kernel_page_table();
+            break;
+        }
+        if !current_cpu_owns_running_user_task(task) {
+            crate::trap::restore_kernel_page_table();
+            break;
+        }
+
+        task.memory_set.lock().activate();
+        crate::trap::prepare_user_trapframe(ctx);
+        enter_foreground_user_task(task.pid.0);
+        crate::trap::interrupts::disable_interrupt();
+        let reason = run_user_task(ctx);
+        leave_foreground_user_task(task.pid.0);
+
+        if !matches!(reason, EscapeReason::SysCall | EscapeReason::NoReason)
+            || !current_cpu_owns_running_user_task(task)
+        {
+            crate::trap::restore_kernel_page_table();
+            break;
+        }
+    }
+}
+
+fn run_current_user_task_one_boundary(task: &Arc<TaskControlBlock>, ctx: &mut TrapFrame) {
+    if !current_cpu_owns_running_user_task(task) {
+        return;
+    }
+    if !crate::syscall::signal::handle_pending_for_user(ctx) {
+        return;
+    }
+    if !current_cpu_owns_running_user_task(task) {
+        return;
+    }
+
+    task.memory_set.lock().activate();
+    crate::trap::prepare_user_trapframe(ctx);
+    enter_foreground_user_task(task.pid.0);
+    crate::trap::interrupts::disable_interrupt();
+    let _reason = run_user_task(ctx);
+    leave_foreground_user_task(task.pid.0);
+    crate::trap::restore_kernel_page_table();
 }
 
 pub fn block_current_for_reason(reason: wait_queue::BlockReason) {
@@ -585,8 +703,8 @@ pub fn block_current_for_reason_until(reason: wait_queue::BlockReason, deadline_
 }
 
 fn switch_kernel_task_back_to_scheduler(task: &Arc<TaskControlBlock>) {
-    let scheduler_ctx_ptr = SCHEDULER_CONTEXT_PTR.load(Ordering::SeqCst);
-    if scheduler_ctx_ptr == 0 {
+    let slot = &SCHEDULER_SLOTS[crate::platform::current_cpu_index()];
+    if slot.active.load(Ordering::Acquire) == 0 {
         log::error!(
             "[task] missing scheduler context for kernel task {}",
             task.pid.0
@@ -594,6 +712,7 @@ fn switch_kernel_task_back_to_scheduler(task: &Arc<TaskControlBlock>) {
         return;
     }
     let current_ctx_ptr = task_ctx_ptr(task);
+    let scheduler_ctx_ptr = slot.context.get();
     unsafe {
         context::switch_to(current_ctx_ptr, scheduler_ctx_ptr as *const TaskContext);
     }
@@ -601,13 +720,14 @@ fn switch_kernel_task_back_to_scheduler(task: &Arc<TaskControlBlock>) {
 
 fn switch_to_kernel_task(task: &Arc<TaskControlBlock>) {
     let task_ctx = task_ctx_ptr(task);
+    let slot = &SCHEDULER_SLOTS[crate::platform::current_cpu_index()];
+    let scheduler_ctx = slot.context.get();
     unsafe {
-        SCHEDULER_CONTEXT.ra = kernel_task_return as usize;
-        SCHEDULER_CONTEXT.sp = 0;
-        SCHEDULER_CONTEXT.s = [0; 12];
+        (*scheduler_ctx).ra = kernel_task_return as usize;
+        (*scheduler_ctx).sp = 0;
+        (*scheduler_ctx).s = [0; 12];
     }
-    let scheduler_ctx = core::ptr::addr_of_mut!(SCHEDULER_CONTEXT);
-    SCHEDULER_CONTEXT_PTR.store(scheduler_ctx as usize, Ordering::SeqCst);
+    slot.active.store(1, Ordering::Release);
 
     log::debug!(
         "[task] Starting kernel task {} via context switch",
@@ -618,7 +738,7 @@ fn switch_to_kernel_task(task: &Arc<TaskControlBlock>) {
         context::switch_to(scheduler_ctx, task_ctx as *const TaskContext);
     }
 
-    SCHEDULER_CONTEXT_PTR.store(0, Ordering::SeqCst);
+    slot.active.store(0, Ordering::Release);
 }
 
 pub fn init_kernel_page() {
@@ -775,6 +895,20 @@ pub fn run_tasks() {
     }
 }
 
+/// Scheduler loop used by secondary CPUs. It shares the global ready queues,
+/// while current task and scheduler context remain CPU-local.
+pub fn run_secondary_tasks() -> ! {
+    loop {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::maybe_report();
+        crate::timer::wake_expired_timers();
+        if run_ready_task_once() || drain_kernel_ready_once() {
+            continue;
+        }
+        wait_for_interrupt();
+    }
+}
+
 /// 挂起当前任务并运行下一个
 ///
 /// 将当前任务放回就绪队列，然后切换到下一个任务
@@ -783,18 +917,23 @@ pub fn run_tasks() {
 pub fn suspend_current_and_run_next() {
     if let Some(task) = current_task() {
         if is_kernel_task(&task) {
-            task.set_status(TaskStatus::Ready);
-            manager::add_task(task.clone());
-            *CURRENT_TASK.lock() = None;
+            // A kernel task is still executing on this CPU until the context
+            // switch has completed.  Let the scheduler publish it only after
+            // switch_to_kernel_task() returns, so another CPU cannot enter the
+            // same kernel stack concurrently.
+    let _ = task.set_status_if(TaskStatus::Running, TaskStatus::Ready);
             switch_kernel_task_back_to_scheduler(&task);
             return;
         }
         if let Some(tf) = crate::trap::clone_current_trapframe() {
             *task.trap_frame.lock() = Some(tf);
         }
+        // Drop the execution claim before making Ready visible in the shared
+        // queue.  A secondary scheduler may dequeue immediately after add_task.
+        *CURRENT_TASK.lock() = None;
+        task.release_running_cpu();
         task.set_status(TaskStatus::Ready);
         manager::add_task(task.clone());
-        *CURRENT_TASK.lock() = None;
         if crate::trap::foreground_driver_active() {
             return;
         }
@@ -824,16 +963,36 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
     let Some(task) = current_task() else {
         return;
     };
+    // Keep the current CPU as the transition owner until the user-run wrapper
+    // has completely unwound. A waker may set Ready during this interval, but
+    // must not enqueue the same TCB while it is still executing here.
+    task.blocking_cpu.store(
+        crate::platform::current_cpu_index(),
+        Ordering::Release,
+    );
     if is_kernel_task(&task) {
         task.set_status(TaskStatus::Blocked);
-        *CURRENT_TASK.lock() = None;
         switch_kernel_task_back_to_scheduler(&task);
         return;
     }
     if let Some(tf) = crate::trap::clone_current_trapframe() {
         *task.trap_frame.lock() = Some(tf);
     }
-    task.set_status(TaskStatus::Blocked);
+    if !task.set_status_if(TaskStatus::Running, TaskStatus::Blocked) {
+        task.blocking_cpu.store(NO_CPU, Ordering::Release);
+        return;
+    }
+    // A wakeup may race with the transition above.  When it arrives while the
+    // task is still Running, the waker records `wait_outcome` instead of
+    // enqueueing a task that is still executing on this CPU.  Recheck after
+    // publishing Blocked so that such an early wakeup cannot be overwritten
+    // by clearing CURRENT_TASK and entering the wait loop.
+    if task.wait_outcome.lock().is_some() {
+        task.blocking_cpu.store(NO_CPU, Ordering::Release);
+        let _ = task.set_status_if(TaskStatus::Blocked, TaskStatus::Running)
+            || task.set_status_if(TaskStatus::Ready, TaskStatus::Running);
+        return;
+    }
     *CURRENT_TASK.lock() = None;
 
     if crate::trap::foreground_driver_active() && deadline_us.is_none() {
@@ -854,13 +1013,13 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
             break;
         }
         if crate::trap::foreground_driver_active() {
-            if run_ready_task_once() {
+            if run_ready_task_once_for_blocked_owner() {
                 no_runnable_spins = 0;
                 continue;
             }
         }
         if !crate::trap::foreground_driver_active() {
-            if run_ready_task_once() {
+            if run_ready_task_once_for_blocked_owner() {
                 no_runnable_spins = 0;
                 continue;
             }
@@ -880,13 +1039,14 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
         }
     }
 
+    task.blocking_cpu.store(NO_CPU, Ordering::Release);
     manager::remove_task_instances(&task);
-    if task.status() == TaskStatus::Ready {
+    if task.set_status_if(TaskStatus::Ready, TaskStatus::Running) {
         *task.block_reason.lock() = None;
-        task.set_status(TaskStatus::Running);
     }
     if task.status() != TaskStatus::Zombie {
-        task.memory_set.lock().activate();
+        // Resume the blocked syscall on the kernel page table.  The scheduler
+        // activates the user address space only immediately before user_restore.
         *CURRENT_TASK.lock() = Some(task);
     }
 }
@@ -905,7 +1065,6 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             );
             task.set_exit_code(exit_code);
             task.set_status(TaskStatus::Zombie);
-            *CURRENT_TASK.lock() = None;
             switch_kernel_task_back_to_scheduler(&task);
             return;
         }
@@ -915,6 +1074,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             finish_process_exit(&task, exit_code);
         }
         *CURRENT_TASK.lock() = None;
+        task.release_running_cpu();
     }
     if crate::trap::foreground_driver_active() {
         return;
@@ -935,10 +1095,16 @@ pub fn exit_thread_group_and_run_next(exit_code: i32) {
         );
         let members = task.thread_group.user_members();
         for member in &members {
-            finish_task_exit(member, exit_code);
+            if Arc::ptr_eq(member, &task) {
+                finish_task_exit(member, exit_code);
+            } else {
+                request_task_exit(member, exit_code);
+            }
         }
+        crate::platform::notify_runnable();
         finish_process_exit(&task, exit_code);
         *CURRENT_TASK.lock() = None;
+        task.release_running_cpu();
     }
     if crate::trap::foreground_driver_active() {
         return;
@@ -950,10 +1116,20 @@ pub(crate) fn terminate_task_group(task: &Arc<TaskControlBlock>, exit_code: i32)
     if task.is_kernel {
         return;
     }
+    let current = current_task();
     let members = task.thread_group.user_members();
     for member in &members {
-        finish_task_exit(member, exit_code);
+        if current
+            .as_ref()
+            .map(|active| Arc::ptr_eq(active, member))
+            .unwrap_or(false)
+        {
+            finish_task_exit(member, exit_code);
+        } else {
+            request_task_exit(member, exit_code);
+        }
     }
+    crate::platform::notify_runnable();
     finish_process_exit(task, exit_code);
 }
 
@@ -999,9 +1175,27 @@ pub(crate) fn terminate_thread_group_peers_for_exec(task: &Arc<TaskControlBlock>
     let members = task.thread_group.user_members();
     for member in &members {
         if member.pid.0 != task.pid.0 && member.status() != TaskStatus::Zombie {
-            finish_task_exit(member, 0);
+            request_task_exit(member, 0);
         }
     }
+    crate::platform::notify_runnable();
+}
+
+fn request_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
+    {
+        let mut status = task.status.lock();
+        if *status == TaskStatus::Zombie {
+            return;
+        }
+        task.set_exit_code(exit_code);
+        *status = TaskStatus::Zombie;
+    }
+    purge_wait_state_for_task(task);
+    *task.trap_frame.lock() = None;
+    *task.block_reason.lock() = None;
+    *task.wait_outcome.lock() = None;
+    crate::task::manager::record_exited_task(task.pid.0, task.thread_group.tgid());
+    crate::fs::fd::flush_console_buffer_for_pid(task.pid.0);
 }
 
 fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
@@ -1013,18 +1207,20 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     };
     if clear_child_tid != 0 {
         let bytes = 0i32.to_ne_bytes();
-        let mut memory_set = task.memory_set.lock();
-        if let Err(err) = crate::syscall::user::copy_to_user_in_memory_set(
-            &mut memory_set,
-            clear_child_tid,
-            &bytes,
-        ) {
-            log::debug!(
-                "[task] clear_child_tid failed tid={} addr={:#x} err={:?}",
-                task.pid.0,
+        {
+            let mut memory_set = task.memory_set.lock();
+            if let Err(err) = crate::syscall::user::copy_to_user_in_memory_set(
+                &mut memory_set,
                 clear_child_tid,
-                err
-            );
+                &bytes,
+            ) {
+                log::debug!(
+                    "[task] clear_child_tid failed tid={} addr={:#x} err={:?}",
+                    task.pid.0,
+                    clear_child_tid,
+                    err
+                );
+            }
         }
         crate::syscall::other::futex_wake_addr_for_task(task, clear_child_tid, usize::MAX);
     }
@@ -1054,16 +1250,14 @@ fn detach_thread_group_shared_memory(members: &[Arc<TaskControlBlock>]) {
 fn release_process_runtime_resources(members: &[Arc<TaskControlBlock>]) {
     crate::trap::restore_kernel_page_table();
 
-    let mut released_memory_sets = Vec::new();
     let mut closed_fd_tables = Vec::new();
     let mut reset_mm_contexts = Vec::new();
 
     for member in members {
-        let memory_key = Arc::as_ptr(&member.memory_set) as usize;
-        if !released_memory_sets.iter().any(|seen| *seen == memory_key) {
-            released_memory_sets.push(memory_key);
-            member.memory_set.lock().release_user_areas();
-        }
+        // Another CPU can still be returning from this thread group's user
+        // context after exit_group has marked every member zombie. Keep the
+        // shared address space intact until the last owning task is dropped;
+        // MemorySet's normal Drop path then releases page tables and frames.
 
         let fd_table = member.inner.lock().fd_table.clone();
         let fd_key = Arc::as_ptr(&fd_table) as usize;
@@ -1078,13 +1272,13 @@ fn release_process_runtime_resources(members: &[Arc<TaskControlBlock>]) {
             let mut mm = member.mm.lock();
             mm.program_break = crate::config::USER_HEAP_START;
             mm.mapped_break = crate::config::USER_HEAP_START;
-            mm.next_mmap = 0x4000_0000;
+            mm.next_mmap = 0x2000_0000;
         }
 
         let mut inner = member.inner.lock();
         inner.program_break = crate::config::USER_HEAP_START;
         inner.mapped_break = crate::config::USER_HEAP_START;
-        inner.next_mmap = 0x4000_0000;
+        inner.next_mmap = 0x2000_0000;
         inner.clear_child_tid = 0;
         inner.robust_list_head = 0;
         inner.robust_list_len = 0;
@@ -1178,14 +1372,20 @@ pub(crate) fn run_next_task() {
             return;
         }
         // 设置当前任务
+        if !task.try_start_running() {
+            if crate::trap::foreground_driver_active() {
+                return;
+            }
+            run_next_task();
+            return;
+        }
         *CURRENT_TASK.lock() = Some(task.clone());
 
         // 设置任务状态为运行中
-        task.set_status(TaskStatus::Running);
-
         log::debug!("[task] Switching to task pid={}", task.pid.0);
         if task.is_kernel {
             switch_to_kernel_task(&task);
+            finish_kernel_task_switch(task);
             return;
         }
         // 获取任务的 TrapFrame（用户态上下文）
@@ -1195,43 +1395,17 @@ pub(crate) fn run_next_task() {
         // `MemorySet::new_bare()` + RISC-V `PageTable::restore()` 会清零根页表「低半」条目；
         // 本项目内核链接在 `0x80200000`，落在该低半区——若对纯内核线程切换 SATP，
         // 会在用户页表里丢失内核代码映射而卡死。
-        let (has_user_ctx, tf_opt, ms_arc) = {
-            let tf = task.trap_frame.lock().take();
-            let has_user = tf.is_some();
-            let ms = task.memory_set.clone();
-            (has_user, tf, ms)
-        };
+        let tf_opt = task.trap_frame.lock().take();
         if let Some(mut ctx) = tf_opt {
             // 恢复任务的 TrapFrame 并返回用户态
             log::debug!("[task] Restoring TrapFrame for task {}", task.pid.0);
-            if !crate::syscall::signal::handle_pending_for_user(&mut ctx) {
-                crate::trap::restore_kernel_page_table();
-                if task.status() != TaskStatus::Zombie {
-                    *task.trap_frame.lock() = Some(ctx);
-                }
-                requeue_after_user_run(task.clone());
-                *CURRENT_TASK.lock() = None;
-                if crate::trap::foreground_driver_active() {
-                    return;
-                }
-                run_next_task();
-                return;
+            run_current_user_task_until_reschedule(&task, &mut ctx);
+            if task.status() != TaskStatus::Zombie {
+                *task.trap_frame.lock() = Some(ctx);
             }
-            // Keep all kernel metadata and signal work on the kernel page
-            // table. Switch immediately before entering user mode.
-            if has_user_ctx {
-                ms_arc.lock().activate();
-            }
-            crate::trap::prepare_user_trapframe(&mut ctx);
-            enter_foreground_user_task(task.pid.0);
-            let reason = run_user_task(&mut ctx);
-            leave_foreground_user_task(task.pid.0);
-            crate::trap::restore_kernel_page_table();
-            log::debug!("[task] User task returned with reason: {:?}", reason);
-            // Normal case: put ctx back and requeue task
-            *task.trap_frame.lock() = Some(ctx);
-            requeue_after_user_run(task.clone());
             *CURRENT_TASK.lock() = None;
+            task.release_running_cpu();
+            requeue_after_user_run(task.clone());
             if crate::trap::foreground_driver_active() {
                 return;
             }
@@ -1240,6 +1414,7 @@ pub(crate) fn run_next_task() {
         } else {
             log::error!("[task] user task {} missing trap frame", task.pid.0);
             *CURRENT_TASK.lock() = None;
+            task.release_running_cpu();
             return;
         }
     } else {
@@ -1287,16 +1462,7 @@ fn idle_loop() {
     }
 
     loop {
-        // 等待中断
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            core::arch::asm!("wfi");
-        }
-
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            core::arch::asm!("idle 0");
-        }
+        wait_for_interrupt();
 
         // 检查是否有新任务
         crate::timer::wake_expired_timers();
@@ -1310,6 +1476,12 @@ fn idle_loop() {
 
 /// Wait for the next interrupt while there is no runnable task.
 fn wait_for_interrupt() {
+    crate::platform::prepare_idle();
+    if manager::has_task() {
+        crate::platform::finish_idle();
+        return;
+    }
+    crate::trap::interrupts::enable_interrupt();
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("wfi");
@@ -1319,6 +1491,8 @@ fn wait_for_interrupt() {
     unsafe {
         core::arch::asm!("idle 0");
     }
+    crate::trap::interrupts::disable_interrupt();
+    crate::platform::finish_idle();
 }
 
 pub(crate) fn run_ready_task_once() -> bool {
@@ -1331,44 +1505,62 @@ pub(crate) fn run_ready_task_once() -> bool {
     ) {
         return true;
     }
+    if !active.try_start_running() {
+        return true;
+    }
 
-    active.set_status(TaskStatus::Running);
     *CURRENT_TASK.lock() = Some(active.clone());
 
-    let (has_user_ctx, tf_opt, ms_arc) = {
-        let tf = active.trap_frame.lock().take();
-        let has_user = tf.is_some();
-        let ms = active.memory_set.clone();
-        (has_user, tf, ms)
-    };
+    let tf_opt = active.trap_frame.lock().take();
     if let Some(mut ctx) = tf_opt {
-        if !crate::syscall::signal::handle_pending_for_user(&mut ctx) {
-            crate::trap::restore_kernel_page_table();
-            if active.status() != TaskStatus::Zombie {
-                *active.trap_frame.lock() = Some(ctx);
-            }
-            requeue_after_user_run(active);
-            *CURRENT_TASK.lock() = None;
-            return true;
-        }
-        if has_user_ctx {
-            ms_arc.lock().activate();
-        }
-        crate::trap::prepare_user_trapframe(&mut ctx);
-        enter_foreground_user_task(active.pid.0);
-        let _reason = run_user_task(&mut ctx);
-        leave_foreground_user_task(active.pid.0);
-        crate::trap::restore_kernel_page_table();
+        run_current_user_task_until_reschedule(&active, &mut ctx);
         if active.status() != TaskStatus::Zombie {
             *active.trap_frame.lock() = Some(ctx);
         }
 
-        requeue_after_user_run(active);
         *CURRENT_TASK.lock() = None;
+        active.release_running_cpu();
+        requeue_after_user_run(active);
         true
     } else {
         log::error!("[task] ready user task {} missing trap frame", active.pid.0);
         *CURRENT_TASK.lock() = None;
+        active.release_running_cpu();
+        true
+    }
+}
+
+fn run_ready_task_once_for_blocked_owner() -> bool {
+    let Some(active) = fetch_dispatchable_user_task() else {
+        return false;
+    };
+    if matches!(
+        active.status(),
+        TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
+    ) {
+        return true;
+    }
+    if !active.try_start_running() {
+        return true;
+    }
+
+    *CURRENT_TASK.lock() = Some(active.clone());
+
+    let tf_opt = active.trap_frame.lock().take();
+    if let Some(mut ctx) = tf_opt {
+        run_current_user_task_one_boundary(&active, &mut ctx);
+        if active.status() != TaskStatus::Zombie {
+            *active.trap_frame.lock() = Some(ctx);
+        }
+
+        *CURRENT_TASK.lock() = None;
+        active.release_running_cpu();
+        requeue_after_user_run(active);
+        true
+    } else {
+        log::error!("[task] ready user task {} missing trap frame", active.pid.0);
+        *CURRENT_TASK.lock() = None;
+        active.release_running_cpu();
         true
     }
 }
@@ -1386,12 +1578,27 @@ pub(crate) fn drain_kernel_ready_once() -> bool {
     ) {
         return true;
     }
+    if !active.try_start_running() {
+        return true;
+    }
 
-    active.set_status(TaskStatus::Running);
     *CURRENT_TASK.lock() = Some(active.clone());
     switch_to_kernel_task(&active);
-    *CURRENT_TASK.lock() = None;
+    finish_kernel_task_switch(active);
     true
+}
+
+fn finish_kernel_task_switch(task: Arc<TaskControlBlock>) {
+    // The scheduler is executing again, so the old CPU no longer touches the
+    // task's kernel stack.  Release ownership before publishing a yielded or
+    // concurrently-woken task to the global queue.
+    *CURRENT_TASK.lock() = None;
+    task.release_running_cpu();
+    task.blocking_cpu.store(NO_CPU, Ordering::Release);
+    fence(Ordering::SeqCst);
+    if task.status() == TaskStatus::Ready {
+        manager::add_task(task);
+    }
 }
 
 fn mark_blocked_task_ready(task: &Arc<TaskControlBlock>, outcome: wait_queue::WaitOutcome) -> bool {
@@ -1403,7 +1610,12 @@ fn mark_blocked_task_ready(task: &Arc<TaskControlBlock>, outcome: wait_queue::Wa
     *task.block_reason.lock() = None;
     *task.wait_outcome.lock() = Some(outcome);
     drop(status);
-    manager::add_task(task.clone());
+    let owner = task.blocking_cpu.load(Ordering::Acquire);
+    if owner == NO_CPU {
+        manager::add_task(task.clone());
+    } else {
+        crate::platform::notify_cpu(owner);
+    }
     true
 }
 
@@ -1415,14 +1627,25 @@ pub(crate) fn wake_task_token_with(
     if task.current_wait_token() != token {
         return false;
     }
-    if task.status() != TaskStatus::Blocked {
-        if task.block_reason.lock().is_some() {
+    let mut status = task.status.lock();
+    if *status != TaskStatus::Blocked {
+        let transitioning = task.block_reason.lock().is_some();
+        if transitioning {
             *task.wait_outcome.lock() = Some(outcome);
-            return true;
         }
-        return false;
+        return transitioning;
     }
-    mark_blocked_task_ready(task, outcome)
+    *status = TaskStatus::Ready;
+    *task.block_reason.lock() = None;
+    *task.wait_outcome.lock() = Some(outcome);
+    drop(status);
+    let owner = task.blocking_cpu.load(Ordering::Acquire);
+    if owner == NO_CPU {
+        manager::add_task(task.clone());
+    } else {
+        crate::platform::notify_cpu(owner);
+    }
+    true
 }
 
 pub(crate) fn wake_blocked_task(
@@ -1490,6 +1713,12 @@ pub struct TaskControlBlock {
     pub sched_policy: AtomicUsize,
     /// Static scheduling priority requested by sched_setscheduler/setparam.
     pub sched_priority: AtomicUsize,
+    /// Linux-visible logical CPU affinity mask.
+    pub affinity_mask: AtomicUsize,
+    /// CPU synchronously waiting to resume this blocked syscall, or NO_CPU.
+    pub blocking_cpu: AtomicUsize,
+    /// CPU that currently owns this task's user context, or NO_CPU.
+    pub running_cpu: AtomicUsize,
 }
 
 unsafe impl Send for TaskControlBlock {}
@@ -1551,5 +1780,36 @@ impl TaskControlBlock {
     pub fn set_sched_params(&self, policy: usize, priority: usize) {
         self.sched_priority.store(priority, Ordering::Relaxed);
         self.sched_policy.store(policy, Ordering::Relaxed);
+    }
+
+    pub fn affinity_mask(&self) -> usize {
+        self.affinity_mask.load(Ordering::Acquire) & crate::platform::online_cpu_mask()
+    }
+
+    pub fn set_affinity_mask(&self, mask: usize) {
+        self.affinity_mask.store(mask, Ordering::Release);
+    }
+
+    pub fn can_run_on_cpu(&self, cpu: usize) -> bool {
+        self.affinity_mask() & (1usize << cpu) != 0
+    }
+
+    pub(crate) fn release_running_cpu(&self) {
+        let cpu = crate::platform::current_cpu_index();
+        if self.running_cpu.load(Ordering::Acquire) == NO_CPU {
+            return;
+        }
+        if self
+            .running_cpu
+            .compare_exchange(cpu, NO_CPU, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            log::error!(
+                "[task] pid={} released by cpu={} with owner={}",
+                self.pid.0,
+                cpu,
+                self.running_cpu.load(Ordering::Acquire)
+            );
+        }
     }
 }

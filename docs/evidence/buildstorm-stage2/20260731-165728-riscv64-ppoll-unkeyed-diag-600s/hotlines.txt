@@ -1,0 +1,30 @@
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:74:[harness] SCRIPT /glibc/buildstorm_testcode.sh
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:78:BUILDSTORM_TOOLCHAIN ok
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:79:BUILDSTORM_MINIBUILD ok
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:81:   Compiling unicode-ident v1.0.24
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:82:   Compiling proc-macro2 v1.0.106
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:83:   Compiling quote v1.0.46
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:84:   Compiling libc v0.2.186
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:85:   Compiling cfg-if v1.0.4
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:86:   Compiling log v0.4.33
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:87:   Compiling find-msvc-tools v0.1.9
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:88:   Compiling shlex v2.0.1
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:89:   Compiling itoa v1.0.18
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:90:   Compiling pkg-config v0.3.33
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:91:   Compiling smallvec v1.15.2
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:92:   Compiling memchr v2.8.2
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:93:   Compiling serde_core v1.0.228
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:94:   Compiling scopeguard v1.2.0
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:95:   Compiling bitflags v2.13.0
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:127:[buildstorm-diag] syscall id=73 count=32395 total_us=9130 max_us=4572 samples=132
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:219:[buildstorm-diag] perf faults=115023 clean_faults=45287 user_pt=339467 kernel_pt=339467 block_reads=52674 block_bytes=353038850 block_same=1233 block_seq=34000 block_random=17433
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:298:   Compiling parking_lot_core v0.9.12
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:299:   Compiling futures-core v0.3.32
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:330:[buildstorm-diag] syscall id=73 count=33049 total_us=16366 max_us=6447 samples=165
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:422:[buildstorm-diag] perf faults=128664 clean_faults=51877 user_pt=372155 kernel_pt=372154 block_reads=53235 block_bytes=355516930 block_same=1274 block_seq=34020 block_random=17933
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:514:   Compiling lock_api v0.4.14
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:546:[buildstorm-diag] syscall id=73 count=33342 total_us=16609 max_us=6447 samples=175
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:638:[buildstorm-diag] perf faults=149406 clean_faults=58517 user_pt=423660 kernel_pt=423660 block_reads=53869 block_bytes=359019010 block_same=1292 block_seq=34230 block_random=18339
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:734:   Compiling pin-project-lite v0.2.17
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:735:   Compiling once_cell v1.21.4
+D:\wll_os-master1\docs\evidence\buildstorm-stage2\20260731-165728-riscv64-ppoll-unkeyed-diag-600s\buildstorm-riscv64-complete.log:736:   Compiling bytes v1.12.0

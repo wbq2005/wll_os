@@ -1,0 +1,3 @@
+[judge] scripted total = 20.0 / 180.0 (+ doc 20 pts, judged manually) = 200 
+[judge] compile: ok=missing
+[{"name": "buildstorm env toolchain", "pass": 1, "total": 1, "score": 8.0}, {"name": "buildstorm env minibuild", "pass": 1, "total": 1, "score": 12.0}, {"name": "buildstorm compile ok", "pass": 0, "total": 1, "score": 0}, {"name": "buildstorm compile time", "pass": 0, "total": 1, "score": 0.0}]

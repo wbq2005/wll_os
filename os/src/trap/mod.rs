@@ -5,6 +5,7 @@ use polyhal_trap::trap::TrapType;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 use spin::Mutex;
 
+use crate::cpu::CpuLocal;
 use crate::syscall::syscall;
 use crate::task::exit_current_and_run_next;
 use crate::task::TaskStatus;
@@ -12,20 +13,19 @@ use crate::timer::set_next_trigger;
 
 const SIGILL: i32 = 4;
 const SIGSEGV: i32 = 11;
-
 lazy_static! {
     /// 存 `TrapFrame` 裸指针（单核）；用 `usize` 避免 `*mut TrapFrame: !Send` 与 `lazy_static` 冲突。
-    pub static ref CURRENT_SYSCALL_CTX_PTR: Mutex<usize> = Mutex::new(0);
+    pub static ref CURRENT_SYSCALL_CTX_PTR: CpuLocal<usize> = CpuLocal::new_with(|_| 0);
 
     /// 标记当前是否处于 execve 调用上下文中。
     /// 置位时 handle_syscall 跳过 syscall_ok() PC 前进，让 execve 直接返回到新程序入口。
-    static ref EXECVE_COMPLETED: Mutex<bool> = Mutex::new(false);
-    static ref SIGRETURN_COMPLETED: Mutex<bool> = Mutex::new(false);
+    static ref EXECVE_COMPLETED: CpuLocal<bool> = CpuLocal::new_with(|_| false);
+    static ref SIGRETURN_COMPLETED: CpuLocal<bool> = CpuLocal::new_with(|_| false);
 
     /// 标记前台驱动模式：当此标志为 true 时，exit/suspend/timer 不要调用 run_next_task()，
     /// 而是将当前任务置为 Zombie 后直接返回，由前台驱动负责收尾。
     static ref FOREGROUND_DRIVER_ACTIVE: Mutex<bool> = Mutex::new(false);
-    static ref SYSCALL_PARKED: Mutex<bool> = Mutex::new(false);
+    static ref SYSCALL_PARKED: CpuLocal<bool> = CpuLocal::new_with(|_| false);
 
 }
 
@@ -171,7 +171,9 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // 系统调用处理
             handle_syscall(ctx);
         }
-        TrapType::StorePageFault(vaddr) | TrapType::LoadPageFault(vaddr) => {
+        TrapType::StorePageFault(vaddr)
+        | TrapType::LoadPageFault(vaddr)
+        | TrapType::PagePrivilegeFault(vaddr) => {
             log::error!(
                 "[trap] Kernel page fault at {:#x}, sepc={:#x}, sp={:#x}",
                 vaddr,
@@ -191,6 +193,10 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         }
         TrapType::Timer => {
             crate::timer::rearm_kernel_tick();
+        }
+        TrapType::Ipi(_) => {
+            let action = crate::platform::acknowledge_local_ipi();
+            crate::platform::handle_ipi(action);
         }
         TrapType::IllegalInstruction(vaddr) => {
             log::error!("[trap] Illegal instruction at {:#x}", vaddr);
@@ -245,17 +251,24 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 let _ = crate::syscall::signal::handle_pending_for_user(ctx);
             }
         }
+        TrapType::Ipi(_) => {
+            let action = crate::platform::acknowledge_local_ipi();
+            crate::platform::handle_ipi(action);
+        }
         trap @ (TrapType::StorePageFault(vaddr)
         | TrapType::LoadPageFault(vaddr)
-        | TrapType::InstructionPageFault(vaddr)) => {
+        | TrapType::InstructionPageFault(vaddr)
+        | TrapType::PagePrivilegeFault(vaddr)) => {
             if let Some(task) = crate::task::current_task() {
+                let is_privilege = matches!(trap, TrapType::PagePrivilegeFault(_));
                 let is_store = matches!(trap, TrapType::StorePageFault(_));
                 let is_exec = matches!(trap, TrapType::InstructionPageFault(_));
-                if task
-                    .memory_set
-                    .lock()
-                    .handle_page_fault(vaddr, is_store, is_exec)
-                    .is_ok()
+                if !is_privilege
+                    && task
+                        .memory_set
+                        .lock()
+                        .handle_page_fault(vaddr, is_store, is_exec)
+                        .is_ok()
                 {
                     return;
                 }
@@ -319,7 +332,11 @@ fn handle_syscall(ctx: &mut TrapFrame) {
 
     // 调用系统调用分发函数
     let syscall_task = crate::task::current_task();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_syscall_enter(syscall_id);
     let result = syscall(syscall_id, args);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_syscall_exit(syscall_id);
 
     *CURRENT_SYSCALL_CTX_PTR.lock() = 0;
     if take_syscall_parked() {
@@ -378,7 +395,16 @@ pub fn handle_exit(exit_code: i32) {
 /// 在用户任务返回后调用，因为 SATP 在用户态运行时被切换到了用户页表。
 /// 内核代码无法通过高虚拟地址访问，必须先恢复内核页表。
 pub fn restore_kernel_page_table() {
+    crate::platform::clear_current_address_space();
     if let Some(ref kpt) = *crate::mm::page_table::kernel_page_table().lock() {
-        kpt.change();
+        if polyhal::pagetable::PageTable::current().root() == kpt.root() {
+            return;
+        }
+        crate::perf_counters::note_kernel_page_table_restore();
+        let reused_kernel_asid = polyhal::pagetable::PageTable::current_asid() == 0;
+        kpt.change_with_asid(0);
+        if reused_kernel_asid {
+            polyhal::pagetable::TLB::flush_all();
+        }
     }
 }

@@ -1,0 +1,3 @@
+﻿diagnostic run after lazy mprotect COW; reached mio v1.2.1 by snapshot 6 / now_us≈841s; old thiserror stall passed
+command: python scripts\run_buildstorm.py --arch riscv64 --image D:\BaiduNetdiskDownload\2026OSImage-Pub\sdcard-rv-pub.img\sdcard-rv-pub.img --stage complete --timeout 900 --memory 16G --smp 8 --build-features buildstorm-diagnostics,perf-counters
+date: 2026-07-31T19:16:08.2746255+08:00
