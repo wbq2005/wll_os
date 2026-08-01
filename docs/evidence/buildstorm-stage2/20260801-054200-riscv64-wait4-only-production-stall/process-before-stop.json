@@ -1,0 +1,18 @@
+﻿[
+    {
+        "Id":  12888,
+        "ProcessName":  "python",
+        "StartTime":  "\/Date(1785533181440)\/",
+        "CPU":  1.359375,
+        "WorkingSet64":  17633280,
+        "Path":  "C:\\Users\\22478\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"
+    },
+    {
+        "Id":  49788,
+        "ProcessName":  "qemu-system-riscv64",
+        "StartTime":  "\/Date(1785533181955)\/",
+        "CPU":  8001.859375,
+        "WorkingSet64":  1370259456,
+        "Path":  "C:\\Program Files\\qemu\\qemu-system-riscv64.exe"
+    }
+]

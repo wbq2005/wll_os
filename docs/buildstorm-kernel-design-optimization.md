@@ -587,3 +587,63 @@ run was stopped before `BUILDSTORM_BEGIN`, and the official compile success
 marker remains unverified. Host memory pressure was recorded separately (about
 1.6 GiB free physical memory while a 16-GiB RV guest was running), so timing
 comparisons from that run are not presented as kernel speedups.
+
+## 13. Child-exit wait race and final-workload sequencing (2026-08-01)
+
+### Root cause and general fix
+
+The RISC-V BuildStorm pre-build repeatedly stalled at crate boundaries where
+Cargo waits for short-lived child processes. Source review found a general
+lost-wakeup race in both `wait4` and `waitid`: each checked the child state,
+then registered a bare child-exit sleep. A child exiting in that interval could
+wake an empty queue, leaving the parent blocked despite an already-reapable
+zombie. `WaitQueue::sleep_until_if` already supports atomic
+register-then-condition checking, so the child wait queue now exposes
+`sleep_on_child_exit_if`. `wait4` rechecks non-consumingly for a zombie and
+matching child; `waitid` also rechecks stopped/continued events without
+consuming them. The following loop iteration remains responsible for the
+normal Linux-visible reap or siginfo write.
+
+This is a process-lifecycle fix with no branch on workload names, executable
+paths, output text, elapsed time, or expected score. The matching update to
+`docs/blocking-semantics.md` records the register-before-recheck invariant.
+
+### Submission sequencing and verification
+
+The default top-level build had `HARNESS_GROUPS=cagent`, so a plain submission
+kernel correctly finished CAgent and then shut down without ever selecting
+BuildStorm. The default is now `cagent,buildstorm`; focused CAgent and
+BuildStorm runners continue to set a single group explicitly. A RISC-V 1G/1CPU
+sequence smoke using the unchanged official image recorded all ten CAgent
+cases as passing and then the next harness selection:
+
+```text
+[harness] SCRIPT /glibc/buildstorm_testcode.sh
+#### OS COMP TEST GROUP START buildstorm-glibc ####
+```
+
+The smoke subsequently exhausted the intentionally small 1G heap while Rust
+started; it is only evidence that selection proceeds beyond CAgent, not a
+BuildStorm complete or performance result. Both RISC-V64 and LoongArch64
+release builds with `WLL_HARNESS_GROUPS=cagent,buildstorm` completed. The
+wait-race candidate also passed both unmodified-image toolchain/minibuild runs
+and independent 8-vCPU SMP regressions; the latter are `capability-pass`.
+The current official judge reports 20/180 scripted points from minibuild-only
+logs, correctly withholding complete points without `BUILDSTORM_COMPILE
+mode=multi ok=true`.
+
+Raw source diffs, hashes, release logs, SMP logs, judge output, command JSON,
+and the sequence smoke are under:
+
+- `docs/evidence/buildstorm-stage2/20260801-waitid-race-crossarch-regressions/`
+- `docs/evidence/buildstorm-stage2/20260801-submission-cagent-then-buildstorm-sequence/`
+
+The official complete gate remains unverified. This workstation has about
+15.7 GiB visible RAM and showed sustained paging with an 8G guest, so the
+archived local complete attempts are not presented as score evidence. Re-run
+both original-image complete commands at `-m 8G -smp 8` on the evaluation
+machine, preserve raw serial and official judge output, then update the timing
+table with only the successful markers. AI assisted with log aggregation and
+race analysis; the developer-reviewed work consists of the source diff, two
+release builds, two SMP regressions, official-image minibuilds, official judge
+outputs, and the CAgent-to-BuildStorm sequence smoke.

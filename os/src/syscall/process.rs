@@ -879,7 +879,13 @@ fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> Sysca
         if !has_matching_child(&task, target) {
             return Err(SysErrNo::ECHILD);
         }
-        match crate::task::wait_queue::sleep_on_child_exit() {
+        // Register the waiter before the final child-state check.  A child can
+        // exit between the checks above and a bare sleep, which would otherwise
+        // lose its SIGCHLD wakeup and leave the parent blocked forever.
+        match crate::task::wait_queue::sleep_on_child_exit_if(|| {
+            Ok(peek_zombie_child(&task, target).is_none()
+                && has_matching_child(&task, target))
+        }) {
             Ok(_) => {}
             Err(SysErrNo::EINTR) => {
                 if let Some((cpid, exit_code)) = reap_zombie_child(&task, target) {
@@ -1057,7 +1063,23 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusag
         if !has_matching_child(&task, target) {
             return Err(SysErrNo::ECHILD);
         }
-        match crate::task::wait_queue::sleep_on_child_exit() {
+        // As with wait4, the final event check must happen only after the
+        // waiter is visible to a concurrent child exit.  Keep this check
+        // non-consuming: the next loop iteration performs the actual reap or
+        // event consumption and writes the user-visible siginfo.
+        match crate::task::wait_queue::sleep_on_child_exit_if(|| {
+            let event_ready = (want_stopped || want_continued)
+                && take_child_wait_event(
+                    &task,
+                    target,
+                    want_stopped,
+                    want_continued,
+                    false,
+                )
+                .is_some();
+            let exit_ready = want_exited && peek_zombie_child(&task, target).is_some();
+            Ok(!event_ready && !exit_ready && has_matching_child(&task, target))
+        }) {
             Ok(_) | Err(SysErrNo::EINTR) => continue,
             Err(err) => return Err(err),
         }

@@ -394,6 +394,13 @@ pub fn sleep_on_child_exit() -> Result<WaitOutcome, SysErrNo> {
     CHILD_WAIT_QUEUE.sleep()
 }
 
+pub fn sleep_on_child_exit_if<F>(should_sleep: F) -> Result<WaitOutcome, SysErrNo>
+where
+    F: FnOnce() -> Result<bool, SysErrNo>,
+{
+    CHILD_WAIT_QUEUE.sleep_until_if(None, should_sleep)
+}
+
 pub fn wake_child_waiters() -> usize {
     CHILD_WAIT_QUEUE.wake_all()
 }

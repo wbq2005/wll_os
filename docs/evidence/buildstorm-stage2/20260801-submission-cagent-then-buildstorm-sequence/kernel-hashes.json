@@ -1,0 +1,12 @@
+﻿[
+    {
+        "Algorithm":  "SHA256",
+        "Hash":  "5B61E179E16E50AD78FE39FA5217482342AACE97C56BB46021357402F91BE820",
+        "Path":  "D:\\wll_os-master1\\target\\riscv64gc-unknown-none-elf\\release\\wll_OS"
+    },
+    {
+        "Algorithm":  "SHA256",
+        "Hash":  "A47170E9A3444807662B61995B3E14FDDAEF082E8721E3B308CC234EF9030470",
+        "Path":  "D:\\wll_os-master1\\target\\loongarch64-unknown-none\\release\\wll_OS"
+    }
+]

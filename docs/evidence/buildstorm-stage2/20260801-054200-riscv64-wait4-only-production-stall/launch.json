@@ -1,0 +1,18 @@
+﻿{
+    "pid":  12888,
+    "started":  "2026-08-01T05:26:21.5594923+08:00",
+    "command":  [
+                    "python",
+                    "scripts\\run_buildstorm.py",
+                    "--arch",
+                    "riscv64",
+                    "--image",
+                    "D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-rv-pub.img\\sdcard-rv-pub.img",
+                    "--stage",
+                    "complete",
+                    "--timeout",
+                    "6250"
+                ],
+    "stdout":  "D:\\wll_os-master1\\_tmp\\buildstorm-riscv64-wait4-race-official-8g8-20260801.out",
+    "stderr":  "D:\\wll_os-master1\\_tmp\\buildstorm-riscv64-wait4-race-official-8g8-20260801.err"
+}

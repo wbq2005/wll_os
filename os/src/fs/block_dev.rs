@@ -16,6 +16,7 @@ pub const DEV_LOOP_CONTROL_MINOR: u32 = 237;
 pub const LOOP_DEVICE_COUNT: usize = 4;
 const SECTOR_SIZE: usize = 512;
 const BLOCK_CACHE_LIMIT: usize = 32 * 1024;
+const BLOCK_CACHE_READ_AHEAD_BLOCKS: usize = 16;
 const ROOT_DISK: &str = "/dev/vda";
 const LOOP_CONTROL: &str = "/dev/loop-control";
 
@@ -169,13 +170,27 @@ impl BlockRange {
         if let Some(data) = self.cache.lock().get(offset) {
             return data;
         }
-        let mut data = vec![0u8; EXT4_BLOCK_SIZE];
+        let available_blocks = self
+            .len
+            .and_then(|len| len.checked_sub(offset))
+            .map(|remaining| remaining / EXT4_BLOCK_SIZE)
+            .unwrap_or(1)
+            .max(1);
+        let block_count = available_blocks.min(BLOCK_CACHE_READ_AHEAD_BLOCKS);
+        let mut data = vec![0u8; block_count * EXT4_BLOCK_SIZE];
         if self.read_raw_at(offset, &mut data).is_err() {
             log::warn!("[block] read_offset failed @{:#x}", offset);
-            return data;
+            return vec![0u8; EXT4_BLOCK_SIZE];
         }
-        self.cache.lock().insert(offset, data.clone());
-        data
+        let first = data[..EXT4_BLOCK_SIZE].to_vec();
+        let mut cache = self.cache.lock();
+        for (index, block) in data.chunks_exact(EXT4_BLOCK_SIZE).enumerate() {
+            let Some(block_offset) = offset.checked_add(index * EXT4_BLOCK_SIZE) else {
+                break;
+            };
+            cache.insert(block_offset, block.to_vec());
+        }
+        first
     }
 
     fn read_cached_blocks(&self, offsets: &[usize]) -> Result<Vec<Vec<u8>>, SysErrNo> {

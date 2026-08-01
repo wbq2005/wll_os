@@ -1,0 +1,22 @@
+﻿[
+    {
+        "Algorithm":  "SHA256",
+        "Hash":  "C03C6091EB1C400D4C1F400130D11810B00E18811D4E5C201E7F75802DFAFDE0",
+        "Path":  "D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-rv-pub.img\\sdcard-rv-pub.img"
+    },
+    {
+        "Algorithm":  "SHA256",
+        "Hash":  "15B2CEF4AF8FCB0BA9EC44FDBE41973EE180B699454B57C630FDCFB5E6DFA550",
+        "Path":  "D:\\BaiduNetdiskDownload\\2026OSImage-Pub\\sdcard-la-pub.img\\sdcard-la-pub.img"
+    },
+    {
+        "Algorithm":  "SHA256",
+        "Hash":  "05EFF64C1640DDD4211679462C27491A6D6C54A4D4358617217E769DB9285339",
+        "Path":  "D:\\wll_os-master1\\target\\riscv64gc-unknown-none-elf\\release\\wll_OS"
+    },
+    {
+        "Algorithm":  "SHA256",
+        "Hash":  "72973C04A311E56DB8CFDF2D8CDF1F49BCFE33F4484A9DB8B4B66D44DA36E53B",
+        "Path":  "D:\\wll_os-master1\\target\\loongarch64-unknown-none\\release\\wll_OS"
+    }
+]

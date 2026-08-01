@@ -37,7 +37,7 @@ the syscall result into `EINTR`.
 
 | Class | Who sets `Blocked` | Who wakes | Ready queue re-entry | Signal interrupt | Timeout |
 | --- | --- | --- | --- | --- | --- |
-| Child wait | `sys_wait4` -> `sleep_on_child_exit()` -> child wait queue | `finish_process_exit()` -> `wake_child_waiters()`; signals can also wake | `wake_task_token` pushes `Ready`; resuming waiter removes its own queued notification | Yes, if a deliverable pending signal exists after wake | No wait timeout; `WNOHANG` is immediate nonblocking return |
+| Child wait | `sys_wait4`/`sys_waitid` -> `sleep_on_child_exit_if()` -> child wait queue | `finish_process_exit()` -> `wake_child_waiters()`; signals can also wake | `wake_task_token` pushes `Ready`; resuming waiter removes its own queued notification | Yes, if a deliverable pending signal exists after wake | No wait timeout; `WNOHANG` is immediate nonblocking return |
 | IO wait | `sys_read` on empty blocking pipe, `sys_ppoll`, `sys_pselect6` -> `sleep_on_io()` | Pipe write, pipe endpoint drop, poll timeout timer, signals | Same token wake path; poll/read loops recheck readiness after wake | Yes for deliverable pending signals | Real for `ppoll`/`pselect6`; none for blocking `read` |
 | Timer sleep | `sys_nanosleep` / dispatched `clock_nanosleep` -> `timer::sleep_until_us()` | `timer::wake_expired_timers()`; signals can also wake | `wake_task_token` pushes `Ready`; syscall resumes when deadline or signal wins | Yes, returns `EINTR`; `rem` is not filled on interruption | Real relative deadline |
 | Futex wait | `sys_futex_stub(FUTEX_WAIT)` -> local futex waiter table -> `block_current_for(Futex)` | `FUTEX_WAKE`, `clear_child_tid` exit wake, timeout timer, signals | `futex_wake_addr` removes the waiter then calls `wake_task_token`; timeout leaves waiter for post-wake cleanup | Yes for deliverable pending signals | Real relative deadline; returns `ETIMEDOUT` if still waiting at deadline |
@@ -51,10 +51,13 @@ Path:
   lists owned by any user thread in the caller's thread group.
 - `WNOHANG` returns `0` only when a matching live child still exists; no
   matching child returns `ECHILD`.
-- The blocking loop verifies that a matching child still exists, retries reap,
-  then calls `sleep_on_child_exit()`.
-- `sleep_on_child_exit()` uses the global `CHILD_WAIT_QUEUE` with
-  `BlockReason::ChildExit`.
+- The blocking loops for `wait4` and `waitid` register the waiter first, then
+  recheck non-consumingly for a matching zombie, stopped/continued event, or
+  disappearance of the matching child. This closes the child-exit race between
+  an earlier state check and wait registration.
+- `sleep_on_child_exit_if()` uses the global `CHILD_WAIT_QUEUE` with
+  `BlockReason::ChildExit`; the next loop iteration performs the actual reap
+  or `waitid` event consumption.
 
 Wake path:
 

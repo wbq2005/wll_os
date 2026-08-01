@@ -1,0 +1,22 @@
+﻿[
+    {
+        "Path":  "\\\\w\\memory\\available mbytes",
+        "CookedValue":  454,
+        "Timestamp":  "\/Date(1785535190799)\/"
+    },
+    {
+        "Path":  "\\\\w\\memory\\pages/sec",
+        "CookedValue":  25529.296142009131,
+        "Timestamp":  "\/Date(1785535190799)\/"
+    },
+    {
+        "Path":  "\\\\w\\paging file(_total)\\% usage",
+        "CookedValue":  12.000778414162887,
+        "Timestamp":  "\/Date(1785535190799)\/"
+    },
+    {
+        "Path":  "\\\\w\\processor information(_total)\\% processor time",
+        "CookedValue":  78.469024627268013,
+        "Timestamp":  "\/Date(1785535190799)\/"
+    }
+]
