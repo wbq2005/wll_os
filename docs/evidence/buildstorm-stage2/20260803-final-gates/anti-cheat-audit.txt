@@ -1,0 +1,7 @@
+Scope: source changes in 2f29015, c335190, 56248cc, and 48b9aa2.
+Reviewed mechanisms: RISC-V ASID/TLB activation, LoongArch conservative TLB activation, ext4 inode metadata cache capacity.
+No source branch depends on an official test name, path, command, output marker, expected score, CPU count, or elapsed time.
+No official image, test script, runner, or judge was modified.
+No tested binary was preloaded and no CPU/time/filesystem state was fabricated.
+Temporary launch diagnostics were removed before the retained commits.
+Official complete remains unverified; capability/release evidence is not promoted to official-pass.

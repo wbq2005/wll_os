@@ -1,0 +1,14 @@
+Candidate local commits: 2f29015, c335190, 56248cc, 48b9aa2
+Branch: wbq_final_buildstorm_compile
+Official suite branch: final-2026
+QEMU: QEMU emulator version 11.0.3
+RISC-V image sha256: d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c
+LoongArch image sha256: d1410544e677e11efb1c240be6ffb201c89d6de58c9675e73314a696e4cefdc5
+Official judge sha256: f9bc3c5c640217947775759b5b02aa4ceedfa76728d25d4f06d94ef5bc9d64dd
+
+Official commands:
+python3 scripts/run_buildstorm.py --arch riscv64 --image /srv/buildstorm/images/sdcard-rv-pub.img --stage complete --timeout 3000 --memory 8G --smp 8
+python3 scripts/run_buildstorm.py --arch loongarch64 --image /srv/buildstorm/images/sdcard-la-pub.img --stage complete --timeout 3000 --memory 8G --smp 8
+python3 /srv/buildstorm/src/testsuits-for-oskernel/judge/judge_buildstorm-glibc.py buildstorm-ARCH-complete.log
+
+Classification: unverified (BUILDSTORM_COMPILE mode=multi ok=true absent)
