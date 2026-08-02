@@ -52,12 +52,6 @@ impl PTE {
 pub struct PageTable(PhysAddr);
 
 impl PageTable {
-    /// Construct a non-owning page-table handle for an existing root.
-    #[inline]
-    pub const fn from_root(root: PhysAddr) -> Self {
-        Self(root)
-    }
-
     /// Get the root Physical Page
     pub const fn root(&self) -> PhysAddr {
         self.0

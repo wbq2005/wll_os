@@ -77,8 +77,6 @@ impl TaskControlBlock {
         let pid = Pid::alloc();
         let thread_group = ThreadGroup::new(pid.0);
         let pgid = pid.0;
-        let user_page_table_root = memory_set.address_space_root();
-        let user_address_space_id = memory_set.address_space_id();
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
@@ -134,8 +132,6 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
-            user_page_table_root: AtomicUsize::new(user_page_table_root),
-            user_address_space_id: AtomicUsize::new(user_address_space_id),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -290,8 +286,6 @@ impl TaskControlBlock {
         let pid = Pid::alloc();
         let thread_group = ThreadGroup::new(pid.0);
         let pgid = pid.0;
-        let user_page_table_root = memory_set.address_space_root();
-        let user_address_space_id = memory_set.address_space_id();
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
@@ -347,8 +341,6 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
-            user_page_table_root: AtomicUsize::new(user_page_table_root),
-            user_address_space_id: AtomicUsize::new(user_address_space_id),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -372,8 +364,6 @@ impl TaskControlBlock {
         let pid = Pid::alloc();
         let thread_group = ThreadGroup::new(pid.0);
         let pgid = pid.0;
-        let user_page_table_root = memory_set.address_space_root();
-        let user_address_space_id = memory_set.address_space_id();
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
@@ -429,8 +419,6 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
-            user_page_table_root: AtomicUsize::new(user_page_table_root),
-            user_address_space_id: AtomicUsize::new(user_address_space_id),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -452,8 +440,6 @@ impl TaskControlBlock {
         let pid = Pid::alloc();
         let thread_group = ThreadGroup::new(pid.0);
         let pgid = pid.0;
-        let user_page_table_root = memory_set.address_space_root();
-        let user_address_space_id = memory_set.address_space_id();
         let task = Arc::new(Self {
             pid,
             thread_group: thread_group.clone(),
@@ -509,8 +495,6 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
-            user_page_table_root: AtomicUsize::new(user_page_table_root),
-            user_address_space_id: AtomicUsize::new(user_address_space_id),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);

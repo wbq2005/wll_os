@@ -881,7 +881,7 @@ implementation; release, SMP, raw serial, provenance, and official judge
 outputs are the developer-verifiable evidence. The raw A/B diagnostic is
 retained at `/srv/buildstorm/evidence/97fbf20-rv-diag-360/`.
 
-## 21. Lockless user page-table identity activation (2026-08-03)
+## 21. Rejected lockless page-table identity candidate (2026-08-03)
 
 The 360-second diagnostics count about 420,000 user address-space activations.
 Compiler threads share one `Arc<Mutex<MemorySet>>`, and the return-to-user path
@@ -890,7 +890,7 @@ only read the stable page-table root and ASID. Mapping edits, faults, and COW
 operations legitimately need the lock; user-root activation does not change
 either identity field between clone and exec.
 
-Each TCB now snapshots the root and ASID at construction. The exec path updates
+The candidate TCB snapshots the root and ASID at construction. The exec path updates
 the current task's snapshot while replacing its MemorySet after terminating
 thread-group peers. User return activates a non-owning page-table handle from
 that snapshot, while mapping mutation remains serialized and retains the
@@ -905,8 +905,15 @@ Both release builds pass, and both independent `-smp 8` regressions pass with
 `_tmp/smp-regression-riscv64.log`, and `_tmp/smp-regression-loongarch64.log`.
 Official compile time and speedup are `not measured`; this remains `unverified`
 until a comparable diagnostic advances the build and an unchanged official
-run emits the complete success marker. The change does not inspect workload
+run emits the complete success marker.
+
+The comparable 360-second run reached the same final `ax-posix-api` crate. Its
+second snapshot counted 427,502 user activations versus 422,719 in the
+baseline, so it showed no throughput improvement. The candidate was reverted
+without a 3000-second run. The experiment did not inspect workload
 names, paths, commands, output, time, or CPU count and does not modify the
 image, official script, judge, clock, or build artifacts. AI assistance was
 used for lock-path analysis and implementation; the saved builds, SMP logs,
 raw serial, hashes, and official judge are the developer-verifiable checks.
+The raw diagnostic is retained at
+`/srv/buildstorm/evidence/cc7d0f7-rv-diag-360/`.
