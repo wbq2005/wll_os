@@ -222,11 +222,11 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 ///
 /// 用户态陷入内核时的处理入口
 pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
-    // The low user address range may overlap platform MMIO.  Leave the user
-    // page table as soon as the assembly entry has saved the user context, so
-    // all syscall, VFS, timer, and driver work runs under the kernel mapping.
-    // User buffers are accessed through translated physical pages rather than
-    // by dereferencing user virtual addresses in this address space.
+    // LoongArch keeps its conservative kernel-root trap boundary. RISC-V user
+    // roots already share the kernel RAM mappings, so ordinary syscall work can
+    // retain the current ASID; low-address MMIO drivers switch roots explicitly.
+    // Scheduling, blocking, exit, and exec still restore the kernel root.
+    #[cfg(target_arch = "loongarch64")]
     restore_kernel_page_table();
 
     // 获取当前任务的 trap 上下文

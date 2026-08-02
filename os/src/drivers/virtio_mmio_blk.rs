@@ -67,6 +67,10 @@ impl VirtioMmioBlock {
         if buf.is_empty() {
             return Ok(());
         }
+        // RISC-V user roots intentionally leave low MMIO unmapped because it
+        // overlaps the user heap. Device access is the boundary that requires
+        // the shared kernel root; the trap return path reactivates the user ASID.
+        crate::trap::restore_kernel_page_table();
         let sector = offset / SECTOR_SIZE;
         let skip = offset % SECTOR_SIZE;
         let sectors_needed = skip.saturating_add(buf.len()).div_ceil(SECTOR_SIZE);
@@ -83,6 +87,7 @@ impl VirtioMmioBlock {
         if data.is_empty() {
             return Ok(());
         }
+        crate::trap::restore_kernel_page_table();
         let sector = offset / SECTOR_SIZE;
         let skip = offset % SECTOR_SIZE;
         let end = skip + data.len();
@@ -111,6 +116,7 @@ impl RawBlockDevice for VirtioMmioBlock {
     }
 
     fn size_bytes(&self) -> Option<usize> {
+        crate::trap::restore_kernel_page_table();
         let sectors = self.blk.lock().capacity();
         (sectors as usize).checked_mul(SECTOR_SIZE)
     }

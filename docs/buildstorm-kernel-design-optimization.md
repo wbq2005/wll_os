@@ -917,3 +917,38 @@ used for lock-path analysis and implementation; the saved builds, SMP logs,
 raw serial, hashes, and official judge are the developer-verifiable checks.
 The raw diagnostic is retained at
 `/srv/buildstorm/evidence/cc7d0f7-rv-diag-360/`.
+
+## 22. RISC-V syscall user-root retention (2026-08-03)
+
+The previous RISC-V trap path restored the shared kernel root before every
+syscall, then reactivated the same user root and ASID on return. A 360-second
+diagnostic counted roughly 420,000 pairs of these transitions. RISC-V user
+page tables already share the kernel RAM root entries, so ordinary syscall,
+VFS, scheduler, and memory-management code does not require the root change.
+The actual conflict is low physical MMIO, which overlaps the user heap range.
+
+RISC-V now retains the current user root across non-scheduling syscall and
+handled-fault boundaries. Virtio MMIO block operations and goldfish RTC reads
+explicitly restore the kernel root before dereferencing low device addresses.
+Scheduling, blocking, task exit, exec replacement, and kernel tasks retain
+their existing kernel-root boundary. LoongArch is unchanged and continues to
+restore the kernel root and perform its conservative activation flush. User
+buffers are still accessed through translated physical frames, and mapping
+edits retain the existing lock and cross-CPU shootdown generation protocol.
+
+Both release builds and both independent `-smp 8` regressions pass, including
+ASID reuse/isolation and 160 MiB heap stress. An additional RISC-V run with the
+unmodified public image reached both official toolchain and minibuild markers
+in 32.1 host seconds, exercising cargo, ext4/virtio I/O, process creation,
+futexes, time, and console output. Raw logs are `_tmp/release-rv-retain-user-
+root.log`, `_tmp/release-la-retain-user-root.log`, `_tmp/smp-regression-
+riscv64.log`, `_tmp/smp-regression-loongarch64.log`, and
+`_tmp/buildstorm-riscv64-minibuild.log`.
+
+Complete-build timing and speedup remain `not measured`, and no official score
+is claimed until the unchanged complete script emits its success marker. The
+implementation does not inspect workload names, paths, commands, output,
+timing, or expected results and does not alter the official image, script,
+judge, CPU count, clock, or artifacts. AI assistance identified the root-
+switch boundary and prepared the patch; the release, SMP, official minibuild,
+raw serial, hashes, and judge outputs are developer-verifiable evidence.

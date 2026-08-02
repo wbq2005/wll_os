@@ -562,6 +562,7 @@ pub fn realtime_ns() -> Option<u64> {
     if paddr == 0 {
         return None;
     }
+    crate::trap::restore_kernel_page_table();
     let base = crate::drivers::hal::phys_to_virt_mmio(paddr) as usize;
     let (high, low) = unsafe {
         loop {
