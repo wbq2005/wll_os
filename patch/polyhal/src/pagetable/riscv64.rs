@@ -276,4 +276,14 @@ impl TLB {
     pub fn flush_all() {
         riscv::asm::sfence_vma_all();
     }
+
+    /// Flush translations tagged with one ASID while retaining other roots.
+    ///
+    /// RISC-V defines `sfence.vma x0, asid` as an ASID-scoped invalidation;
+    /// this is sufficient when returning to the shared kernel root (ASID 0)
+    /// and avoids discarding user-ASID translations on every trap return.
+    #[inline]
+    pub fn flush_asid(asid: usize) {
+        unsafe { sfence_vma(0, asid) }
+    }
 }

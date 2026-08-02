@@ -750,3 +750,23 @@ These are `unverified` complete-build attempts, not score claims. The first
 remaining blocker is environmental/runtime throughput for the official
 multi-crate guest build; kernel release and independent SMP gates remain
 passing. No comparable successful compile time is available (`not measured`).
+
+## 16. RISC-V ASID-0 scoped kernel-return invalidation (2026-08-03)
+
+The previous diagnostics counted roughly 493,000 user and kernel page-table
+activations in a short official workload. The kernel-return half was calling
+global `sfence.vma`, which also discarded translations belonging to live user
+ASIDs. The new transition rule keeps LoongArch's conservative full
+invalidation, while RISC-V uses the ISA-defined `sfence.vma x0, asid=0` when
+returning to the shared kernel root. Full flushes remain in explicit
+shootdown and ASID-reuse paths.
+
+This is a general ASID/TLB ownership optimization and does not inspect test
+names, paths, commands, output, or timing. Both production release builds and
+the independent 8-CPU SMP regression passed after the change. Regression
+evidence is in `docs/evidence/buildstorm-stage2/20260803-asid0-scoped-flush/`:
+RV reports `tlb_targets=0xfe, asid_check=translation`; LA reports
+`tlb_targets=0x7f, asid_check=root-csr`. Build elapsed comparison is
+`not measured`; the official complete run is still in progress, so no
+complete-build speedup or score is claimed. The candidate source change is
+committed separately and remains unpushed until both official gates pass.
