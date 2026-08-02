@@ -1,0 +1,1 @@
+python3 scripts/run_buildstorm.py --arch loongarch64 --image /srv/buildstorm/images/sdcard-la-pub.img --stage complete --timeout 3000 --memory 8G --smp 8

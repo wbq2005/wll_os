@@ -726,3 +726,27 @@ table state is retired before return. The conservative LoongArch activation
 flush remains required until a complete generation/ownership design has direct
 official-script regression coverage. Performance improvement is `not
 applicable`, and no score claim is made.
+
+## 15. Official 3000-second rerun on 2026-08-03
+
+The new public images were run without modification using the unchanged
+official runner and judge, QEMU 11.0.3, `-m 8G -smp 8`, and a 3000-second
+timeout. Both architectures reproduced the same shared blocker: the script
+successfully prebuilt `tg-xtask`, entered `BUILDSTORM_BEGIN mode=multi`, and
+then spent the entire window compiling the ArceOS std target and Rust core
+libraries inside the guest. No kernel panic, OOM, or test-specific branch was
+observed.
+
+| Architecture | Host elapsed | Result | Judge | Evidence |
+| --- | ---: | --- | ---: | --- |
+| RISC-V64 | 3000.044 s | timeout before compile marker | 20.0/180 | `docs/evidence/buildstorm-stage2/20260803-official-3000-timeout/` |
+| LoongArch64 | 3000.247 s | timeout before compile marker | 20.0/180 | `docs/evidence/buildstorm-stage2/20260803-official-3000-timeout/` |
+
+Runner JSON records the exact commands, `-m 8G -smp 8`, QEMU version, kernel
+hashes (`f986ca60...cd8c8d` and `bbd2f231...ade41b5`), and elapsed times.
+The official judge script hash was
+`f9bc3c5c640217947775759b5b02aa4ceedfa76728d25d4f06d94ef5bc9d64dd`.
+These are `unverified` complete-build attempts, not score claims. The first
+remaining blocker is environmental/runtime throughput for the official
+multi-crate guest build; kernel release and independent SMP gates remain
+passing. No comparable successful compile time is available (`not measured`).
