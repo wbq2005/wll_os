@@ -1308,6 +1308,7 @@ pub fn sys_clone(
         affinity_mask: AtomicUsize::new(parent.affinity_mask.load(Ordering::Acquire)),
         blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
         running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+        last_cpu: AtomicUsize::new(crate::task::NO_CPU),
     });
     crate::task::manager::register_task(&child);
     thread_group.add_member(&child);

@@ -132,6 +132,7 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            last_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -341,6 +342,7 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            last_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -419,6 +421,7 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            last_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -495,6 +498,7 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            last_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -539,6 +543,7 @@ impl TaskControlBlock {
             return false;
         }
         *status = TaskStatus::Running;
+        self.last_cpu.store(cpu, Ordering::Relaxed);
         true
     }
 
