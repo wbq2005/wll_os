@@ -28,7 +28,11 @@ const CLEAN_PAGE_CACHE_MAX_PAGES: usize = 65536;
 const CLEAN_PAGE_CACHE_MEMORY_DIVISOR: usize = 32;
 const PBLOCK_RUN_CACHE_LIMIT: usize = 2048;
 const PBLOCK_RUN_LOOKAHEAD: u32 = 16;
-const INODE_METADATA_CACHE_LIMIT: usize = 32 * 1024;
+// The official compiler workload touches more than 50K distinct inodes in a
+// single run.  Clearing the whole cache at 32K turns that working set into a
+// repeated ext4 inode/block scan.  Keep enough entries for the workload while
+// retaining the existing explicit invalidation on namespace and inode writes.
+const INODE_METADATA_CACHE_LIMIT: usize = 128 * 1024;
 const NEGATIVE_PATH_CACHE_LIMIT: usize = 64 * 1024;
 const DEFAULT_WRITEBACK_WORKER_ENABLED: bool = false;
 static WRITEBACK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);

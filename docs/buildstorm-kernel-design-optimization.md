@@ -770,3 +770,18 @@ RV reports `tlb_targets=0xfe, asid_check=translation`; LA reports
 `not measured`; the official complete run is still in progress, so no
 complete-build speedup or score is claimed. The candidate source change is
 committed separately and remains unpushed until both official gates pass.
+
+## 17. Ext4 inode metadata cache working-set correction (2026-08-03)
+
+The diagnostic snapshot observed 52,989 ext4 metadata lookups in 300 seconds.
+The previous 32,768-entry inode metadata cache cleared the entire B-tree when
+full, so a compiler working set larger than that limit repeatedly reread inode
+blocks. The limit is now 131,072 entries. Existing namespace/inode mutation
+invalidations remain authoritative, so this only changes retention capacity;
+it does not return stale metadata or special-case an official workload.
+
+Both architecture release builds passed with this change. Their raw build
+logs are in `docs/evidence/buildstorm-stage2/20260803-metadata-cache-capacity/`.
+The LoongArch official complete run using this candidate is active; timing and
+score remain `unverified` until its `BUILDSTORM_COMPILE mode=multi ok=true`
+marker and official judge result are recorded.
