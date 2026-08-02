@@ -364,7 +364,7 @@ impl MemorySet {
         // LoongArch page-table edits currently occur under kernel ASID 0 and
         // need a conservative local invalidation before re-entering user mode.
         // RISC-V can retain its ASID-tagged entries across the transition.
-        if self.address_space_id == 0 {
+        if self.address_space_id == 0 || cfg!(target_arch = "loongarch64") {
             // Returning to the shared kernel root only needs to retire
             // entries tagged with kernel ASID 0.  Flushing every ASID here
             // defeats the purpose of retaining user translations across the

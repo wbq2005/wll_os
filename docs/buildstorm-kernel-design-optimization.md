@@ -785,3 +785,19 @@ logs are in `docs/evidence/buildstorm-stage2/20260803-metadata-cache-capacity/`.
 The LoongArch official complete run using this candidate is active; timing and
 score remain `unverified` until its `BUILDSTORM_COMPILE mode=multi ok=true`
 marker and official judge result are recorded.
+
+## 18. Corrected LoongArch flush boundary (2026-08-03)
+
+The first ASID-scoped implementation accidentally changed the activation
+condition from `address_space_id == 0 || loongarch64` to only
+`address_space_id == 0`. That removed the conservative LoongArch flush for
+nonzero user ASIDs and caused an `InstructionNotExist` trap during the first
+official user program. The corrected implementation scopes invalidation only
+on RISC-V; LoongArch retains full local invalidation for every user activation.
+
+An independent 180-second official-script run with the corrected boundary
+reached `BUILDSTORM_TOOLCHAIN`, `BUILDSTORM_MINIBUILD`, and
+`BUILDSTORM_BEGIN mode=multi` without the trap; it then continued compiling
+the ArceOS std dependencies. Evidence is in
+`docs/evidence/buildstorm-stage2/20260803-loongarch-tlb-fix-180/`. This is
+diagnostic progress, not an official complete pass or score claim.
