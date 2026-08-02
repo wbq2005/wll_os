@@ -1719,8 +1719,6 @@ pub struct TaskControlBlock {
     pub blocking_cpu: AtomicUsize,
     /// CPU that currently owns this task's user context, or NO_CPU.
     pub running_cpu: AtomicUsize,
-    /// CPU that most recently ran this task, used as a soft cache-locality hint.
-    pub last_cpu: AtomicUsize,
 }
 
 unsafe impl Send for TaskControlBlock {}
@@ -1794,10 +1792,6 @@ impl TaskControlBlock {
 
     pub fn can_run_on_cpu(&self, cpu: usize) -> bool {
         self.affinity_mask() & (1usize << cpu) != 0
-    }
-
-    pub(crate) fn prefers_cpu(&self, cpu: usize) -> bool {
-        self.last_cpu.load(Ordering::Relaxed) == cpu
     }
 
     pub(crate) fn release_running_cpu(&self) {

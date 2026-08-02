@@ -840,7 +840,7 @@ change was verified by release builds, independent SMP runs, raw official
 serial output, and the unchanged judge. The remaining complete-build timing is
 `not measured` because no successful complete marker exists.
 
-## 20. Soft last-CPU scheduling locality (2026-08-03)
+## 20. Rejected soft last-CPU scheduling candidate (2026-08-03)
 
 The corrected `102a055` RISC-V candidate was rerun with QEMU 11.0.3, the
 unmodified public image and official script, `-m 8G -smp 8`, and the
@@ -857,7 +857,7 @@ Scheduler inspection found that a foreground task is requeued globally after
 each 50 ms timer boundary and can resume on any eligible CPU. The TCB recorded
 only current ownership and explicit affinity, so it could not prefer the CPU
 whose local ASID/TLB and QEMU translation cache already contained the task's
-working set. The architecture-neutral scheduler now records the CPU after a
+working set. The candidate architecture-neutral scheduler recorded the CPU after a
 successful Ready-to-Running transition and prefers that CPU among equal-
 priority runnable tasks. This is a soft hint: explicit affinity is checked
 first, realtime priorities retain their ordering and bounded fairness, and a
@@ -867,10 +867,16 @@ Both release builds pass (RISC-V64 11.03 seconds, LoongArch64 21.79 seconds),
 and both independent 8-CPU SMP regressions pass with `dispatch=0xff`, ASID
 isolation, and 160 MiB heap stress. Raw local logs are in `_tmp/release-rv-last-
 cpu.log`, `_tmp/release-la-last-cpu.log`, `_tmp/smp-regression-riscv64.log`,
-and `_tmp/smp-regression-loongarch64.log`. Comparable official compile time and
-speedup are `not measured` until a new run completes. The change does not
+and `_tmp/smp-regression-loongarch64.log`.
+
+A directly comparable 360-second diagnostic reached the same final crate,
+`ax-posix-api`, as the previous candidate. Its second snapshot counted 418,234
+user activations versus 422,719 previously, a 1.1% reduction, but it did not
+advance the official build boundary. The optimization was therefore rejected
+and its code reverted; no 3000-second run or speedup is claimed. The experiment did not
 inspect test names, paths, commands, markers, elapsed time, or expected output;
 it does not alter the image, official script, judge, clock, CPU count, or build
 artifacts. AI assistance identified the migration hypothesis and prepared the
 implementation; release, SMP, raw serial, provenance, and official judge
-outputs are the developer-verifiable evidence.
+outputs are the developer-verifiable evidence. The raw A/B diagnostic is
+retained at `/srv/buildstorm/evidence/97fbf20-rv-diag-360/`.

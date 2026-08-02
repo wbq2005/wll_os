@@ -125,10 +125,8 @@ fn fetch_from_queue(queue: &Mutex<ReadyQueue>) -> Option<Arc<TaskControlBlock>> 
     let current_cpu = crate::platform::current_cpu_index();
     let mut best_index = None;
     let mut best_priority = 0;
-    let mut best_local = false;
     let mut lower_rt_index = None;
     let mut lower_rt_priority = 0;
-    let mut lower_rt_local = false;
     let mut index = 0;
     while index < queue.tasks.len() {
         let task = &queue.tasks[index];
@@ -143,33 +141,18 @@ fn fetch_from_queue(queue: &Mutex<ReadyQueue>) -> Option<Arc<TaskControlBlock>> 
         // Scheduling attributes may change while a task is queued, so choose
         // using the current effective priority instead of caching it at enqueue.
         let priority = task.effective_sched_priority();
-        let local = task.prefers_cpu(current_cpu);
         if priority > best_priority {
             if best_priority > 0 && best_priority > lower_rt_priority {
                 lower_rt_index = best_index;
                 lower_rt_priority = best_priority;
-                lower_rt_local = best_local;
             }
             best_index = Some(index);
             best_priority = priority;
-            best_local = local;
-        } else if priority == best_priority && local && !best_local {
-            best_index = Some(index);
-            best_local = true;
         } else if priority > 0 && priority < best_priority && priority > lower_rt_priority {
             lower_rt_index = Some(index);
             lower_rt_priority = priority;
-            lower_rt_local = local;
-        } else if priority > 0
-            && priority == lower_rt_priority
-            && local
-            && !lower_rt_local
-        {
-            lower_rt_index = Some(index);
-            lower_rt_local = true;
         } else if best_index.is_none() {
             best_index = Some(index);
-            best_local = local;
         }
         index += 1;
     }
