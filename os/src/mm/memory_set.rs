@@ -364,16 +364,13 @@ impl MemorySet {
         // LoongArch page-table edits currently occur under kernel ASID 0 and
         // need a conservative local invalidation before re-entering user mode.
         // RISC-V can retain its ASID-tagged entries across the transition.
-        if self.address_space_id == 0 || cfg!(target_arch = "loongarch64") {
-            // Returning to the shared kernel root only needs to retire
-            // entries tagged with kernel ASID 0.  Flushing every ASID here
-            // defeats the purpose of retaining user translations across the
-            // syscall/trap boundary.  LoongArch keeps its conservative full
-            // flush because its ASID invalidation semantics are not yet
-            // proven equivalent.
-            #[cfg(target_arch = "riscv64")]
-            TLB::flush_asid(0);
-            #[cfg(not(target_arch = "riscv64"))]
+        // RISC-V keeps the shared kernel root permanently on ASID 0. User page
+        // table edits do not modify that root, and explicit kernel mapping
+        // changes already invalidate their affected entries, so restoring the
+        // same root needs no sfence.vma. LoongArch still requires the proven
+        // conservative full invalidation on every user-root activation.
+        #[cfg(target_arch = "loongarch64")]
+        {
             TLB::flush_all();
         }
     }

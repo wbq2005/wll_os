@@ -1,0 +1,51 @@
+{
+  "classification": "capability-pass",
+  "arch": "loongarch64",
+  "image": "/srv/buildstorm/images/sdcard-la-pub.img",
+  "image_bytes": 15032385536,
+  "memory": "8G",
+  "smp": 8,
+  "build_command": [
+    "cargo",
+    "+nightly-2025-01-18",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--target",
+    "loongarch64-unknown-none",
+    "--no-default-features",
+    "--features",
+    "loongarch,smp-regression"
+  ],
+  "build_elapsed_seconds": 7.127574272002676,
+  "build_log": "/srv/buildstorm/src/wll_os/_tmp/smp-regression-build-loongarch64.log",
+  "kernel_sha256": "1a1b395c642534e23005f05ef468603f82316b1380293cb401abdc4768299bba",
+  "qemu_version": "QEMU emulator version 11.0.3",
+  "host_elapsed_seconds": 0.2030299379985081,
+  "passed": true,
+  "result_lines": [
+    "[smp-regression] pass cpus=8 mask=0xff dispatch=0xff tlb_targets=0x7f asid_pair=1/2 reused_asid=1 asid_check=root-csr isolation_iters=64 heap_stress_mib=160 checksum=90"
+  ],
+  "qemu_args": [
+    "/usr/local/bin/qemu-system-loongarch64",
+    "-snapshot",
+    "-kernel",
+    "/srv/buildstorm/src/wll_os/target/loongarch64-unknown-none/release/wll_OS",
+    "-m",
+    "8G",
+    "-smp",
+    "8",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "stdio",
+    "-drive",
+    "file=/srv/buildstorm/images/sdcard-la-pub.img,if=none,format=raw,id=x0",
+    "-no-reboot",
+    "-device",
+    "virtio-blk-pci,drive=x0"
+  ]
+}

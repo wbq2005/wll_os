@@ -801,3 +801,41 @@ reached `BUILDSTORM_TOOLCHAIN`, `BUILDSTORM_MINIBUILD`, and
 the ArceOS std dependencies. Evidence is in
 `docs/evidence/buildstorm-stage2/20260803-loongarch-tlb-fix-180/`. This is
 diagnostic progress, not an official complete pass or score claim.
+
+## 19. Final corrected dual-architecture gate and remaining blocker
+
+After correcting the LoongArch activation boundary, both production release
+builds and both independent 8-CPU SMP regressions passed. RISC-V reported
+`cpus=8`, `dispatch=0xff`, and `asid_check=translation`; LoongArch reported
+`cpus=8`, `dispatch=0xff`, and `asid_check=root-csr`. The raw build, serial,
+and JSON records are in `docs/evidence/buildstorm-stage2/20260803-final-gates/`.
+
+The corrected candidate was then run sequentially with the unmodified public
+images, official runner and judge, QEMU 11.0.3, `-m 8G -smp 8`, and a
+3000-second timeout:
+
+| Architecture | Host elapsed | Markers | Judge | Evidence |
+| --- | ---: | --- | ---: | --- |
+| RISC-V64 | 3000.090 s | toolchain, minibuild, BEGIN; no compile success | 20.0/180 | `docs/evidence/buildstorm-stage2/20260803-final-official-rv/` |
+| LoongArch64 | 3000.272 s | toolchain, minibuild, BEGIN; no compile success | 20.0/180 | `docs/evidence/buildstorm-stage2/20260803-final-official-la/` |
+
+Neither run produced a kernel panic, OOM, or architecture trap. Both remained
+inside the official Rust/ArceOS standard-library dependency build when the
+window expired. Consequently both complete gates remain `unverified`; no
+complete-build score or speedup is claimed.
+
+RISC-V now also avoids invalidating the unchanged shared kernel root on every
+trap boundary. ASID reuse and explicit mapping shootdowns retain their required
+invalidations, while LoongArch keeps full activation invalidation. Both release
+and SMP gates pass after this refinement. A 300-second diagnostic still ended
+in dependency compilation; evidence is in
+`docs/evidence/buildstorm-stage2/20260803-rv-no-kernel-sfence-300/`.
+
+The anti-cheating audit found no branch on official test names, paths, command
+text, output markers, CPU count, elapsed time, or expected score. The candidate
+does not modify an official image, test script, runner, or judge, and does not
+preload a tested binary or fabricate time/CPU/filesystem state. AI assistance
+was used to inspect traces and propose the ASID/cache changes; each retained
+change was verified by release builds, independent SMP runs, raw official
+serial output, and the unchanged judge. The remaining complete-build timing is
+`not measured` because no successful complete marker exists.

@@ -1,0 +1,121 @@
+[DTB] ptr = 0x9000000000100000
+[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+[kernel] Hello, OS!
+[kernel] Memory init
+[VIRTIO] Probing...
+[VIRTIO] found
+[EXT4] mounted successfully
+[kernel] Starting sched.
+[harness] SCRIPT /glibc/buildstorm_testcode.sh
+#### OS COMP TEST GROUP START buildstorm-glibc ####
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+rustc 1.98.0-nightly (57d06900f 2026-05-27)
+cargo 1.98.0-nightly (fbb61be30 2026-05-26)
+BUILDSTORM_TOOLCHAIN ok
+BUILDSTORM_MINIBUILD ok
+----- pre-build tg-xtask (untimed) -----
+warning: failed to save last-use data
+This may prevent cargo from accurately tracking what is being used in its global cache. This information is used for automatically removing unused data in the cache.
+
+out of range integral type conversion attempted
+
+Caused by:
+  out of range integral type conversion attempted
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.72s
+----- build arceos-helloworld (timed, arch=loongarch64) -----
+BUILDSTORM_BEGIN mode=multi
+warning: failed to save last-use data
+This may prevent cargo from accurately tracking what is being used in its global cache. This information is used for automatically removing unused data in the cache.
+
+out of range integral type conversion attempted
+
+Caused by:
+  out of range integral type conversion attempted
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.00s
+     Running `target/debug/tg-xtask arceos build -p arceos-helloworld --arch loongarch64`
+[1970-01-01T00:01:13Z INFO  axbuild::context] Workspace root: /work/tgoskits
+Using build config: /work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml
+[1970-01-01T00:01:20Z INFO  axbuild::build::config_file] Found build config at /work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml
+Using build config: /work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml
+[1970-01-01T00:01:27Z INFO  axbuild::build::config_file] Found build config at /work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml
+[axbuild] cargo build package=arceos-helloworld target=scripts/targets/std/pie/loongarch64-unknown-linux-musl.json config=/work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml ...
+sh -c /work/tgoskits/tmp/axbuild/std/prebuild/prebuild-loongarch64-unknown-linux-musl-bd8e59296c60d6af.sh
+AR_loongarch64_unknown_linux_musl=loongarch64-linux-musl-ar
+AX_LOG=info
+AX_TARGET=loongarch64-unknown-none-softfloat
+CARGO_UNSTABLE_JSON_TARGET_SPEC=true
+CC_loongarch64_unknown_linux_musl=loongarch64-linux-musl-cc
+CFLAGS_loongarch64_unknown_linux_musl=-mabi=lp64s -msoft-float -fno-stack-protector
+CXXFLAGS_loongarch64_unknown_linux_musl=-mabi=lp64s -msoft-float -fno-stack-protector
+SMP=1
+cargo build --config /work/tgoskits/tmp/axbuild/std/config-loongarch64-unknown-linux-musl-dynamic.toml -p arceos-helloworld --target scripts/targets/std/pie/loongarch64-unknown-linux-musl.json -Z unstable-options --target-dir /work/tgoskits/target --features arceos,ax-std/irq,ax-std/paging,ax-std/smp,ax-std/std-compat -Z json-target-spec --release --message-format json-render-diagnostics
+warning: failed to save last-use data
+This may prevent cargo from accurately tracking what is being used in its global cache. This information is used for automatically removing unused data in the cache.
+
+out of range integral type conversion attempted
+
+Caused by:
+  out of range integral type conversion attempted
+   Compiling compiler_builtins v0.1.160 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling libc v0.2.185
+   Compiling std v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/std)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling thiserror v2.0.18
+   Compiling heapless v0.9.3
+   Compiling ax-errno v0.6.1 (/work/tgoskits/components/axerrno)
+   Compiling ax-percpu v0.4.14 (/work/tgoskits/components/percpu/percpu)
+   Compiling num-traits v0.2.19
+   Compiling radium v0.7.0
+   Compiling libc v0.2.186
+   Compiling rust_decimal v1.42.1
+   Compiling anyhow v1.0.103
+   Compiling ax-alloc v0.8.12 (/work/tgoskits/os/arceos/modules/axalloc)
+   Compiling someboot v0.3.5 (/work/tgoskits/platforms/someboot)
+   Compiling somehal v0.8.0 (/work/tgoskits/platforms/somehal)
+   Compiling ax-driver v0.12.0 (/work/tgoskits/drivers/ax-driver)
+   Compiling axplat-dyn v0.7.12 (/work/tgoskits/platforms/axplat-dyn)
+   Compiling ax-hal v0.5.28 (/work/tgoskits/os/arceos/modules/axhal)
+   Compiling ax-task v0.6.4 (/work/tgoskits/os/arceos/modules/axtask)
+   Compiling ax-runtime v0.10.4 (/work/tgoskits/os/arceos/modules/axruntime)
+   Compiling scope-local v0.4.2 (/work/tgoskits/components/scope-local)
+   Compiling ax-posix-api v0.5.29 (/work/tgoskits/os/arceos/api/arceos_posix_api)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rustc-std-workspace-core v1.99.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/rustc-std-workspace-core)
+   Compiling alloc v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rustc-demangle v0.1.27
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling panic_abort v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_abort)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling cfg-if v1.0.4
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rustc-literal-escaper v0.0.7
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling unwind v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/unwind)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rustc-std-workspace-alloc v1.99.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/rustc-std-workspace-alloc)
+   Compiling panic_unwind v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_unwind)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling hashbrown v0.17.1
+   Compiling std_detect v0.1.5 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/std_detect)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
