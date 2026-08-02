@@ -711,15 +711,18 @@ compile time is `not measured`.
 The 600-second RISC-V diagnostic recorded 493,072 user page-table activations.
 RISC-V already writes the ASID-tagged `satp` root without a full TLB flush.
 The corresponding LoongArch activation path still performed `TLB::flush_all()`
-for every nonzero ASID return. This was redundant with the page-table layer:
-each leaf map/unmap executes LoongArch `invtlb 0x06`, which invalidates that
-virtual address across global and non-global ASIDs, and an existing IPI
-shootdown reaches other CPUs executing the same root. The candidate retains the
-full flush for shared ASID 0 and retains all map/unmap invalidations; it removes
-only the repeated activation-time global flush for a stable nonzero ASID.
+for every nonzero ASID return. A candidate removed that activation-time flush
+because each leaf map/unmap already executes LoongArch `invtlb 0x06` and the
+existing IPI shootdown reaches other CPUs executing the same root.
 
-Both local release builds completed after this change (LoongArch64 13.99 s,
-RISC-V64 12.16 s), but these are host-side build times and not BuildStorm guest
-scores. Independent 8-CPU SMP regression and unmodified-image official complete
-evidence for this candidate are pending, so performance improvement is
-`unverified` and no score claim is made.
+Both local release builds and both independent 8-CPU SMP regressions completed
+after this change, but the unmodified LoongArch official image exposed a
+stronger correctness boundary: the harness entered the official script and
+then shut down before the first toolchain marker. The 64-second run used
+`-m 8G -smp 8`; its runner recorded no result markers. The candidate was
+therefore reverted. Per-address invalidation under kernel ASID 0 is not by
+itself proof that every user-ASID translation affected by intermediate page-
+table state is retired before return. The conservative LoongArch activation
+flush remains required until a complete generation/ownership design has direct
+official-script regression coverage. Performance improvement is `not
+applicable`, and no score claim is made.

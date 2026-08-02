@@ -361,11 +361,10 @@ impl MemorySet {
         if !already_active {
             self.page_table.change_with_asid(self.address_space_id);
         }
-        // A user mapping edit invalidates its virtual address across every
-        // LoongArch ASID, then the existing shootdown path reaches CPUs that
-        // are running the same root. Do not flush the entire local TLB again
-        // for an unchanged nonzero ASID on every user return.
-        if self.address_space_id == 0 {
+        // LoongArch page-table edits currently occur under kernel ASID 0 and
+        // need a conservative local invalidation before re-entering user mode.
+        // RISC-V can retain its ASID-tagged entries across the transition.
+        if self.address_space_id == 0 || cfg!(target_arch = "loongarch64") {
             TLB::flush_all();
         }
     }
