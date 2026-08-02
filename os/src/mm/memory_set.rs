@@ -347,19 +347,23 @@ impl MemorySet {
     }
 
     pub fn activate(&self) {
+        Self::activate_address_space(self.address_space_root(), self.address_space_id);
+    }
+
+    pub fn activate_address_space(address_space_root: usize, address_space_id: usize) {
         crate::perf_counters::note_user_page_table_activation();
-        // Callers hold the shared MemorySet lock while activating. Publishing
-        // the root before changing the hardware page table makes a concurrent
-        // page-table editor observe this CPU only after the new root is live;
-        // an editor that finished earlier leaves a generation handled here.
-        crate::platform::mark_current_address_space(self.address_space_root());
+        // Publishing the stable root before changing the hardware page table
+        // preserves the shootdown generation handshake with concurrent mapping
+        // editors without serializing every user return on the MemorySet lock.
+        crate::platform::mark_current_address_space(address_space_root);
+        let page_table = PageTable::from_root(PhysAddr::new(address_space_root));
         #[cfg(target_arch = "riscv64")]
-        let already_active = PageTable::current().root() == self.page_table.root()
-            && PageTable::current_asid() == self.address_space_id;
+        let already_active = PageTable::current().root() == page_table.root()
+            && PageTable::current_asid() == address_space_id;
         #[cfg(not(target_arch = "riscv64"))]
         let already_active = false;
         if !already_active {
-            self.page_table.change_with_asid(self.address_space_id);
+            page_table.change_with_asid(address_space_id);
         }
         // LoongArch page-table edits currently occur under kernel ASID 0 and
         // need a conservative local invalidation before re-entering user mode.

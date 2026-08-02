@@ -880,3 +880,33 @@ artifacts. AI assistance identified the migration hypothesis and prepared the
 implementation; release, SMP, raw serial, provenance, and official judge
 outputs are the developer-verifiable evidence. The raw A/B diagnostic is
 retained at `/srv/buildstorm/evidence/97fbf20-rv-diag-360/`.
+
+## 21. Lockless user page-table identity activation (2026-08-03)
+
+The 360-second diagnostics count about 420,000 user address-space activations.
+Compiler threads share one `Arc<Mutex<MemorySet>>`, and the return-to-user path
+previously acquired that process-wide lock on every syscall even though it
+only read the stable page-table root and ASID. Mapping edits, faults, and COW
+operations legitimately need the lock; user-root activation does not change
+either identity field between clone and exec.
+
+Each TCB now snapshots the root and ASID at construction. The exec path updates
+the current task's snapshot while replacing its MemorySet after terminating
+thread-group peers. User return activates a non-owning page-table handle from
+that snapshot, while mapping mutation remains serialized and retains the
+existing active-root publication, shootdown generation, ASID reuse, and
+architecture-specific invalidation rules. RISC-V still retains ASID-tagged
+translations; LoongArch still performs its conservative local activation
+flush.
+
+Both release builds pass, and both independent `-smp 8` regressions pass with
+`dispatch=0xff`, ASID reuse/isolation, and 160 MiB heap stress. The raw logs are
+`_tmp/release-rv-lockless-activate.log`, `_tmp/release-la-lockless-activate.log`,
+`_tmp/smp-regression-riscv64.log`, and `_tmp/smp-regression-loongarch64.log`.
+Official compile time and speedup are `not measured`; this remains `unverified`
+until a comparable diagnostic advances the build and an unchanged official
+run emits the complete success marker. The change does not inspect workload
+names, paths, commands, output, time, or CPU count and does not modify the
+image, official script, judge, clock, or build artifacts. AI assistance was
+used for lock-path analysis and implementation; the saved builds, SMP logs,
+raw serial, hashes, and official judge are the developer-verifiable checks.

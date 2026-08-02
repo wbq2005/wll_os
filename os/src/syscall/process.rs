@@ -794,9 +794,13 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             // the stable kernel root before replacing it so PageTableWrapper
             // can release the old root and all of its user page-table frames.
             crate::trap::restore_kernel_page_table();
+            let new_root = new_memory_set.address_space_root();
+            let new_asid = new_memory_set.address_space_id();
             let mut ms = task.memory_set.lock();
             log::info!("[syscall] execve: replacing memory set");
             *ms = new_memory_set;
+            task.user_page_table_root.store(new_root, Ordering::Release);
+            task.user_address_space_id.store(new_asid, Ordering::Release);
         }
 
         {
@@ -1251,6 +1255,10 @@ pub fn sys_clone(
         Some(parent.clone())
     };
 
+    let (user_page_table_root, user_address_space_id) = {
+        let memory_set = memory_set.lock();
+        (memory_set.address_space_root(), memory_set.address_space_id())
+    };
     let child = Arc::new(crate::task::TaskControlBlock {
         pid: child_pid_obj,
         thread_group: thread_group.clone(),
@@ -1308,6 +1316,8 @@ pub fn sys_clone(
         affinity_mask: AtomicUsize::new(parent.affinity_mask.load(Ordering::Acquire)),
         blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
         running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+        user_page_table_root: AtomicUsize::new(user_page_table_root),
+        user_address_space_id: AtomicUsize::new(user_address_space_id),
     });
     crate::task::manager::register_task(&child);
     thread_group.add_member(&child);

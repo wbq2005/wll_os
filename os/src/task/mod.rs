@@ -652,7 +652,7 @@ pub(crate) fn run_current_user_task_until_reschedule(
             break;
         }
 
-        task.memory_set.lock().activate();
+        task.activate_memory_set();
         crate::trap::prepare_user_trapframe(ctx);
         enter_foreground_user_task(task.pid.0);
         crate::trap::interrupts::disable_interrupt();
@@ -679,7 +679,7 @@ fn run_current_user_task_one_boundary(task: &Arc<TaskControlBlock>, ctx: &mut Tr
         return;
     }
 
-    task.memory_set.lock().activate();
+    task.activate_memory_set();
     crate::trap::prepare_user_trapframe(ctx);
     enter_foreground_user_task(task.pid.0);
     crate::trap::interrupts::disable_interrupt();
@@ -1719,6 +1719,9 @@ pub struct TaskControlBlock {
     pub blocking_cpu: AtomicUsize,
     /// CPU that currently owns this task's user context, or NO_CPU.
     pub running_cpu: AtomicUsize,
+    /// Stable page-table identity cached outside the contended MemorySet lock.
+    pub user_page_table_root: AtomicUsize,
+    pub user_address_space_id: AtomicUsize,
 }
 
 unsafe impl Send for TaskControlBlock {}
@@ -1792,6 +1795,13 @@ impl TaskControlBlock {
 
     pub fn can_run_on_cpu(&self, cpu: usize) -> bool {
         self.affinity_mask() & (1usize << cpu) != 0
+    }
+
+    pub(crate) fn activate_memory_set(&self) {
+        MemorySet::activate_address_space(
+            self.user_page_table_root.load(Ordering::Acquire),
+            self.user_address_space_id.load(Ordering::Acquire),
+        );
     }
 
     pub(crate) fn release_running_cpu(&self) {
