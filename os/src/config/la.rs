@@ -10,6 +10,7 @@ pub const USER_START_ADDR: usize = 0x1000;
 /// 用户栈顶部地址 (低 128MB 区域)
 pub const USER_STACK_TOP: usize = 0x8000_0000;
 /// 用户栈大小 (512KB)
-pub const USER_STACK_SIZE: usize = 0x8_0000;
+// Keep the same lazy user-stack contract on both finals architectures.
+pub const USER_STACK_SIZE: usize = 0x40_0000;
 /// 用户堆起始地址
 pub const USER_HEAP_START: usize = 0x1000_0000;

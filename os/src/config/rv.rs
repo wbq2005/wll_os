@@ -19,7 +19,10 @@ pub const KERNEL_VADDR_END: usize = 0xffff_ffff_ffffffff;
 /// 用户程序起始地址
 pub const USER_START_ADDR: usize = 0x1000;
 /// 用户栈大小 (512KB)
-pub const USER_STACK_SIZE: usize = 0x8_0000;
+// Rust cargo/tg-xtask can use more than 512 KiB of main-thread stack while
+// compiling in the official 8 GiB guest. Pages remain lazy, so this only
+// enlarges the valid VMA and does not pre-allocate 4 MiB.
+pub const USER_STACK_SIZE: usize = 0x40_0000;
 /// 用户栈顶地址（初始 SP，栈从高地址向下生长）
 /// 使用用户空间高地址区域
 pub const USER_STACK_TOP: usize = 0x7fff_f000;

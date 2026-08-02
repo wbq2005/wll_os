@@ -647,3 +647,79 @@ table with only the successful markers. AI assisted with log aggregation and
 race analysis; the developer-reviewed work consists of the source diff, two
 release builds, two SMP regressions, official-image minibuilds, official judge
 outputs, and the CAgent-to-BuildStorm sequence smoke.
+
+## 14. New official image gate and current blocker (2026-08-02)
+
+### General memory and execve fixes
+
+The current candidate reserves a memory-scaled kernel heap range of up to 1 GiB
+and uses one eighth of detected RAM before the cap. This is a general allocator
+policy for transient kernel allocations; it does not inspect BuildStorm names,
+paths, output, or elapsed time. Both architecture configurations now expose a
+4 MiB lazy user-stack VMA. `execve` accepts up to 4096 vector entries and 1 MiB
+of string data, returning `E2BIG` instead of silently truncating a vector. Stack
+strings and pointer words are copied page-wise through the address-space
+translation API, avoiding a byte-at-a-time translation loop for large Rust
+compiler argument vectors. The existing shared kernel-root and ASID ownership
+rules are unchanged.
+
+The attempted RISC-V lazy user-root shortcut was reverted after the official
+minibuild failed immediately: low user roots do not safely cover all paths that
+touch kernel/virtio mappings. The safe design remains explicit kernel-root
+coverage for kernel work and architecture-local page-table activation. This
+negative experiment is preserved as evidence and is not part of the production
+claim.
+
+### Official complete runs on the new images
+
+The unmodified official images, official runner, and official judge were used
+with QEMU 11.0.3, `-m 8G -smp 8`, and the revised 3000-second timeout. Both
+runs reached the environment gates and then timed out during the real multi-
+crate compile:
+
+| Architecture | Host elapsed | Markers | Judge | Evidence |
+| --- | ---: | --- | ---: | --- |
+| RISC-V64 | 3000.148 s | toolchain, minibuild, BEGIN; no compile success | 20.0/180 | `docs/evidence/buildstorm-stage2/20260802-riscv64-new-image-official-3000-timeout/` |
+| LoongArch64 | 3000.086 s | toolchain, minibuild, BEGIN; no compile success | 20.0/180 | `docs/evidence/buildstorm-stage2/20260802-loongarch64-final-official-3000-timeout/` |
+
+The official judge output is saved beside each raw serial log, runner JSON,
+release-build log, command, QEMU/version data, image/source hashes, and timing
+record. The valid 600-second RISC-V diagnostic preceding the official run
+measured `user_pt=493072`, `kernel_pt=493072`, `mprotect=62968` (about 35.9 s),
+`statx=54890` (about 28.0 s), `openat=23201` (about 28.9 s), and 30,605 block
+reads totaling 1,924,387,330 bytes. These numbers identify translation and
+metadata/block I/O pressure, but are diagnostic evidence only and do not imply
+complete-build points.
+
+### Gate status and audit
+
+Both release builds and independent eight-vCPU SMP regressions remain passing;
+the official complete gate is `unverified` on both architectures because the
+required `BUILDSTORM_COMPILE mode=multi ok=true` marker is absent. The official
+judge therefore correctly awards only the 20 environment points. The
+anti-cheat audit found that this candidate diff adds no branch on test names,
+paths, commands, output strings, CPU count, fake time, or expected score, and
+does not modify an official image, script, or judge. The pre-existing harness
+does select named test groups, and the pre-existing diagnostics are explicitly
+feature-gated; neither is used by the candidate's allocator, stack, or execve
+paths. Diagnostic-only counters remain excluded from the production artifact.
+No complete-build speedup or timing score is claimed; comparable successful
+compile time is `not measured`.
+
+### LoongArch ASID activation refinement
+
+The 600-second RISC-V diagnostic recorded 493,072 user page-table activations.
+RISC-V already writes the ASID-tagged `satp` root without a full TLB flush.
+The corresponding LoongArch activation path still performed `TLB::flush_all()`
+for every nonzero ASID return. This was redundant with the page-table layer:
+each leaf map/unmap executes LoongArch `invtlb 0x06`, which invalidates that
+virtual address across global and non-global ASIDs, and an existing IPI
+shootdown reaches other CPUs executing the same root. The candidate retains the
+full flush for shared ASID 0 and retains all map/unmap invalidations; it removes
+only the repeated activation-time global flush for a stable nonzero ASID.
+
+Both local release builds completed after this change (LoongArch64 13.99 s,
+RISC-V64 12.16 s), but these are host-side build times and not BuildStorm guest
+scores. Independent 8-CPU SMP regression and unmodified-image official complete
+evidence for this candidate are pending, so performance improvement is
+`unverified` and no score claim is made.

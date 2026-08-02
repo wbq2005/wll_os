@@ -70,6 +70,11 @@ const CLD_KILLED: i32 = 2;
 const CLD_STOPPED: i32 = 5;
 const CLD_CONTINUED: i32 = 6;
 
+// Keep execve vectors bounded without silently dropping a trailing argument.
+// Modern rustc invokes can contain hundreds of --check-cfg pairs.
+const MAX_EXEC_VECTOR_ENTRIES: usize = 4096;
+const MAX_EXEC_VECTOR_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone, Copy)]
 enum WaitTarget {
     AnyChild,
@@ -171,21 +176,25 @@ fn take_child_wait_event(
 
 fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
     let mut result = Vec::new();
+    let mut total_bytes = 0usize;
     if base == 0 {
         return Ok(result);
     }
-    for i in 0..256 {
+    for i in 0..MAX_EXEC_VECTOR_ENTRIES {
         let str_ptr = read_user_usize(base + i * core::mem::size_of::<usize>())?;
         if str_ptr == 0 {
-            break;
+            return Ok(result);
         }
         let s = read_user_cstr(str_ptr as *const u8)?;
-        if s.is_empty() {
-            break;
+        total_bytes = total_bytes
+            .checked_add(s.len() + 1)
+            .ok_or(SysErrNo::E2BIG)?;
+        if total_bytes > MAX_EXEC_VECTOR_BYTES {
+            return Err(SysErrNo::E2BIG);
         }
         result.push(s);
     }
-    Ok(result)
+    Err(SysErrNo::E2BIG)
 }
 
 struct ScriptInterpreter {
@@ -291,6 +300,32 @@ fn read_user_path(ptr: *const u8) -> Result<String, SysErrNo> {
     super::user::read_path_cstr(ptr as usize)
 }
 
+fn write_stack_bytes(
+    memory_set: &crate::mm::memory_set::MemorySet,
+    dst: usize,
+    data: &[u8],
+) {
+    let mut copied = 0usize;
+    while copied < data.len() {
+        let Some(va) = dst.checked_add(copied) else {
+            break;
+        };
+        let page_left = crate::config::PAGE_SIZE - va % crate::config::PAGE_SIZE;
+        let count = page_left.min(data.len() - copied);
+        let Some(pa) = memory_set.translate(VirtAddr::new(va)) else {
+            break;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data[copied..copied + count].as_ptr(),
+                pa.raw() as *mut u8,
+                count,
+            );
+        }
+        copied += count;
+    }
+}
+
 pub(crate) fn proc_self_exe_target(path: &str) -> Result<Option<String>, SysErrNo> {
     if path != "/proc/self/exe" && path != "/proc/thread-self/exe" {
         return Ok(None);
@@ -354,16 +389,10 @@ fn setup_user_stack_with_credentials(
     let mut sp = stack_top;
 
     // 辅助函数：往栈上写 bytes
+    // Copy strings a page at a time; rustc can pass hundreds of arguments.
     let write_bytes = |ms: &crate::mm::memory_set::MemorySet, sp: &mut usize, data: &[u8]| {
         *sp -= data.len();
-        for (i, &b) in data.iter().enumerate() {
-            let va = VirtAddr::new(*sp + i);
-            if let Some(pa) = ms.translate(va) {
-                unsafe {
-                    *(pa.raw() as *mut u8) = b;
-                }
-            }
-        }
+        write_stack_bytes(ms, *sp, data);
     };
 
     // 1) 将所有 argv/envp 字符串写到栈顶区域，记录各自地址
@@ -478,14 +507,7 @@ fn setup_user_stack_with_credentials(
     let mut pos = final_sp;
     let write_at = |ms: &crate::mm::memory_set::MemorySet, pos: usize, val: usize| {
         let bytes = val.to_le_bytes();
-        for (i, &b) in bytes.iter().enumerate() {
-            let va = VirtAddr::new(pos + i);
-            if let Some(pa) = ms.translate(va) {
-                unsafe {
-                    *(pa.raw() as *mut u8) = b;
-                }
-            }
-        }
+        write_stack_bytes(ms, pos, &bytes);
     };
 
     let sz = core::mem::size_of::<usize>();

@@ -22,11 +22,14 @@ pub fn init_heap() {
 /// Reserve a memory-scaled physical range for transient kernel allocations.
 ///
 /// User pages remain owned by the frame allocator. This permanently removes
-/// one contiguous chunk (at most 1 GiB, and normally 1/16 of RAM) and adds it
+/// one contiguous chunk (at most 1 GiB, and normally 1/8 of RAM) and adds it
 /// to the kernel buddy heap so parallel exec, VFS writeback, and scheduler
 /// metadata do not have to fit inside the fixed early-boot heap alone.
 pub fn grow_from_frame_allocator(total_memory_bytes: usize) -> usize {
-    let requested = (total_memory_bytes / 16).min(MAX_DYNAMIC_HEAP_SIZE);
+    // Large user-space builds can require a single high-order allocation.
+    // Reserving 1/8 of RAM keeps a complete 512 MiB buddy block available on
+    // the official 8 GiB runs while remaining capped at the existing 1 GiB.
+    let requested = (total_memory_bytes / 8).min(MAX_DYNAMIC_HEAP_SIZE);
     let requested = if requested.is_power_of_two() {
         requested
     } else {
