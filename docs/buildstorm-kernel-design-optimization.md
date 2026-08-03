@@ -952,3 +952,19 @@ timing, or expected results and does not alter the official image, script,
 judge, CPU count, clock, or artifacts. AI assistance identified the root-
 switch boundary and prepared the patch; the release, SMP, official minibuild,
 raw serial, hashes, and judge outputs are developer-verifiable evidence.
+
+## 23. Rejected active-root fast-path (2026-08-03)
+
+A follow-up candidate skipped user-root activation whenever the CPU-local
+active-address-space slot was merely nonzero. Both release builds and the
+RISC-V 8-CPU SMP regression passed, but the unmodified official-image workload
+did not: its `ax-posix-api` build script exited with `SIGILL`, and the minibuild
+gate reported failure. A nonzero slot is insufficient because it does not
+prove that the recorded root and ASID belong to the task about to resume.
+
+The candidate was reverted before ECS deployment. The retained `70f3813`
+mechanism still performs the exact root/ASID check on every user return and
+therefore does not have this stale-identity failure. Raw negative evidence is
+`_tmp/buildstorm-riscv64-minibuild.log`. No timing or score is claimed. This
+experiment did not modify the official image, script, judge, clock, CPU count,
+or artifacts and did not branch on workload names, paths, commands, or output.
