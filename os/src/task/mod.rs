@@ -652,7 +652,7 @@ pub(crate) fn run_current_user_task_until_reschedule(
             break;
         }
 
-        task.memory_set.lock().activate();
+        task.activate_memory_set_if_needed();
         crate::trap::prepare_user_trapframe(ctx);
         enter_foreground_user_task(task.pid.0);
         crate::trap::interrupts::disable_interrupt();
@@ -679,7 +679,7 @@ fn run_current_user_task_one_boundary(task: &Arc<TaskControlBlock>, ctx: &mut Tr
         return;
     }
 
-    task.memory_set.lock().activate();
+    task.activate_memory_set_if_needed();
     crate::trap::prepare_user_trapframe(ctx);
     enter_foreground_user_task(task.pid.0);
     crate::trap::interrupts::disable_interrupt();
@@ -1792,6 +1792,16 @@ impl TaskControlBlock {
 
     pub fn can_run_on_cpu(&self, cpu: usize) -> bool {
         self.affinity_mask() & (1usize << cpu) != 0
+    }
+
+    #[inline]
+    fn activate_memory_set_if_needed(&self) {
+        let memory_set = self.memory_set.lock();
+        #[cfg(target_arch = "riscv64")]
+        if crate::platform::current_address_space_is(memory_set.address_space_root()) {
+            return;
+        }
+        memory_set.activate();
     }
 
     pub(crate) fn release_running_cpu(&self) {

@@ -398,6 +398,11 @@ pub fn clear_current_address_space() {
     ACTIVE_ADDRESS_SPACE[current_cpu_index()].store(0, Ordering::Release);
 }
 
+#[inline]
+pub fn current_address_space_is(root: usize) -> bool {
+    root != 0 && ACTIVE_ADDRESS_SPACE[current_cpu_index()].load(Ordering::Acquire) == root
+}
+
 pub fn tlb_shootdown(address_space_root: usize) {
     tlb_shootdown_inner(address_space_root, false);
 }

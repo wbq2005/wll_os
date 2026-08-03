@@ -968,3 +968,27 @@ therefore does not have this stale-identity failure. Raw negative evidence is
 `_tmp/buildstorm-riscv64-minibuild.log`. No timing or score is claimed. This
 experiment did not modify the official image, script, judge, clock, CPU count,
 or artifacts and did not branch on workload names, paths, commands, or output.
+
+## 24. Exact active-root activation fast-path (2026-08-03)
+
+The corrected follow-up keeps the MemorySet lock and reads the task's actual
+page-table root. RISC-V skips `MemorySet::activate()` only when the CPU-local
+active root exactly equals that root. A device access, scheduling boundary,
+exec, or any different task leaves zero or a different root and therefore
+takes the full activation path. LoongArch remains unconditional.
+
+Both release builds, both independent 8-CPU SMP regressions, and an additional
+unmodified-image RISC-V official minibuild pass; the latter reached both
+environment markers in 31.7 host seconds without the rejected candidate's
+`SIGILL`. Raw logs are `_tmp/release-rv-exact-active-root.log`,
+`_tmp/release-la-exact-active-root.log`, `_tmp/smp-regression-riscv64.log`,
+`_tmp/smp-regression-loongarch64.log`, and
+`_tmp/buildstorm-riscv64-minibuild.log`.
+
+Complete timing and speedup are `not measured`; no official score is claimed.
+The fast-path only removes redundant synchronization after exact identity
+verification. It does not change mapping edits, shootdowns, ASID reuse, MMIO
+boundaries, official inputs, clock, CPU count, artifacts, or workload-visible
+semantics, and it contains no test-name/path/command/output condition. AI
+assistance prepared and audited the identity condition; the saved release,
+SMP, official-image serial, hashes, and judge results are developer-verifiable.
