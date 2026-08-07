@@ -770,3 +770,9 @@ RISC-V64 production 300 秒窗口在 `BUILDSTORM_BEGIN` 前退出：serial 只�
 fork 深拷贝还是未覆盖的用户地址空间路径导致脚本过早返回，因此禁止在该候选上继续
 叠加修补。下一个 MM 候选必须先用独立 user-process lifecycle / mmap / fork 回归隔离
 这个失败边界，再决定是否重新设计数据表示。
+
+回滚后的同镜像、同 runner、同 `-snapshot -m 8G -smp 8` 对照窗口已完成：正常输出
+toolchain、minibuild 和 `BUILDSTORM_BEGIN mode=multi`，300.050895 s 内有 23 个
+`Compiling`、2 个 `Finished`，最后为 `ax-posix-api`，无 panic。该对照证据位于
+`20260807-riscv64-production-smp8-baseline-control-window300/`，排除了 runner、镜像和
+该次宿主环境造成脚本立即退出的解释；它不构成 full compile 成功。
