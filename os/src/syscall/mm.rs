@@ -143,7 +143,7 @@ fn read_area_bytes(area: &MapArea, src: usize, dst: &mut [u8]) -> Result<(), Sys
         let page_idx = (align_down(addr) - area.start_va.raw()) / PAGE_SIZE;
         let page_off = addr % PAGE_SIZE;
         let copy_len = (dst.len() - copied).min(PAGE_SIZE - page_off);
-        let frame = area.frames.get(page_idx).ok_or(SysErrNo::EFAULT)?;
+        let frame = area.resident.lookup(page_idx).ok_or(SysErrNo::EFAULT)?;
         let src_ptr = (frame.ppn().addr() + page_off) as *const u8;
         unsafe {
             core::ptr::copy_nonoverlapping(src_ptr, dst[copied..].as_mut_ptr(), copy_len);
@@ -182,7 +182,7 @@ fn collect_shared_file_writes_for(
         {
             continue;
         }
-        if area.frames.is_empty() {
+        if area.resident.is_empty() {
             continue;
         }
         let copy_start = start.max(area.start_va.raw());

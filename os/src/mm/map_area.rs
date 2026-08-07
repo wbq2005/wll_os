@@ -2,7 +2,130 @@ use super::frame_allocator::FrameTracker;
 use crate::mm::page_table::PTEFlags;
 use crate::{config::PAGE_SIZE, fs::fd::FileDescriptor};
 use alloc::vec::Vec;
+use core::mem;
 use polyhal::VirtAddr;
+
+/// The sole owner of resident data frames for one logical VMA.
+///
+/// This first migration stage intentionally retains the legacy dense layout:
+/// frames are indexed from the VMA start and the set is either empty or
+/// contiguous.  Callers use this API rather than reaching into a `Vec`, so a
+/// later sparse-run implementation can change the representation without
+/// creating a second owner table.
+#[derive(Clone, Default)]
+pub struct ResidentSet {
+    dense: Vec<FrameTracker>,
+}
+
+impl ResidentSet {
+    pub const fn new() -> Self {
+        Self { dense: Vec::new() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dense.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.dense.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.dense.capacity()
+    }
+
+    /// Return the page at a VMA-relative VPN.
+    pub fn lookup(&self, vpn: usize) -> Option<&FrameTracker> {
+        self.dense.get(vpn)
+    }
+
+    pub fn lookup_mut(&mut self, vpn: usize) -> Option<&mut FrameTracker> {
+        self.dense.get_mut(vpn)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &FrameTracker> {
+        self.dense.iter()
+    }
+
+    /// Insert one VMA-relative page.  The dense compatibility form accepts
+    /// only an append, which prevents silently shifting virtual-page identity.
+    pub fn insert(&mut self, vpn: usize, page: FrameTracker) -> Result<(), FrameTracker> {
+        if vpn != self.dense.len() {
+            return Err(page);
+        }
+        self.dense.push(page);
+        Ok(())
+    }
+
+    /// Insert a contiguous suffix.  This is the legacy equivalent of adding
+    /// a run at `start_vpn`; sparse implementations will remove the suffix
+    /// restriction while preserving the ownership contract.
+    pub fn insert_run(
+        &mut self,
+        start_vpn: usize,
+        mut pages: Vec<FrameTracker>,
+    ) -> Result<(), Vec<FrameTracker>> {
+        if start_vpn != self.dense.len() {
+            return Err(pages);
+        }
+        self.dense.append(&mut pages);
+        Ok(())
+    }
+
+    /// Extract a contiguous suffix into a new owner.  The current dense
+    /// representation cannot preserve an interior hole, so callers must first
+    /// split the logical VMA at the range boundary.
+    pub fn extract_range(&mut self, start_vpn: usize, end_vpn: usize) -> Option<Self> {
+        if start_vpn > end_vpn || end_vpn != self.dense.len() {
+            return None;
+        }
+        Some(Self {
+            dense: self.dense.split_off(start_vpn),
+        })
+    }
+
+    pub fn split_off(&mut self, vpn: usize) -> Option<Self> {
+        if vpn > self.dense.len() {
+            return None;
+        }
+        Some(Self {
+            dense: self.dense.split_off(vpn),
+        })
+    }
+
+    pub fn merge_from(&mut self, mut other: Self) {
+        self.dense.append(&mut other.dense);
+    }
+
+    pub fn iter_range(
+        &self,
+        start_vpn: usize,
+        end_vpn: usize,
+    ) -> impl Iterator<Item = (usize, &FrameTracker)> {
+        self.dense
+            .get(start_vpn..end_vpn)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+            .map(move |(index, page)| (start_vpn + index, page))
+    }
+
+    pub fn drain_all(&mut self) -> Self {
+        Self {
+            dense: mem::take(&mut self.dense),
+        }
+    }
+
+    pub fn into_frames(self) -> Vec<FrameTracker> {
+        self.dense
+    }
+
+    pub fn replace_all(&mut self, pages: Vec<FrameTracker>) -> Self {
+        Self {
+            dense: mem::replace(&mut self.dense, pages),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub enum MapAreaBacking {
@@ -93,7 +216,10 @@ pub struct MapArea {
     pub start_va: VirtAddr,
     pub end_va: VirtAddr,
     pub flags: PTEFlags,
-    pub frames: Vec<FrameTracker>,
+    /// Resident pages are owned only here.  Keep the field crate-visible while
+    /// the compatibility migration removes direct `MapArea.frames` access;
+    /// all frame operations must go through `ResidentSet` methods.
+    pub(crate) resident: ResidentSet,
     pub backing: MapAreaBacking,
 }
 
@@ -112,7 +238,7 @@ impl MapArea {
             start_va,
             end_va,
             flags,
-            frames: Vec::new(),
+            resident: ResidentSet::new(),
             backing,
         }
     }
@@ -130,11 +256,11 @@ impl MapArea {
     }
 
     pub fn has_frames(&self) -> bool {
-        !self.frames.is_empty()
+        !self.resident.is_empty()
     }
 
     fn has_full_frames(&self) -> bool {
-        self.frames.len() == self.page_count()
+        self.resident.len() == self.page_count()
     }
 
     pub fn overlaps(&self, start: usize, end: usize) -> bool {
@@ -142,7 +268,7 @@ impl MapArea {
     }
 
     pub fn can_merge_with(&self, next: &Self) -> bool {
-        let compatible_frames = (self.frames.is_empty() && next.frames.is_empty())
+        let compatible_frames = (self.resident.is_empty() && next.resident.is_empty())
             || (self.has_full_frames() && next.has_full_frames());
         self.end_va.raw() == next.start_va.raw()
             && self.flags.bits() == next.flags.bits()
@@ -150,9 +276,9 @@ impl MapArea {
             && compatible_frames
     }
 
-    pub fn merge_with(&mut self, mut next: Self) {
+    pub fn merge_with(&mut self, next: Self) {
         self.end_va = next.end_va;
-        self.frames.append(&mut next.frames);
+        self.resident.merge_from(next.resident);
     }
 
     pub fn split_at(&mut self, split_va: VirtAddr) -> Option<Self> {
@@ -165,13 +291,13 @@ impl MapArea {
         }
 
         let right_idx = (split - self.start_va.raw()) / PAGE_SIZE;
-        let right_frames = if self.frames.is_empty() {
-            Vec::new()
+        let right_resident = if self.resident.is_empty() {
+            ResidentSet::new()
         } else {
-            if right_idx > self.frames.len() {
+            if right_idx > self.resident.len() {
                 return None;
             }
-            self.frames.split_off(right_idx)
+            self.resident.split_off(right_idx)?
         };
         let old_end = self.end_va;
         let right_backing = self.backing.split_right(split - self.start_va.raw());
@@ -181,7 +307,7 @@ impl MapArea {
             start_va: split_va,
             end_va: old_end,
             flags: self.flags,
-            frames: right_frames,
+            resident: right_resident,
             backing: right_backing,
         })
     }

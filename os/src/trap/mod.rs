@@ -66,7 +66,13 @@ pub fn prepare_user_trapframe(tf: &mut TrapFrame) {
     #[cfg(target_arch = "riscv64")]
     {
         let bits = unsafe { core::mem::transmute::<_, usize>(tf.sstatus) };
-        let bits = (bits & !(1 << 8)) | (1 << 5) | (3 << 13);
+        // `user_restore` writes this value before it has completed restoring
+        // registers and executing `sret`.  SIE must stay clear throughout
+        // that transition: an IPI in the middle is entered through `uservec`
+        // (sscratch already names the user frame) and would treat a partial
+        // restore as a user trap.  SPIE is set so `sret` enables interrupts
+        // only after the CPU has actually entered the user context.
+        let bits = (bits & !((1 << 8) | (1 << 1))) | (1 << 5) | (3 << 13);
         tf.sstatus = unsafe { core::mem::transmute(bits) };
     }
     #[cfg(target_arch = "loongarch64")]
@@ -289,6 +295,12 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 }
 
                 let sepc = ctx[TrapFrameArgs::SEPC];
+                #[cfg(feature = "smp-regression")]
+                crate::smp_regression::note_user_memory_lifecycle_terminal_trap(
+                    1,
+                    vaddr,
+                    sepc,
+                );
                 let sp = ctx[TrapFrameArgs::SP];
                 let ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
                 let fault_pa = ms.translate(polyhal::VirtAddr::new(vaddr));
@@ -315,6 +327,12 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             exit_user_thread_group_for_signal(SIGSEGV);
         }
         TrapType::IllegalInstruction(vaddr) => {
+            #[cfg(feature = "smp-regression")]
+            crate::smp_regression::note_user_memory_lifecycle_terminal_trap(
+                2,
+                vaddr,
+                ctx[TrapFrameArgs::SEPC],
+            );
             log::error!(
                 "[trap] User illegal instruction at {:#x}, killing process",
                 vaddr
@@ -322,6 +340,12 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             exit_user_thread_group_for_signal(SIGILL);
         }
         _ => {
+            #[cfg(feature = "smp-regression")]
+            crate::smp_regression::note_user_memory_lifecycle_terminal_trap(
+                3,
+                0,
+                ctx[TrapFrameArgs::SEPC],
+            );
             log::warn!(
                 "[trap] Unhandled user trap {:?}, killing process",
                 trap_type

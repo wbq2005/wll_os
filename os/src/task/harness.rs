@@ -944,6 +944,46 @@ fn run_user_program_spec_foreground_exit_code(spec: &UserProgramSpec) -> Result<
     Ok(exit_code)
 }
 
+/// Independent user-address-space lifecycle regression.
+///
+/// This deliberately uses a small dynamic user program rather than an official
+/// contest script. It covers ELF/interpreter loading, initial stack setup,
+/// anonymous user memory, user entry, and normal process teardown.
+#[cfg(feature = "smp-regression")]
+pub(crate) fn run_user_memory_lifecycle_regression() {
+    crate::smp_regression::reset_user_memory_lifecycle_diagnostic();
+    let spec = UserProgramSpec {
+        path: String::from("/busybox"),
+        argv: alloc::vec![
+            String::from("/busybox"),
+            String::from("sh"),
+            String::from("-c"),
+            String::from("exit 0"),
+        ],
+        envp: alloc::vec![
+            String::from("PATH=/:/bin:/usr/bin"),
+            String::from("LD_LIBRARY_PATH=/lib"),
+        ],
+        cwd: String::from("/"),
+        root: String::from("/glibc"),
+        marker_name: None,
+    };
+    let exit_code = run_user_program_spec_foreground_exit_code(&spec)
+        .expect("user-memory lifecycle launch");
+    if exit_code != 0 {
+        if let Some((kind, vaddr, sepc)) =
+            crate::smp_regression::user_memory_lifecycle_terminal_trap()
+        {
+            console_write(&format!(
+                "[smp-regression] lifecycle-terminal-trap kind={} vaddr={:#x} sepc={:#x}\n",
+                kind, vaddr, sepc
+            ));
+        }
+        panic!("[smp-regression] fail phase=user-memory-lifecycle exit={}", exit_code);
+    }
+    console_write("[smp-regression] pass phase=user-memory-lifecycle\n");
+}
+
 fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
     #[cfg(feature = "libctest")]
     const DEFAULT_RUN_TIMEOUT_US: usize = 15_000_000;

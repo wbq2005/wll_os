@@ -67,7 +67,7 @@ fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
     }
 
     let mf = effective_mapping_flags(area.flags);
-    for (idx, frame) in area.frames.iter().enumerate() {
+    for (idx, frame) in area.resident.iter().enumerate() {
         let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
         let paddr = PhysAddr::new(frame.ppn().addr());
         page_table.map_page(vaddr, paddr, mf, MappingSize::Page4KB);
@@ -85,9 +85,13 @@ fn map_area_page_window(
     }
 
     let mf = effective_mapping_flags(area.flags);
-    let end_idx = start_idx.saturating_add(page_count).min(area.frames.len());
+    let end_idx = start_idx
+        .saturating_add(page_count)
+        .min(area.resident.len());
     for idx in start_idx..end_idx {
-        let frame = &area.frames[idx];
+        let Some(frame) = area.resident.lookup(idx) else {
+            break;
+        };
         let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
         let paddr = PhysAddr::new(frame.ppn().addr());
         page_table.map_page(vaddr, paddr, mf, MappingSize::Page4KB);
@@ -103,7 +107,7 @@ fn unmap_area_pages_without_shootdown(
         return;
     }
 
-    for idx in 0..area.frames.len() {
+    for idx in 0..area.resident.len() {
         let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
         page_table.unmap_page(vaddr);
     }
@@ -123,12 +127,12 @@ fn remap_area_pages(page_table: &PageTableWrapper, area: &MapArea, old_flags: PT
 }
 
 fn copy_area_frames(area: &mut MapArea) -> Result<Vec<FrameTracker>, SysErrNo> {
-    if area.frames.is_empty() {
+    if area.resident.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut frames = Vec::new();
-    for src_frame in &area.frames {
+    for src_frame in area.resident.iter() {
         let Some(frame) = frame_allocator::alloc_frame() else {
             return Err(SysErrNo::ENOMEM);
         };
@@ -141,7 +145,7 @@ fn copy_area_frames(area: &mut MapArea) -> Result<Vec<FrameTracker>, SysErrNo> {
         }
         frames.push(frame);
     }
-    Ok(mem::replace(&mut area.frames, frames))
+    Ok(area.resident.replace_all(frames).into_frames())
 }
 
 fn read_backing_page(backing: &MapAreaBacking, _page_start: usize) -> Result<Vec<u8>, SysErrNo> {
@@ -160,7 +164,7 @@ fn read_backing_page(backing: &MapAreaBacking, _page_start: usize) -> Result<Vec
 pub struct MemorySet {
     pub page_table: PageTableWrapper,
     address_space_id: usize,
-    /// User VMAs. Framed areas own their user data frames through `MapArea`.
+    /// User VMAs own resident pages through `MapArea::resident`.
     pub areas: Vec<MapArea>,
 }
 
@@ -232,7 +236,9 @@ impl MemorySet {
                 self.page_table
                     .map_page(vaddr, paddr, mf, MappingSize::Page4KB);
             }
-            area.frames.push(frame);
+            area.resident
+                .insert(area.resident.len(), frame)
+                .map_err(|_| SysErrNo::EFAULT)?;
         }
 
         self.areas.push(area);
@@ -325,10 +331,10 @@ impl MemorySet {
             permission,
             backing,
         );
-        area.frames = frames.to_vec();
+        let _ = area.resident.replace_all(frames.to_vec());
         if has_leaf_permission(permission) {
             let mf = effective_mapping_flags(permission);
-            for (idx, frame) in area.frames.iter().enumerate() {
+            for (idx, frame) in area.resident.iter().enumerate() {
                 let vaddr = VirtAddr::new(start + idx * PAGE_SIZE);
                 let paddr = PhysAddr::new(frame.ppn().addr());
                 self.page_table
@@ -552,7 +558,7 @@ impl MemorySet {
                 && flags.contains(PTEFlags::W)
                 && area.has_frames()
                 && (area.flags.contains(PTEFlags::COW)
-                    || area.frames.iter().any(|frame| frame.ref_count() > 1))
+                    || area.resident.iter().any(|frame| frame.ref_count() > 1))
             {
                 // Linux does not eagerly duplicate a whole private mapping
                 // merely because mprotect made it writable.  Keep shared
@@ -598,7 +604,7 @@ impl MemorySet {
             return Err(SysErrNo::EFAULT);
         }
         let first_frame = (page_start - source.start_va.raw()) / PAGE_SIZE;
-        let Some(available_pages) = source.frames.len().checked_sub(first_frame) else {
+        let Some(available_pages) = source.resident.len().checked_sub(first_frame) else {
             return Err(SysErrNo::EFAULT);
         };
         let max_pages = available_pages.min(COW_FAULT_WINDOW_PAGES);
@@ -608,7 +614,9 @@ impl MemorySet {
 
         let mut replacements = Vec::new();
         for relative in 0..max_pages {
-            let source_frame = &source.frames[first_frame + relative];
+            let Some(source_frame) = source.resident.lookup(first_frame + relative) else {
+                return Err(SysErrNo::EFAULT);
+            };
             if source_frame.ref_count() > 1 {
                 let Some(frame) = frame_allocator::alloc_frame() else {
                     if relative == 0 {
@@ -643,7 +651,7 @@ impl MemorySet {
         };
         if self.areas[index].start_va.raw() != page_start
             || self.areas[index].end_va.raw() != window_end
-            || self.areas[index].frames.len() != replacements.len()
+            || self.areas[index].resident.len() != replacements.len()
         {
             return Err(SysErrNo::EFAULT);
         }
@@ -654,7 +662,11 @@ impl MemorySet {
             let area = &mut self.areas[index];
             for (frame_index, replacement) in replacements.into_iter().enumerate() {
                 if let Some(frame) = replacement {
-                    old_frames.push(mem::replace(&mut area.frames[frame_index], frame));
+                    let old = area
+                        .resident
+                        .lookup_mut(frame_index)
+                        .ok_or(SysErrNo::EFAULT)?;
+                    old_frames.push(mem::replace(old, frame));
                 }
             }
             area.flags.remove(PTEFlags::COW);
@@ -737,7 +749,7 @@ impl MemorySet {
             let page_idx = (align_down(addr) - area.start_va.raw()) / PAGE_SIZE;
             let page_off = addr % PAGE_SIZE;
             let copy_len = (src.len() - copied).min(PAGE_SIZE - page_off);
-            let frame = area.frames.get(page_idx).ok_or(SysErrNo::EFAULT)?;
+            let frame = area.resident.lookup(page_idx).ok_or(SysErrNo::EFAULT)?;
             let dst_ptr = (frame.ppn().addr() + page_off) as *mut u8;
             unsafe {
                 core::ptr::copy_nonoverlapping(src[copied..].as_ptr(), dst_ptr, copy_len);
@@ -898,7 +910,7 @@ impl MemorySet {
                     left.end_va.raw() == page_start
                         && left.flags.bits() == window_flags
                         && matches!(left.backing, MapAreaBacking::Anonymous)
-                        && left.frames.len() == left.page_count()
+                        && left.resident.len() == left.page_count()
                 };
                 let right_mergeable =
                     window_end == area.end_va.raw() && area_index + 1 < self.areas.len() && {
@@ -906,7 +918,7 @@ impl MemorySet {
                         right.start_va.raw() == window_end
                             && right.flags.bits() == window_flags
                             && matches!(right.backing, MapAreaBacking::Anonymous)
-                            && right.frames.len() == right.page_count()
+                            && right.resident.len() == right.page_count()
                     };
                 crate::buildstorm_diagnostics::note_anonymous_vma_install(
                     left_mergeable,
@@ -918,18 +930,19 @@ impl MemorySet {
                     let left = &self.areas[area_index - 1];
                     crate::buildstorm_diagnostics::note_anonymous_move_shape(
                         true,
-                        left.frames.capacity().saturating_sub(left.frames.len()) >= frames.len(),
+                        left.resident.capacity().saturating_sub(left.resident.len())
+                            >= frames.len(),
                         window_end < area.end_va.raw(),
-                        left.frames.len(),
+                        left.resident.len(),
                         self.areas.len().saturating_sub(area_index + 1),
                     );
                 } else if right_mergeable {
                     let right = &self.areas[area_index + 1];
                     crate::buildstorm_diagnostics::note_anonymous_move_shape(
                         false,
-                        frames.capacity().saturating_sub(frames.len()) >= right.frames.len(),
+                        frames.capacity().saturating_sub(frames.len()) >= right.resident.len(),
                         page_start > area.start_va.raw(),
-                        right.frames.len(),
+                        right.resident.len(),
                         self.areas.len().saturating_sub(area_index + 1),
                     );
                 }
@@ -953,7 +966,7 @@ impl MemorySet {
             #[cfg(feature = "buildstorm-diagnostics")]
             drop(anonymous_split);
             let _mapped_pages = frames.len();
-            self.areas[idx].frames = frames;
+            let _ = self.areas[idx].resident.replace_all(frames);
             #[cfg(feature = "buildstorm-diagnostics")]
             let anonymous_map = crate::buildstorm_diagnostics::WorkScope::new(
                 crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousMap,
@@ -1006,7 +1019,7 @@ impl MemorySet {
                 return Err(SysErrNo::EFAULT);
             }
             let _mapped_pages = cache_frames.len();
-            self.areas[idx].frames = cache_frames;
+            let _ = self.areas[idx].resident.replace_all(cache_frames);
             map_area_pages(&self.page_table, &self.areas[idx]);
             self.coalesce_areas();
             #[cfg(feature = "buildstorm-diagnostics")]
@@ -1045,7 +1058,11 @@ impl MemorySet {
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), frame.ppn().addr() as *mut u8, PAGE_SIZE);
         }
-        self.areas[idx].frames.push(frame);
+        let resident_len = self.areas[idx].resident.len();
+        self.areas[idx]
+            .resident
+            .insert(resident_len, frame)
+            .map_err(|_| SysErrNo::EFAULT)?;
         map_area_pages(&self.page_table, &self.areas[idx]);
         #[cfg(feature = "buildstorm-diagnostics")]
         fault_resolution.finish(
@@ -1137,10 +1154,12 @@ impl MemorySet {
         for area in old_areas {
             if let Some(last) = merged.last_mut() {
                 if last.can_merge_with(&area) {
-                    let incoming_frames = area.frames.len();
-                    if last.frames.capacity().saturating_sub(last.frames.len()) < incoming_frames {
+                    let incoming_frames = area.resident.len();
+                    if last.resident.capacity().saturating_sub(last.resident.len())
+                        < incoming_frames
+                    {
                         frame_reallocs = frame_reallocs.saturating_add(1);
-                        frame_relocate = frame_relocate.saturating_add(last.frames.len());
+                        frame_relocate = frame_relocate.saturating_add(last.resident.len());
                     }
                     merges = merges.saturating_add(1);
                     merged_frames = merged_frames.saturating_add(incoming_frames);
@@ -1196,7 +1215,7 @@ impl MemorySet {
                 MapArea::with_backing(area.start_va, area.end_va, area.flags, area.backing.clone());
 
             if is_shared_mapping(area) {
-                new_area.frames = area.frames.clone();
+                new_area.resident = area.resident.clone();
                 map_area_pages(&new_ms.page_table, &new_area);
                 new_ms.areas.push(new_area);
                 continue;
@@ -1209,20 +1228,20 @@ impl MemorySet {
                     remap_area_pages(&self.page_table, area, old_flags);
                 }
                 new_area.flags = area.flags;
-                new_area.frames = area.frames.clone();
+                new_area.resident = area.resident.clone();
                 map_area_pages(&new_ms.page_table, &new_area);
                 new_ms.areas.push(new_area);
                 continue;
             }
 
             if is_readonly_share_candidate(area) {
-                new_area.frames = area.frames.clone();
+                new_area.resident = area.resident.clone();
                 map_area_pages(&new_ms.page_table, &new_area);
                 new_ms.areas.push(new_area);
                 continue;
             }
 
-            for (idx, src_frame) in area.frames.iter().enumerate() {
+            for (idx, src_frame) in area.resident.iter().enumerate() {
                 let Some(frame) = frame_allocator::alloc_frame() else {
                     return Err(SysErrNo::ENOMEM);
                 };
@@ -1243,7 +1262,10 @@ impl MemorySet {
                         .page_table
                         .map_page(vaddr, new_paddr, mf, MappingSize::Page4KB);
                 }
-                new_area.frames.push(frame);
+                new_area
+                    .resident
+                    .insert(new_area.resident.len(), frame)
+                    .map_err(|_| SysErrNo::EFAULT)?;
             }
 
             new_ms.areas.push(new_area);
@@ -1270,13 +1292,13 @@ impl Clone for MemorySet {
                 MapArea::with_backing(area.start_va, area.end_va, new_flags, area.backing.clone());
 
             if matches!(area.backing, MapAreaBacking::SharedMemory { .. }) {
-                new_area.frames = area.frames.clone();
+                new_area.resident = area.resident.clone();
                 map_area_pages(&new_ms.page_table, &new_area);
                 new_ms.areas.push(new_area);
                 continue;
             }
 
-            for (idx, src_frame) in area.frames.iter().enumerate() {
+            for (idx, src_frame) in area.resident.iter().enumerate() {
                 if let Some(frame) = frame_allocator::alloc_frame() {
                     let new_paddr = PhysAddr::new(frame.ppn().addr());
                     let src_paddr = PhysAddr::new(src_frame.ppn().addr());
@@ -1295,7 +1317,7 @@ impl Clone for MemorySet {
                             .page_table
                             .map_page(vaddr, new_paddr, mf, MappingSize::Page4KB);
                     }
-                    new_area.frames.push(frame);
+                    let _ = new_area.resident.insert(new_area.resident.len(), frame);
                 }
             }
 

@@ -3,6 +3,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use polyhal::VirtAddr;
 
+use crate::mm::frame_allocator;
+use crate::mm::map_area::{MapAreaBacking, ResidentSet};
 use crate::mm::memory_set::MemorySet;
 use crate::mm::page_table::PTEFlags;
 use crate::task::TaskControlBlock;
@@ -13,11 +15,227 @@ static SEEN_MASK: AtomicUsize = AtomicUsize::new(0);
 static TLB_READY_MASK: AtomicUsize = AtomicUsize::new(0);
 static DONE_MASK: AtomicUsize = AtomicUsize::new(0);
 static RELEASE_TLB_WORKERS: AtomicBool = AtomicBool::new(false);
+// The lifecycle probe records only the first terminal user trap.  It is
+// intentionally feature-local: it lets the independent regression expose its
+// failure boundary without adding a per-fault production log path.
+static LIFECYCLE_TERMINAL_RECORDED: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE_TERMINAL_KIND: AtomicUsize = AtomicUsize::new(0);
+static LIFECYCLE_TERMINAL_VADDR: AtomicUsize = AtomicUsize::new(0);
+static LIFECYCLE_TERMINAL_SEPC: AtomicUsize = AtomicUsize::new(0);
+static LIFECYCLE_TASK_DONE: AtomicBool = AtomicBool::new(false);
 
 const HEAP_STRESS_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const HEAP_STRESS_CHUNKS: usize = 10;
 const ASID_TEST_VADDR: usize = 0x4000_0000;
 const ASID_ISOLATION_ITERATIONS: usize = 64;
+const RESIDENT_TEST_VADDR: usize = 0x4100_0000;
+const SHARED_LEFT_VADDR: usize = 0x4200_0000;
+const SHARED_RIGHT_VADDR: usize = 0x4300_0000;
+
+/// Exercise the ResidentSet ownership API independently of the contest
+/// workload.  This keeps the dense compatibility contract explicit before its
+/// storage is replaced by sparse runs.
+fn verify_resident_set_api() {
+    let mut pages = ResidentSet::new();
+    let mut initial = Vec::new();
+    for _ in 0..2 {
+        initial.push(frame_allocator::alloc_frame().expect("resident API frame allocation"));
+    }
+    if pages.insert_run(0, initial).is_err() {
+        panic!("[smp-regression] fail phase=resident-set-api initial-run");
+    }
+    if pages
+        .insert(
+            2,
+            frame_allocator::alloc_frame().expect("resident API suffix allocation"),
+        )
+        .is_err()
+    {
+        panic!("[smp-regression] fail phase=resident-set-api suffix-insert");
+    }
+    if pages.len() != 3 || pages.lookup(0).is_none() || pages.iter_range(1, 3).count() != 2 {
+        panic!("[smp-regression] fail phase=resident-set-api lookup");
+    }
+
+    let rejected = frame_allocator::alloc_frame().expect("resident API rejection allocation");
+    if pages.insert(4, rejected).is_ok() {
+        panic!("[smp-regression] fail phase=resident-set-api gap-insert");
+    }
+
+    let suffix = pages
+        .extract_range(2, 3)
+        .expect("resident API suffix extraction");
+    let middle = pages.split_off(1).expect("resident API split");
+    pages.merge_from(middle);
+    pages.merge_from(suffix);
+    if pages.len() != 3 || pages.lookup(2).is_none() {
+        panic!("[smp-regression] fail phase=resident-set-api transfer");
+    }
+    let drained = pages.drain_all();
+    if !pages.is_empty() || drained.len() != 3 {
+        panic!("[smp-regression] fail phase=resident-set-api drain");
+    }
+    drop(drained);
+}
+
+/// Verify the bridge between the current dense ResidentSet compatibility form
+/// and user-memory lifecycle operations.  No official command, path, marker,
+/// or expected contest output participates in this regression.
+fn verify_resident_memory_lifecycle() {
+    let page = crate::config::PAGE_SIZE;
+    let flags = PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V;
+
+    let mut parent = MemorySet::new_bare();
+    parent
+        .insert_lazy_area_with_backing(
+            VirtAddr::new(RESIDENT_TEST_VADDR),
+            VirtAddr::new(RESIDENT_TEST_VADDR + 4 * page),
+            flags,
+            MapAreaBacking::Anonymous,
+        )
+        .expect("resident lifecycle lazy area");
+    parent
+        .handle_page_fault(RESIDENT_TEST_VADDR + page, true, false)
+        .expect("resident lifecycle anonymous fault");
+    if parent
+        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+        .is_none()
+    {
+        panic!("[smp-regression] fail phase=resident-memory anonymous-fault");
+    }
+
+    let mut child = parent.fork_cow().expect("resident lifecycle fork COW");
+    let parent_page = parent
+        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+        .expect("resident lifecycle parent mapping");
+    child
+        .handle_page_fault(RESIDENT_TEST_VADDR + page, true, false)
+        .expect("resident lifecycle COW write");
+    let child_page = child
+        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+        .expect("resident lifecycle child mapping");
+    if parent_page == child_page {
+        panic!("[smp-regression] fail phase=resident-memory cow-isolation");
+    }
+    child
+        .protect_range(
+            VirtAddr::new(RESIDENT_TEST_VADDR + page),
+            VirtAddr::new(RESIDENT_TEST_VADDR + 3 * page),
+            flags,
+        )
+        .expect("resident lifecycle cross-range mprotect");
+    child
+        .unmap_range(
+            VirtAddr::new(RESIDENT_TEST_VADDR + page),
+            VirtAddr::new(RESIDENT_TEST_VADDR + 2 * page),
+        )
+        .expect("resident lifecycle partial munmap");
+    if child
+        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+        .is_some()
+    {
+        panic!("[smp-regression] fail phase=resident-memory partial-munmap");
+    }
+    parent.release_user_areas();
+    if !parent.areas.is_empty() {
+        panic!("[smp-regression] fail phase=resident-memory release");
+    }
+    drop(child);
+    drop(parent);
+
+    let shared_frames =
+        alloc::vec![frame_allocator::alloc_frame().expect("shared frame allocation")];
+    let mut left = MemorySet::new_bare();
+    let mut right = MemorySet::new_bare();
+    left.insert_shared_framed_area(
+        VirtAddr::new(SHARED_LEFT_VADDR),
+        VirtAddr::new(SHARED_LEFT_VADDR + page),
+        flags,
+        MapAreaBacking::SharedMemory {
+            shmid: 1,
+            base: SHARED_LEFT_VADDR,
+            offset: 0,
+        },
+        &shared_frames,
+    )
+    .expect("resident lifecycle shared left");
+    right
+        .insert_shared_framed_area(
+            VirtAddr::new(SHARED_RIGHT_VADDR),
+            VirtAddr::new(SHARED_RIGHT_VADDR + page),
+            flags,
+            MapAreaBacking::SharedMemory {
+                shmid: 1,
+                base: SHARED_RIGHT_VADDR,
+                offset: 0,
+            },
+            &shared_frames,
+        )
+        .expect("resident lifecycle shared right");
+    let left_page = left
+        .translate(VirtAddr::new(SHARED_LEFT_VADDR))
+        .expect("resident lifecycle shared left mapping");
+    let right_page = right
+        .translate(VirtAddr::new(SHARED_RIGHT_VADDR))
+        .expect("resident lifecycle shared right mapping");
+    if left_page != right_page {
+        panic!("[smp-regression] fail phase=resident-memory shared-identity");
+    }
+    left.unmap_range(
+        VirtAddr::new(SHARED_LEFT_VADDR),
+        VirtAddr::new(SHARED_LEFT_VADDR + page),
+    )
+    .expect("resident lifecycle shared unmap");
+    if right.translate(VirtAddr::new(SHARED_RIGHT_VADDR)).is_none() {
+        panic!("[smp-regression] fail phase=resident-memory shared-lifetime");
+    }
+    drop(left);
+    drop(right);
+    drop(shared_frames);
+
+    let shared_memory = crate::task::new_shared_memory_set(MemorySet::new_bare());
+    let clone_vm_view = shared_memory.clone();
+    if !alloc::sync::Arc::ptr_eq(&shared_memory, &clone_vm_view) {
+        panic!("[smp-regression] fail phase=resident-memory clone-vm-sharing");
+    }
+    drop(clone_vm_view);
+    drop(shared_memory);
+
+    crate::println!("[smp-regression] pass phase=resident-memory-lifecycle");
+}
+
+pub(crate) fn reset_user_memory_lifecycle_diagnostic() {
+    LIFECYCLE_TERMINAL_KIND.store(0, Ordering::Relaxed);
+    LIFECYCLE_TERMINAL_VADDR.store(0, Ordering::Relaxed);
+    LIFECYCLE_TERMINAL_SEPC.store(0, Ordering::Relaxed);
+    LIFECYCLE_TERMINAL_RECORDED.store(false, Ordering::Release);
+}
+
+pub(crate) fn note_user_memory_lifecycle_terminal_trap(
+    kind: usize,
+    vaddr: usize,
+    sepc: usize,
+) {
+    if LIFECYCLE_TERMINAL_RECORDED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        LIFECYCLE_TERMINAL_KIND.store(kind, Ordering::Release);
+        LIFECYCLE_TERMINAL_VADDR.store(vaddr, Ordering::Release);
+        LIFECYCLE_TERMINAL_SEPC.store(sepc, Ordering::Release);
+    }
+}
+
+pub(crate) fn user_memory_lifecycle_terminal_trap() -> Option<(usize, usize, usize)> {
+    if !LIFECYCLE_TERMINAL_RECORDED.load(Ordering::Acquire) {
+        return None;
+    }
+    Some((
+        LIFECYCLE_TERMINAL_KIND.load(Ordering::Acquire),
+        LIFECYCLE_TERMINAL_VADDR.load(Ordering::Acquire),
+        LIFECYCLE_TERMINAL_SEPC.load(Ordering::Acquire),
+    ))
+}
 
 fn mapped_address_space(value: usize) -> MemorySet {
     let mut memory = MemorySet::new_bare();
@@ -100,7 +318,11 @@ fn verify_asid_isolation_and_reuse() -> (usize, usize, usize) {
 
     // Keep the old data frame alive so a stale translation cannot pass by
     // accidentally pointing at a frame immediately recycled by the allocator.
-    let old_frame = left.areas[0].frames[0].clone();
+    let old_frame = left.areas[0]
+        .resident
+        .lookup(0)
+        .expect("ASID regression mapping must own its frame")
+        .clone();
     drop(left);
 
     let mut reused = None;
@@ -139,6 +361,36 @@ fn stress_kernel_heap() -> usize {
     }
     drop(chunks);
     checksum
+}
+
+/// Run the user-lifecycle probe from a real kernel task.  The production
+/// harness launches user programs from a kernel task too; running it directly
+/// on the boot stack leaves no current task or orphan reaper, making the
+/// regression exercise a different and unstable lifecycle boundary.
+fn user_memory_lifecycle_driver() -> ! {
+    crate::task::harness::run_user_memory_lifecycle_regression();
+    LIFECYCLE_TASK_DONE.store(true, Ordering::Release);
+    crate::task::exit_current_and_run_next(0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn run_user_memory_lifecycle_regression() {
+    LIFECYCLE_TASK_DONE.store(false, Ordering::Release);
+    let driver = TaskControlBlock::new_kernel_task(user_memory_lifecycle_driver);
+    crate::task::manager::add_task(driver.clone());
+
+    // Completion is published before the driver unwinds through the kernel
+    // scheduler.  Do not start the following SMP phase until that task has
+    // also released its CPU and reached Zombie state.
+    while !LIFECYCLE_TASK_DONE.load(Ordering::Acquire)
+        || driver.status() != crate::task::TaskStatus::Zombie
+    {
+        if !crate::task::drain_kernel_ready_once() {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 fn worker() -> ! {
@@ -180,6 +432,8 @@ fn wait_for(mask: &AtomicUsize, expected: usize, phase: &str) {
 pub fn run() {
     let heap_checksum = stress_kernel_heap();
     let (left_asid, right_asid, reused_asid) = verify_asid_isolation_and_reuse();
+    verify_resident_set_api();
+    verify_resident_memory_lifecycle();
     #[cfg(target_arch = "riscv64")]
     let asid_check = "translation";
     #[cfg(target_arch = "loongarch64")]
@@ -233,6 +487,10 @@ pub fn run() {
 
     RELEASE_TLB_WORKERS.store(true, Ordering::Release);
     wait_for(&DONE_MASK, expected, "completion");
+
+    // Keep the existing ASID/SMP transport sequence intact.  The independent
+    // user lifecycle probe runs only after every worker has completed.
+    run_user_memory_lifecycle_regression();
 
     crate::println!(
         "[smp-regression] pass cpus={} mask={:#x} dispatch={:#x} tlb_targets={:#x} asid_pair={}/{} reused_asid={} asid_check={} isolation_iters={} heap_stress_mib={} checksum={}",
