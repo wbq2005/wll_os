@@ -747,3 +747,26 @@ resident 页而拆分 VMA、插入 `Vec`、映射，然后全量 sort/coalesce�
 其不变量、锁、COW、shared/file mapping、SMP TLB 和失败回滚要求见
 `20260807-vma-resident-state-split-design.md`。该文件完成评审与独立回归设计前，不开始
 生产代码修改；完整 BuildStorm 仍为 `unverified / not completed`。
+
+## 16. VMA/resident-page split 第一阶段尝试（已回滚）
+
+在第 15 节证据和设计门槛完成后，曾实施并验证第一阶段：为 anonymous lazy fault 增加
+VPN → `FrameTracker` resident 表，使 fault 安装不再 split 或 coalesce 逻辑 VMA；
+`mprotect`、`munmap`、release 与 fork/clone 对该表补充映射、释放和逐页深拷贝处理。
+没有改动调度、VFS、块缓存、官方镜像、guest 脚本、judge、marker 或 guest 时间。
+
+四个本地 release 构建组合均通过（RISC-V64/LoongArch64、diagnostics on/off），但首个
+RISC-V64 production 300 秒窗口在 `BUILDSTORM_BEGIN` 前退出：serial 只到
+`[harness] SCRIPT /glibc/buildstorm_testcode.sh`，随后为
+`[harness] ALL TESTS DONE, shutting down`。没有 panic/OOM，QEMU exit code 为 0，
+但没有任何 toolchain、minibuild、compile marker，故这不是可比较的性能结果。
+
+原始失败证据：
+
+`docs/evidence/buildstorm-stage2/20260807-riscv64-production-smp8-vma-resident-split-window300/`
+
+该行为构成功能性回归，未满足候选保留条件；实现已在本地和远端立即回滚到
+`2655369` 的 diagnostics 基线，未提交 production 代码。当前不能断言是 resident 表、
+fork 深拷贝还是未覆盖的用户地址空间路径导致脚本过早返回，因此禁止在该候选上继续
+叠加修补。下一个 MM 候选必须先用独立 user-process lifecycle / mmap / fork 回归隔离
+这个失败边界，再决定是否重新设计数据表示。
