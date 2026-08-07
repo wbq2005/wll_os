@@ -320,6 +320,13 @@ static REMOTE_SHOOTDOWNS: AtomicUsize = AtomicUsize::new(0);
 static REMOTE_SHOOTDOWN_TARGETS: AtomicUsize = AtomicUsize::new(0);
 
 static PATH_COMPONENT_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+static PATH_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static PATH_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+static NEGATIVE_PATH_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static DIR_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static DIR_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+static INODE_METADATA_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static INODE_METADATA_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
 static INODE_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 static INODE_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
 static METADATA_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -330,6 +337,8 @@ static VIRTIO_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static VIRTIO_BYTES: AtomicUsize = AtomicUsize::new(0);
 static VIRTIO_QUEUE_US: AtomicUsize = AtomicUsize::new(0);
 static VIRTIO_COMPLETE_US: AtomicUsize = AtomicUsize::new(0);
+static LOGICAL_VMA_CURRENT: AtomicUsize = AtomicUsize::new(0);
+static LOGICAL_VMA_MAX: AtomicUsize = AtomicUsize::new(0);
 
 static LOCK_ACQUIRES: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new(0) }; LOCK_SLOTS];
 static LOCK_CONTENDED: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new(0) }; LOCK_SLOTS];
@@ -378,11 +387,18 @@ fn block_actor_slot(task: &crate::task::TaskControlBlock) -> usize {
 #[inline]
 pub(crate) fn note_user_tick() {
     USER_TICKS[cpu_slot()].fetch_add(1, Ordering::Relaxed);
+    if let Some(task) = crate::task::current_task() {
+        task.diagnostic_user_ticks.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[inline]
 pub(crate) fn note_kernel_tick() {
     KERNEL_TICKS[cpu_slot()].fetch_add(1, Ordering::Relaxed);
+    if let Some(task) = crate::task::current_task() {
+        task.diagnostic_kernel_ticks
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -396,6 +412,14 @@ pub(crate) fn note_user_run(elapsed_us: usize, escape_kind: usize) {
     USER_RUN_COUNT[cpu].fetch_add(1, Ordering::Relaxed);
     USER_RUN_TOTAL_US[cpu].fetch_add(elapsed_us, Ordering::Relaxed);
     USER_RUN_MAX_US[cpu].fetch_max(elapsed_us, Ordering::Relaxed);
+    if let Some(task) = crate::task::current_task() {
+        task.diagnostic_user_run_count
+            .fetch_add(1, Ordering::Relaxed);
+        task.diagnostic_user_run_total_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+        task.diagnostic_user_run_max_us
+            .fetch_max(elapsed_us, Ordering::Relaxed);
+    }
     match escape_kind {
         0 => USER_RUN_SYSCALL[cpu].fetch_add(1, Ordering::Relaxed),
         1 => USER_RUN_TIMER[cpu].fetch_add(1, Ordering::Relaxed),
@@ -465,6 +489,46 @@ pub(crate) fn note_blocked_owner_timed_loop(elapsed_us: usize, empty_iterations:
 #[inline]
 pub(crate) fn note_path_component_lookup(components: usize) {
     PATH_COMPONENT_LOOKUPS.fetch_add(components, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn note_path_cache(hit: bool, negative_hit: bool) {
+    if hit {
+        PATH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PATH_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    if negative_hit {
+        NEGATIVE_PATH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn note_dir_cache(hit: bool) {
+    if hit {
+        DIR_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        DIR_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn note_inode_metadata_cache(hit: bool) {
+    if hit {
+        INODE_METADATA_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        INODE_METADATA_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn note_vma_count(count: usize) {
+    LOGICAL_VMA_CURRENT.store(count, Ordering::Relaxed);
+    LOGICAL_VMA_MAX.fetch_max(count, Ordering::Relaxed);
+    if let Some(task) = crate::task::current_task() {
+        task.diagnostic_vma_current.store(count, Ordering::Relaxed);
+        task.diagnostic_vma_max.fetch_max(count, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -641,6 +705,10 @@ pub(crate) fn note_block_end(task: &crate::task::TaskControlBlock, outcome: Wait
     BLOCK_TOTAL_US[slot].fetch_add(elapsed, Ordering::Relaxed);
     BLOCK_MAX_US[slot].fetch_max(elapsed, Ordering::Relaxed);
     BLOCK_ACTOR_TOTAL_US[actor_slot].fetch_add(elapsed, Ordering::Relaxed);
+    task.diagnostic_block_count
+        .fetch_add(1, Ordering::Relaxed);
+    task.diagnostic_block_total_us
+        .fetch_add(elapsed, Ordering::Relaxed);
     match outcome {
         WaitOutcome::Woken => BLOCK_WOKEN[slot].fetch_add(1, Ordering::Relaxed),
         WaitOutcome::TimedOut => BLOCK_TIMED_OUT[slot].fetch_add(1, Ordering::Relaxed),
@@ -1014,7 +1082,8 @@ pub(crate) fn maybe_report() {
     crate::println!("BUILDSTORM_DIAG anonymous_vma installs={} left={} right={} both={} neither={} current={} max={} pages={} pages_max={}", ANONYMOUS_VMA_INSTALLS.load(Ordering::Relaxed), ANONYMOUS_VMA_LEFT_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_RIGHT_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_BOTH_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_NEITHER_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_CURRENT.load(Ordering::Relaxed), ANONYMOUS_VMA_MAX.load(Ordering::Relaxed), ANONYMOUS_VMA_PAGES.load(Ordering::Relaxed), ANONYMOUS_VMA_PAGES_MAX.load(Ordering::Relaxed));
     crate::println!("BUILDSTORM_DIAG anonymous_move left_selected={} left_no_realloc={} left_shrink={} left_remove={} left_frame_relocate={} left_remove_suffix={} left_remove_suffix_max={} right_selected={} right_no_realloc={} right_shrink={} right_remove={} right_frame_move={} right_remove_suffix={} right_remove_suffix_max={} zero_metadata={}", ANONYMOUS_MOVE_LEFT_SELECTED.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_NO_REALLOC.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_SHRINK.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_FRAME_RELOCATE.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE_SUFFIX.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE_SUFFIX_MAX.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_SELECTED.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_NO_REALLOC.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_SHRINK.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_FRAME_MOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE_SUFFIX.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE_SUFFIX_MAX.load(Ordering::Relaxed), ANONYMOUS_MOVE_ZERO_METADATA.load(Ordering::Relaxed));
     crate::println!("BUILDSTORM_DIAG anonymous_coalesce calls={} areas={} areas_max={} sort_us={} scan_us={} total_us={} merges={} merged_frames={} frame_reallocs={} frame_relocate={}", ANONYMOUS_COALESCE_CALLS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_AREAS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_AREAS_MAX.load(Ordering::Relaxed), ANONYMOUS_COALESCE_SORT_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_SCAN_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_TOTAL_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_MERGES.load(Ordering::Relaxed), ANONYMOUS_COALESCE_MERGED_FRAMES.load(Ordering::Relaxed), ANONYMOUS_COALESCE_FRAME_REALLOCS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_FRAME_RELOCATE.load(Ordering::Relaxed));
-    crate::println!("BUILDSTORM_DIAG cache path_components={} inode_hit={} inode_miss={} metadata_hit={} metadata_miss={} block_hit={} block_miss={} virtio_requests={} virtio_bytes={} virtio_queue_us={} virtio_complete_us={}", PATH_COMPONENT_LOOKUPS.load(Ordering::Relaxed), INODE_CACHE_HITS.load(Ordering::Relaxed), INODE_CACHE_MISSES.load(Ordering::Relaxed), METADATA_CACHE_HITS.load(Ordering::Relaxed), METADATA_CACHE_MISSES.load(Ordering::Relaxed), BLOCK_CACHE_HITS.load(Ordering::Relaxed), BLOCK_CACHE_MISSES.load(Ordering::Relaxed), VIRTIO_REQUESTS.load(Ordering::Relaxed), VIRTIO_BYTES.load(Ordering::Relaxed), VIRTIO_QUEUE_US.load(Ordering::Relaxed), VIRTIO_COMPLETE_US.load(Ordering::Relaxed));
+    crate::println!("BUILDSTORM_DIAG vma current={} max={}", LOGICAL_VMA_CURRENT.load(Ordering::Relaxed), LOGICAL_VMA_MAX.load(Ordering::Relaxed));
+    crate::println!("BUILDSTORM_DIAG cache path_components={} path_hit={} path_miss={} negative_path_hit={} dir_hit={} dir_miss={} inode_metadata_hit={} inode_metadata_miss={} inode_hit={} inode_miss={} metadata_hit={} metadata_miss={} block_hit={} block_miss={} virtio_requests={} virtio_bytes={} virtio_queue_us={} virtio_complete_us={}", PATH_COMPONENT_LOOKUPS.load(Ordering::Relaxed), PATH_CACHE_HITS.load(Ordering::Relaxed), PATH_CACHE_MISSES.load(Ordering::Relaxed), NEGATIVE_PATH_CACHE_HITS.load(Ordering::Relaxed), DIR_CACHE_HITS.load(Ordering::Relaxed), DIR_CACHE_MISSES.load(Ordering::Relaxed), INODE_METADATA_CACHE_HITS.load(Ordering::Relaxed), INODE_METADATA_CACHE_MISSES.load(Ordering::Relaxed), INODE_CACHE_HITS.load(Ordering::Relaxed), INODE_CACHE_MISSES.load(Ordering::Relaxed), METADATA_CACHE_HITS.load(Ordering::Relaxed), METADATA_CACHE_MISSES.load(Ordering::Relaxed), BLOCK_CACHE_HITS.load(Ordering::Relaxed), BLOCK_CACHE_MISSES.load(Ordering::Relaxed), VIRTIO_REQUESTS.load(Ordering::Relaxed), VIRTIO_BYTES.load(Ordering::Relaxed), VIRTIO_QUEUE_US.load(Ordering::Relaxed), VIRTIO_COMPLETE_US.load(Ordering::Relaxed));
     for slot in 0..WORK_SLOTS {
         let count = WORK_COUNTS[slot].load(Ordering::Relaxed);
         if count != 0 {
@@ -1107,7 +1176,6 @@ pub(crate) fn maybe_report() {
         selected[slot] = true;
         crate::println!("BUILDSTORM_DIAG lock_rank={} name={} acquire_count={} contended_count={} wait_total_us={} wait_max_us={} hold_total_us={} hold_max_us={}", rank + 1, LOCK_NAMES[slot], LOCK_ACQUIRES[slot].load(Ordering::Relaxed), LOCK_CONTENDED[slot].load(Ordering::Relaxed), LOCK_WAIT_TOTAL_US[slot].load(Ordering::Relaxed), LOCK_WAIT_MAX_US[slot].load(Ordering::Relaxed), LOCK_HOLD_TOTAL_US[slot].load(Ordering::Relaxed), LOCK_HOLD_MAX_US[slot].load(Ordering::Relaxed));
     }
-    if sequence % 3 == 0 {
-        crate::task::manager::diagnostic_dump_user_comm();
-    }
+    crate::task::manager::diagnostic_dump_user_comm();
+    crate::println!("BUILDSTORM_DIAG snapshot_end={}", sequence);
 }

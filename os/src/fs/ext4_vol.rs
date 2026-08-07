@@ -626,8 +626,12 @@ pub struct Ext4StatFs {
 
 fn inode_kind(fs: &Ext4, ino: u32) -> Ext4NodeKind {
     if let Some((_meta, kind)) = INODE_METADATA_CACHE.read().get(&ino).copied() {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_inode_metadata_cache(true);
         return kind;
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_inode_metadata_cache(false);
     let inode = fs.get_inode_ref(ino).inode;
     if inode.is_dir() {
         Ext4NodeKind::Directory
@@ -1911,8 +1915,12 @@ pub fn flush_all_cached() -> Result<(), SysErrNo> {
 
 fn metadata_for_ino(fs: &Ext4, ino: u32) -> Ext4Metadata {
     if let Some((meta, _kind)) = INODE_METADATA_CACHE.read().get(&ino).copied() {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_inode_metadata_cache(true);
         return overlay_dynamic_metadata(meta);
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_inode_metadata_cache(false);
     let iref = fs.get_inode_ref(ino);
     let inode = iref.inode;
     let kind = if inode.is_dir() {
@@ -2555,8 +2563,12 @@ pub fn regular_file_size(ino: u32) -> Result<usize, SysErrNo> {
 
 fn cached_dir_entries(fs: &Ext4, ino: u32) -> Arc<BTreeMap<String, (u32, bool)>> {
     if let Some(entries) = DIR_CACHE.read().get(&ino).cloned() {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_dir_cache(true);
         return entries;
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_dir_cache(false);
 
     let mut out = BTreeMap::new();
     for e in fs.ext4_dir_get_entries(ino) {
@@ -2890,11 +2902,17 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, Ext4NodeKind)> {
         return None;
     }
     if let Some(found) = PATH_CACHE.read().get(&n).copied() {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_path_cache(true, false);
         return Some(found);
     }
     if NEGATIVE_PATH_CACHE.read().contains(&n) {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_path_cache(false, true);
         return None;
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_path_cache(false, false);
     let tail = n.trim_matches('/');
     let parts: Vec<&str> = if tail.is_empty() {
         Vec::new()

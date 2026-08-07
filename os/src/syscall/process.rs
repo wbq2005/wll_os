@@ -1326,6 +1326,24 @@ pub fn sys_clone(
         diagnostic_woken_reason: AtomicUsize::new(0),
         #[cfg(feature = "buildstorm-diagnostics")]
         diagnostic_last_cpu: AtomicUsize::new(crate::task::NO_CPU),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_user_ticks: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_kernel_ticks: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_user_run_count: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_user_run_total_us: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_user_run_max_us: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_block_count: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_block_total_us: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_vma_current: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_vma_max: AtomicUsize::new(0),
     });
     crate::task::manager::register_task(&child);
     thread_group.add_member(&child);

@@ -1857,6 +1857,28 @@ pub struct TaskControlBlock {
     pub diagnostic_woken_reason: AtomicUsize,
     #[cfg(feature = "buildstorm-diagnostics")]
     pub diagnostic_last_cpu: AtomicUsize,
+    /// Per-task cumulative accounting used only by the rate-limited
+    /// BuildStorm diagnostic snapshots.  Keeping these counters in the TCB
+    /// avoids a dynamically allocated TGID table on hot paths; the reporter
+    /// aggregates threads by TGID offline.
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_user_ticks: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_kernel_ticks: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_user_run_count: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_user_run_total_us: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_user_run_max_us: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_block_count: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_block_total_us: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_vma_current: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_vma_max: AtomicUsize,
 }
 
 unsafe impl Send for TaskControlBlock {}

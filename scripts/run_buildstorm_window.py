@@ -97,24 +97,14 @@ def diag_fields(line: str) -> dict[str, int | str]:
     return fields
 
 
-def parse_guest_aggregate(text: str) -> dict[str, Any] | None:
-    """Return only the last complete 10-second diagnostic snapshot.
-
-    The serial log remains authoritative.  This host-side projection avoids
-    manually transcribing counters while intentionally ignoring per-process
-    diagnostic lines and all pre-final snapshots.
-    """
-    lines = text.splitlines()
-    snapshots = [
-        index for index, line in enumerate(lines)
-        if line.startswith("BUILDSTORM_DIAG snapshot=")
-    ]
-    if not snapshots:
-        return None
-
+def parse_guest_aggregate_block(
+    lines: list[str], start: int, end: int,
+) -> dict[str, Any]:
+    """Parse one complete fixed-format 10-second diagnostic snapshot."""
     result: dict[str, Any] = {
         "snapshot": None,
         "cpus": {},
+        "user_runs": {},
         "work": {},
         "fault_sources": {},
         "fault_resolutions": {},
@@ -123,9 +113,12 @@ def parse_guest_aggregate(text: str) -> dict[str, Any] | None:
         "wait_actors": {},
         "blocked_owners": {},
         "locks": [],
+        "actors": [],
         "vma_slots": None,
+        "serial_line_index": start,
+        "complete": False,
     }
-    for line in lines[snapshots[-1]:]:
+    for line in lines[start:end]:
         if not line.startswith("BUILDSTORM_DIAG "):
             continue
         body = line[len("BUILDSTORM_DIAG "):]
@@ -136,8 +129,20 @@ def parse_guest_aggregate(text: str) -> dict[str, Any] | None:
             cpu = fields.get("cpu")
             if isinstance(cpu, int):
                 result["cpus"][str(cpu)] = fields
+        elif body.startswith("user_run "):
+            cpu = fields.get("cpu")
+            if isinstance(cpu, int):
+                result["user_runs"][str(cpu)] = fields
         elif body.startswith("mm "):
             result["mm"] = fields
+        elif body.startswith("vma "):
+            result["vma"] = fields
+        elif body.startswith("anonymous_vma "):
+            result["anonymous_vma"] = fields
+        elif body.startswith("anonymous_move "):
+            result["anonymous_move"] = fields
+        elif body.startswith("anonymous_coalesce "):
+            result["anonymous_coalesce"] = fields
         elif body.startswith("cache "):
             result["cache"] = fields
         elif body.startswith("work="):
@@ -176,14 +181,59 @@ def parse_guest_aggregate(text: str) -> dict[str, Any] | None:
             result["fd_lifecycle"] = fields
         elif body.startswith("vma_slots "):
             result["vma_slots"] = fields
+        elif body.startswith("comm "):
+            result["actors"].append(fields)
+        elif body.startswith("snapshot_end="):
+            result["complete"] = True
         elif body.startswith("lock_rank="):
             result["locks"].append(fields)
     return result
 
 
-def summarize_serial(serial: Path) -> dict[str, Any]:
+def parse_guest_aggregates(text: str) -> list[dict[str, Any]]:
+    """Parse every diagnostic snapshot so late-phase deltas stay reproducible."""
+    lines = text.splitlines()
+    starts = [
+        index for index, line in enumerate(lines)
+        if line.startswith("BUILDSTORM_DIAG snapshot=")
+    ]
+    return [
+        parse_guest_aggregate_block(
+            lines,
+            start,
+            starts[index + 1] if index + 1 < len(starts) else len(lines),
+        )
+        for index, start in enumerate(starts)
+    ]
+
+
+def parse_guest_aggregate(text: str) -> dict[str, Any] | None:
+    """Return the last 10-second diagnostic snapshot."""
+    snapshots = parse_guest_aggregates(text)
+    complete = [snapshot for snapshot in snapshots if snapshot["complete"]]
+    return complete[-1] if complete else None
+
+
+def summarize_serial(
+    serial: Path, guest_aggregates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     text = serial.read_bytes().decode("utf-8", errors="replace")
     compiling = COMPILING_RE.findall(text)
+    aggregates = guest_aggregates if guest_aggregates is not None else parse_guest_aggregates(text)
+    complete_aggregates = [snapshot for snapshot in aggregates if snapshot["complete"]]
+    marker_line = next(
+        (index for index, line in enumerate(text.splitlines()) if "BUILDSTORM_BEGIN mode=multi" in line),
+        None,
+    )
+    before_marker = None
+    if marker_line is not None:
+        before_marker = next(
+            (
+                snapshot for snapshot in reversed(complete_aggregates)
+                if snapshot["serial_line_index"] < marker_line
+            ),
+            None,
+        )
     return {
         "compiling_lines": len(compiling),
         "last_crate": compiling[-1] if compiling else None,
@@ -195,7 +245,10 @@ def summarize_serial(serial: Path) -> dict[str, Any]:
             line for line in text.splitlines()
             if "[buildstorm-diag]" in line or line.startswith("BUILDSTORM_DIAG ")
         ],
-        "guest_aggregate_final": parse_guest_aggregate(text),
+        "guest_aggregate_snapshot_count": len(aggregates),
+        "guest_aggregate_complete_snapshot_count": len(complete_aggregates),
+        "guest_aggregate_before_marker": before_marker,
+        "guest_aggregate_final": complete_aggregates[-1] if complete_aggregates else None,
         "panic_seen": any(marker.decode() in text for marker in PANIC_MARKERS),
     }
 
@@ -341,7 +394,10 @@ def run(args: argparse.Namespace) -> int:
             process.kill()
             process.wait(timeout=10)
 
-    summary = summarize_serial(serial)
+    serial_text = serial.read_bytes().decode("utf-8", errors="replace")
+    guest_aggregates = parse_guest_aggregates(serial_text)
+    write_json(output / "guest-aggregates.json", {"snapshots": guest_aggregates})
+    summary = summarize_serial(serial, guest_aggregates)
     summary.update({
         "qemu_exit_code_before_termination": process.returncode if process is not None else None,
         "marker_seen": marker_at is not None,

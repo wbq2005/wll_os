@@ -1117,6 +1117,8 @@ impl MemorySet {
             merged.push(area);
         }
         self.areas = merged;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_vma_count(self.areas.len());
     }
 
     #[cfg(feature = "buildstorm-diagnostics")]
@@ -1149,6 +1151,7 @@ impl MemorySet {
             merged.push(area);
         }
         self.areas = merged;
+        crate::buildstorm_diagnostics::note_vma_count(self.areas.len());
         let finished = crate::timer::get_time_us();
         crate::buildstorm_diagnostics::note_anonymous_coalesce_detail(
             area_count,
@@ -1181,6 +1184,8 @@ impl MemorySet {
                 index += 1;
             }
         }
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_vma_count(self.areas.len());
     }
 
     pub fn fork_cow(&mut self) -> Result<Self, SysErrNo> {

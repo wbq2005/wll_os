@@ -455,11 +455,20 @@ pub(crate) fn diagnostic_dump_user_comm() {
             continue;
         };
         crate::println!(
-            "BUILDSTORM_DIAG comm pid={} tgid={} status={:?} block={:?} comm={}",
+            "BUILDSTORM_DIAG comm pid={} tgid={} status={:?} block={:?} user_ticks={} kernel_ticks={} user_run_count={} user_run_total_us={} user_run_max_us={} block_count={} block_total_us={} vma_current={} vma_max={} comm={}",
             task.pid.0,
             task.thread_group.tgid(),
             status,
             reason,
+            task.diagnostic_user_ticks.load(Ordering::Relaxed),
+            task.diagnostic_kernel_ticks.load(Ordering::Relaxed),
+            task.diagnostic_user_run_count.load(Ordering::Relaxed),
+            task.diagnostic_user_run_total_us.load(Ordering::Relaxed),
+            task.diagnostic_user_run_max_us.load(Ordering::Relaxed),
+            task.diagnostic_block_count.load(Ordering::Relaxed),
+            task.diagnostic_block_total_us.load(Ordering::Relaxed),
+            task.diagnostic_vma_current.load(Ordering::Relaxed),
+            task.diagnostic_vma_max.load(Ordering::Relaxed),
             inner.exec_path,
         );
     }
