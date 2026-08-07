@@ -88,11 +88,17 @@ fn pipe_wait_key(state: &Arc<Mutex<PipeState>>, event: usize) -> WaitKey {
 }
 
 fn wake_pipe_readers(state: &Arc<Mutex<PipeState>>) {
-    crate::task::wait_queue::wake_io_keyed_waiters(pipe_wait_key(state, PIPE_WAIT_READABLE));
+    let woken =
+        crate::task::wait_queue::wake_io_keyed_waiters(pipe_wait_key(state, PIPE_WAIT_READABLE));
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_pipe_wake(true, woken);
 }
 
 fn wake_pipe_writers(state: &Arc<Mutex<PipeState>>) {
-    crate::task::wait_queue::wake_io_keyed_waiters(pipe_wait_key(state, PIPE_WAIT_WRITABLE));
+    let woken =
+        crate::task::wait_queue::wake_io_keyed_waiters(pipe_wait_key(state, PIPE_WAIT_WRITABLE));
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_pipe_wake(false, woken);
 }
 
 fn eventfd_wait_key(state: &Arc<Mutex<EventFdState>>, event: usize) -> WaitKey {
@@ -796,9 +802,7 @@ impl FileDescriptor {
                 if socket.is_message_oriented() {
                     socket.dgram_queue.is_empty() && !socket.receive_eof()
                 } else {
-                    socket.connected
-                        && socket.rx_buf.is_empty()
-                        && !socket.receive_eof()
+                    socket.connected && socket.rx_buf.is_empty() && !socket.receive_eof()
                 }
             }
             _ => false,
@@ -1126,8 +1130,12 @@ impl FileDescriptor {
                     let mut pipe = state.lock();
                     if pipe.buf.is_empty() {
                         if pipe.writers == 0 {
+                            #[cfg(feature = "buildstorm-diagnostics")]
+                            crate::buildstorm_diagnostics::note_pipe_read(Ok(0));
                             return Ok(0);
                         }
+                        #[cfg(feature = "buildstorm-diagnostics")]
+                        crate::buildstorm_diagnostics::note_pipe_read(Err(SysErrNo::EAGAIN));
                         return Err(SysErrNo::EAGAIN);
                     }
                     let was_full = pipe.buf.len() == PIPE_CAPACITY;
@@ -1137,6 +1145,8 @@ impl FileDescriptor {
                 if wake_writers {
                     wake_pipe_writers(state);
                 }
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_pipe_read(Ok(n));
                 Ok(n)
             }
             FileDescriptor::PipeWrite { .. } => Err(SysErrNo::EBADF),
@@ -1396,10 +1406,14 @@ impl FileDescriptor {
                 let (written, wake_readers) = {
                     let mut pipe = state.lock();
                     if pipe.readers == 0 {
+                        #[cfg(feature = "buildstorm-diagnostics")]
+                        crate::buildstorm_diagnostics::note_pipe_write(Err(SysErrNo::EPIPE));
                         return Err(SysErrNo::EPIPE);
                     }
                     let available = PIPE_CAPACITY.saturating_sub(pipe.buf.len());
                     if available == 0 {
+                        #[cfg(feature = "buildstorm-diagnostics")]
+                        crate::buildstorm_diagnostics::note_pipe_write(Err(SysErrNo::EAGAIN));
                         return Err(SysErrNo::EAGAIN);
                     }
                     let was_empty = pipe.buf.is_empty();
@@ -1409,6 +1423,8 @@ impl FileDescriptor {
                 if wake_readers {
                     wake_pipe_readers(state);
                 }
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_pipe_write(Ok(written));
                 Ok(written)
             }
             FileDescriptor::PipeRead { .. } => Err(SysErrNo::EBADF),
@@ -2127,6 +2143,62 @@ impl FileDescriptorTable {
             }
         }
         closed
+    }
+
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub fn diagnostic_pipe_counts(&self) -> (usize, usize) {
+        let mut endpoints = 0usize;
+        let mut cloexec = 0usize;
+        for (index, entry) in self.fds.iter().enumerate() {
+            if matches!(
+                entry,
+                Some(FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. })
+            ) {
+                endpoints += 1;
+                if self.fd_flags[index] & FD_CLOEXEC != 0 {
+                    cloexec += 1;
+                }
+            }
+        }
+        (endpoints, cloexec)
+    }
+
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub fn diagnostic_pipe_alias_status(&self, fd: usize) -> Option<(usize, usize, usize)> {
+        let (target_state, target_read, target_nonblock, global_refs) = match self.get(fd)? {
+            FileDescriptor::PipeRead { state, nonblock } => {
+                let global_refs = state.lock().readers;
+                (Arc::as_ptr(state) as usize, true, *nonblock, global_refs)
+            }
+            FileDescriptor::PipeWrite { state, nonblock } => {
+                let global_refs = state.lock().writers;
+                (Arc::as_ptr(state) as usize, false, *nonblock, global_refs)
+            }
+            _ => return None,
+        };
+        let mut aliases = 0usize;
+        let mut mismatches = 0usize;
+        for entry in self.fds.iter().flatten() {
+            let candidate = match entry {
+                FileDescriptor::PipeRead { state, nonblock } => {
+                    Some((Arc::as_ptr(state) as usize, true, *nonblock))
+                }
+                FileDescriptor::PipeWrite { state, nonblock } => {
+                    Some((Arc::as_ptr(state) as usize, false, *nonblock))
+                }
+                _ => None,
+            };
+            if let Some((state, read, nonblock)) = candidate {
+                if state == target_state && read == target_read {
+                    aliases += 1;
+                    if nonblock != target_nonblock {
+                        mismatches += 1;
+                    }
+                }
+            }
+        }
+        let external_aliases = global_refs.saturating_sub(aliases);
+        Some((aliases.saturating_sub(1), mismatches, external_aliases))
     }
 
     pub fn close_all(&mut self) {

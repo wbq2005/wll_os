@@ -23,19 +23,15 @@ static PLATFORM_KIND: AtomicUsize = AtomicUsize::new(PlatformKind::Unknown as us
 static PHYSICAL_CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
 static TOTAL_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 static GOLDFISH_RTC_BASE: AtomicUsize = AtomicUsize::new(0);
-static CPU_IDS: [AtomicUsize; MAX_CPUS] =
-    [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
+static CPU_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 static CPU_STATES: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(CpuState::Absent as usize) }; MAX_CPUS];
 static SECONDARY_RELEASED: AtomicBool = AtomicBool::new(false);
 static IDLE_MASK: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE_ADDRESS_SPACE: [AtomicUsize; MAX_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_CPUS];
+static ACTIVE_ADDRESS_SPACE: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static TLB_GENERATION: AtomicUsize = AtomicUsize::new(0);
-static TLB_REQUEST: [AtomicUsize; MAX_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_CPUS];
-static TLB_ACK: [AtomicUsize; MAX_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_CPUS];
+static TLB_REQUEST: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static TLB_ACK: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
 
 const IPI_RESCHEDULE: u32 = 1 << 1;
@@ -408,6 +404,10 @@ pub fn tlb_shootdown(address_space_root: usize) {
 }
 
 fn tlb_shootdown_inner(address_space_root: usize, all_cpus: bool) {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::TlbShootdown,
+    );
     if address_space_root == 0 {
         return;
     }
@@ -424,7 +424,9 @@ fn tlb_shootdown_inner(address_space_root: usize, all_cpus: bool) {
     }
     #[cfg(target_arch = "riscv64")]
     if !all_cpus {
-        let generation = TLB_GENERATION.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        let generation = TLB_GENERATION
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
         for cpu in 0..MAX_CPUS {
             if targets & (1usize << cpu) != 0 {
                 TLB_REQUEST[cpu].store(generation, Ordering::Release);
@@ -442,6 +444,8 @@ fn tlb_shootdown_inner(address_space_root: usize, all_cpus: bool) {
     if targets == 0 {
         return;
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_remote_shootdown(targets.count_ones() as usize);
     #[cfg(target_arch = "riscv64")]
     {
         let mut hart_mask_base = usize::MAX;
@@ -468,14 +472,12 @@ fn tlb_shootdown_inner(address_space_root: usize, all_cpus: bool) {
                 }
             }
             if mask_fits {
-                let _ =
-                    sbi_rt::remote_sfence_vma(hart_mask, hart_mask_base, 0, usize::MAX);
+                let _ = sbi_rt::remote_sfence_vma(hart_mask, hart_mask_base, 0, usize::MAX);
             } else {
                 for cpu in 0..MAX_CPUS {
                     if targets & (1usize << cpu) != 0 {
                         if let Some(hardware_id) = cpu_hardware_id(cpu) {
-                            let _ =
-                                sbi_rt::remote_sfence_vma(1, hardware_id, 0, usize::MAX);
+                            let _ = sbi_rt::remote_sfence_vma(1, hardware_id, 0, usize::MAX);
                         }
                     }
                 }
@@ -498,7 +500,9 @@ fn tlb_shootdown_inner(address_space_root: usize, all_cpus: bool) {
                 return;
             }
         }
-        let generation = TLB_GENERATION.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        let generation = TLB_GENERATION
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
         for cpu in 0..MAX_CPUS {
             if targets & (1usize << cpu) != 0 {
                 TLB_REQUEST[cpu].store(generation, Ordering::Release);
@@ -510,8 +514,7 @@ fn tlb_shootdown_inner(address_space_root: usize, all_cpus: bool) {
                 let mut spins = 0usize;
                 while TLB_ACK[cpu].load(Ordering::Acquire) != generation {
                     if !all_cpus
-                        && ACTIVE_ADDRESS_SPACE[cpu].load(Ordering::Acquire)
-                            != address_space_root
+                        && ACTIVE_ADDRESS_SPACE[cpu].load(Ordering::Acquire) != address_space_root
                     {
                         break;
                     }
@@ -537,6 +540,8 @@ fn tlb_shootdown_inner(address_space_root: usize, all_cpus: bool) {
 
 /// Invalidate every TLB before retired ASIDs become eligible for reuse.
 pub fn flush_tlb_all_cpus() {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_local_tlb_flush();
     polyhal::pagetable::TLB::flush_all();
     tlb_shootdown_inner(usize::MAX, true);
 }

@@ -192,6 +192,8 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             exit_current_and_run_next(-2);
         }
         TrapType::Timer => {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_kernel_tick();
             crate::timer::rearm_kernel_tick();
         }
         TrapType::Ipi(_) => {
@@ -237,6 +239,8 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             handle_syscall(ctx);
         }
         TrapType::Timer => {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_user_tick();
             // The foreground runner owns saving the returned trap frame and
             // requeueing the current task.  Calling suspend_current_and_run_next
             // here as well would enqueue the same task twice and leave one queue
@@ -263,19 +267,30 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 let is_privilege = matches!(trap, TrapType::PagePrivilegeFault(_));
                 let is_store = matches!(trap, TrapType::StorePageFault(_));
                 let is_exec = matches!(trap, TrapType::InstructionPageFault(_));
-                if !is_privilege
-                    && task
-                        .memory_set
-                        .lock()
+                let page_fault_handled = if is_privilege {
+                    false
+                } else {
+                    let mut memory_set = task.memory_set.lock();
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    let _fault_source =
+                        crate::buildstorm_diagnostics::PageFaultSourceScope::new(if is_exec {
+                            crate::buildstorm_diagnostics::PageFaultSource::HardwareExec
+                        } else if is_store {
+                            crate::buildstorm_diagnostics::PageFaultSource::HardwareStore
+                        } else {
+                            crate::buildstorm_diagnostics::PageFaultSource::HardwareLoad
+                        });
+                    memory_set
                         .handle_page_fault(vaddr, is_store, is_exec)
                         .is_ok()
-                {
+                };
+                if page_fault_handled {
                     return;
                 }
 
                 let sepc = ctx[TrapFrameArgs::SEPC];
                 let sp = ctx[TrapFrameArgs::SP];
-                let ms = task.memory_set.lock();
+                let ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
                 let fault_pa = ms.translate(polyhal::VirtAddr::new(vaddr));
                 let sepc_pa = ms.translate(polyhal::VirtAddr::new(sepc));
                 log::error!(
@@ -402,8 +417,12 @@ pub fn restore_kernel_page_table() {
         }
         crate::perf_counters::note_kernel_page_table_restore();
         let reused_kernel_asid = polyhal::pagetable::PageTable::current_asid() == 0;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_root_activation(false, false);
         kpt.change_with_asid(0);
         if reused_kernel_asid {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_local_tlb_flush();
             polyhal::pagetable::TLB::flush_all();
         }
     }

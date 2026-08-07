@@ -347,6 +347,10 @@ impl MemorySet {
     }
 
     pub fn activate(&self) {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+            crate::buildstorm_diagnostics::WorkClass::AddressSpaceActivation,
+        );
         crate::perf_counters::note_user_page_table_activation();
         // Callers hold the shared MemorySet lock while activating. Publishing
         // the root before changing the hardware page table makes a concurrent
@@ -359,7 +363,12 @@ impl MemorySet {
         #[cfg(not(target_arch = "riscv64"))]
         let already_active = false;
         if !already_active {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_root_activation(true, false);
             self.page_table.change_with_asid(self.address_space_id);
+        } else {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_root_activation(true, true);
         }
         // LoongArch page-table edits currently occur under kernel ASID 0 and
         // need a conservative local invalidation before re-entering user mode.
@@ -371,6 +380,8 @@ impl MemorySet {
         // conservative full invalidation on every user-root activation.
         #[cfg(target_arch = "loongarch64")]
         {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_local_tlb_flush();
             TLB::flush_all();
         }
     }
@@ -511,12 +522,7 @@ impl MemorySet {
         let mut index = self.first_area_ending_after(start);
         let mut already_protected = true;
         while index < self.areas.len() && self.areas[index].start_va.raw() < end {
-            if self.areas[index]
-                .flags
-                .difference(PTEFlags::COW)
-                .bits()
-                != flags.bits()
-            {
+            if self.areas[index].flags.difference(PTEFlags::COW).bits() != flags.bits() {
                 already_protected = false;
                 break;
             }
@@ -530,56 +536,54 @@ impl MemorySet {
         self.split_area_at(end);
 
         let mut changed_mappings = false;
-        for area in &mut self.areas {
-            if area.start_va.raw() >= start && area.end_va.raw() <= end {
-                let old_flags = area.flags;
-                if old_flags.difference(PTEFlags::COW).bits() == flags.bits() {
-                    continue;
-                }
-                let private_file_backed =
-                    matches!(area.backing, MapAreaBacking::File { shared: false, .. });
-                let anonymous = matches!(area.backing, MapAreaBacking::Anonymous);
-                let mut new_flags = flags;
-                if (anonymous || private_file_backed)
-                    && flags.contains(PTEFlags::W)
-                    && area.has_frames()
-                    && (area.flags.contains(PTEFlags::COW)
-                        || area.frames.iter().any(|frame| frame.ref_count() > 1))
-                {
-                    // Linux does not eagerly duplicate a whole private mapping
-                    // merely because mprotect made it writable.  Keep shared
-                    // clean/COW frames read-only and resolve at the first
-                    // store fault; otherwise one mprotect over a large rustc
-                    // mapping can monopolize the kernel for seconds/minutes.
-                    new_flags |= PTEFlags::COW;
-                }
-                area.flags = new_flags;
-                if area.has_frames()
-                    && (has_leaf_permission(old_flags) || has_leaf_permission(new_flags))
-                {
-                    if has_leaf_permission(new_flags) {
-                        // map_page overwrites the existing leaf and performs
-                        // the required local invalidation.
-                        map_area_pages(&self.page_table, area);
-                    } else {
-                        unmap_area_pages_without_shootdown(
-                            &self.page_table,
-                            area,
-                            old_flags,
-                        );
-                    }
-                    changed_mappings = true;
-                }
+        let mut index = self.first_area_ending_after(start);
+        while index < self.areas.len() && self.areas[index].start_va.raw() < end {
+            let area = &mut self.areas[index];
+            let old_flags = area.flags;
+            if old_flags.difference(PTEFlags::COW).bits() == flags.bits() {
+                index += 1;
+                continue;
             }
+            let private_file_backed =
+                matches!(area.backing, MapAreaBacking::File { shared: false, .. });
+            let anonymous = matches!(area.backing, MapAreaBacking::Anonymous);
+            let mut new_flags = flags;
+            if (anonymous || private_file_backed)
+                && flags.contains(PTEFlags::W)
+                && area.has_frames()
+                && (area.flags.contains(PTEFlags::COW)
+                    || area.frames.iter().any(|frame| frame.ref_count() > 1))
+            {
+                // Linux does not eagerly duplicate a whole private mapping
+                // merely because mprotect made it writable.  Keep shared
+                // clean/COW frames read-only and resolve at the first
+                // store fault; otherwise one mprotect over a large rustc
+                // mapping can monopolize the kernel for seconds/minutes.
+                new_flags |= PTEFlags::COW;
+            }
+            area.flags = new_flags;
+            if area.has_frames()
+                && (has_leaf_permission(old_flags) || has_leaf_permission(new_flags))
+            {
+                if has_leaf_permission(new_flags) {
+                    // map_page overwrites the existing leaf and performs
+                    // the required local invalidation.
+                    map_area_pages(&self.page_table, area);
+                } else {
+                    unmap_area_pages_without_shootdown(&self.page_table, area, old_flags);
+                }
+                changed_mappings = true;
+            }
+            index += 1;
         }
         if changed_mappings {
             crate::platform::tlb_shootdown(self.page_table.root().raw());
         }
-        self.coalesce_areas();
+        self.coalesce_changed_range(start, end);
         Ok(())
     }
 
-    fn resolve_cow_page(&mut self, page_start: usize) -> Result<(), SysErrNo> {
+    fn resolve_cow_page(&mut self, page_start: usize) -> Result<usize, SysErrNo> {
         let Some(source_index) = self.area_index_containing(page_start) else {
             return Err(SysErrNo::EFAULT);
         };
@@ -644,6 +648,7 @@ impl MemorySet {
             return Err(SysErrNo::EFAULT);
         }
 
+        let resolved_pages = replacements.len();
         let mut old_frames = Vec::new();
         {
             let area = &mut self.areas[index];
@@ -657,7 +662,7 @@ impl MemorySet {
         remap_area_pages(&self.page_table, &self.areas[index], old_flags);
         drop(old_frames);
         self.coalesce_areas();
-        Ok(())
+        Ok(resolved_pages)
     }
 
     fn ensure_page_writable(&mut self, page_start: usize) -> Result<(), SysErrNo> {
@@ -669,9 +674,14 @@ impl MemorySet {
             return Err(SysErrNo::EFAULT);
         }
         if flags.contains(PTEFlags::COW) {
-            return self.resolve_cow_page(page_start);
+            self.resolve_cow_page(page_start)?;
+            return Ok(());
         }
         if self.translate(VirtAddr::new(page_start)).is_none() {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let _fault_source = crate::buildstorm_diagnostics::PageFaultSourceScope::new(
+                crate::buildstorm_diagnostics::PageFaultSource::PrepareWrite,
+            );
             self.handle_page_fault(page_start, true, false)?;
         }
         Ok(())
@@ -686,6 +696,10 @@ impl MemorySet {
             return Err(SysErrNo::EFAULT);
         }
         if self.translate(VirtAddr::new(page_start)).is_none() {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let _fault_source = crate::buildstorm_diagnostics::PageFaultSourceScope::new(
+                crate::buildstorm_diagnostics::PageFaultSource::PrepareRead,
+            );
             self.handle_page_fault(page_start, false, false)?;
         }
         Ok(())
@@ -768,6 +782,16 @@ impl MemorySet {
         is_store: bool,
         is_exec: bool,
     ) -> Result<(), SysErrNo> {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let _diag = crate::buildstorm_diagnostics::WorkScope::new(if is_exec {
+            crate::buildstorm_diagnostics::WorkClass::PageFaultExec
+        } else if is_store {
+            crate::buildstorm_diagnostics::WorkClass::PageFaultStore
+        } else {
+            crate::buildstorm_diagnostics::WorkClass::PageFaultLoad
+        });
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let fault_resolution = crate::buildstorm_diagnostics::PageFaultResolutionScope::new();
         crate::perf_counters::note_page_fault();
         let page_start = align_down(fault_addr);
         let page_end = page_start.checked_add(PAGE_SIZE).ok_or(SysErrNo::EFAULT)?;
@@ -791,7 +815,12 @@ impl MemorySet {
             return Err(SysErrNo::EFAULT);
         }
         if is_store && area.flags.contains(PTEFlags::COW) {
-            self.resolve_cow_page(page_start)?;
+            let _resolved_pages = self.resolve_cow_page(page_start)?;
+            #[cfg(feature = "buildstorm-diagnostics")]
+            fault_resolution.finish(
+                crate::buildstorm_diagnostics::PageFaultResolution::Cow,
+                _resolved_pages,
+            );
             return Ok(());
         }
         let clean_cache_page = if !is_store && !area.flags.contains(PTEFlags::W) {
@@ -810,11 +839,21 @@ impl MemorySet {
             None
         };
         if self.translate(VirtAddr::new(page_start)).is_some() {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            fault_resolution.finish(
+                crate::buildstorm_diagnostics::PageFaultResolution::ExistingMapping,
+                0,
+            );
             return Ok(());
         }
         if matches!(area.backing, MapAreaBacking::File { .. }) && area.has_frames() {
             let page_idx = (page_start - area.start_va.raw()) / PAGE_SIZE;
             map_area_page_window(&self.page_table, area, page_idx, 1);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            fault_resolution.finish(
+                crate::buildstorm_diagnostics::PageFaultResolution::FileResident,
+                1,
+            );
             return Ok(());
         }
 
@@ -823,6 +862,10 @@ impl MemorySet {
             && !area.flags.contains(PTEFlags::COW)
             && !area.flags.contains(PTEFlags::X)
         {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let anonymous_allocate = crate::buildstorm_diagnostics::WorkScope::new(
+                crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousAllocate,
+            );
             let pages_to_end = (area.end_va.raw() - page_start) / PAGE_SIZE;
             let window_pages = pages_to_end.min(ANONYMOUS_FAULT_WINDOW_PAGES);
             let mut frames = Vec::new();
@@ -833,6 +876,12 @@ impl MemorySet {
                     None => break,
                 }
             }
+            #[cfg(feature = "buildstorm-diagnostics")]
+            drop(anonymous_allocate);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let _anonymous_install = crate::buildstorm_diagnostics::WorkScope::new(
+                crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousInstall,
+            );
             let window_bytes = frames
                 .len()
                 .checked_mul(PAGE_SIZE)
@@ -841,6 +890,55 @@ impl MemorySet {
                 .checked_add(window_bytes)
                 .ok_or(SysErrNo::EFAULT)?;
 
+            #[cfg(feature = "buildstorm-diagnostics")]
+            {
+                let window_flags = area.flags.bits();
+                let left_mergeable = page_start == area.start_va.raw() && area_index > 0 && {
+                    let left = &self.areas[area_index - 1];
+                    left.end_va.raw() == page_start
+                        && left.flags.bits() == window_flags
+                        && matches!(left.backing, MapAreaBacking::Anonymous)
+                        && left.frames.len() == left.page_count()
+                };
+                let right_mergeable =
+                    window_end == area.end_va.raw() && area_index + 1 < self.areas.len() && {
+                        let right = &self.areas[area_index + 1];
+                        right.start_va.raw() == window_end
+                            && right.flags.bits() == window_flags
+                            && matches!(right.backing, MapAreaBacking::Anonymous)
+                            && right.frames.len() == right.page_count()
+                    };
+                crate::buildstorm_diagnostics::note_anonymous_vma_install(
+                    left_mergeable,
+                    right_mergeable,
+                    self.areas.len(),
+                    frames.len(),
+                );
+                if left_mergeable {
+                    let left = &self.areas[area_index - 1];
+                    crate::buildstorm_diagnostics::note_anonymous_move_shape(
+                        true,
+                        left.frames.capacity().saturating_sub(left.frames.len()) >= frames.len(),
+                        window_end < area.end_va.raw(),
+                        left.frames.len(),
+                        self.areas.len().saturating_sub(area_index + 1),
+                    );
+                } else if right_mergeable {
+                    let right = &self.areas[area_index + 1];
+                    crate::buildstorm_diagnostics::note_anonymous_move_shape(
+                        false,
+                        frames.capacity().saturating_sub(frames.len()) >= right.frames.len(),
+                        page_start > area.start_va.raw(),
+                        right.frames.len(),
+                        self.areas.len().saturating_sub(area_index + 1),
+                    );
+                }
+            }
+
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let anonymous_split = crate::buildstorm_diagnostics::WorkScope::new(
+                crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousSplit,
+            );
             self.split_area_at(page_start);
             self.split_area_at(window_end);
             let Some(idx) = self.area_index_containing(page_start) else {
@@ -852,9 +950,30 @@ impl MemorySet {
             {
                 return Err(SysErrNo::EFAULT);
             }
+            #[cfg(feature = "buildstorm-diagnostics")]
+            drop(anonymous_split);
+            let _mapped_pages = frames.len();
             self.areas[idx].frames = frames;
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let anonymous_map = crate::buildstorm_diagnostics::WorkScope::new(
+                crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousMap,
+            );
             map_area_pages(&self.page_table, &self.areas[idx]);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            drop(anonymous_map);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let _anonymous_coalesce = crate::buildstorm_diagnostics::WorkScope::new(
+                crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousCoalesce,
+            );
+            #[cfg(feature = "buildstorm-diagnostics")]
+            self.coalesce_areas_anonymous_diagnostic();
+            #[cfg(not(feature = "buildstorm-diagnostics"))]
             self.coalesce_areas();
+            #[cfg(feature = "buildstorm-diagnostics")]
+            fault_resolution.finish(
+                crate::buildstorm_diagnostics::PageFaultResolution::AnonymousDemand,
+                _mapped_pages,
+            );
             return Ok(());
         }
 
@@ -886,9 +1005,15 @@ impl MemorySet {
             {
                 return Err(SysErrNo::EFAULT);
             }
+            let _mapped_pages = cache_frames.len();
             self.areas[idx].frames = cache_frames;
             map_area_pages(&self.page_table, &self.areas[idx]);
             self.coalesce_areas();
+            #[cfg(feature = "buildstorm-diagnostics")]
+            fault_resolution.finish(
+                crate::buildstorm_diagnostics::PageFaultResolution::CleanFileCache,
+                _mapped_pages,
+            );
             return Ok(());
         }
 
@@ -905,6 +1030,11 @@ impl MemorySet {
 
         if self.areas[idx].has_frames() {
             map_area_pages(&self.page_table, &self.areas[idx]);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            fault_resolution.finish(
+                crate::buildstorm_diagnostics::PageFaultResolution::ExistingFrame,
+                1,
+            );
             return Ok(());
         }
 
@@ -917,6 +1047,11 @@ impl MemorySet {
         }
         self.areas[idx].frames.push(frame);
         map_area_pages(&self.page_table, &self.areas[idx]);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        fault_resolution.finish(
+            crate::buildstorm_diagnostics::PageFaultResolution::BackingRead,
+            1,
+        );
         Ok(())
     }
 
@@ -982,6 +1117,70 @@ impl MemorySet {
             merged.push(area);
         }
         self.areas = merged;
+    }
+
+    #[cfg(feature = "buildstorm-diagnostics")]
+    fn coalesce_areas_anonymous_diagnostic(&mut self) {
+        let total_started = crate::timer::get_time_us();
+        let sort_started = total_started;
+        self.sort_areas();
+        let after_sort = crate::timer::get_time_us();
+        let old_areas = mem::take(&mut self.areas);
+        let area_count = old_areas.len();
+        let mut merged: Vec<MapArea> = Vec::new();
+        let mut merges = 0usize;
+        let mut merged_frames = 0usize;
+        let mut frame_reallocs = 0usize;
+        let mut frame_relocate = 0usize;
+        for area in old_areas {
+            if let Some(last) = merged.last_mut() {
+                if last.can_merge_with(&area) {
+                    let incoming_frames = area.frames.len();
+                    if last.frames.capacity().saturating_sub(last.frames.len()) < incoming_frames {
+                        frame_reallocs = frame_reallocs.saturating_add(1);
+                        frame_relocate = frame_relocate.saturating_add(last.frames.len());
+                    }
+                    merges = merges.saturating_add(1);
+                    merged_frames = merged_frames.saturating_add(incoming_frames);
+                    last.merge_with(area);
+                    continue;
+                }
+            }
+            merged.push(area);
+        }
+        self.areas = merged;
+        let finished = crate::timer::get_time_us();
+        crate::buildstorm_diagnostics::note_anonymous_coalesce_detail(
+            area_count,
+            after_sort.saturating_sub(sort_started),
+            finished.saturating_sub(after_sort),
+            finished.saturating_sub(total_started),
+            merges,
+            merged_frames,
+            frame_reallocs,
+            frame_relocate,
+        );
+    }
+
+    /// Coalesce only the part of the already-sorted VMA vector whose flags may
+    /// have changed.  The global variant remains for operations that can add,
+    /// remove, or reorder arbitrary areas.
+    fn coalesce_changed_range(&mut self, start: usize, end: usize) {
+        if self.areas.len() < 2 {
+            return;
+        }
+        let mut index = self.first_area_ending_after(start).saturating_sub(1);
+        while index + 1 < self.areas.len() {
+            if self.areas[index].start_va.raw() >= end {
+                break;
+            }
+            if self.areas[index].can_merge_with(&self.areas[index + 1]) {
+                let next = self.areas.remove(index + 1);
+                self.areas[index].merge_with(next);
+            } else {
+                index += 1;
+            }
+        }
     }
 
     pub fn fork_cow(&mut self) -> Result<Self, SysErrNo> {

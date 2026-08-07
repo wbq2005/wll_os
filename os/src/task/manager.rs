@@ -88,7 +88,17 @@ fn push_task_back(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
     if task.status() != TaskStatus::Ready {
         return;
     }
-    queue.lock().push_back(task);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let mut queue = crate::buildstorm_diagnostics::lock(
+        crate::buildstorm_diagnostics::LockClass::TaskManager,
+        queue,
+    );
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
+    let mut queue = queue.lock();
+    queue.push_back(task);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_runqueue_len(queue.len());
+    drop(queue);
     crate::platform::notify_runnable();
 }
 
@@ -104,7 +114,17 @@ fn push_task_front(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
     if task.status() != TaskStatus::Ready {
         return;
     }
-    queue.lock().push_front(task);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let mut queue = crate::buildstorm_diagnostics::lock(
+        crate::buildstorm_diagnostics::LockClass::TaskManager,
+        queue,
+    );
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
+    let mut queue = queue.lock();
+    queue.push_front(task);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_runqueue_len(queue.len());
+    drop(queue);
     crate::platform::notify_runnable();
 }
 
@@ -121,7 +141,15 @@ pub fn fetch_kernel_task() -> Option<Arc<TaskControlBlock>> {
 }
 
 fn fetch_from_queue(queue: &Mutex<ReadyQueue>) -> Option<Arc<TaskControlBlock>> {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let mut queue = crate::buildstorm_diagnostics::lock(
+        crate::buildstorm_diagnostics::LockClass::TaskManager,
+        queue,
+    );
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
     let mut queue = queue.lock();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_runqueue_len(queue.len());
     let current_cpu = crate::platform::current_cpu_index();
     let mut best_index = None;
     let mut best_priority = 0;
@@ -191,7 +219,15 @@ pub fn has_kernel_task() -> bool {
 }
 
 fn has_runnable_task(queue: &Mutex<ReadyQueue>) -> bool {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let mut queue = crate::buildstorm_diagnostics::lock(
+        crate::buildstorm_diagnostics::LockClass::TaskManager,
+        queue,
+    );
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
     let mut queue = queue.lock();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_runqueue_len(queue.len());
     let current_cpu = crate::platform::current_cpu_index();
     let mut index = 0;
     while index < queue.tasks.len() {
@@ -311,6 +347,122 @@ pub fn was_thread_group_seen(tgid: usize) -> bool {
 
 pub fn queue_len() -> usize {
     user_queue_len() + kernel_queue_len()
+}
+
+/// Snapshot only.  It deliberately walks the weak registry in place instead of
+/// building a task vector, because BuildStorm diagnostics must not allocate while
+/// reporting scheduler state.
+#[cfg(feature = "buildstorm-diagnostics")]
+pub(crate) fn diagnostic_task_counts() -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
+    let registry = TASK_REGISTRY.lock();
+    let mut user_live = 0usize;
+    let mut user_runnable = 0usize;
+    let mut user_blocked = 0usize;
+    let mut rustc_live = 0usize;
+    let mut rustc_runnable = 0usize;
+    let mut process_live = 0usize;
+    let mut process_runnable = 0usize;
+    let mut process_blocked = 0usize;
+    let mut rustc_process_live = 0usize;
+    let mut rustc_process_runnable = 0usize;
+    for weak in registry.iter() {
+        let Some(task) = weak.upgrade() else {
+            continue;
+        };
+        if task.is_kernel {
+            continue;
+        }
+        user_live += 1;
+        let status = *task.status.lock();
+        if matches!(status, TaskStatus::Ready | TaskStatus::Running) {
+            user_runnable += 1;
+        }
+        if matches!(status, TaskStatus::Blocked) {
+            user_blocked += 1;
+        }
+        let is_rustc = task
+            .inner
+            .try_lock()
+            .map(|inner| inner.exec_path.contains("rustc"))
+            .unwrap_or(false);
+        if is_rustc {
+            rustc_live += 1;
+            if matches!(status, TaskStatus::Ready | TaskStatus::Running) {
+                rustc_runnable += 1;
+            }
+        }
+        // The thread-group leader is the process identity in this kernel.
+        // Count it separately from TCBs so rustc worker threads do not inflate
+        // the diagnostic process-concurrency result.  This reporting path is
+        // feature-gated, allocation-free, and never changes scheduler policy.
+        if task.pid.0 == task.thread_group.tgid() {
+            process_live += 1;
+            if matches!(status, TaskStatus::Ready | TaskStatus::Running) {
+                process_runnable += 1;
+            }
+            if matches!(status, TaskStatus::Blocked) {
+                process_blocked += 1;
+            }
+            if is_rustc {
+                rustc_process_live += 1;
+                if matches!(status, TaskStatus::Ready | TaskStatus::Running) {
+                    rustc_process_runnable += 1;
+                }
+            }
+        }
+    }
+    (
+        user_live,
+        user_runnable,
+        user_blocked,
+        rustc_live,
+        rustc_runnable,
+        process_live,
+        process_runnable,
+        process_blocked,
+        rustc_process_live,
+        rustc_process_runnable,
+    )
+}
+
+/// Rate-limited caller-side diagnostic output only.  It deliberately uses the
+/// existing weak registry and `try_lock` so it neither allocates nor blocks a
+/// user task merely to print its command name.
+#[cfg(feature = "buildstorm-diagnostics")]
+pub(crate) fn diagnostic_dump_user_comm() {
+    let registry = TASK_REGISTRY.lock();
+    for weak in registry.iter() {
+        let Some(task) = weak.upgrade() else {
+            continue;
+        };
+        if task.is_kernel {
+            continue;
+        }
+        let status = *task.status.lock();
+        let reason = *task.block_reason.lock();
+        let Some(inner) = task.inner.try_lock() else {
+            continue;
+        };
+        crate::println!(
+            "BUILDSTORM_DIAG comm pid={} tgid={} status={:?} block={:?} comm={}",
+            task.pid.0,
+            task.thread_group.tgid(),
+            status,
+            reason,
+            inner.exec_path,
+        );
+    }
 }
 
 pub fn user_queue_len() -> usize {

@@ -27,7 +27,17 @@ static LAST_BLOCK_READ_END: [AtomicUsize; crate::config::MAX_CPUS] =
     [const { AtomicUsize::new(usize::MAX) }; crate::config::MAX_CPUS];
 
 #[cfg(all(feature = "perf-counters", feature = "buildstorm-diagnostics"))]
-pub fn diagnostic_snapshot() -> (usize, usize, usize, usize, usize, usize, usize, usize, usize) {
+pub fn diagnostic_snapshot() -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
     (
         PAGE_FAULTS.load(Ordering::Relaxed),
         CLEAN_FILE_FAULTS.load(Ordering::Relaxed),
@@ -90,8 +100,8 @@ pub fn note_block_read(offset: usize, bytes: usize) {
         let cpu = crate::platform::current_cpu_index();
         if cpu < crate::config::MAX_CPUS {
             let previous_offset = LAST_BLOCK_READ_OFFSET[cpu].swap(offset, Ordering::Relaxed);
-            let previous_end = LAST_BLOCK_READ_END[cpu]
-                .swap(offset.saturating_add(bytes), Ordering::Relaxed);
+            let previous_end =
+                LAST_BLOCK_READ_END[cpu].swap(offset.saturating_add(bytes), Ordering::Relaxed);
             if previous_offset == offset {
                 BLOCK_READ_SAME.fetch_add(1, Ordering::Relaxed);
             } else if previous_end == offset {

@@ -151,23 +151,70 @@ impl BlockRange {
     }
 
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), SysErrNo> {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let _io = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::BlockCache,
+            &self.io_lock,
+        );
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         let _io = self.io_lock.lock();
         self.read_raw_at(offset, buf)
     }
 
     pub fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), SysErrNo> {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let _io = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::BlockCache,
+            &self.io_lock,
+        );
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         let _io = self.io_lock.lock();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::BlockCache,
+            &self.cache,
+        )
+        .invalidate_range(offset, data.len());
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         self.cache.lock().invalidate_range(offset, data.len());
         self.write_raw_at(offset, data)
     }
 
     fn read_cached_block(&self, offset: usize) -> Vec<u8> {
-        if let Some(data) = self.cache.lock().get(offset) {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let cached = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::BlockCache,
+            &self.cache,
+        )
+        .get(offset);
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
+        let cached = self.cache.lock().get(offset);
+        if let Some(data) = cached {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_block_cache(true);
             return data;
         }
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_block_cache(false);
 
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let _io = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::BlockCache,
+            &self.io_lock,
+        );
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         let _io = self.io_lock.lock();
-        if let Some(data) = self.cache.lock().get(offset) {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let cached = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::BlockCache,
+            &self.cache,
+        )
+        .get(offset);
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
+        let cached = self.cache.lock().get(offset);
+        if let Some(data) = cached {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_block_cache(true);
             return data;
         }
         let available_blocks = self
@@ -183,6 +230,12 @@ impl BlockRange {
             return vec![0u8; EXT4_BLOCK_SIZE];
         }
         let first = data[..EXT4_BLOCK_SIZE].to_vec();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let mut cache = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::BlockCache,
+            &self.cache,
+        );
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         let mut cache = self.cache.lock();
         for (index, block) in data.chunks_exact(EXT4_BLOCK_SIZE).enumerate() {
             let Some(block_offset) = offset.checked_add(index * EXT4_BLOCK_SIZE) else {
@@ -196,21 +249,43 @@ impl BlockRange {
     fn read_cached_blocks(&self, offsets: &[usize]) -> Result<Vec<Vec<u8>>, SysErrNo> {
         let mut blocks: Vec<Option<Vec<u8>>> = vec![None; offsets.len()];
         {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let mut cache = crate::buildstorm_diagnostics::lock(
+                crate::buildstorm_diagnostics::LockClass::BlockCache,
+                &self.cache,
+            );
+            #[cfg(not(feature = "buildstorm-diagnostics"))]
             let mut cache = self.cache.lock();
             for (index, offset) in offsets.iter().copied().enumerate() {
                 blocks[index] = cache.get(offset);
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_block_cache(blocks[index].is_some());
             }
         }
         if blocks.iter().all(Option::is_some) {
             return Ok(blocks.into_iter().flatten().collect());
         }
 
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let _io = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::BlockCache,
+            &self.io_lock,
+        );
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         let _io = self.io_lock.lock();
         {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let mut cache = crate::buildstorm_diagnostics::lock(
+                crate::buildstorm_diagnostics::LockClass::BlockCache,
+                &self.cache,
+            );
+            #[cfg(not(feature = "buildstorm-diagnostics"))]
             let mut cache = self.cache.lock();
             for (index, offset) in offsets.iter().copied().enumerate() {
                 if blocks[index].is_none() {
                     blocks[index] = cache.get(offset);
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    crate::buildstorm_diagnostics::note_block_cache(blocks[index].is_some());
                 }
             }
         }
@@ -235,6 +310,12 @@ impl BlockRange {
                 .ok_or(SysErrNo::EFBIG)?;
             let mut data = vec![0u8; run_bytes];
             self.read_raw_at(offsets[run_start], &mut data)?;
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let mut cache = crate::buildstorm_diagnostics::lock(
+                crate::buildstorm_diagnostics::LockClass::BlockCache,
+                &self.cache,
+            );
+            #[cfg(not(feature = "buildstorm-diagnostics"))]
             let mut cache = self.cache.lock();
             for block_index in run_start..run_end {
                 let data_start = (block_index - run_start) * EXT4_BLOCK_SIZE;
@@ -245,7 +326,10 @@ impl BlockRange {
             index = run_end;
         }
 
-        blocks.into_iter().collect::<Option<Vec<_>>>().ok_or(SysErrNo::EIO)
+        blocks
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(SysErrNo::EIO)
     }
 }
 
@@ -268,8 +352,7 @@ impl BlockDevice for BlockRange {
             if count == 0 {
                 break;
             }
-            out[copied..copied + count]
-                .copy_from_slice(&data[block_offset..block_offset + count]);
+            out[copied..copied + count].copy_from_slice(&data[block_offset..block_offset + count]);
             copied += count;
             block = block.saturating_add(EXT4_BLOCK_SIZE);
             if block >= end && copied < EXT4_BLOCK_SIZE {
@@ -540,6 +623,10 @@ pub fn root_device_numbers() -> Option<(u32, u32)> {
 }
 
 pub fn read_root_blocks(offsets: &[usize]) -> Result<Vec<Vec<u8>>, SysErrNo> {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::ExtentLookup,
+    );
     let path = root_source_path();
     let range = range_for_path(&path).ok_or(SysErrNo::ENODEV)?;
     range.read_cached_blocks(offsets)

@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Image,
 
-    [int]$TimeoutSeconds = 6250,
+    [int]$TimeoutSeconds = 15000,
     [string]$Repo = (Split-Path -Parent $PSScriptRoot),
     [string]$PythonExe = "python.exe",
     [string]$BuildFeatures = ""

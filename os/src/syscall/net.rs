@@ -1027,9 +1027,7 @@ pub fn sys_recvfrom(
                     && if socket.is_message_oriented() {
                         socket.dgram_queue.is_empty() && !socket.receive_eof()
                     } else {
-                        socket.connected
-                            && socket.rx_buf.is_empty()
-                            && !socket.receive_eof()
+                        socket.connected && socket.rx_buf.is_empty() && !socket.receive_eof()
                     })
             },
         )?;
@@ -1134,9 +1132,7 @@ pub fn sys_shutdown(fd: usize, how: usize) -> SyscallRet {
     let (close_read, close_write) = match how {
         SHUT_RD => (true, false),
         SHUT_WR => (false, true),
-        SHUT_RDWR => {
-            (true, true)
-        }
+        SHUT_RDWR => (true, true),
         _ => return Err(SysErrNo::EINVAL),
     };
     socket.shutdown_read |= close_read;

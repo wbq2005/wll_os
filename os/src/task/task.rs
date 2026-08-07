@@ -132,6 +132,16 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_block_started_at: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_block_reason: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_woken_at: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_woken_reason: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_last_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -341,6 +351,16 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_block_started_at: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_block_reason: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_woken_at: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_woken_reason: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_last_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -419,6 +439,16 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_block_started_at: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_block_reason: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_woken_at: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_woken_reason: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_last_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -495,6 +525,16 @@ impl TaskControlBlock {
             affinity_mask: AtomicUsize::new(crate::platform::online_cpu_mask().max(1)),
             blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
             running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_block_started_at: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_block_reason: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_woken_at: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_woken_reason: AtomicUsize::new(0),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_last_cpu: AtomicUsize::new(crate::task::NO_CPU),
         });
         crate::task::manager::register_task(&task);
         thread_group.add_member(&task);
@@ -539,6 +579,15 @@ impl TaskControlBlock {
             return false;
         }
         *status = TaskStatus::Running;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        {
+            crate::buildstorm_diagnostics::note_woken_task_dispatched(self);
+            let previous = self.diagnostic_last_cpu.swap(cpu, Ordering::Relaxed);
+            if previous != crate::task::NO_CPU && previous != cpu {
+                crate::buildstorm_diagnostics::note_migration();
+            }
+            crate::buildstorm_diagnostics::note_context_switch();
+        }
         true
     }
 

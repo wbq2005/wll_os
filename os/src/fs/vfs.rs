@@ -43,6 +43,20 @@ lazy_static! {
         RwLock::new(BTreeMap::new());
 }
 
+#[cfg(feature = "buildstorm-diagnostics")]
+macro_rules! vfs_lock {
+    ($mutex:expr) => {
+        crate::buildstorm_diagnostics::lock(crate::buildstorm_diagnostics::LockClass::Vfs, &$mutex)
+    };
+}
+
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+macro_rules! vfs_lock {
+    ($mutex:expr) => {
+        $mutex.lock()
+    };
+}
+
 const RESOLVED_PARENT_CACHE_LIMIT: usize = 16 * 1024;
 const READLINK_RESULT_CACHE_LIMIT: usize = 16 * 1024;
 
@@ -279,7 +293,7 @@ fn path_is_under(path: &str, parent: &str) -> bool {
 
 fn mounted_ext4_backend_path(path: &str) -> Option<String> {
     let norm = normalize_path(path);
-    let mounts = MOUNT_TABLE.lock();
+    let mounts = vfs_lock!(MOUNT_TABLE);
     let entry = mounts
         .iter()
         .filter(|entry| {
@@ -307,7 +321,7 @@ fn is_tmpfs_path(path: &str) -> bool {
     if super::is_memfs_volatile_dir(&norm) {
         return true;
     }
-    let mounts = MOUNT_TABLE.lock();
+    let mounts = vfs_lock!(MOUNT_TABLE);
     mounts.iter().any(|entry| {
         matches!(entry.backend, MountBackend::Tmpfs) && path_is_under(&norm, &entry.host_target)
     })
@@ -315,7 +329,7 @@ fn is_tmpfs_path(path: &str) -> bool {
 
 fn mounted_vfat_backend(path: &str) -> Option<(Arc<vfat::VfatVolume>, String)> {
     let norm = normalize_path(path);
-    let mounts = MOUNT_TABLE.lock();
+    let mounts = vfs_lock!(MOUNT_TABLE);
     let entry = mounts
         .iter()
         .filter(|entry| {
@@ -343,7 +357,7 @@ fn mounted_vfat_backend(path: &str) -> Option<(Arc<vfat::VfatVolume>, String)> {
 
 fn mount_entry_index_for_target(path: &str) -> Option<usize> {
     let norm = normalize_path(path);
-    let mounts = MOUNT_TABLE.lock();
+    let mounts = vfs_lock!(MOUNT_TABLE);
     mounts
         .iter()
         .enumerate()
@@ -353,7 +367,7 @@ fn mount_entry_index_for_target(path: &str) -> Option<usize> {
 
 fn is_readonly_mount_path(path: &str) -> bool {
     let norm = normalize_path(path);
-    let mounts = MOUNT_TABLE.lock();
+    let mounts = vfs_lock!(MOUNT_TABLE);
     mounts
         .iter()
         .filter(|entry| path_is_under(&norm, &entry.host_target))
@@ -414,12 +428,15 @@ enum FinalSymlink {
 }
 
 fn path_components(path: &str) -> VecDeque<String> {
-    normalize_path(path)
+    let components: VecDeque<String> = normalize_path(path)
         .trim_matches('/')
         .split('/')
         .filter(|part| !part.is_empty())
         .map(String::from)
-        .collect()
+        .collect();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_path_component_lookup(components.len());
+    components
 }
 
 /// Resolve symbolic links one component at a time.  Requeueing the complete
@@ -2035,10 +2052,7 @@ pub fn read_executable_file(name: &str) -> Option<Arc<Vec<u8>>> {
 
     let tmpfs_path = is_tmpfs_path(&norm);
     let mem_data = if tmpfs_path || mounted_ext4_backend_path(&norm).is_none() {
-        MEM_FS
-            .lock()
-            .get_file(&norm)
-            .map(|f| Arc::new(f.to_vec()))
+        MEM_FS.lock().get_file(&norm).map(|f| Arc::new(f.to_vec()))
     } else {
         None
     };
@@ -2073,28 +2087,19 @@ fn basename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-fn read_interpreter_logical(
-    root: &str,
-    logical: &str,
-) -> Option<(String, String, Arc<Vec<u8>>)> {
+fn read_interpreter_logical(root: &str, logical: &str) -> Option<(String, String, Arc<Vec<u8>>)> {
     let logical = normalize_path(logical);
     let host = super::apply_root(root, &logical);
     read_executable_file(&host).map(|data| (logical, host, data))
 }
 
-fn read_interpreter_host(
-    logical: &str,
-    host: &str,
-) -> Option<(String, String, Arc<Vec<u8>>)> {
+fn read_interpreter_host(logical: &str, host: &str) -> Option<(String, String, Arc<Vec<u8>>)> {
     let logical = normalize_path(logical);
     let host = normalize_path(host);
     read_executable_file(&host).map(|data| (logical, host, data))
 }
 
-pub fn read_interpreter(
-    root: &str,
-    interp: &str,
-) -> Option<(String, String, Arc<Vec<u8>>)> {
+pub fn read_interpreter(root: &str, interp: &str) -> Option<(String, String, Arc<Vec<u8>>)> {
     let interp = normalize_path(interp);
     if let Some(found) = read_interpreter_logical(root, &interp) {
         return Some(found);
@@ -3869,8 +3874,7 @@ pub fn open_path(
     if !tmpfs_path && !removed {
         #[cfg(feature = "buildstorm-diagnostics")]
         let started_at = crate::timer::get_time_us();
-        if let Some((ino, ext4_vol::Ext4NodeKind::Regular)) =
-            ext4_vol::lookup_kind(&ext_path_norm)
+        if let Some((ino, ext4_vol::Ext4NodeKind::Regular)) = ext4_vol::lookup_kind(&ext_path_norm)
         {
             #[cfg(feature = "buildstorm-diagnostics")]
             crate::buildstorm_diagnostics::note_phase(

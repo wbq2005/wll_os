@@ -992,3 +992,95 @@ boundaries, official inputs, clock, CPU count, artifacts, or workload-visible
 semantics, and it contains no test-name/path/command/output condition. AI
 assistance prepared and audited the identity condition; the saved release,
 SMP, official-image serial, hashes, and judge results are developer-verifiable.
+
+## 25. Evidence-driven BuildStorm throughput campaign (2026-08-06 to 2026-08-07)
+
+### Verified boundary and retained production change
+
+The outer complete-run timeout is now 15,000 seconds, exceeding the official
+guest compile allowance of 14,400 seconds. The unmodified RISC-V64 glibc
+image, production release kernel, diagnostics-disabled build, QEMU
+`-snapshot -m 8G -smp 8`, and official script completed the full outer window
+without panic or OOM. It emitted the toolchain and minibuild success markers
+but no `BUILDSTORM_COMPILE mode=multi ok=true`; the official judge therefore
+still reports only 20.0 scripted points. The run reached 33 `Compiling`
+events and ended at `rustc-literal-escaper`, proving sustained slow progress
+rather than a completed compile or deterministic kernel crash.
+
+The short-window runner starts its 300-second clock only after
+`BUILDSTORM_BEGIN mode=multi`, records Cargo progress and host samplers, and
+terminates only its own QEMU process. Comparable production windows observed
+2 `Compiling` events with one vCPU and 23 with eight vCPUs, an 11.5x event-
+count ratio. This is a progress indicator, not normalized compiler throughput
+or an official score.
+
+The only new production optimization retained by the campaign is range-local
+`mprotect` processing. The previous implementation scanned and globally
+sorted/rebuilt every VMA while holding the process MemorySet lock for a change
+that can affect only one requested range. The retained implementation starts
+at the first overlapping VMA, stops at the range end, and coalesces only the
+changed interval and its immediate boundaries. Operations that can add,
+remove, or reorder arbitrary mappings retain the global coalescer.
+
+In comparable feature-gated diagnostics, aggregate `mprotect` time fell from
+31,569,748 to 2,050,299 microseconds, approximately 93.5%. In feature-off
+production windows the first timed crate moved from 130.157906 to 113.134767
+seconds, and the 23rd crate moved from 139.770461 to 123.749086 seconds,
+11.46% earlier. Both architecture release builds, both independent eight-CPU
+SMP/TLB/ASID regressions, and both official toolchain/minibuild checks passed.
+The subsequent 15,000-second run still did not finish, so complete-build time
+and score remain unverified.
+
+### Diagnostic and experiment infrastructure
+
+`buildstorm-diagnostics` remains an explicit, default-off feature. Its hot
+paths use fixed relaxed atomics and per-CPU/fixed-size state; one CPU emits an
+aggregate report every ten seconds. Production does not emit these reports or
+branch on process names. The counters cover CPU user/kernel/idle ticks,
+context switches, migrations, run queues, live/runnable/blocked processes,
+blocking categories, page faults, root activation/TLB activity, selected VFS
+and virtio work, and ranked lock wait/hold totals. The window runner preserves
+raw serial output, complete QEMU arguments, source/image/kernel identity,
+timeline progress, and host pidstat/iostat/vmstat data.
+
+### Rejected and blocked candidates
+
+Every rejected production candidate changed one hypothesis only and was
+reverted immediately when it failed the 5% floor. The concise table and
+evidence index are in
+`docs/evidence/buildstorm-stage2/20260807-rejected-candidates-summary.md`.
+The rejected set includes a larger anonymous-fault window, local anonymous
+coalescing, scheduler empty-ready waiting and blocked-owner boundaries, shared
+pipe OFD nonblocking state, adjacent VMA extension, a zero-move subset,
+`VecDeque`, bounded batching, and encapsulated vacant slots. The final vacant-
+slot production window was 10.44% slower at the first timed crate and 9.22%
+slower at the 23rd crate even though diagnostic coalescer time fell 94.73%.
+
+The current blocker is not a missing syscall and not a host swap/device
+saturation condition. After the retained `mprotect` fix, anonymous demand-
+fault metadata maintenance is measurable, but every tested contiguous-
+`Vec<MapArea>` shortcut failed production throughput. No further threshold
+tuning in that representation is authorized. A future candidate needs a
+separate ownership/COW/file-mapping audit for a representation that avoids
+both middle VMA insertion and whole-vector reconstruction.
+
+### Reproduction, compliance, and AI disclosure
+
+The authoritative attribution report is
+`docs/evidence/buildstorm-stage2/20260806-attribution-report.md`; the VMA-wide
+audit is `docs/evidence/buildstorm-stage2/20260807-global-vma-audit.md`.
+Evidence was captured with official suite commit
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`, official image SHA-256
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`,
+and QEMU 11.0.3. Exact commands and artifact hashes are in each `runner.json`
+or `launch.json`; large host sampler logs remain in the named local/ECS
+evidence directories and are intentionally not duplicated in this commit.
+
+No retained path inspects an official crate, test, command, output marker,
+artifact name, elapsed time, or expected score. The official image, guest
+script, judge, markers, CPU count, and guest time are unchanged. AI assisted
+with trace classification, code audits, candidate implementation, and report
+drafting. The developer-verifiable checks are the source diff, dual release
+builds, dual SMP regressions, official-image marker windows, 15,000-second raw
+serial and host metrics, hashes, and official judge output. There is still no
+successful compile marker, so no complete-build or timing-score claim is made.

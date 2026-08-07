@@ -1,7 +1,8 @@
 use super::SyscallRet;
 use crate::console::putchar;
 use crate::task::wait_queue::{
-    sleep_on_io_if, sleep_on_io_key_if, sleep_on_io_keys_if, WaitKey, WaitOutcome,
+    sleep_on_io_if, sleep_on_io_key_if, sleep_on_pipe_fd_ready_key_if, sleep_on_poll_if,
+    sleep_on_poll_keys_if, WaitKey, WaitOutcome,
 };
 use crate::task::{current_task, SharedFdTable};
 use crate::utils::error::SysErrNo;
@@ -531,7 +532,7 @@ fn direct_write_at_fd_from_user(
 }
 
 fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
-    let (wait_key, deadline) = {
+    let (wait_key, deadline, is_pipe) = {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
         if file_desc.is_pipe_read() {
@@ -544,6 +545,7 @@ fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, S
             (
                 file_desc.pipe_read_wait_key().ok_or(SysErrNo::EBADF)?,
                 None,
+                true,
             )
         } else if let Some(wait_key) = file_desc.eventfd_read_wait_key() {
             if file_desc.eventfd_read_nonblocking() {
@@ -552,7 +554,7 @@ fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, S
             if !file_desc.eventfd_read_would_block() {
                 return Ok(false);
             }
-            (wait_key, None)
+            (wait_key, None, false)
         } else if let Some(wait_key) = file_desc.socket_read_wait_key() {
             if file_desc.socket_read_nonblocking() {
                 return Err(SysErrNo::EAGAIN);
@@ -563,12 +565,16 @@ fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, S
             let deadline = file_desc
                 .socket_recv_timeout_us()
                 .map(|timeout| crate::timer::get_time_us().saturating_add(timeout));
-            (wait_key, deadline)
+            (wait_key, deadline, false)
         } else {
             return Err(SysErrNo::EAGAIN);
         }
     };
-    let outcome = sleep_on_io_key_if(wait_key, deadline, || {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if is_pipe {
+        crate::buildstorm_diagnostics::note_pipe_wait(true);
+    }
+    let outcome = sleep_on_pipe_fd_ready_key_if(wait_key, deadline, || {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
         if file_desc.is_pipe_read() {
@@ -591,7 +597,7 @@ fn wait_read_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, S
 }
 
 fn wait_write_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, SysErrNo> {
-    let wait_key = {
+    let (wait_key, is_pipe) = {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
         if file_desc.is_pipe_write() {
@@ -601,7 +607,10 @@ fn wait_write_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, 
             if !file_desc.pipe_write_would_block() {
                 return Ok(false);
             }
-            file_desc.pipe_write_wait_key().ok_or(SysErrNo::EBADF)?
+            (
+                file_desc.pipe_write_wait_key().ok_or(SysErrNo::EBADF)?,
+                true,
+            )
         } else if let Some(wait_key) = file_desc.eventfd_write_wait_key() {
             if file_desc.eventfd_write_nonblocking() {
                 return Err(SysErrNo::EAGAIN);
@@ -609,12 +618,16 @@ fn wait_write_after_eagain(fd_table: &SharedFdTable, fd: usize) -> Result<bool, 
             if !file_desc.eventfd_write_would_block() {
                 return Ok(false);
             }
-            wait_key
+            (wait_key, false)
         } else {
             return Err(SysErrNo::EAGAIN);
         }
     };
-    let _ = sleep_on_io_key_if(wait_key, None, || {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if is_pipe {
+        crate::buildstorm_diagnostics::note_pipe_wait(false);
+    }
+    let _ = sleep_on_pipe_fd_ready_key_if(wait_key, None, || {
         let fds = fd_table.lock();
         let file_desc = fds.get(fd).ok_or(SysErrNo::EBADF)?;
         if file_desc.is_pipe_write() {
@@ -2180,6 +2193,10 @@ fn fd_status_flags(file_desc: &FileDescriptor) -> usize {
 /// - mode: 文件模式
 pub fn sys_openat(dirfd: isize, pathname: *const u8, flags: u32, mode: u32) -> SyscallRet {
     #[cfg(feature = "buildstorm-diagnostics")]
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::OpenAt,
+    );
+    #[cfg(feature = "buildstorm-diagnostics")]
     let started_at = crate::timer::get_time_us();
     let resolved = resolve_host_path(dirfd, pathname);
     #[cfg(feature = "buildstorm-diagnostics")]
@@ -2816,6 +2833,10 @@ pub fn sys_readlinkat(
     buf: *mut u8,
     bufsiz: usize,
 ) -> SyscallRet {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::Readlink,
+    );
     if buf.is_null() {
         return Err(SysErrNo::EFAULT);
     }
@@ -2887,6 +2908,8 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: usize) -> SyscallRet {
         return Err(SysErrNo::EINVAL);
     }
     let nonblock = (flags & pipe_flags::O_NONBLOCK) != 0;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_pipe2(flags, pipe_flags::O_NONBLOCK, pipe_flags::O_CLOEXEC);
     let fd_flags = if (flags & pipe_flags::O_CLOEXEC) != 0 {
         fd::FD_CLOEXEC
     } else {
@@ -3048,6 +3071,10 @@ pub fn sys_close(fd: usize) -> SyscallRet {
 ///
 /// 返回值: 成功返回读取的字节数，失败返回错误码
 pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> SyscallRet {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::Read,
+    );
     log::debug!("[syscall] read(fd={}, buf={:p}, count={})", fd, buf, count);
 
     if count == 0 {
@@ -3239,6 +3266,10 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> SyscallRet {
 /// 复制文件描述符
 /// - old_fd: 旧文件描述符
 pub fn sys_pread64(fd: usize, buf: *mut u8, count: usize, offset: usize) -> SyscallRet {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::Pread,
+    );
     if count == 0 {
         let mut empty: [u8; 0] = [];
         return with_fixed_io_fd_mut(fd, |file_desc| {
@@ -3309,6 +3340,12 @@ pub fn sys_dup(old_fd: usize) -> SyscallRet {
     let inner = task.inner.lock();
     let nofile_limit = inner.rlimit_nofile;
     let mut fds = inner.fd_table.lock();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_dup(
+        fds.get(old_fd)
+            .map(|fd| fd.is_pipe_read() || fd.is_pipe_write())
+            .unwrap_or(false),
+    );
     fds.dup_below(old_fd, nofile_limit)
 }
 
@@ -3340,6 +3377,12 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: usize) -> SyscallRet {
     let inner = task.inner.lock();
     let nofile_limit = inner.rlimit_nofile;
     let mut fds = inner.fd_table.lock();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_dup(
+        fds.get(old_fd)
+            .map(|fd| fd.is_pipe_read() || fd.is_pipe_write())
+            .unwrap_or(false),
+    );
     let replaced_key = fds.get(new_fd).and_then(fd_lock_key);
     let new_fd = fds.dup2_below(old_fd, new_fd, nofile_limit)?;
     fds.set_fd_flags(new_fd, fd_flags)?;
@@ -3439,6 +3482,17 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
     let inner = task.inner.lock();
     let nofile_limit = inner.rlimit_nofile;
     let mut fds = inner.fd_table.lock();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        let pipe = fds
+            .get(fd)
+            .map(|entry| entry.is_pipe_read() || entry.is_pipe_write())
+            .unwrap_or(false);
+        crate::buildstorm_diagnostics::note_fcntl(cmd, pipe, F_GETFD, F_SETFD, F_GETFL, F_SETFL);
+        if matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC) {
+            crate::buildstorm_diagnostics::note_dup(pipe);
+        }
+    }
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             if arg >= nofile_limit.min(fd::MAX_FD_NUM) {
@@ -3465,6 +3519,16 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> SyscallRet {
         F_SETFL => {
             let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
             file_desc.set_status_flags(arg);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            if let Some((aliases, mismatches, external_aliases)) =
+                fds.diagnostic_pipe_alias_status(fd)
+            {
+                crate::buildstorm_diagnostics::note_pipe_aliases(
+                    aliases,
+                    mismatches,
+                    external_aliases,
+                );
+            }
             Ok(0)
         }
         F_SETLEASE => {
@@ -4089,13 +4153,13 @@ fn sys_epoll_wait_deadline(
             if crate::timer::get_time_us() >= deadline {
                 return Ok(0);
             }
-            if sleep_on_io_if(Some(deadline), || Ok(epoll_ready_count(&state) == 0))?
+            if sleep_on_poll_if(Some(deadline), || Ok(epoll_ready_count(&state) == 0))?
                 == WaitOutcome::TimedOut
             {
                 return epoll_collect_ready(&state, events, maxevents);
             }
         } else {
-            let _ = sleep_on_io_if(None, || Ok(epoll_ready_count(&state) == 0))?;
+            let _ = sleep_on_poll_if(None, || Ok(epoll_ready_count(&state) == 0))?;
         }
     }
 }
@@ -4367,15 +4431,18 @@ pub fn sys_ppoll(
             if crate::timer::get_time_us() >= deadline {
                 return Ok(0);
             }
-            let outcome = if !wait_keys.is_empty() {
-                #[cfg(feature = "buildstorm-diagnostics")]
-                crate::buildstorm_diagnostics::note_ppoll_sleep(true);
-                sleep_on_io_keys_if(&wait_keys, Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
-            } else {
-                #[cfg(feature = "buildstorm-diagnostics")]
-                crate::buildstorm_diagnostics::note_ppoll_sleep(false);
-                sleep_on_io_if(Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
-            };
+            let outcome =
+                if !wait_keys.is_empty() {
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    crate::buildstorm_diagnostics::note_ppoll_sleep(true);
+                    sleep_on_poll_keys_if(&wait_keys, Some(deadline), || {
+                        Ok(poll_once(fds, nfds)? == 0)
+                    })?
+                } else {
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    crate::buildstorm_diagnostics::note_ppoll_sleep(false);
+                    sleep_on_poll_if(Some(deadline), || Ok(poll_once(fds, nfds)? == 0))?
+                };
             if outcome == WaitOutcome::TimedOut {
                 return Ok(poll_once(fds, nfds)?);
             }
@@ -4383,11 +4450,11 @@ pub fn sys_ppoll(
             if !wait_keys.is_empty() {
                 #[cfg(feature = "buildstorm-diagnostics")]
                 crate::buildstorm_diagnostics::note_ppoll_sleep(true);
-                let _ = sleep_on_io_keys_if(&wait_keys, None, || Ok(poll_once(fds, nfds)? == 0))?;
+                let _ = sleep_on_poll_keys_if(&wait_keys, None, || Ok(poll_once(fds, nfds)? == 0))?;
             } else {
                 #[cfg(feature = "buildstorm-diagnostics")]
                 crate::buildstorm_diagnostics::note_ppoll_sleep(false);
-                let _ = sleep_on_io_if(None, || Ok(poll_once(fds, nfds)? == 0))?;
+                let _ = sleep_on_poll_if(None, || Ok(poll_once(fds, nfds)? == 0))?;
             }
         }
     }
@@ -4535,7 +4602,7 @@ pub fn sys_pselect6(
                 store_pselect_result(readfds, writefds, exceptfds, &result)?;
                 return Ok(0);
             }
-            if sleep_on_io_if(Some(deadline), || {
+            if sleep_on_poll_if(Some(deadline), || {
                 Ok(pselect_poll(nfds, &read_in, &write_in, &except_in)?.ready == 0)
             })? == WaitOutcome::TimedOut
             {
@@ -4544,7 +4611,7 @@ pub fn sys_pselect6(
                 return Ok(result.ready);
             }
         } else {
-            let _ = sleep_on_io_if(None, || {
+            let _ = sleep_on_poll_if(None, || {
                 Ok(pselect_poll(nfds, &read_in, &write_in, &except_in)?.ready == 0)
             })?;
         }
@@ -5066,6 +5133,10 @@ pub fn sys_statx(
     mask: usize,
     statxbuf: *mut u8,
 ) -> SyscallRet {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::Statx,
+    );
     if statxbuf.is_null() {
         return Err(SysErrNo::EFAULT);
     }

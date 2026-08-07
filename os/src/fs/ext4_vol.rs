@@ -8,9 +8,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "buildstorm-diagnostics")]
 use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use ext4_rs::{Errno, Ext4, Ext4Error, InodeFileType, BLOCK_SIZE};
 
@@ -103,6 +103,23 @@ lazy_static! {
 }
 
 type RegularCacheEntry = Arc<Mutex<CachedRegularFile>>;
+
+#[cfg(feature = "buildstorm-diagnostics")]
+macro_rules! ext4_mutation_lock {
+    () => {
+        crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::Ext4,
+            &EXT4_MUTATION_LOCK,
+        )
+    };
+}
+
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+macro_rules! ext4_mutation_lock {
+    () => {
+        EXT4_MUTATION_LOCK.lock()
+    };
+}
 
 struct WritebackQueue {
     pending: VecDeque<u32>,
@@ -1129,11 +1146,7 @@ fn prefetch_clean_page_frames(
         }
         let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                block.as_ptr(),
-                frame.ppn().addr() as *mut u8,
-                read_len,
-            );
+            core::ptr::copy_nonoverlapping(block.as_ptr(), frame.ppn().addr() as *mut u8, read_len);
         }
         frames.push(frame);
     }
@@ -1170,13 +1183,7 @@ pub fn clean_page_cache_frames(
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let metadata = clean_page_read_metadata(&fs, ino)?;
     let start_page_idx = file_offset / PAGE_SIZE;
-    let _ = prefetch_clean_page_frames(
-        &fs,
-        ino,
-        start_page_idx,
-        read_ahead_pages,
-        metadata,
-    );
+    let _ = prefetch_clean_page_frames(&fs, ino, start_page_idx, read_ahead_pages, metadata);
     let mut source = None;
     let mut frames = Vec::new();
     for page in 0..max_pages {
@@ -1598,7 +1605,7 @@ pub fn close_regular_ino(ino: u32) {
 }
 
 fn finish_unlinked_regular(ino: u32) -> Result<(), SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     cancel_queued_writeback(ino);
     discard_regular_cache(ino);
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
@@ -1641,7 +1648,7 @@ fn uncached_regular_write(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, 
         return Ok(0);
     }
     invalidate_executable_image(ino);
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     invalidate_pblock_runs_ino(ino);
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let written = fs.write_at(ino, offset, buf).map_err(map_ext4_err)?;
@@ -1657,7 +1664,7 @@ fn flush_time_override(ino: u32) -> Result<(), SysErrNo> {
     let Some(times) = DATA_TIME_OVERRIDES.lock().get(&ino).copied() else {
         return Ok(());
     };
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let (mtime_sec, mtime_extra, ctime_sec, ctime_extra) = times;
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let mut iref = fs.get_inode_ref(ino);
@@ -1722,7 +1729,7 @@ fn take_writeback_snapshot(ino: u32) -> WritebackSnapshotResult {
 }
 
 fn apply_writeback_snapshot(snapshot: &WritebackSnapshot) -> Result<(), SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     invalidate_pblock_runs_ino(snapshot.ino);
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let old_size = fs.get_inode_ref(snapshot.ino).inode.size();
@@ -2136,7 +2143,7 @@ pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
     } else if !delay_delete {
         discard_regular_cache(child_ino);
     }
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     fs.dir_remove_entry(&mut parent_ref, &name)
         .map_err(map_ext4_err)?;
     if old_links > 0 {
@@ -2171,7 +2178,7 @@ pub fn unlink_regular_file(path: &str) -> Result<(), SysErrNo> {
 }
 
 pub fn mkdir_ext4_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
     let (parent_path, name) = split_parent_name(&norm)?;
@@ -2209,7 +2216,7 @@ pub fn mkdir_ext4(path: &str) -> Result<(), SysErrNo> {
 }
 
 pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
     if norm == "/" {
@@ -2258,7 +2265,7 @@ pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
 
 /// 创建普通文件（已存在则由 `generic_open` 语义处理）。
 pub fn create_regular_ext4_with_mode(path: &str, mode: u32) -> Result<u32, SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
     let (parent_path, name) = split_parent_name(&norm)?;
@@ -2319,7 +2326,7 @@ pub fn truncate_regular_ino(ino: u32, size: u64) -> Result<(), SysErrNo> {
         flush_cached_ino(ino)?;
         discard_regular_cache(ino);
     }
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let mut iref = fs.get_inode_ref(ino);
     let old_size = iref.inode.size();
     if size < old_size {
@@ -2415,7 +2422,7 @@ pub fn file_flags_by_ino(ino: u32) -> Result<u32, SysErrNo> {
 }
 
 pub fn set_file_flags_ino(ino: u32, flags: u32) -> Result<(), SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let mut iref = fs.get_inode_ref(ino);
     iref.inode.set_flags(flags);
@@ -2428,7 +2435,7 @@ pub fn set_file_flags_ino(ino: u32, flags: u32) -> Result<(), SysErrNo> {
 }
 
 pub fn set_mode_ino(ino: u32, mode: u32) -> Result<(), SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let mut iref = fs.get_inode_ref(ino);
     let file_type = iref.inode.mode() & 0o170000;
@@ -2450,7 +2457,7 @@ pub fn set_mode_path(path: &str, mode: u32) -> Result<(), SysErrNo> {
 }
 
 pub fn set_owner_ino(ino: u32, uid: Option<u32>, gid: Option<u32>) -> Result<(), SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let mut iref = fs.get_inode_ref(ino);
     let is_regular = iref.inode.is_file();
@@ -2493,7 +2500,7 @@ pub fn set_times_ino(
     mtime: Option<(isize, isize)>,
 ) -> Result<(), SysErrNo> {
     flush_cached_ino(ino)?;
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let mut iref = fs.get_inode_ref(ino);
     if let Some((sec, nsec)) = atime {
@@ -2695,7 +2702,7 @@ fn path_is_descendant(parent: &str, child: &str) -> bool {
 }
 
 pub fn create_symlink_ext4(target: &str, link_path: &str) -> Result<(), SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(link_path);
     let (parent_path, name) = split_parent_name(&norm)?;
@@ -2737,7 +2744,7 @@ pub fn create_symlink_ext4(target: &str, link_path: &str) -> Result<(), SysErrNo
 }
 
 pub fn link_ext4(old_path: &str, new_path: &str, follow_old: bool) -> Result<(), SysErrNo> {
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let old = if follow_old {
         resolve_symlinks(old_path)?
@@ -2830,7 +2837,7 @@ pub fn rename_ext4(old_path: &str, new_path: &str, no_replace: bool) -> Result<(
         }
     }
 
-    let _mutation = EXT4_MUTATION_LOCK.lock();
+    let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let mut child_ref = fs.get_inode_ref(old_ino);
     let now = current_ext4_time();

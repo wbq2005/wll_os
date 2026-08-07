@@ -92,6 +92,13 @@ pub fn add_frames_range(start: usize, end: usize) {
     let start_ppn = ((start + PAGE_SIZE - 1) / PAGE_SIZE).max(1);
     let end_ppn = end / PAGE_SIZE;
     if start_ppn < end_ppn {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::FrameAllocator,
+            &FRAME_ALLOCATOR,
+        )
+        .add_frame(start_ppn, end_ppn);
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         FRAME_ALLOCATOR.lock().add_frame(start_ppn, end_ppn);
         MEM_REGIONS.lock().push((start_ppn, end_ppn));
         let pages = end_ppn - start_ppn;
@@ -116,6 +123,13 @@ fn is_managed_range(start_ppn: usize, pages: usize) -> bool {
 /// 分配一个物理页帧
 pub fn alloc_frame() -> Option<FrameTracker> {
     loop {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let ppn = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::FrameAllocator,
+            &FRAME_ALLOCATOR,
+        )
+        .alloc(1)?;
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         let ppn = FRAME_ALLOCATOR.lock().alloc(1)?;
         if !is_managed_range(ppn, 1) {
             log::warn!(
@@ -142,6 +156,13 @@ pub fn alloc_contiguous_frames(pages: usize) -> Option<usize> {
         return Some(0);
     }
     loop {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let ppn = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::FrameAllocator,
+            &FRAME_ALLOCATOR,
+        )
+        .alloc(pages)?;
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         let ppn = FRAME_ALLOCATOR.lock().alloc(pages)?;
         if is_managed_range(ppn, pages) {
             FREE_MANAGED_FRAMES.fetch_sub(pages, Ordering::Relaxed);
@@ -166,6 +187,13 @@ pub fn dealloc_contiguous_frames(start_ppn: usize, pages: usize) {
             );
             return;
         }
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::FrameAllocator,
+            &FRAME_ALLOCATOR,
+        )
+        .dealloc(start_ppn, pages);
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         FRAME_ALLOCATOR.lock().dealloc(start_ppn, pages);
         FREE_MANAGED_FRAMES.fetch_add(pages, Ordering::Relaxed);
     }
@@ -181,6 +209,13 @@ pub fn dealloc_frame(ppn: PhysPageNum) {
         );
         return;
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::lock(
+        crate::buildstorm_diagnostics::LockClass::FrameAllocator,
+        &FRAME_ALLOCATOR,
+    )
+    .dealloc(ppn.0, 1);
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
     FRAME_ALLOCATOR.lock().dealloc(ppn.0, 1);
     FREE_MANAGED_FRAMES.fetch_add(1, Ordering::Relaxed);
 }

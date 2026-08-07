@@ -9,6 +9,10 @@ use crate::utils::error::SysErrNo;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {
     Io,
+    /// Diagnostic-only attribution for pipe/eventfd/socket readiness waits.
+    PipeFdReady,
+    /// Diagnostic-only attribution for poll, ppoll, select, and epoll waits.
+    Poll,
     ChildExit,
     Timer,
     Futex,
@@ -97,6 +101,21 @@ impl WaitQueue {
     where
         F: FnOnce() -> Result<bool, SysErrNo>,
     {
+        self.sleep_until_keys_if_with_reason(keys, deadline_us, self.reason, should_sleep)
+    }
+
+    /// Keep the scheduler's ordinary I/O wait behavior unchanged while letting
+    /// diagnostic-only wrappers record a more precise blocked category.
+    pub fn sleep_until_keys_if_with_reason<F>(
+        &self,
+        keys: &[WaitKey],
+        deadline_us: Option<usize>,
+        reason: BlockReason,
+        should_sleep: F,
+    ) -> Result<WaitOutcome, SysErrNo>
+    where
+        F: FnOnce() -> Result<bool, SysErrNo>,
+    {
         let task = current_task().ok_or(SysErrNo::ESRCH)?;
 
         // Foreground scheduling parks a blocking syscall and resumes it by
@@ -129,8 +148,14 @@ impl WaitQueue {
         crate::timer::remove_task_timeouts(&task);
         let token = task.next_wait_token();
         *task.wait_outcome.lock() = None;
-        *task.block_reason.lock() = Some(self.reason);
+        *task.block_reason.lock() = Some(reason);
         {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let mut waiters = crate::buildstorm_diagnostics::lock(
+                crate::buildstorm_diagnostics::LockClass::WaitQueue,
+                &self.waiters,
+            );
+            #[cfg(not(feature = "buildstorm-diagnostics"))]
             let mut waiters = self.waiters.lock();
             if keys.is_empty() {
                 waiters.push_back(WaitEntry {
@@ -172,7 +197,9 @@ impl WaitQueue {
             crate::timer::add_timeout(deadline, task.clone(), token);
         }
 
-        block_current_for(self.reason, deadline_us);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_block_start(&task, reason);
+        block_current_for(reason, deadline_us);
 
         if crate::trap::syscall_parked() {
             return Err(SysErrNo::ERESTARTSYS);
@@ -196,6 +223,13 @@ impl WaitQueue {
     pub fn wake_n(&self, n: usize) -> usize {
         let mut woke = 0usize;
         while woke < n {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let entry = crate::buildstorm_diagnostics::lock(
+                crate::buildstorm_diagnostics::LockClass::WaitQueue,
+                &self.waiters,
+            )
+            .pop_front();
+            #[cfg(not(feature = "buildstorm-diagnostics"))]
             let entry = self.waiters.lock().pop_front();
             let Some(entry) = entry else {
                 break;
@@ -210,6 +244,13 @@ impl WaitQueue {
     pub fn wake_all(&self) -> usize {
         let mut woke = 0usize;
         loop {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let entry = crate::buildstorm_diagnostics::lock(
+                crate::buildstorm_diagnostics::LockClass::WaitQueue,
+                &self.waiters,
+            )
+            .pop_front();
+            #[cfg(not(feature = "buildstorm-diagnostics"))]
             let entry = self.waiters.lock().pop_front();
             let Some(entry) = entry else {
                 break;
@@ -237,6 +278,12 @@ impl WaitQueue {
         let mut woke = 0usize;
         while woke < limit {
             let entry = {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                let mut waiters = crate::buildstorm_diagnostics::lock(
+                    crate::buildstorm_diagnostics::LockClass::WaitQueue,
+                    &self.waiters,
+                );
+                #[cfg(not(feature = "buildstorm-diagnostics"))]
                 let mut waiters = self.waiters.lock();
                 let Some(index) = waiters.iter().position(|entry| matches(entry)) else {
                     break;
@@ -255,6 +302,12 @@ impl WaitQueue {
 
     pub fn remove_task_waiters(&self, task: &Arc<TaskControlBlock>) -> usize {
         let mut removed = 0usize;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let mut waiters = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::WaitQueue,
+            &self.waiters,
+        );
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         let mut waiters = self.waiters.lock();
         let mut index = 0usize;
         while index < waiters.len() {
@@ -273,6 +326,12 @@ impl WaitQueue {
     }
 
     fn remove_waiters(&self, pid: usize, token: usize) -> bool {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let mut waiters = crate::buildstorm_diagnostics::lock(
+            crate::buildstorm_diagnostics::LockClass::WaitQueue,
+            &self.waiters,
+        );
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         let mut waiters = self.waiters.lock();
         let mut removed = false;
         let mut index = 0usize;
@@ -302,7 +361,6 @@ impl WaitQueue {
             })
             .collect()
     }
-
 }
 
 impl Default for WaitQueue {
@@ -367,6 +425,27 @@ where
     IO_WAIT_QUEUE.sleep_until_key_if(Some(key), deadline_us, should_sleep)
 }
 
+pub fn sleep_on_pipe_fd_ready_key_if<F>(
+    key: WaitKey,
+    deadline_us: Option<usize>,
+    should_sleep: F,
+) -> Result<WaitOutcome, SysErrNo>
+where
+    F: FnOnce() -> Result<bool, SysErrNo>,
+{
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        return IO_WAIT_QUEUE.sleep_until_keys_if_with_reason(
+            &[key],
+            deadline_us,
+            BlockReason::PipeFdReady,
+            should_sleep,
+        );
+    }
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
+    IO_WAIT_QUEUE.sleep_until_key_if(Some(key), deadline_us, should_sleep)
+}
+
 pub fn sleep_on_io_keys_if<F>(
     keys: &[WaitKey],
     deadline_us: Option<usize>,
@@ -375,6 +454,47 @@ pub fn sleep_on_io_keys_if<F>(
 where
     F: FnOnce() -> Result<bool, SysErrNo>,
 {
+    IO_WAIT_QUEUE.sleep_until_keys_if(keys, deadline_us, should_sleep)
+}
+
+pub fn sleep_on_poll_if<F>(
+    deadline_us: Option<usize>,
+    should_sleep: F,
+) -> Result<WaitOutcome, SysErrNo>
+where
+    F: FnOnce() -> Result<bool, SysErrNo>,
+{
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        return IO_WAIT_QUEUE.sleep_until_keys_if_with_reason(
+            &[],
+            deadline_us,
+            BlockReason::Poll,
+            should_sleep,
+        );
+    }
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
+    IO_WAIT_QUEUE.sleep_until_if(deadline_us, should_sleep)
+}
+
+pub fn sleep_on_poll_keys_if<F>(
+    keys: &[WaitKey],
+    deadline_us: Option<usize>,
+    should_sleep: F,
+) -> Result<WaitOutcome, SysErrNo>
+where
+    F: FnOnce() -> Result<bool, SysErrNo>,
+{
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        return IO_WAIT_QUEUE.sleep_until_keys_if_with_reason(
+            keys,
+            deadline_us,
+            BlockReason::Poll,
+            should_sleep,
+        );
+    }
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
     IO_WAIT_QUEUE.sleep_until_keys_if(keys, deadline_us, should_sleep)
 }
 

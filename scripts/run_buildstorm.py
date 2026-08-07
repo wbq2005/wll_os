@@ -70,8 +70,15 @@ def build(
     repo: Path, arch: str, extra_features: str | None
 ) -> tuple[Path, list[str], float, Path]:
     config = ARCHES[arch]
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        cargo_candidate = Path.home() / ".cargo" / "bin" / "cargo"
+        if cargo_candidate.is_file():
+            cargo = str(cargo_candidate)
+    if cargo is None:
+        raise FileNotFoundError("cargo is not on PATH or ~/.cargo/bin/cargo")
     command = [
-        "cargo", "+nightly-2025-01-18", "build", "--locked", "--offline",
+        cargo, "+nightly-2025-01-18", "build", "--locked", "--offline",
         "--release", "--target", str(config["target"]), *config["features"],
     ]
     if extra_features:
@@ -235,7 +242,12 @@ def main() -> int:
     parser.add_argument("--arch", choices=ARCHES, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--stage", choices=STAGE_MARKERS, default="toolchain")
-    parser.add_argument("--timeout", type=int, default=6250)
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=15000,
+        help="outer QEMU deadline; official complete compilation permits 14400 seconds",
+    )
     parser.add_argument("--memory", help="override the architecture default")
     parser.add_argument("--smp", type=int, help="override the architecture default")
     parser.add_argument("--skip-build", action="store_true")

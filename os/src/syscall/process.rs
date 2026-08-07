@@ -774,7 +774,15 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             inner.has_execed = true;
             inner.robust_list_head = 0;
             inner.robust_list_len = 0;
-            let closed = inner.fd_table.lock().close_on_exec();
+            let mut fds = inner.fd_table.lock();
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let (pipe_endpoints, pipe_cloexec) = fds.diagnostic_pipe_counts();
+            let closed = fds.close_on_exec();
+            #[cfg(feature = "buildstorm-diagnostics")]
+            {
+                let pipe_closed = closed.iter().filter(|entry| entry.is_pipe_read() || entry.is_pipe_write()).count();
+                crate::buildstorm_diagnostics::note_exec_pipes(pipe_endpoints, pipe_cloexec, pipe_closed);
+            }
             closed
         };
         crate::syscall::fs::release_posix_locks_for_closed_files(
@@ -794,7 +802,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             // the stable kernel root before replacing it so PageTableWrapper
             // can release the old root and all of its user page-table frames.
             crate::trap::restore_kernel_page_table();
-            let mut ms = task.memory_set.lock();
+            let mut ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
             log::info!("[syscall] execve: replacing memory set");
             *ms = new_memory_set;
         }
@@ -1138,7 +1146,7 @@ pub fn sys_clone(
 
     if log::log_enabled!(log::Level::Info) {
         let (area_count, page_count) = {
-            let ms = parent.memory_set.lock();
+            let ms = crate::buildstorm_memory_set_lock!(&parent.memory_set);
             let pages = ms.areas.iter().fold(0usize, |sum, area| {
                 let start = area.start_va.raw() / crate::config::PAGE_SIZE;
                 let end =
@@ -1178,7 +1186,7 @@ pub fn sys_clone(
         // fork_cow copies backing frames through physical mappings while the
         // syscall remains on the kernel page table.  The parent address space
         // is reactivated by the scheduler before its next user-mode entry.
-        let child_memory = parent.memory_set.lock().fork_cow()?;
+        let child_memory = crate::buildstorm_memory_set_lock!(&parent.memory_set).fork_cow()?;
         new_shared_memory_set(child_memory)
     };
     let mm = if share_vm {
@@ -1308,6 +1316,16 @@ pub fn sys_clone(
         affinity_mask: AtomicUsize::new(parent.affinity_mask.load(Ordering::Acquire)),
         blocking_cpu: AtomicUsize::new(crate::task::NO_CPU),
         running_cpu: AtomicUsize::new(crate::task::NO_CPU),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_block_started_at: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_block_reason: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_woken_at: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_woken_reason: AtomicUsize::new(0),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_last_cpu: AtomicUsize::new(crate::task::NO_CPU),
     });
     crate::task::manager::register_task(&child);
     thread_group.add_member(&child);
@@ -1321,7 +1339,7 @@ pub fn sys_clone(
     }
     if (clone_bits & CLONE_CHILD_SETTID) != 0 && child_tid != 0 {
         let bytes = (child_pid as i32).to_ne_bytes();
-        let mut child_memory = child.memory_set.lock();
+        let mut child_memory = crate::buildstorm_memory_set_lock!(&child.memory_set);
         super::user::copy_to_user_in_memory_set(&mut child_memory, child_tid, &bytes)?;
     }
 

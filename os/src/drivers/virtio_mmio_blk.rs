@@ -64,6 +64,10 @@ impl VirtioMmioBlock {
     }
 
     fn read_phys(&self, offset: usize, buf: &mut [u8]) -> Result<(), ()> {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+            crate::buildstorm_diagnostics::WorkClass::VirtioRead,
+        );
         if buf.is_empty() {
             return Ok(());
         }
@@ -75,6 +79,35 @@ impl VirtioMmioBlock {
         let skip = offset % SECTOR_SIZE;
         let sectors_needed = skip.saturating_add(buf.len()).div_ceil(SECTOR_SIZE);
         let mut tmp = vec![0u8; sectors_needed * SECTOR_SIZE];
+        #[cfg(feature = "buildstorm-diagnostics")]
+        {
+            let queued_at = crate::timer::get_time_us();
+            let guard = self.blk.try_lock();
+            let contended = guard.is_none();
+            let mut blk = match guard {
+                Some(blk) => blk,
+                None => self.blk.lock(),
+            };
+            let started_at = crate::timer::get_time_us();
+            crate::buildstorm_diagnostics::note_lock_acquire(
+                crate::buildstorm_diagnostics::LockClass::Virtio,
+                contended,
+                started_at.saturating_sub(queued_at),
+            );
+            let result = blk.read_blocks(sector, &mut tmp).map_err(|_| ());
+            drop(blk);
+            crate::buildstorm_diagnostics::note_lock_hold(
+                crate::buildstorm_diagnostics::LockClass::Virtio,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
+            crate::buildstorm_diagnostics::note_virtio_request(
+                buf.len(),
+                started_at.saturating_sub(queued_at),
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
+            result?;
+        }
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         self.blk
             .lock()
             .read_blocks(sector, &mut tmp)
@@ -84,6 +117,10 @@ impl VirtioMmioBlock {
     }
 
     fn write_phys(&self, offset: usize, data: &[u8]) -> Result<(), ()> {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+            crate::buildstorm_diagnostics::WorkClass::VirtioWrite,
+        );
         if data.is_empty() {
             return Ok(());
         }
@@ -100,6 +137,35 @@ impl VirtioMmioBlock {
 
         tmp[skip..end].copy_from_slice(data);
 
+        #[cfg(feature = "buildstorm-diagnostics")]
+        {
+            let queued_at = crate::timer::get_time_us();
+            let guard = self.blk.try_lock();
+            let contended = guard.is_none();
+            let mut blk = match guard {
+                Some(blk) => blk,
+                None => self.blk.lock(),
+            };
+            let started_at = crate::timer::get_time_us();
+            crate::buildstorm_diagnostics::note_lock_acquire(
+                crate::buildstorm_diagnostics::LockClass::Virtio,
+                contended,
+                started_at.saturating_sub(queued_at),
+            );
+            let result = blk.write_blocks(sector, &tmp).map_err(|_| ());
+            drop(blk);
+            crate::buildstorm_diagnostics::note_lock_hold(
+                crate::buildstorm_diagnostics::LockClass::Virtio,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
+            crate::buildstorm_diagnostics::note_virtio_request(
+                data.len(),
+                started_at.saturating_sub(queued_at),
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
+            result?;
+        }
+        #[cfg(not(feature = "buildstorm-diagnostics"))]
         self.blk.lock().write_blocks(sector, &tmp).map_err(|_| ())?;
         Ok(())
     }

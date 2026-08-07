@@ -120,6 +120,51 @@ impl UserProgramSpec {
 
 /// `MemorySet` / `FdTable` 在 `CLONE_VM` / `CLONE_FILES` 下跨任务共享（`fork` 时各自深拷贝）。
 pub type SharedMemorySet = Arc<Mutex<MemorySet>>;
+
+// Keep MemorySet lock accounting complete in diagnostic kernels without
+// changing the production lock type or lock path.  Callers pass a reference
+// to the shared mutex; the feature-enabled expansion records wait and hold
+// time, while production expands to the original spin-mutex lock.
+#[cfg(feature = "buildstorm-diagnostics")]
+#[macro_export]
+macro_rules! buildstorm_memory_set_lock {
+    ($mutex:expr) => {
+        $crate::buildstorm_diagnostics::lock(
+            $crate::buildstorm_diagnostics::LockClass::MemorySet,
+            $mutex,
+        )
+    };
+}
+
+// Keep the user-entry activation path separate from the aggregate MemorySet
+// class in diagnostic kernels.  Production expands to the exact same lock
+// operation and has no additional counter or branch.
+#[cfg(feature = "buildstorm-diagnostics")]
+#[macro_export]
+macro_rules! buildstorm_memory_set_activation_lock {
+    ($mutex:expr) => {
+        $crate::buildstorm_diagnostics::lock(
+            $crate::buildstorm_diagnostics::LockClass::MemorySetActivation,
+            $mutex,
+        )
+    };
+}
+
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+#[macro_export]
+macro_rules! buildstorm_memory_set_activation_lock {
+    ($mutex:expr) => {
+        $mutex.lock()
+    };
+}
+
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+#[macro_export]
+macro_rules! buildstorm_memory_set_lock {
+    ($mutex:expr) => {
+        $mutex.lock()
+    };
+}
 pub type SharedFdTable = Arc<Mutex<FileDescriptorTable>>;
 pub type SharedFsContext = Arc<Mutex<FsContext>>;
 pub type SharedMmContext = Arc<Mutex<MmContext>>;
@@ -656,7 +701,19 @@ pub(crate) fn run_current_user_task_until_reschedule(
         crate::trap::prepare_user_trapframe(ctx);
         enter_foreground_user_task(task.pid.0);
         crate::trap::interrupts::disable_interrupt();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let user_run_started = crate::timer::get_time_us();
         let reason = run_user_task(ctx);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_user_run(
+            crate::timer::get_time_us().saturating_sub(user_run_started),
+            match reason {
+                EscapeReason::SysCall => 0,
+                EscapeReason::Timer => 1,
+                EscapeReason::IRQ => 2,
+                EscapeReason::NoReason => 3,
+            },
+        );
         leave_foreground_user_task(task.pid.0);
 
         if !matches!(reason, EscapeReason::SysCall | EscapeReason::NoReason)
@@ -683,7 +740,19 @@ fn run_current_user_task_one_boundary(task: &Arc<TaskControlBlock>, ctx: &mut Tr
     crate::trap::prepare_user_trapframe(ctx);
     enter_foreground_user_task(task.pid.0);
     crate::trap::interrupts::disable_interrupt();
-    let _reason = run_user_task(ctx);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let user_run_started = crate::timer::get_time_us();
+    let reason = run_user_task(ctx);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_user_run(
+        crate::timer::get_time_us().saturating_sub(user_run_started),
+        match reason {
+            EscapeReason::SysCall => 0,
+            EscapeReason::Timer => 1,
+            EscapeReason::IRQ => 2,
+            EscapeReason::NoReason => 3,
+        },
+    );
     leave_foreground_user_task(task.pid.0);
     crate::trap::restore_kernel_page_table();
 }
@@ -757,7 +826,9 @@ pub fn add_initproc() {
         if start_interactive_shell() {
             return;
         }
-        console_write("[interactive] failed to start BusyBox shell; falling back to normal init/harness\n");
+        console_write(
+            "[interactive] failed to start BusyBox shell; falling back to normal init/harness\n",
+        );
     }
 
     // A compile-time harness filter is an explicit test-runner request.  It
@@ -768,7 +839,7 @@ pub fn add_initproc() {
     }
 
     let init_candidates = ["init", "/init"];
-    let elf_data = init_candidates//读取elf文件
+    let elf_data = init_candidates //读取elf文件
         .iter()
         .find_map(|path| crate::fs::read_executable_file(path));
 
@@ -797,7 +868,13 @@ pub fn add_initproc() {
 fn interactive_mode_enabled() -> bool {
     matches!(
         option_env!("WLL_INTERACTIVE"),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on") | Some("ON")
+        Some("1")
+            | Some("true")
+            | Some("TRUE")
+            | Some("yes")
+            | Some("YES")
+            | Some("on")
+            | Some("ON")
     )
 }
 
@@ -805,12 +882,19 @@ fn start_interactive_shell() -> bool {
     // 运行时 ext4 镜像在不同 libc 根目录下可能都有 busybox；优先选择能被
     // VFS 读到的第一个候选路径。这里不假设 /bin/sh 一定存在，因为测试镜像
     // 中常常只提供 /musl/busybox 或 /glibc/busybox。
-    let shell_candidates = ["/busybox", "/bin/busybox", "/musl/busybox", "/glibc/busybox"];
+    let shell_candidates = [
+        "/busybox",
+        "/bin/busybox",
+        "/musl/busybox",
+        "/glibc/busybox",
+    ];
     let Some(shell_path) = shell_candidates
         .iter()
         .find(|path| crate::fs::read_executable_file(path).is_some())
     else {
-        console_write("[interactive] BusyBox not found. Build with DEV_PRELOAD=1 and attach sdcard image.\n");
+        console_write(
+            "[interactive] BusyBox not found. Build with DEV_PRELOAD=1 and attach sdcard image.\n",
+        );
         return false;
     };
 
@@ -820,7 +904,11 @@ fn start_interactive_shell() -> bool {
 
     let spec = UserProgramSpec {
         path: String::from(*shell_path),
-        argv: vec![String::from(*shell_path), String::from("sh"), String::from("-i")],
+        argv: vec![
+            String::from(*shell_path),
+            String::from("sh"),
+            String::from("-i"),
+        ],
         envp: vec![
             // /tmp 放在最前面，是为了让内核安装的 demo 脚本优先被找到。
             // 后续路径覆盖根目录、普通 /bin，以及 musl/glibc 镜像中的工具。
@@ -921,7 +1009,7 @@ pub fn suspend_current_and_run_next() {
             // switch has completed.  Let the scheduler publish it only after
             // switch_to_kernel_task() returns, so another CPU cannot enter the
             // same kernel stack concurrently.
-    let _ = task.set_status_if(TaskStatus::Running, TaskStatus::Ready);
+            let _ = task.set_status_if(TaskStatus::Running, TaskStatus::Ready);
             switch_kernel_task_back_to_scheduler(&task);
             return;
         }
@@ -966,10 +1054,8 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
     // Keep the current CPU as the transition owner until the user-run wrapper
     // has completely unwound. A waker may set Ready during this interval, but
     // must not enqueue the same TCB while it is still executing here.
-    task.blocking_cpu.store(
-        crate::platform::current_cpu_index(),
-        Ordering::Release,
-    );
+    task.blocking_cpu
+        .store(crate::platform::current_cpu_index(), Ordering::Release);
     if is_kernel_task(&task) {
         task.set_status(TaskStatus::Blocked);
         switch_kernel_task_back_to_scheduler(&task);
@@ -982,6 +1068,8 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
         task.blocking_cpu.store(NO_CPU, Ordering::Release);
         return;
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_blocked_owner_enter();
     // A wakeup may race with the transition above.  When it arrives while the
     // task is still Running, the waker records `wait_outcome` instead of
     // enqueueing a task that is still executing on this CPU.  Recheck after
@@ -991,16 +1079,24 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
         task.blocking_cpu.store(NO_CPU, Ordering::Release);
         let _ = task.set_status_if(TaskStatus::Blocked, TaskStatus::Running)
             || task.set_status_if(TaskStatus::Ready, TaskStatus::Running);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_blocked_owner_exit();
         return;
     }
     *CURRENT_TASK.lock() = None;
 
     if crate::trap::foreground_driver_active() && deadline_us.is_none() {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_blocked_owner_exit();
         crate::trap::signal_syscall_parked();
         return;
     }
 
     let mut no_runnable_spins = 0usize;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let blocked_owner_loop_started = crate::timer::get_time_us();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let mut blocked_owner_empty_iterations = 0usize;
     while task.status() == TaskStatus::Blocked {
         // Timed waits must be observed even when other foreground tasks keep
         // the ready queue non-empty.
@@ -1029,6 +1125,10 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
             }
         }
         if crate::trap::foreground_driver_active() {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            {
+                blocked_owner_empty_iterations = blocked_owner_empty_iterations.saturating_add(1);
+            }
             no_runnable_spins += 1;
             if no_runnable_spins >= FOREGROUND_NO_RUNNABLE_SPINS {
                 core::hint::spin_loop();
@@ -1039,10 +1139,22 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
         }
     }
 
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if crate::trap::foreground_driver_active() && deadline_us.is_some() {
+        crate::buildstorm_diagnostics::note_blocked_owner_timed_loop(
+            crate::timer::get_time_us().saturating_sub(blocked_owner_loop_started),
+            blocked_owner_empty_iterations,
+        );
+    }
+
     task.blocking_cpu.store(NO_CPU, Ordering::Release);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_blocked_owner_exit();
     manager::remove_task_instances(&task);
     if task.set_status_if(TaskStatus::Ready, TaskStatus::Running) {
         *task.block_reason.lock() = None;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_woken_task_dispatched(&task);
     }
     if task.status() != TaskStatus::Zombie {
         // Resume the blocked syscall on the kernel page table.  The scheduler
@@ -1208,7 +1320,7 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     if clear_child_tid != 0 {
         let bytes = 0i32.to_ne_bytes();
         {
-            let mut memory_set = task.memory_set.lock();
+            let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
             if let Err(err) = crate::syscall::user::copy_to_user_in_memory_set(
                 &mut memory_set,
                 clear_child_tid,
@@ -1318,8 +1430,8 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
 
     let mut orphans = Vec::new();
     for member in &members {
-        let mut inner = member.inner.lock();//获取任务的锁
-        orphans.extend(core::mem::take(&mut inner.children));//&mut inner.children 意思是：可变借用 children
+        let mut inner = member.inner.lock(); //获取任务的锁
+        orphans.extend(core::mem::take(&mut inner.children)); //&mut inner.children 意思是：可变借用 children
     }
     if !orphans.is_empty() {
         if let Some(reaper) = orphan_reaper() {
@@ -1359,7 +1471,6 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
 /// 从就绪队列中获取下一个任务并切换到它。
 /// 在 foreground driver 下，如果没有可运行任务则返回，由前台驱动继续执行。
 pub(crate) fn run_next_task() {
-
     if let Some(task) = fetch_dispatchable_task() {
         if matches!(
             task.status(),
@@ -1463,6 +1574,8 @@ fn idle_loop() {
 
     loop {
         wait_for_interrupt();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_idle_tick();
 
         // 检查是否有新任务
         crate::timer::wake_expired_timers();
@@ -1544,6 +1657,9 @@ fn run_ready_task_once_for_blocked_owner() -> bool {
         return true;
     }
 
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_blocked_owner_loop_dispatch();
+
     *CURRENT_TASK.lock() = Some(active.clone());
 
     let tf_opt = active.trap_frame.lock().take();
@@ -1610,7 +1726,11 @@ fn mark_blocked_task_ready(task: &Arc<TaskControlBlock>, outcome: wait_queue::Wa
     *task.block_reason.lock() = None;
     *task.wait_outcome.lock() = Some(outcome);
     drop(status);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_block_end(task, outcome);
     let owner = task.blocking_cpu.load(Ordering::Acquire);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_blocked_owner_wake((owner != NO_CPU).then_some(owner));
     if owner == NO_CPU {
         manager::add_task(task.clone());
     } else {
@@ -1639,7 +1759,11 @@ pub(crate) fn wake_task_token_with(
     *task.block_reason.lock() = None;
     *task.wait_outcome.lock() = Some(outcome);
     drop(status);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_block_end(task, outcome);
     let owner = task.blocking_cpu.load(Ordering::Acquire);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_blocked_owner_wake((owner != NO_CPU).then_some(owner));
     if owner == NO_CPU {
         manager::add_task(task.clone());
     } else {
@@ -1719,6 +1843,20 @@ pub struct TaskControlBlock {
     pub blocking_cpu: AtomicUsize,
     /// CPU that currently owns this task's user context, or NO_CPU.
     pub running_cpu: AtomicUsize,
+    /// Diagnostic-only wait accounting.  These fields exist only in diagnostic
+    /// kernels so production task layout and behavior remain unchanged.
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_block_started_at: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_block_reason: AtomicUsize,
+    /// Timestamp/reason published by a waker until the next dispatch. Kept
+    /// solely in diagnostic kernels to measure wake-to-run handoff latency.
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_woken_at: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_woken_reason: AtomicUsize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub diagnostic_last_cpu: AtomicUsize,
 }
 
 unsafe impl Send for TaskControlBlock {}
@@ -1796,7 +1934,7 @@ impl TaskControlBlock {
 
     #[inline]
     fn activate_memory_set_if_needed(&self) {
-        let memory_set = self.memory_set.lock();
+        let memory_set = crate::buildstorm_memory_set_activation_lock!(&self.memory_set);
         #[cfg(target_arch = "riscv64")]
         if crate::platform::current_address_space_is(memory_set.address_space_root()) {
             return;

@@ -728,16 +728,17 @@ impl MemFileSystem {
             });
         }
 
-        self.specials.get(&name).copied().map(|kind| {
-            MemNodeSnapshot::Special {
+        self.specials
+            .get(&name)
+            .copied()
+            .map(|kind| MemNodeSnapshot::Special {
                 kind,
                 metadata: self
                     .metadata
                     .get(&name)
                     .copied()
                     .unwrap_or_else(|| MemNodeMetadata::new(0o666)),
-            }
-        })
+            })
     }
 
     fn xattr_inode_and_set_allowed(&self, name: &str) -> Result<(u64, bool), SysErrNo> {

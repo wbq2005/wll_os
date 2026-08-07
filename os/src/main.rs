@@ -23,9 +23,9 @@ global_asm!(include_str!("entry_riscv64.asm"));
 global_asm!(include_str!("entry_loongarch64.asm"));
 
 // 模块声明
-mod config;
 #[cfg(feature = "buildstorm-diagnostics")]
 mod buildstorm_diagnostics;
+mod config;
 mod console;
 mod cpu;
 mod drivers;
@@ -192,12 +192,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
 
     // The heap allocator converts physical frames through the architecture's
     // normal RAM mapping (LoongArch DMW1 or RISC-V identity mapping).
-    let heap_growth =
-        mm::heap_allocator::grow_from_frame_allocator(platform::total_memory_bytes());
-    log::info!(
-        "[heap] dynamic extension={} MiB",
-        heap_growth / 1024 / 1024
-    );
+    let heap_growth = mm::heap_allocator::grow_from_frame_allocator(platform::total_memory_bytes());
+    log::info!("[heap] dynamic extension={} MiB", heap_growth / 1024 / 1024);
 
     #[cfg(target_arch = "loongarch64")]
     mm::page_table::init_kernel_page_table();
