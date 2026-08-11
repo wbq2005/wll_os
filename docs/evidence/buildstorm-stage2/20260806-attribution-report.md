@@ -168,6 +168,42 @@ three futex-blocked.  Consequently this sample must not be used to claim the
 maximum number of distinct concurrent rustc processes; that diagnostic
 coverage remains open.
 
+## Clean `50c9bd3` diagnostics control (2026-08-07)
+
+Raw evidence: `/srv/buildstorm/evidence/20260807-riscv64-50c9-clean-diagnostics-window300/`.
+This is an unmodified official RISC-V64 image and guest script, with only the
+`buildstorm-diagnostics` feature enabled, `-snapshot -m 8G -smp 8`, and a
+300.299254061003-second marker window. It produced toolchain, minibuild and
+begin markers, 23 `Compiling` lines and 2 `Finished` lines; it produced no
+panic/OOM or compile-success marker. It is diagnostic evidence only.
+
+| Required classification item | Clean-control result |
+| --- | --- |
+| Maximum rustc concurrency | 37 snapshots: max **2 rustc processes**, **9 rustc TCBs**, **2 runnable rustc TCBs**. At the final snapshot there was one rustc process, with one running TCB and three futex-blocked TCBs. |
+| All eight vCPUs execute user work | Yes. CPUs 0--7 had nonzero user ticks: `3493,2176,781,6211,548,580,487,508`; work was markedly imbalanced. |
+| 8-core / 1-core progress | Historical matching 1/8-vCPU controls remain 2/23 `Compiling` events: **11.5x event-count ratio**, not normalized compiler throughput. |
+| Largest aggregate blocking class | `wait4/waitid`: `455,686,431 us`; then poll `393,864,240 us`, futex `210,050,706 us`, pipe readiness `201,039,221 us`; block I/O only `3,089,659 us`. These sums are task-time and overlap. |
+| Largest lock wait | `memory_set_activation`: `12,263,883 us`; next `memory_set`: `3,500,958 us`. |
+| MM/TLB direct time | address-space activation `238,914 us` + TLB shootdown `385,773 us` = `624,687 us` (about 0.21% of the 300-second window if treated as representative). Counts: 36,369 user roots, 36,034 kernel roots, 72,403 page-table writes, 6,553 remote shootdowns / 10,895 targets. |
+| Block-device classification | Virtio queue/completion were `14,046 us` / `4,289,285 us`; block-cache hits/misses `1,327,208` / `121,952`; inode metadata hits/misses `54,043` / `26,224`. This excludes device wait or block-cache lock contention as the first measured hotspot, but does not prove metadata lookup is irrelevant. |
+| Host health | No swap; no sustained host I/O wait or NVMe utilization. All eight TCG threads existed and had CPU time, though the final QEMU process sample was about 299% CPU because the final rustc phase exposed only one running compiler worker. |
+
+The clean control confirms that global scheduler, TLB and block-device changes
+must not be selected merely from cumulative wait sums. The first remaining
+production direction requires a new, representation-level MM design with a
+measured per-VMA resident-run shape/allocation cost, or an independently
+measured VFS metadata subphase; no additional production patch is authorized
+by this control alone.
+
+The same control also records the current VMA shape: 129,205 anonymous
+installations, 122,665,046 VMA entries scanned during 129,207 coalesces, and
+58,146,334 microseconds in anonymous coalescing. Neighbor opportunities are
+not absent (`left=71,456`, `right=56,164`, `both=6,206`), but the associated
+move counters include 18,675,838 left suffix removals and 30,650,449 right
+frame moves. Together with the already rejected left/right extension,
+vacancy, batching and sparse-`BTreeMap` candidates, this rules out choosing
+another local `Vec<MapArea>` special case without new independent evidence.
+
 All eight active vCPUs had nonzero final user ticks, but work was uneven
 (CPU 0-7: `3893, 6361, 2136, 796, 417, 526, 560, 578`).  Instrumented
 address-space activation plus TLB-shootdown time was `239,207 + 358,602 =
@@ -1196,3 +1232,49 @@ hot coalescer can be removed diagnostically, but retaining middle split
 insertion and physical-slot growth still makes production progress roughly
 9--10% worse.  No further threshold tuning is justified, and there is still
 no exact `BUILDSTORM_COMPILE mode=multi ok=true` marker.
+
+### 20260812 correctness-gate repair: vfork wait and nested-COW remap
+
+The retained correctness changes are documented separately from performance
+candidates. Diagnostics before the repair showed `CLONE_VM | CLONE_VFORK`
+(`clone_flags=0x4100`) with a valid envp-slot VMA/PTE/resident entry but a
+poisoned pointer at exec time. The parent released and reused its stack before
+the vfork child completed exec. The repair defers the parent until child
+exec/exit and wakes it through a dedicated deferred-block handshake. This is a
+verified root cause from serial diagnostics, not a performance claim.
+
+The second repair addresses nested private COW. After the first COW fault, a
+later fork could see VMA-level COW already set and skip making the parent's
+writable PTE read-only. The page state then became COW while the parent PTE
+remained writable. The repair remaps the parent whenever a page transitions
+into COW; the nested-fork regression checks that a subsequent parent write
+separates the frame.
+
+The repaired diagnostics run is retained remotely under
+`20260812-riscv64-diagnostics-smp8-nested-cow-remap-timeout300/`; it passed
+`resident-memory-lifecycle`, `user-memory-lifecycle`, and
+`BUILDSTORM_MINIBUILD ok`, reached 22 `Compiling` lines, and had no stack
+smashing or exec failure. It was a bounded diagnostic run, not an official
+compile pass.
+
+The comparable production window is archived at
+`20260812-riscv64-production-smp8-nested-cow-remap-window300/`. It used the
+official image, production release kernel, diagnostics disabled, `-snapshot
+-m 8G -smp 8`, and QEMU 11.0.3. The marker-window duration was
+`300.183398145 s`; it reached 23 `Compiling` lines, ended at
+`ax-posix-api v0.5.29`, and had two `Finished` lines. There was no panic or
+OOM. The only result markers were `BUILDSTORM_TOOLCHAIN ok`,
+`BUILDSTORM_MINIBUILD ok`, and `BUILDSTORM_BEGIN mode=multi`. QEMU exit code
+`-9` is intentional window termination. The comparable baseline also reached
+23 events, so measured progress is **0% improvement**; no full compile success
+is claimed.
+
+Window provenance: source commit `50c9bd348f13cd845880bdcf1ccf3a1e84eac0ea`,
+dirty-diff SHA-256
+`3b070754d619d33381ad991ec099b293d8ddb65bfd76c48905dfacdc70841c8f`, kernel
+SHA-256 `a86c8e958861404f4b5ff60ab4e4f4ac065c0e3c5a5d6d351919a52a44fc9f26`,
+image SHA-256
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`.
+Complete launch arguments and host `pidstat`, `iostat`, `vmstat`, and QEMU
+thread samples are in the archived window directory. The guest aggregate file
+is empty because production diagnostics were disabled.

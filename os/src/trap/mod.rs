@@ -62,6 +62,70 @@ fn exit_user_thread_group_for_signal(signum: i32) {
     crate::task::exit_thread_group_and_run_next(crate::task::signal_exit_code(signum));
 }
 
+#[cfg(feature = "buildstorm-diagnostics")]
+fn note_terminal_user_trap(
+    kind: usize,
+    task: Option<&alloc::sync::Arc<crate::task::TaskControlBlock>>,
+    vaddr: usize,
+    ctx: &TrapFrame,
+) {
+    let sepc = ctx[TrapFrameArgs::SEPC];
+    let sp = ctx[TrapFrameArgs::SP];
+    let ra = ctx[TrapFrameArgs::RA];
+    let tp = ctx[TrapFrameArgs::TLS];
+    let Some(task) = task else {
+        crate::buildstorm_diagnostics::note_first_terminal_user_trap(
+            kind, 0, vaddr, sepc, sp, ra, tp, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        return;
+    };
+    let ms = crate::buildstorm_memory_set_lock!(
+        crate::buildstorm_diagnostics::MemorySetLockSite::Other,
+        &task.memory_set,
+    );
+    let fault_pa = ms
+        .translate(polyhal::VirtAddr::new(vaddr))
+        .map(|pa| pa.raw())
+        .unwrap_or(0);
+    let sepc_pa = ms
+        .translate(polyhal::VirtAddr::new(sepc))
+        .map(|pa| pa.raw())
+        .unwrap_or(0);
+    let (vma_start, vma_end, vma_flags, backing, resident, page_state) = ms
+        .areas
+        .iter()
+        .find(|area| area.contains(polyhal::VirtAddr::new(vaddr)))
+        .map(|area| {
+            let (backing, resident, page_state) = area.diagnostic_page_snapshot(vaddr);
+            (
+                area.start_va.raw(),
+                area.end_va.raw(),
+                area.flags.bits() as usize,
+                backing,
+                resident,
+                page_state,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0, 0));
+    crate::buildstorm_diagnostics::note_first_terminal_user_trap(
+        kind,
+        task.pid.0,
+        vaddr,
+        sepc,
+        sp,
+        ra,
+        tp,
+        fault_pa,
+        sepc_pa,
+        vma_start,
+        vma_end,
+        vma_flags,
+        backing,
+        resident,
+        page_state,
+    );
+}
+
 pub fn prepare_user_trapframe(tf: &mut TrapFrame) {
     #[cfg(target_arch = "riscv64")]
     {
@@ -276,7 +340,10 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 let page_fault_handled = if is_privilege {
                     false
                 } else {
-                    let mut memory_set = task.memory_set.lock();
+                    let mut memory_set = crate::buildstorm_memory_set_lock!(
+                        crate::buildstorm_diagnostics::MemorySetLockSite::HardwarePageFault,
+                        &task.memory_set,
+                    );
                     #[cfg(feature = "buildstorm-diagnostics")]
                     let _fault_source =
                         crate::buildstorm_diagnostics::PageFaultSourceScope::new(if is_exec {
@@ -295,14 +362,27 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 }
 
                 let sepc = ctx[TrapFrameArgs::SEPC];
+                #[cfg(feature = "buildstorm-diagnostics")]
+                let terminal_kind = match trap {
+                    TrapType::LoadPageFault(_) => 1,
+                    TrapType::StorePageFault(_) => 2,
+                    TrapType::InstructionPageFault(_) => 3,
+                    TrapType::PagePrivilegeFault(_) => 4,
+                    _ => unreachable!(),
+                };
                 #[cfg(feature = "smp-regression")]
                 crate::smp_regression::note_user_memory_lifecycle_terminal_trap(
                     1,
                     vaddr,
                     sepc,
                 );
+                #[cfg(feature = "buildstorm-diagnostics")]
+                note_terminal_user_trap(terminal_kind, Some(&task), vaddr, ctx);
                 let sp = ctx[TrapFrameArgs::SP];
-                let ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+                let ms = crate::buildstorm_memory_set_lock!(
+                    crate::buildstorm_diagnostics::MemorySetLockSite::Other,
+                    &task.memory_set,
+                );
                 let fault_pa = ms.translate(polyhal::VirtAddr::new(vaddr));
                 let sepc_pa = ms.translate(polyhal::VirtAddr::new(sepc));
                 log::error!(
@@ -318,6 +398,19 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                     sepc_pa
                 );
             } else {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                note_terminal_user_trap(
+                    match trap {
+                        TrapType::LoadPageFault(_) => 1,
+                        TrapType::StorePageFault(_) => 2,
+                        TrapType::InstructionPageFault(_) => 3,
+                        TrapType::PagePrivilegeFault(_) => 4,
+                        _ => unreachable!(),
+                    },
+                    None,
+                    vaddr,
+                    ctx,
+                );
                 log::error!(
                     "[trap] User page fault {:?} at {:#x}, killing process",
                     trap,
@@ -333,6 +426,8 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 vaddr,
                 ctx[TrapFrameArgs::SEPC],
             );
+            #[cfg(feature = "buildstorm-diagnostics")]
+            note_terminal_user_trap(2, crate::task::current_task().as_ref(), vaddr, ctx);
             log::error!(
                 "[trap] User illegal instruction at {:#x}, killing process",
                 vaddr
@@ -346,6 +441,8 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 0,
                 ctx[TrapFrameArgs::SEPC],
             );
+            #[cfg(feature = "buildstorm-diagnostics")]
+            note_terminal_user_trap(3, crate::task::current_task().as_ref(), 0, ctx);
             log::warn!(
                 "[trap] Unhandled user trap {:?}, killing process",
                 trap_type

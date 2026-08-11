@@ -29,6 +29,7 @@ candidate with less than 5% progress improvement was reverted immediately.
 | `VecDeque<MapArea>` plus local coalescing | First timed crate 9.56% slower; 23rd event 8.10% slower | Reverted. `20260807-riscv64-production-smp8-mprotect-vma-vecdeque-local-coalesce-window300/` |
 | Batch global coalescing every 64 anonymous installs | First timed crate 10.27% slower; 23rd event 8.90% slower | Reverted. `20260807-riscv64-production-smp8-anonymous-coalesce-batch64-window300/` |
 | Encapsulated bounded vacant VMA slots | First timed crate 10.44% slower; 23rd event 9.22% slower | Reverted. `20260807-riscv64-production-smp8-vma-vacant-slots-window300/` |
+| VMA/resident sparse `BTreeMap` runs with page-level state | 23 events, but first event at `150.60147683699688 s` versus baseline `102.94391007099966 s` | Reverted immediately. Coalesce counter reached zero, but the end-to-end timeline regressed by about `47.66 s`; raw evidence: `/srv/buildstorm/evidence/20260807-riscv64-resident-state-production-window300/` |
 
 The rejected active-root identity, CPU-locality, and lockless-activation
 experiments predating this table are documented in sections 20 through 24 of
@@ -76,3 +77,20 @@ production candidate is currently retained or authorized.
 
 Detailed raw attribution, hashes, host metrics, and official judge output are
 indexed by `20260806-attribution-report.md` and `20260807-global-vma-audit.md`.
+
+### Comparison correction for sparse ResidentSet
+
+The sparse ResidentSet row above is not yet an admissible retention decision:
+its candidate run used `50c9bd3` plus a dirty diff, while the historical 23-event
+control used `4a6bee2`. The candidate kernel and raw window remain preserved at
+`/srv/buildstorm/evidence/20260807-riscv64-resident-state-production-window300/`.
+A clean `50c9bd3` control must be run before classifying this candidate as a
+performance regression or improvement.
+
+That control is now complete at
+`/srv/buildstorm/evidence/20260807-riscv64-50c9-clean-control-window300-default/`.
+Both runs reached 23 events, but the sparse candidate's first/last `Compiling`
+events were `150.60147683699688` / `159.21617303099993` seconds after marker,
+versus `122.56186046500079` / `131.77706680900155` for the clean control.
+The candidate was about 28 / 27 seconds later and is therefore formally
+rejected under the under-5%-improvement rollback rule.

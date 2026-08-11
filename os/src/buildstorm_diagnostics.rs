@@ -65,6 +65,53 @@ const WORK_NAMES: [&str; 21] = [
 ];
 const WORK_SLOTS: usize = WORK_NAMES.len();
 
+// VFS and ext4 paths already expose these stable phase boundaries.  Keep their
+// numeric IDs source-compatible while recording only fixed-size aggregates:
+// diagnostics must not log individual syscalls, path lookups, or block I/O.
+const PHASE_NAMES: [&str; 40] = [
+    "readlink_user_path",
+    "readlink_target",
+    "readlink_copy_out",
+    "openat_path_resolve",
+    "openat_vfs_and_fd",
+    "close_fd_remove",
+    "close_descriptor_drop",
+    "statx_user_path",
+    "statx_path_resolve",
+    "statx_vfs_metadata",
+    "statx_copy_out",
+    "vfs_readlink_parent_resolve",
+    "vfs_readlink_search_access",
+    "vfs_readlink_mem_probe",
+    "vfs_readlink_ext4_lookup",
+    "vfs_symlink_backend_probe",
+    "vfs_symlink_ext4_lookup",
+    "ext4_close_reclaim_lock",
+    "reserved_18",
+    "ext4_close_discard",
+    "reserved_20",
+    "ext4_close_not_cached",
+    "ext4_close_dirty_queued",
+    "vfs_lookup_parent_symlinks",
+    "vfs_lookup_search_access",
+    "vfs_lookup_metadata",
+    "vfs_metadata_backend_select",
+    "vfs_metadata_mem",
+    "vfs_metadata_ext4",
+    "vfs_metadata_ext4_symlink",
+    "vfs_metadata_convert",
+    "vfs_open_pseudo_refresh",
+    "vfs_open_parent_symlink",
+    "vfs_open_final_symlink",
+    "vfs_open_backend_probe",
+    "vfs_open_directory_probe",
+    "vfs_open_ext4_regular_lookup",
+    "vfs_open_create_parent_probe",
+    "vfs_open_create",
+    "vfs_open_missing_errno",
+];
+const PHASE_SLOTS: usize = PHASE_NAMES.len();
+
 #[derive(Clone, Copy)]
 #[repr(usize)]
 pub(crate) enum PageFaultSource {
@@ -140,6 +187,50 @@ const LOCK_NAMES: [&str; 11] = [
 ];
 const LOCK_SLOTS: usize = LOCK_NAMES.len();
 
+/// Why a shared user address-space lock was acquired.
+///
+/// These are deliberately call-path classes, not process, command, crate, or
+/// path names. They make the aggregate MemorySet lock total actionable without
+/// emitting an event for any individual syscall or fault.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum MemorySetLockSite {
+    Other,
+    UserEntryActivation,
+    HardwarePageFault,
+    UserCopyRead,
+    UserCopyWrite,
+    Brk,
+    Mmap,
+    Mprotect,
+    Munmap,
+    FileInvalidate,
+    FileWriteback,
+    SharedMemory,
+    ForkCow,
+    ExecReplace,
+    Futex,
+}
+
+const MEMORY_SET_LOCK_SITE_NAMES: [&str; 15] = [
+    "other",
+    "user_entry_activation",
+    "hardware_page_fault",
+    "user_copy_read",
+    "user_copy_write",
+    "brk",
+    "mmap",
+    "mprotect",
+    "munmap",
+    "file_invalidate",
+    "file_writeback",
+    "shared_memory",
+    "fork_cow",
+    "exec_replace",
+    "futex",
+];
+const MEMORY_SET_LOCK_SITE_SLOTS: usize = MEMORY_SET_LOCK_SITE_NAMES.len();
+
 const BLOCK_NAMES: [&str; 7] = [
     "block_io",
     "pipe_fd_ready",
@@ -155,6 +246,339 @@ const BLOCK_ACTOR_SLOTS: usize = BLOCK_ACTOR_NAMES.len();
 
 static NEXT_REPORT_AT_US: AtomicUsize = AtomicUsize::new(0);
 static REPORT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+// Terminal user traps are exceptional lifecycle boundaries, rather than a
+// page-fault trace.  Capture just the first one so a failed diagnostic run can
+// be attributed without perturbing the normal MM hot path.
+//
+// State: empty -> recording -> ready -> reported.  The release store makes
+// every field visible to the harness before it formats the single record.
+static FIRST_TERMINAL_USER_TRAP_STATE: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_KIND: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_PID: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_VADDR: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_SEPC: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_SP: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_RA: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_TP: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_FAULT_PA: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_SEPC_PA: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_VMA_START: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_VMA_END: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_VMA_FLAGS: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_BACKING: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_RESIDENT: AtomicUsize = AtomicUsize::new(0);
+static FIRST_TERMINAL_USER_TRAP_PAGE_STATE: AtomicUsize = AtomicUsize::new(0);
+
+// The first failed fault-resolution branch is kept separate from the terminal
+// trap.  A syscall-side user-copy may fail without becoming a signal, whereas
+// a terminal trap needs its register snapshot.  Both records are single-shot.
+static FIRST_PAGE_FAULT_FAILURE_STATE: AtomicUsize = AtomicUsize::new(0);
+static FIRST_PAGE_FAULT_FAILURE_STAGE: AtomicUsize = AtomicUsize::new(0);
+static FIRST_PAGE_FAULT_FAILURE_ERRNO: AtomicUsize = AtomicUsize::new(0);
+static FIRST_PAGE_FAULT_FAILURE_VADDR: AtomicUsize = AtomicUsize::new(0);
+
+// Keep only the first execve error.  This is a failure-boundary record, not a
+// syscall trace; production builds do not compile this state or its output.
+static FIRST_EXEC_FAILURE_STATE: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_ERRNO: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_PID: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_PATH_PTR: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_ARGV_PTR: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_ENVP_PTR: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_STAGE: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_VECTOR_BASE: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_INDEX: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_ENTRY_ADDR: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_VALUE_PTR: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_PARENT_PID: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_CLONE_FLAGS: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_VMA_START: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_VMA_END: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_VMA_FLAGS: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_BACKING: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_RESIDENT: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_PAGE_STATE: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EXEC_FAILURE_PTE_PA: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy)]
+pub(crate) struct TerminalUserTrap {
+    pub kind: usize,
+    pub pid: usize,
+    pub vaddr: usize,
+    pub sepc: usize,
+    pub sp: usize,
+    pub ra: usize,
+    pub tp: usize,
+    pub fault_pa: usize,
+    pub sepc_pa: usize,
+    pub vma_start: usize,
+    pub vma_end: usize,
+    pub vma_flags: usize,
+    pub backing: usize,
+    pub resident: usize,
+    pub page_state: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PageFaultFailure {
+    pub stage: usize,
+    pub errno: usize,
+    pub vaddr: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExecFailure {
+    pub errno: usize,
+    pub pid: usize,
+    pub path_ptr: usize,
+    pub argv_ptr: usize,
+    pub envp_ptr: usize,
+    pub stage: usize,
+    pub vector_base: usize,
+    pub index: usize,
+    pub entry_addr: usize,
+    pub value_ptr: usize,
+    pub parent_pid: usize,
+    pub clone_flags: usize,
+    pub vma_start: usize,
+    pub vma_end: usize,
+    pub vma_flags: usize,
+    pub backing: usize,
+    pub resident: usize,
+    pub page_state: usize,
+    pub pte_pa: usize,
+}
+
+pub(crate) const EXEC_FAILURE_STAGE_FALLBACK: usize = 0;
+pub(crate) const EXEC_FAILURE_STAGE_PATH: usize = 1;
+pub(crate) const EXEC_FAILURE_STAGE_ARGV_ENTRY: usize = 2;
+pub(crate) const EXEC_FAILURE_STAGE_ARGV_STRING: usize = 3;
+pub(crate) const EXEC_FAILURE_STAGE_ENVP_ENTRY: usize = 4;
+pub(crate) const EXEC_FAILURE_STAGE_ENVP_STRING: usize = 5;
+
+/// Failure-stage value for the clean executable/file-page cache path.
+pub(crate) const PAGE_FAULT_FAILURE_CLEAN_CACHE: usize = 1;
+/// One-shot page-fault error boundaries.  These constants are only used by
+/// the diagnostics feature; production kernels neither format nor emit them.
+pub(crate) const PAGE_FAULT_FAILURE_CLEAN_EMPTY: usize = 2;
+pub(crate) const PAGE_FAULT_FAILURE_CLEAN_WINDOW: usize = 3;
+pub(crate) const PAGE_FAULT_FAILURE_CLEAN_SPLIT_LOOKUP: usize = 4;
+pub(crate) const PAGE_FAULT_FAILURE_CLEAN_SPLIT_SHAPE: usize = 5;
+pub(crate) const PAGE_FAULT_FAILURE_FALLBACK_SPLIT_LOOKUP: usize = 6;
+pub(crate) const PAGE_FAULT_FAILURE_FALLBACK_SPLIT_SHAPE: usize = 7;
+pub(crate) const PAGE_FAULT_FAILURE_FALLBACK_ALLOC: usize = 8;
+pub(crate) const PAGE_FAULT_FAILURE_BACKING_READ: usize = 9;
+pub(crate) const PAGE_FAULT_FAILURE_RESIDENT_INSERT: usize = 10;
+pub(crate) const PAGE_FAULT_FAILURE_PREPARE_WRITE_NO_VMA: usize = 11;
+pub(crate) const PAGE_FAULT_FAILURE_PREPARE_WRITE_PERM: usize = 12;
+pub(crate) const PAGE_FAULT_FAILURE_PREPARE_READ_NO_VMA: usize = 13;
+pub(crate) const PAGE_FAULT_FAILURE_PREPARE_READ_PERM: usize = 14;
+pub(crate) const PAGE_FAULT_FAILURE_HANDLER_NO_VMA: usize = 15;
+pub(crate) const PAGE_FAULT_FAILURE_HANDLER_NO_LEAF: usize = 16;
+pub(crate) const PAGE_FAULT_FAILURE_HANDLER_EXEC_PERM: usize = 17;
+pub(crate) const PAGE_FAULT_FAILURE_HANDLER_STORE_PERM: usize = 18;
+pub(crate) const PAGE_FAULT_FAILURE_HANDLER_READ_PERM: usize = 19;
+pub(crate) const PAGE_FAULT_FAILURE_HANDLER_COW: usize = 20;
+
+#[inline]
+pub(crate) fn note_first_page_fault_failure(stage: usize, errno: usize, vaddr: usize) {
+    if FIRST_PAGE_FAULT_FAILURE_STATE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    FIRST_PAGE_FAULT_FAILURE_STAGE.store(stage, Ordering::Relaxed);
+    FIRST_PAGE_FAULT_FAILURE_ERRNO.store(errno, Ordering::Relaxed);
+    FIRST_PAGE_FAULT_FAILURE_VADDR.store(vaddr, Ordering::Relaxed);
+    FIRST_PAGE_FAULT_FAILURE_STATE.store(2, Ordering::Release);
+}
+
+pub(crate) fn take_first_page_fault_failure() -> Option<PageFaultFailure> {
+    FIRST_PAGE_FAULT_FAILURE_STATE
+        .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    Some(PageFaultFailure {
+        stage: FIRST_PAGE_FAULT_FAILURE_STAGE.load(Ordering::Relaxed),
+        errno: FIRST_PAGE_FAULT_FAILURE_ERRNO.load(Ordering::Relaxed),
+        vaddr: FIRST_PAGE_FAULT_FAILURE_VADDR.load(Ordering::Relaxed),
+    })
+}
+
+#[inline]
+pub(crate) fn note_first_exec_failure_boundary(
+    errno: usize,
+    pid: usize,
+    path_ptr: usize,
+    argv_ptr: usize,
+    envp_ptr: usize,
+    stage: usize,
+    vector_base: usize,
+    index: usize,
+    entry_addr: usize,
+    value_ptr: usize,
+    parent_pid: usize,
+    clone_flags: usize,
+    vma_start: usize,
+    vma_end: usize,
+    vma_flags: usize,
+    backing: usize,
+    resident: usize,
+    page_state: usize,
+    pte_pa: usize,
+) {
+    if FIRST_EXEC_FAILURE_STATE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    FIRST_EXEC_FAILURE_ERRNO.store(errno, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_PID.store(pid, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_PATH_PTR.store(path_ptr, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_ARGV_PTR.store(argv_ptr, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_ENVP_PTR.store(envp_ptr, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_STAGE.store(stage, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_VECTOR_BASE.store(vector_base, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_INDEX.store(index, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_ENTRY_ADDR.store(entry_addr, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_VALUE_PTR.store(value_ptr, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_PARENT_PID.store(parent_pid, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_CLONE_FLAGS.store(clone_flags, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_VMA_START.store(vma_start, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_VMA_END.store(vma_end, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_VMA_FLAGS.store(vma_flags, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_BACKING.store(backing, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_RESIDENT.store(resident, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_PAGE_STATE.store(page_state, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_PTE_PA.store(pte_pa, Ordering::Relaxed);
+    FIRST_EXEC_FAILURE_STATE.store(2, Ordering::Release);
+}
+
+#[inline]
+pub(crate) fn note_first_exec_failure(
+    errno: usize,
+    pid: usize,
+    path_ptr: usize,
+    argv_ptr: usize,
+    envp_ptr: usize,
+) {
+    note_first_exec_failure_boundary(
+        errno,
+        pid,
+        path_ptr,
+        argv_ptr,
+        envp_ptr,
+        EXEC_FAILURE_STAGE_FALLBACK,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+}
+
+pub(crate) fn take_first_exec_failure() -> Option<ExecFailure> {
+    FIRST_EXEC_FAILURE_STATE
+        .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    Some(ExecFailure {
+        errno: FIRST_EXEC_FAILURE_ERRNO.load(Ordering::Relaxed),
+        pid: FIRST_EXEC_FAILURE_PID.load(Ordering::Relaxed),
+        path_ptr: FIRST_EXEC_FAILURE_PATH_PTR.load(Ordering::Relaxed),
+        argv_ptr: FIRST_EXEC_FAILURE_ARGV_PTR.load(Ordering::Relaxed),
+        envp_ptr: FIRST_EXEC_FAILURE_ENVP_PTR.load(Ordering::Relaxed),
+        stage: FIRST_EXEC_FAILURE_STAGE.load(Ordering::Relaxed),
+        vector_base: FIRST_EXEC_FAILURE_VECTOR_BASE.load(Ordering::Relaxed),
+        index: FIRST_EXEC_FAILURE_INDEX.load(Ordering::Relaxed),
+        entry_addr: FIRST_EXEC_FAILURE_ENTRY_ADDR.load(Ordering::Relaxed),
+        value_ptr: FIRST_EXEC_FAILURE_VALUE_PTR.load(Ordering::Relaxed),
+        parent_pid: FIRST_EXEC_FAILURE_PARENT_PID.load(Ordering::Relaxed),
+        clone_flags: FIRST_EXEC_FAILURE_CLONE_FLAGS.load(Ordering::Relaxed),
+        vma_start: FIRST_EXEC_FAILURE_VMA_START.load(Ordering::Relaxed),
+        vma_end: FIRST_EXEC_FAILURE_VMA_END.load(Ordering::Relaxed),
+        vma_flags: FIRST_EXEC_FAILURE_VMA_FLAGS.load(Ordering::Relaxed),
+        backing: FIRST_EXEC_FAILURE_BACKING.load(Ordering::Relaxed),
+        resident: FIRST_EXEC_FAILURE_RESIDENT.load(Ordering::Relaxed),
+        page_state: FIRST_EXEC_FAILURE_PAGE_STATE.load(Ordering::Relaxed),
+        pte_pa: FIRST_EXEC_FAILURE_PTE_PA.load(Ordering::Relaxed),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn note_first_terminal_user_trap(
+    kind: usize,
+    pid: usize,
+    vaddr: usize,
+    sepc: usize,
+    sp: usize,
+    ra: usize,
+    tp: usize,
+    fault_pa: usize,
+    sepc_pa: usize,
+    vma_start: usize,
+    vma_end: usize,
+    vma_flags: usize,
+    backing: usize,
+    resident: usize,
+    page_state: usize,
+) {
+    if FIRST_TERMINAL_USER_TRAP_STATE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    FIRST_TERMINAL_USER_TRAP_KIND.store(kind, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_PID.store(pid, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_VADDR.store(vaddr, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_SEPC.store(sepc, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_SP.store(sp, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_RA.store(ra, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_TP.store(tp, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_FAULT_PA.store(fault_pa, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_SEPC_PA.store(sepc_pa, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_VMA_START.store(vma_start, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_VMA_END.store(vma_end, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_VMA_FLAGS.store(vma_flags, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_BACKING.store(backing, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_RESIDENT.store(resident, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_PAGE_STATE.store(page_state, Ordering::Relaxed);
+    FIRST_TERMINAL_USER_TRAP_STATE.store(2, Ordering::Release);
+}
+
+/// Return the first terminal user trap exactly once for a harness record.
+pub(crate) fn take_first_terminal_user_trap() -> Option<TerminalUserTrap> {
+    FIRST_TERMINAL_USER_TRAP_STATE
+        .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    Some(TerminalUserTrap {
+        kind: FIRST_TERMINAL_USER_TRAP_KIND.load(Ordering::Relaxed),
+        pid: FIRST_TERMINAL_USER_TRAP_PID.load(Ordering::Relaxed),
+        vaddr: FIRST_TERMINAL_USER_TRAP_VADDR.load(Ordering::Relaxed),
+        sepc: FIRST_TERMINAL_USER_TRAP_SEPC.load(Ordering::Relaxed),
+        sp: FIRST_TERMINAL_USER_TRAP_SP.load(Ordering::Relaxed),
+        ra: FIRST_TERMINAL_USER_TRAP_RA.load(Ordering::Relaxed),
+        tp: FIRST_TERMINAL_USER_TRAP_TP.load(Ordering::Relaxed),
+        fault_pa: FIRST_TERMINAL_USER_TRAP_FAULT_PA.load(Ordering::Relaxed),
+        sepc_pa: FIRST_TERMINAL_USER_TRAP_SEPC_PA.load(Ordering::Relaxed),
+        vma_start: FIRST_TERMINAL_USER_TRAP_VMA_START.load(Ordering::Relaxed),
+        vma_end: FIRST_TERMINAL_USER_TRAP_VMA_END.load(Ordering::Relaxed),
+        vma_flags: FIRST_TERMINAL_USER_TRAP_VMA_FLAGS.load(Ordering::Relaxed),
+        backing: FIRST_TERMINAL_USER_TRAP_BACKING.load(Ordering::Relaxed),
+        resident: FIRST_TERMINAL_USER_TRAP_RESIDENT.load(Ordering::Relaxed),
+        page_state: FIRST_TERMINAL_USER_TRAP_PAGE_STATE.load(Ordering::Relaxed),
+    })
+}
 
 static USER_TICKS: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
 static KERNEL_TICKS: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
@@ -195,6 +619,9 @@ static BLOCKED_OWNER_EMPTY_ITERATIONS: [AtomicUsize; CPU_SLOTS] =
 static WORK_COUNTS: [AtomicUsize; WORK_SLOTS] = [const { AtomicUsize::new(0) }; WORK_SLOTS];
 static WORK_TOTAL_US: [AtomicUsize; WORK_SLOTS] = [const { AtomicUsize::new(0) }; WORK_SLOTS];
 static WORK_MAX_US: [AtomicUsize; WORK_SLOTS] = [const { AtomicUsize::new(0) }; WORK_SLOTS];
+static PHASE_COUNTS: [AtomicUsize; PHASE_SLOTS] = [const { AtomicUsize::new(0) }; PHASE_SLOTS];
+static PHASE_TOTAL_US: [AtomicUsize; PHASE_SLOTS] = [const { AtomicUsize::new(0) }; PHASE_SLOTS];
+static PHASE_MAX_US: [AtomicUsize; PHASE_SLOTS] = [const { AtomicUsize::new(0) }; PHASE_SLOTS];
 static PAGE_FAULT_SOURCE_COUNTS: [AtomicUsize; PAGE_FAULT_SOURCE_SLOTS] =
     [const { AtomicUsize::new(0) }; PAGE_FAULT_SOURCE_SLOTS];
 static PAGE_FAULT_SOURCE_TOTAL_US: [AtomicUsize; PAGE_FAULT_SOURCE_SLOTS] =
@@ -346,6 +773,18 @@ static LOCK_WAIT_TOTAL_US: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new
 static LOCK_WAIT_MAX_US: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new(0) }; LOCK_SLOTS];
 static LOCK_HOLD_TOTAL_US: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new(0) }; LOCK_SLOTS];
 static LOCK_HOLD_MAX_US: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new(0) }; LOCK_SLOTS];
+static MEMORY_SET_LOCK_SITE_ACQUIRES: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
+    [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
+static MEMORY_SET_LOCK_SITE_CONTENDED: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
+    [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
+static MEMORY_SET_LOCK_SITE_WAIT_TOTAL_US: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
+    [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
+static MEMORY_SET_LOCK_SITE_WAIT_MAX_US: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
+    [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
+static MEMORY_SET_LOCK_SITE_HOLD_TOTAL_US: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
+    [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
+static MEMORY_SET_LOCK_SITE_HOLD_MAX_US: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
+    [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
 
 #[inline]
 fn now_us() -> usize {
@@ -823,6 +1262,7 @@ impl PageFaultResolutionScope {
 pub(crate) struct TimedLockGuard<'a, T> {
     guard: MutexGuard<'a, T>,
     class: LockClass,
+    memory_set_site: Option<MemorySetLockSite>,
     acquired_at: usize,
 }
 
@@ -843,11 +1283,44 @@ impl<T> Drop for TimedLockGuard<'_, T> {
         let hold = now_us().saturating_sub(self.acquired_at);
         LOCK_HOLD_TOTAL_US[slot].fetch_add(hold, Ordering::Relaxed);
         LOCK_HOLD_MAX_US[slot].fetch_max(hold, Ordering::Relaxed);
+        if let Some(site) = self.memory_set_site {
+            let site = site as usize;
+            MEMORY_SET_LOCK_SITE_HOLD_TOTAL_US[site].fetch_add(hold, Ordering::Relaxed);
+            MEMORY_SET_LOCK_SITE_HOLD_MAX_US[site].fetch_max(hold, Ordering::Relaxed);
+        }
     }
 }
 
 #[inline]
 pub(crate) fn lock<'a, T>(class: LockClass, mutex: &'a Mutex<T>) -> TimedLockGuard<'a, T> {
+    lock_with_memory_set_site(class, None, mutex)
+}
+
+#[inline]
+pub(crate) fn lock_memory_set<'a, T>(
+    site: MemorySetLockSite,
+    mutex: &'a Mutex<T>,
+) -> TimedLockGuard<'a, T> {
+    lock_with_memory_set_site(LockClass::MemorySet, Some(site), mutex)
+}
+
+#[inline]
+pub(crate) fn lock_memory_set_activation<'a, T>(
+    mutex: &'a Mutex<T>,
+) -> TimedLockGuard<'a, T> {
+    lock_with_memory_set_site(
+        LockClass::MemorySetActivation,
+        Some(MemorySetLockSite::UserEntryActivation),
+        mutex,
+    )
+}
+
+#[inline]
+fn lock_with_memory_set_site<'a, T>(
+    class: LockClass,
+    memory_set_site: Option<MemorySetLockSite>,
+    mutex: &'a Mutex<T>,
+) -> TimedLockGuard<'a, T> {
     let slot = class as usize;
     let started = now_us();
     let (guard, contended) = match mutex.try_lock() {
@@ -856,15 +1329,25 @@ pub(crate) fn lock<'a, T>(class: LockClass, mutex: &'a Mutex<T>) -> TimedLockGua
     };
     let acquired = now_us();
     LOCK_ACQUIRES[slot].fetch_add(1, Ordering::Relaxed);
+    if let Some(site) = memory_set_site {
+        MEMORY_SET_LOCK_SITE_ACQUIRES[site as usize].fetch_add(1, Ordering::Relaxed);
+    }
     if contended {
         let waited = acquired.saturating_sub(started);
         LOCK_CONTENDED[slot].fetch_add(1, Ordering::Relaxed);
         LOCK_WAIT_TOTAL_US[slot].fetch_add(waited, Ordering::Relaxed);
         LOCK_WAIT_MAX_US[slot].fetch_max(waited, Ordering::Relaxed);
+        if let Some(site) = memory_set_site {
+            let site = site as usize;
+            MEMORY_SET_LOCK_SITE_CONTENDED[site].fetch_add(1, Ordering::Relaxed);
+            MEMORY_SET_LOCK_SITE_WAIT_TOTAL_US[site].fetch_add(waited, Ordering::Relaxed);
+            MEMORY_SET_LOCK_SITE_WAIT_MAX_US[site].fetch_max(waited, Ordering::Relaxed);
+        }
     }
     TimedLockGuard {
         guard,
         class,
+        memory_set_site,
         acquired_at: acquired,
     }
 }
@@ -895,10 +1378,18 @@ pub(crate) fn note_virtio_request(bytes: usize, queue_us: usize, complete_us: us
     VIRTIO_COMPLETE_US.fetch_add(complete_us, Ordering::Relaxed);
 }
 
-// Existing phase hooks remain source-compatible while the scoped operation counters
-// above provide the compact report consumed by the window runner.
+// Phase hooks are aggregate-only and remain feature-gated by every callsite.
+// Out-of-range IDs are ignored so diagnostic coverage cannot change the
+// production path's error behavior.
 #[inline]
-pub(crate) fn note_phase(_phase: usize, _elapsed_us: usize) {}
+pub(crate) fn note_phase(phase: usize, elapsed_us: usize) {
+    if phase >= PHASE_SLOTS {
+        return;
+    }
+    PHASE_COUNTS[phase].fetch_add(1, Ordering::Relaxed);
+    PHASE_TOTAL_US[phase].fetch_add(elapsed_us, Ordering::Relaxed);
+    PHASE_MAX_US[phase].fetch_max(elapsed_us, Ordering::Relaxed);
+}
 #[inline]
 pub(crate) fn note_ppoll_call(_nfds: usize) {
     PPOLL_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1096,6 +1587,18 @@ pub(crate) fn maybe_report() {
             );
         }
     }
+    for slot in 0..PHASE_SLOTS {
+        let count = PHASE_COUNTS[slot].load(Ordering::Relaxed);
+        if count != 0 {
+            crate::println!(
+                "BUILDSTORM_DIAG phase={} count={} total_us={} max_us={}",
+                PHASE_NAMES[slot],
+                count,
+                PHASE_TOTAL_US[slot].load(Ordering::Relaxed),
+                PHASE_MAX_US[slot].load(Ordering::Relaxed)
+            );
+        }
+    }
     for slot in 0..PAGE_FAULT_SOURCE_SLOTS {
         let count = PAGE_FAULT_SOURCE_COUNTS[slot].load(Ordering::Relaxed);
         if count != 0 {
@@ -1175,6 +1678,12 @@ pub(crate) fn maybe_report() {
         };
         selected[slot] = true;
         crate::println!("BUILDSTORM_DIAG lock_rank={} name={} acquire_count={} contended_count={} wait_total_us={} wait_max_us={} hold_total_us={} hold_max_us={}", rank + 1, LOCK_NAMES[slot], LOCK_ACQUIRES[slot].load(Ordering::Relaxed), LOCK_CONTENDED[slot].load(Ordering::Relaxed), LOCK_WAIT_TOTAL_US[slot].load(Ordering::Relaxed), LOCK_WAIT_MAX_US[slot].load(Ordering::Relaxed), LOCK_HOLD_TOTAL_US[slot].load(Ordering::Relaxed), LOCK_HOLD_MAX_US[slot].load(Ordering::Relaxed));
+    }
+    for site in 0..MEMORY_SET_LOCK_SITE_SLOTS {
+        let acquires = MEMORY_SET_LOCK_SITE_ACQUIRES[site].load(Ordering::Relaxed);
+        if acquires != 0 {
+            crate::println!("BUILDSTORM_DIAG memory_set_site={} acquire_count={} contended_count={} wait_total_us={} wait_max_us={} hold_total_us={} hold_max_us={}", MEMORY_SET_LOCK_SITE_NAMES[site], acquires, MEMORY_SET_LOCK_SITE_CONTENDED[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_WAIT_TOTAL_US[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_WAIT_MAX_US[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_HOLD_TOTAL_US[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_HOLD_MAX_US[site].load(Ordering::Relaxed));
+        }
     }
     crate::task::manager::diagnostic_dump_user_comm();
     crate::println!("BUILDSTORM_DIAG snapshot_end={}", sequence);

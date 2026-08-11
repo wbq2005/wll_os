@@ -316,7 +316,10 @@ fn futex_addr_key_for_op(
     // by a process-local virtual address.  Anonymous/private mappings still
     // need address-space isolation, so only true shared VMAs use a shared key.
     super::with_kernel_page_table(|| {
-        let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut memory_set = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::Futex,
+            &task.memory_set,
+        );
         memory_set.prepare_read(uaddr, core::mem::size_of::<i32>())?;
         let paddr = memory_set
             .translate(polyhal::VirtAddr::new(uaddr))
@@ -1986,18 +1989,27 @@ pub(crate) fn process_robust_list_on_exit(task: &Arc<crate::task::TaskControlBlo
 
     let read_usize_at = |addr: usize| -> Result<usize, SysErrNo> {
         let mut bytes = [0u8; core::mem::size_of::<usize>()];
-        let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut memory_set = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyRead,
+            &task.memory_set,
+        );
         super::user::copy_from_user_in_memory_set(&mut memory_set, addr, &mut bytes)?;
         Ok(usize::from_ne_bytes(bytes))
     };
     let read_i32_at = |addr: usize| -> Result<i32, SysErrNo> {
         let mut bytes = [0u8; core::mem::size_of::<i32>()];
-        let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut memory_set = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyRead,
+            &task.memory_set,
+        );
         super::user::copy_from_user_in_memory_set(&mut memory_set, addr, &mut bytes)?;
         Ok(i32::from_ne_bytes(bytes))
     };
     let write_i32_at = |addr: usize, value: i32| -> Result<(), SysErrNo> {
-        let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut memory_set = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyWrite,
+            &task.memory_set,
+        );
         super::user::copy_to_user_in_memory_set(&mut memory_set, addr, &value.to_ne_bytes())
     };
 

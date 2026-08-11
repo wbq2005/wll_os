@@ -106,6 +106,7 @@ def parse_guest_aggregate_block(
         "cpus": {},
         "user_runs": {},
         "work": {},
+        "phases": {},
         "fault_sources": {},
         "fault_resolutions": {},
         "blocks": {},
@@ -113,6 +114,7 @@ def parse_guest_aggregate_block(
         "wait_actors": {},
         "blocked_owners": {},
         "locks": [],
+        "memory_set_sites": {},
         "actors": [],
         "vma_slots": None,
         "serial_line_index": start,
@@ -149,6 +151,10 @@ def parse_guest_aggregate_block(
             name = fields.get("work")
             if isinstance(name, str):
                 result["work"][name] = fields
+        elif body.startswith("phase="):
+            name = fields.get("phase")
+            if isinstance(name, str):
+                result["phases"][name] = fields
         elif body.startswith("fault_source="):
             name = fields.get("fault_source")
             if isinstance(name, str):
@@ -187,6 +193,10 @@ def parse_guest_aggregate_block(
             result["complete"] = True
         elif body.startswith("lock_rank="):
             result["locks"].append(fields)
+        elif body.startswith("memory_set_site="):
+            name = fields.get("memory_set_site")
+            if isinstance(name, str):
+                result["memory_set_sites"][name] = fields
     return result
 
 
@@ -302,7 +312,9 @@ def run(args: argparse.Namespace) -> int:
     build_command: list[str] | None = None
     build_elapsed: float | None = None
     build_log: Path | None = None
-    if args.skip_build:
+    if args.kernel is not None:
+        kernel = args.kernel.resolve()
+    elif args.skip_build:
         kernel = repo / "target" / str(config["target"]) / "release" / "wll_OS"
     else:
         kernel, build_command, build_elapsed, build_log = build(repo, args.arch, args.build_features)
@@ -420,6 +432,11 @@ def main() -> int:
     parser.add_argument("--window", type=int, default=300)
     parser.add_argument("--begin-timeout", type=int, default=1800)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument(
+        "--kernel",
+        type=Path,
+        help="prebuilt kernel artifact; bypasses the local build without changing guest inputs",
+    )
     parser.add_argument("--build-features", help="explicit diagnostic-only kernel features")
     return run(parser.parse_args())
 

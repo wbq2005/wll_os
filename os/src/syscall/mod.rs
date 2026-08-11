@@ -449,7 +449,23 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_GETPPID => process::sys_getppid(),
         SYSCALL_SCHED_YIELD => process::sys_sched_yield(),
         SYSCALL_CLONE => process::sys_clone(args[0], args[1], args[2], args[3], args[4]),
-        SYSCALL_EXECVE => process::sys_execve(args[0] as *const u8, args[1], args[2]),
+        SYSCALL_EXECVE => {
+            let result = process::sys_execve(args[0] as *const u8, args[1], args[2]);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            if let Err(error) = result {
+                let pid = crate::task::current_task()
+                    .map(|task| task.pid.0)
+                    .unwrap_or(0);
+                crate::buildstorm_diagnostics::note_first_exec_failure(
+                    error as usize,
+                    pid,
+                    args[0],
+                    args[1],
+                    args[2],
+                );
+            }
+            result
+        }
         SYSCALL_WAIT4 => {
             process::sys_wait4(args[0] as isize, args[1] as *mut i32, args[2], args[3])
         }

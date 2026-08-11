@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use polyhal::VirtAddr;
 
 use crate::mm::frame_allocator;
-use crate::mm::map_area::{MapAreaBacking, ResidentSet};
+use crate::mm::map_area::{MapArea, MapAreaBacking, ResidentSet};
 use crate::mm::memory_set::MemorySet;
 use crate::mm::page_table::PTEFlags;
 use crate::task::TaskControlBlock;
@@ -32,9 +32,8 @@ const RESIDENT_TEST_VADDR: usize = 0x4100_0000;
 const SHARED_LEFT_VADDR: usize = 0x4200_0000;
 const SHARED_RIGHT_VADDR: usize = 0x4300_0000;
 
-/// Exercise the ResidentSet ownership API independently of the contest
-/// workload.  This keeps the dense compatibility contract explicit before its
-/// storage is replaced by sparse runs.
+/// Exercise sparse ResidentSet ownership and topology-transfer APIs
+/// independently of the contest workload.
 fn verify_resident_set_api() {
     let mut pages = ResidentSet::new();
     let mut initial = Vec::new();
@@ -46,39 +45,107 @@ fn verify_resident_set_api() {
     }
     if pages
         .insert(
-            2,
-            frame_allocator::alloc_frame().expect("resident API suffix allocation"),
+            4,
+            frame_allocator::alloc_frame().expect("resident API sparse allocation"),
         )
         .is_err()
     {
-        panic!("[smp-regression] fail phase=resident-set-api suffix-insert");
+        panic!("[smp-regression] fail phase=resident-set-api sparse-insert");
     }
-    if pages.len() != 3 || pages.lookup(0).is_none() || pages.iter_range(1, 3).count() != 2 {
+    if pages.len() != 3
+        || pages.lookup(0).is_none()
+        || pages.lookup(3).is_some()
+        || pages.iter_range(1, 5).count() != 2
+    {
         panic!("[smp-regression] fail phase=resident-set-api lookup");
     }
 
-    let rejected = frame_allocator::alloc_frame().expect("resident API rejection allocation");
-    if pages.insert(4, rejected).is_ok() {
-        panic!("[smp-regression] fail phase=resident-set-api gap-insert");
+    let suffix = pages
+        .extract_range(1, 5)
+        .expect("resident API sparse extraction");
+    if suffix.len() != 2
+        || pages.len() != 1
+        || suffix.lookup(0).is_none()
+        || suffix.lookup(3).is_none()
+    {
+        panic!("[smp-regression] fail phase=resident-set-api extraction");
     }
 
-    let suffix = pages
-        .extract_range(2, 3)
-        .expect("resident API suffix extraction");
-    let middle = pages.split_off(1).expect("resident API split");
-    pages.merge_from(middle);
-    pages.merge_from(suffix);
-    if pages.len() != 3 || pages.lookup(2).is_none() {
-        panic!("[smp-regression] fail phase=resident-set-api transfer");
+    let mut left = ResidentSet::new();
+    if left
+        .insert(
+            0,
+            frame_allocator::alloc_frame().expect("resident API merge left allocation"),
+        )
+        .is_err()
+    {
+        panic!("[smp-regression] fail phase=resident-set-api merge-left");
+    }
+    let mut right = ResidentSet::new();
+    if right
+        .insert(
+            0,
+            frame_allocator::alloc_frame().expect("resident API merge right allocation"),
+        )
+        .is_err()
+    {
+        panic!("[smp-regression] fail phase=resident-set-api merge-right");
+    }
+    left.merge_from_at(2, &mut right);
+    if left.lookup(2).is_none() || !right.is_empty() {
+        panic!("[smp-regression] fail phase=resident-set-api merge");
+    }
+    let split = left.split_off(2).expect("resident API split");
+    if split.lookup(0).is_none() || left.lookup(2).is_some() {
+        panic!("[smp-regression] fail phase=resident-set-api split");
+    }
+    let mut split = split;
+    left.merge_from_at(2, &mut split);
+    if left.lookup(2).is_none() || !split.is_empty() {
+        panic!("[smp-regression] fail phase=resident-set-api merge-after-split");
     }
     let drained = pages.drain_all();
-    if !pages.is_empty() || drained.len() != 3 {
+    if !pages.is_empty() || drained.len() != 1 {
         panic!("[smp-regression] fail phase=resident-set-api drain");
     }
     drop(drained);
+    drop(suffix);
+
+    // Sparse VMA topology must not depend on where the last resident page
+    // happens to be.  A split in a trailing hole yields an empty right owner;
+    // merging it later must restore the right page at its original VPN.
+    let page_size = crate::config::PAGE_SIZE;
+    let base = VirtAddr::new(RESIDENT_TEST_VADDR);
+    let mut area = MapArea::new(
+        base,
+        VirtAddr::new(RESIDENT_TEST_VADDR + 8 * page_size),
+        PTEFlags::R,
+    );
+    if area
+        .append_resident(frame_allocator::alloc_frame().expect("resident API VMA left allocation"))
+        .is_err()
+    {
+        panic!("[smp-regression] fail phase=resident-set-api VMA-left-insert");
+    }
+    let mut right = area
+        .split_at(VirtAddr::new(RESIDENT_TEST_VADDR + 4 * page_size))
+        .expect("resident API sparse VMA trailing-hole split");
+    if right.has_frames() {
+        panic!("[smp-regression] fail phase=resident-set-api trailing-hole-split");
+    }
+    if right
+        .append_resident(frame_allocator::alloc_frame().expect("resident API VMA right allocation"))
+        .is_err()
+    {
+        panic!("[smp-regression] fail phase=resident-set-api VMA-right-insert");
+    }
+    area.merge_with(right);
+    if area.resident().lookup(4).is_none() || area.resident().lookup(8).is_some() {
+        panic!("[smp-regression] fail phase=resident-set-api sparse-vma-merge");
+    }
 }
 
-/// Verify the bridge between the current dense ResidentSet compatibility form
+/// Verify the bridge between sparse ResidentSet storage
 /// and user-memory lifecycle operations.  No official command, path, marker,
 /// or expected contest output participates in this regression.
 fn verify_resident_memory_lifecycle() {
@@ -109,6 +176,15 @@ fn verify_resident_memory_lifecycle() {
         .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
         .expect("resident lifecycle parent mapping");
     child
+        .handle_page_fault(RESIDENT_TEST_VADDR + 3 * page, true, false)
+        .expect("resident lifecycle COW hole first store");
+    if child
+        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + 3 * page))
+        .is_none()
+    {
+        panic!("[smp-regression] fail phase=resident-memory cow-hole");
+    }
+    child
         .handle_page_fault(RESIDENT_TEST_VADDR + page, true, false)
         .expect("resident lifecycle COW write");
     let child_page = child
@@ -116,6 +192,33 @@ fn verify_resident_memory_lifecycle() {
         .expect("resident lifecycle child mapping");
     if parent_page == child_page {
         panic!("[smp-regression] fail phase=resident-memory cow-isolation");
+    }
+    parent
+        .handle_page_fault(RESIDENT_TEST_VADDR + page, true, false)
+        .expect("resident lifecycle parent COW write");
+    if !parent.regression_mapping_is_writable(VirtAddr::new(RESIDENT_TEST_VADDR + page)) {
+        panic!("[smp-regression] fail phase=resident-memory private-leaf-write");
+    }
+    let nested_child = parent
+        .fork_cow()
+        .expect("resident lifecycle nested fork COW");
+    if parent.regression_mapping_is_writable(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+        || nested_child.regression_mapping_is_writable(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+    {
+        panic!("[smp-regression] fail phase=resident-memory nested-fork-readonly");
+    }
+    let nested_child_page = nested_child
+        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+        .expect("resident lifecycle nested child mapping");
+    parent
+        .handle_page_fault(RESIDENT_TEST_VADDR + page, true, false)
+        .expect("resident lifecycle nested parent COW write");
+    if parent
+        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+        .expect("resident lifecycle nested parent mapping")
+        == nested_child_page
+    {
+        panic!("[smp-regression] fail phase=resident-memory nested-cow-isolation");
     }
     child
         .protect_range(
@@ -141,6 +244,7 @@ fn verify_resident_memory_lifecycle() {
         panic!("[smp-regression] fail phase=resident-memory release");
     }
     drop(child);
+    drop(nested_child);
     drop(parent);
 
     let shared_frames =
@@ -211,11 +315,7 @@ pub(crate) fn reset_user_memory_lifecycle_diagnostic() {
     LIFECYCLE_TERMINAL_RECORDED.store(false, Ordering::Release);
 }
 
-pub(crate) fn note_user_memory_lifecycle_terminal_trap(
-    kind: usize,
-    vaddr: usize,
-    sepc: usize,
-) {
+pub(crate) fn note_user_memory_lifecycle_terminal_trap(kind: usize, vaddr: usize, sepc: usize) {
     if LIFECYCLE_TERMINAL_RECORDED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
@@ -319,7 +419,7 @@ fn verify_asid_isolation_and_reuse() -> (usize, usize, usize) {
     // Keep the old data frame alive so a stale translation cannot pass by
     // accidentally pointing at a frame immediately recycled by the allocator.
     let old_frame = left.areas[0]
-        .resident
+        .resident()
         .lookup(0)
         .expect("ASID regression mapping must own its frame")
         .clone();

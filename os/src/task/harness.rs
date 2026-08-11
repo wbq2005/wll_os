@@ -958,7 +958,7 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
             String::from("/busybox"),
             String::from("sh"),
             String::from("-c"),
-            String::from("exit 0"),
+            String::from("/busybox true; exit 0"),
         ],
         envp: alloc::vec![
             String::from("PATH=/:/bin:/usr/bin"),
@@ -970,6 +970,56 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
     };
     let exit_code = run_user_program_spec_foreground_exit_code(&spec)
         .expect("user-memory lifecycle launch");
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        if let Some(failure) = crate::buildstorm_diagnostics::take_first_page_fault_failure() {
+            console_write(&format!(
+                "BUILDSTORM_DIAG lifecycle_page_fault_failure stage={} errno={} vaddr={:#x}\n",
+                failure.stage, failure.errno, failure.vaddr,
+            ));
+        }
+        if let Some(failure) = crate::buildstorm_diagnostics::take_first_exec_failure() {
+            console_write(&format!(
+                "BUILDSTORM_DIAG lifecycle_exec_failure errno={} pid={} parent_pid={} clone_flags={:#x} stage={} vector_base={:#x} index={} entry_addr={:#x} value_ptr={:#x} slot_vma=[{:#x},{:#x}) slot_flags={:#x} backing={} resident={} page_state={} pte_pa={:#x} path_ptr={:#x} argv_ptr={:#x} envp_ptr={:#x}\n",
+                failure.errno,
+                failure.pid,
+                failure.parent_pid,
+                failure.clone_flags,
+                failure.stage,
+                failure.vector_base,
+                failure.index,
+                failure.entry_addr,
+                failure.value_ptr,
+                failure.vma_start,
+                failure.vma_end,
+                failure.vma_flags,
+                failure.backing,
+                failure.resident,
+                failure.page_state,
+                failure.pte_pa,
+                failure.path_ptr,
+                failure.argv_ptr,
+                failure.envp_ptr,
+            ));
+        }
+        if let Some(trap) = crate::buildstorm_diagnostics::take_first_terminal_user_trap() {
+            console_write(&format!(
+                "BUILDSTORM_DIAG lifecycle_terminal_user_trap kind={} pid={} vaddr={:#x} sepc={:#x} fault_pa={:#x} sepc_pa={:#x} vma=[{:#x},{:#x}) flags={:#x} backing={} resident={} page_state={}\n",
+                trap.kind,
+                trap.pid,
+                trap.vaddr,
+                trap.sepc,
+                trap.fault_pa,
+                trap.sepc_pa,
+                trap.vma_start,
+                trap.vma_end,
+                trap.vma_flags,
+                trap.backing,
+                trap.resident,
+                trap.page_state,
+            ));
+        }
+    }
     if exit_code != 0 {
         if let Some((kind, vaddr, sepc)) =
             crate::smp_regression::user_memory_lifecycle_terminal_trap()
@@ -982,6 +1032,96 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
         panic!("[smp-regression] fail phase=user-memory-lifecycle exit={}", exit_code);
     }
     console_write("[smp-regression] pass phase=user-memory-lifecycle\n");
+
+    // The busybox probe is intentionally static/self-contained.  A separate
+    // diagnostic-only dynamic ELF probe exercises the glibc interpreter and
+    // fork/exec path without changing production harness behavior.
+    #[cfg(feature = "buildstorm-diagnostics")]
+    run_dynamic_user_memory_lifecycle_probe();
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+fn run_dynamic_user_memory_lifecycle_probe() {
+    crate::smp_regression::reset_user_memory_lifecycle_diagnostic();
+    let spec = UserProgramSpec {
+        path: String::from("/usr/bin/bash"),
+        argv: alloc::vec![
+            String::from("/usr/bin/bash"),
+            String::from("-c"),
+            String::from("exit 0"),
+        ],
+        envp: alloc::vec![
+            String::from("PATH=/usr/bin:/bin:/"),
+            String::from("LD_LIBRARY_PATH=/lib:/usr/lib"),
+        ],
+        cwd: String::from("/"),
+        root: String::from("/"),
+        marker_name: None,
+    };
+    let exit_code = match run_user_program_spec_foreground_exit_code(&spec) {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            console_write(&format!(
+                "BUILDSTORM_DIAG dynamic_launch_failure errno={}\n",
+                error as usize,
+            ));
+            -1
+        }
+    };
+    if let Some(failure) = crate::buildstorm_diagnostics::take_first_page_fault_failure() {
+        console_write(&format!(
+            "BUILDSTORM_DIAG dynamic_page_fault_failure stage={} errno={} vaddr={:#x}\n",
+            failure.stage, failure.errno, failure.vaddr,
+        ));
+    }
+    if let Some(failure) = crate::buildstorm_diagnostics::take_first_exec_failure() {
+        console_write(&format!(
+            "BUILDSTORM_DIAG dynamic_exec_failure errno={} pid={} parent_pid={} clone_flags={:#x} stage={} vector_base={:#x} index={} entry_addr={:#x} value_ptr={:#x} slot_vma=[{:#x},{:#x}) slot_flags={:#x} backing={} resident={} page_state={} pte_pa={:#x} path_ptr={:#x} argv_ptr={:#x} envp_ptr={:#x}\n",
+            failure.errno,
+            failure.pid,
+            failure.parent_pid,
+            failure.clone_flags,
+            failure.stage,
+            failure.vector_base,
+            failure.index,
+            failure.entry_addr,
+            failure.value_ptr,
+            failure.vma_start,
+            failure.vma_end,
+            failure.vma_flags,
+            failure.backing,
+            failure.resident,
+            failure.page_state,
+            failure.pte_pa,
+            failure.path_ptr,
+            failure.argv_ptr,
+            failure.envp_ptr,
+        ));
+    }
+    if let Some(trap) = crate::buildstorm_diagnostics::take_first_terminal_user_trap() {
+        console_write(&format!(
+            "BUILDSTORM_DIAG dynamic_terminal_user_trap kind={} pid={} vaddr={:#x} sepc={:#x} sp={:#x} ra={:#x} tp={:#x} fault_pa={:#x} sepc_pa={:#x} vma=[{:#x},{:#x}) flags={:#x} backing={} resident={} page_state={}\n",
+            trap.kind,
+            trap.pid,
+            trap.vaddr,
+            trap.sepc,
+            trap.sp,
+            trap.ra,
+            trap.tp,
+            trap.fault_pa,
+            trap.sepc_pa,
+            trap.vma_start,
+            trap.vma_end,
+            trap.vma_flags,
+            trap.backing,
+            trap.resident,
+            trap.page_state,
+        ));
+    }
+    console_write(&format!(
+        "BUILDSTORM_DIAG dynamic_script_exit code={}\n",
+        exit_code
+    ));
 }
 
 fn foreground_timeout_us(spec: &UserProgramSpec) -> usize {
@@ -1301,5 +1441,71 @@ fn script_program_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
 
 fn run_script(script_path: &str) -> Result<(), ScriptLaunchError> {
     let spec = script_program_spec(script_path)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        // One lifecycle boundary record per harness script.  This is not a
+        // syscall/page-fault trace and does not alter the production result:
+        // the non-diagnostic path below also treats a launched script as a
+        // completed harness item regardless of its user exit status.
+        let exit_code = run_user_program_spec_foreground_exit_code(&spec)
+            .map_err(ScriptLaunchError::CreateTask)?;
+        if let Some(failure) = crate::buildstorm_diagnostics::take_first_page_fault_failure()
+        {
+            console_write(&format!(
+                "BUILDSTORM_DIAG page_fault_failure stage={} errno={} vaddr={:#x}\n",
+                failure.stage, failure.errno, failure.vaddr,
+            ));
+        }
+        if let Some(failure) = crate::buildstorm_diagnostics::take_first_exec_failure() {
+            console_write(&format!(
+                "BUILDSTORM_DIAG exec_failure errno={} pid={} parent_pid={} clone_flags={:#x} stage={} vector_base={:#x} index={} entry_addr={:#x} value_ptr={:#x} slot_vma=[{:#x},{:#x}) slot_flags={:#x} backing={} resident={} page_state={} pte_pa={:#x} path_ptr={:#x} argv_ptr={:#x} envp_ptr={:#x}\n",
+                failure.errno,
+                failure.pid,
+                failure.parent_pid,
+                failure.clone_flags,
+                failure.stage,
+                failure.vector_base,
+                failure.index,
+                failure.entry_addr,
+                failure.value_ptr,
+                failure.vma_start,
+                failure.vma_end,
+                failure.vma_flags,
+                failure.backing,
+                failure.resident,
+                failure.page_state,
+                failure.pte_pa,
+                failure.path_ptr,
+                failure.argv_ptr,
+                failure.envp_ptr,
+            ));
+        }
+        if let Some(trap) = crate::buildstorm_diagnostics::take_first_terminal_user_trap() {
+            console_write(&format!(
+                "BUILDSTORM_DIAG terminal_user_trap kind={} pid={} vaddr={:#x} sepc={:#x} sp={:#x} ra={:#x} tp={:#x} fault_pa={:#x} sepc_pa={:#x} vma=[{:#x},{:#x}) flags={:#x} backing={} resident={} page_state={}\n",
+                trap.kind,
+                trap.pid,
+                trap.vaddr,
+                trap.sepc,
+                trap.sp,
+                trap.ra,
+                trap.tp,
+                trap.fault_pa,
+                trap.sepc_pa,
+                trap.vma_start,
+                trap.vma_end,
+                trap.vma_flags,
+                trap.backing,
+                trap.resident,
+                trap.page_state,
+            ));
+        }
+        console_write(&format!(
+            "BUILDSTORM_DIAG script_exit code={}\n",
+            exit_code
+        ));
+        return Ok(());
+    }
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
     run_user_program_spec_foreground(&spec).map_err(ScriptLaunchError::CreateTask)
 }

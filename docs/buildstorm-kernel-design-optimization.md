@@ -1084,3 +1084,44 @@ drafting. The developer-verifiable checks are the source diff, dual release
 builds, dual SMP regressions, official-image marker windows, 15,000-second raw
 serial and host metrics, hashes, and official judge output. There is still no
 successful compile marker, so no complete-build or timing-score claim is made.
+
+## 28. vfork lifetime and nested-COW correctness gate (2026-08-12)
+
+Feature-gated exec diagnostics isolated a general process-lifetime failure:
+for `CLONE_VM | CLONE_VFORK`, the parent resumed and reused its stack before
+the child completed exec or exit. The failing envp slot had a valid VMA, PTE,
+and resident entry, but its pointer value had already been overwritten. The
+fix introduces a deferred block/wake handshake around vfork publication and
+releases the parent from both child exec-success and exit paths. It does not
+inspect command names, paths, crates, test names, markers, or expected output.
+
+The same audit found a second general MM correctness issue. A private page
+that had completed one COW fault could be writable in the parent while its VMA
+already carried the COW flag. A later fork skipped the parent remap because
+the VMA flag did not change, changed the page-level state back to COW, and
+left the shared parent PTE writable. `fork_cow` now remaps the parent whenever
+the page state transitions into COW. The independent SMP regression performs
+a nested fork and verifies read-only parent/child PTEs and frame separation on
+the next parent write.
+
+RISC-V64 and LoongArch64 production/SMP release checks passed, as did the
+RISC-V64 diagnostic lifecycle run. That run passed resident-memory lifecycle,
+user-memory lifecycle, and minibuild without the prior exec failure or stack
+smashing. The feature-off RISC-V64 production window used the unmodified
+official image with `-snapshot -m 8G -smp 8` and reached 23 `Compiling` lines
+in 300 seconds, exactly the same coarse progress as the comparable baseline.
+Before/after progress is therefore 23/23 (0% measured improvement); this is a
+correctness gate, not a retained performance optimization. No successful
+`BUILDSTORM_COMPILE mode=multi ok=true` marker has yet been observed.
+
+Raw production-window evidence, launch arguments, hashes, and host samplers
+are in
+`docs/evidence/buildstorm-stage2/20260812-riscv64-production-smp8-nested-cow-remap-window300/`.
+The complete reproduction is `python3 scripts/run_buildstorm.py --arch
+riscv64 --image /srv/buildstorm/images/sdcard-rv-pub.img --stage complete
+--timeout 15000 --memory 8G --smp 8`, with diagnostics disabled. AI assisted
+with semantic auditing, diagnostic design, implementation review, and report
+drafting. Developer-verifiable evidence consists of the source diff, dual-
+architecture builds/regressions, raw serial logs, hashes, exact QEMU arguments,
+and host metrics; official compile and judge success remain unverified until
+the exact successful marker is present.

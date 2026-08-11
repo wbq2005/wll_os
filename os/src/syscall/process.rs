@@ -54,6 +54,25 @@ const CLONE_DETACHED: usize = 0x00400000;
 
 const CLONE_CHILD_SETTID: usize = 0x01000000;
 
+pub(crate) fn release_vfork_parent(task: &Arc<TaskControlBlock>) -> bool {
+    let parent = {
+        let inner = task.inner.lock();
+        if inner.clone_flags & CLONE_VFORK == 0 {
+            return false;
+        }
+        inner.parent.clone()
+    };
+    parent
+        .as_ref()
+        .map(|parent| {
+            crate::task::wake_deferred_block(
+                parent,
+                crate::task::wait_queue::BlockReason::ChildExit,
+            )
+        })
+        .unwrap_or(false)
+}
+
 const WNOHANG: usize = 0x0000_0001;
 const WSTOPPED: usize = 0x0000_0002;
 const WNOWAIT: usize = 0x0100_0000;
@@ -74,6 +93,27 @@ const CLD_CONTINUED: i32 = 6;
 // Modern rustc invokes can contain hundreds of --check-cfg pairs.
 const MAX_EXEC_VECTOR_ENTRIES: usize = 4096;
 const MAX_EXEC_VECTOR_BYTES: usize = 1024 * 1024;
+
+#[cfg(feature = "buildstorm-diagnostics")]
+const EXEC_FAILURE_STAGE_ARGV_ENTRY: usize =
+    crate::buildstorm_diagnostics::EXEC_FAILURE_STAGE_ARGV_ENTRY;
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+const EXEC_FAILURE_STAGE_ARGV_ENTRY: usize = 0;
+#[cfg(feature = "buildstorm-diagnostics")]
+const EXEC_FAILURE_STAGE_ARGV_STRING: usize =
+    crate::buildstorm_diagnostics::EXEC_FAILURE_STAGE_ARGV_STRING;
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+const EXEC_FAILURE_STAGE_ARGV_STRING: usize = 0;
+#[cfg(feature = "buildstorm-diagnostics")]
+const EXEC_FAILURE_STAGE_ENVP_ENTRY: usize =
+    crate::buildstorm_diagnostics::EXEC_FAILURE_STAGE_ENVP_ENTRY;
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+const EXEC_FAILURE_STAGE_ENVP_ENTRY: usize = 0;
+#[cfg(feature = "buildstorm-diagnostics")]
+const EXEC_FAILURE_STAGE_ENVP_STRING: usize =
+    crate::buildstorm_diagnostics::EXEC_FAILURE_STAGE_ENVP_STRING;
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+const EXEC_FAILURE_STAGE_ENVP_STRING: usize = 0;
 
 #[derive(Clone, Copy)]
 enum WaitTarget {
@@ -174,18 +214,115 @@ fn take_child_wait_event(
     None
 }
 
-fn read_user_str_array(base: usize) -> Result<Vec<String>, SysErrNo> {
+#[cfg(feature = "buildstorm-diagnostics")]
+#[allow(clippy::too_many_arguments)]
+fn note_exec_failure_boundary(
+    error: SysErrNo,
+    path_ptr: usize,
+    argv_ptr: usize,
+    envp_ptr: usize,
+    stage: usize,
+    vector_base: usize,
+    index: usize,
+    entry_addr: usize,
+    value_ptr: usize,
+) {
+    let Some(task) = current_task() else {
+        return;
+    };
+    let (parent_pid, clone_flags) = {
+        let inner = task.inner.lock();
+        (
+            inner.parent.as_ref().map(|parent| parent.pid.0).unwrap_or(0),
+            inner.clone_flags,
+        )
+    };
+    let (vma_start, vma_end, vma_flags, backing, resident, page_state, pte_pa) = {
+        let memory_set = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyRead,
+            &task.memory_set,
+        );
+        memory_set.diagnostic_user_page_snapshot(entry_addr)
+    };
+    crate::buildstorm_diagnostics::note_first_exec_failure_boundary(
+        error as usize,
+        task.pid.0,
+        path_ptr,
+        argv_ptr,
+        envp_ptr,
+        stage,
+        vector_base,
+        index,
+        entry_addr,
+        value_ptr,
+        parent_pid,
+        clone_flags,
+        vma_start,
+        vma_end,
+        vma_flags,
+        backing,
+        resident,
+        page_state,
+        pte_pa,
+    );
+}
+
+fn read_user_str_array(
+    base: usize,
+    path_ptr: usize,
+    argv_ptr: usize,
+    envp_ptr: usize,
+    _entry_failure_stage: usize,
+    _string_failure_stage: usize,
+) -> Result<Vec<String>, SysErrNo> {
     let mut result = Vec::new();
     let mut total_bytes = 0usize;
     if base == 0 {
         return Ok(result);
     }
     for i in 0..MAX_EXEC_VECTOR_ENTRIES {
-        let str_ptr = read_user_usize(base + i * core::mem::size_of::<usize>())?;
+        let entry_addr = base
+            .checked_add(i.saturating_mul(core::mem::size_of::<usize>()))
+            .ok_or(SysErrNo::EFAULT)?;
+        let str_ptr = match read_user_usize(entry_addr) {
+            Ok(str_ptr) => str_ptr,
+            Err(error) => {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                note_exec_failure_boundary(
+                    error,
+                    path_ptr,
+                    argv_ptr,
+                    envp_ptr,
+                    _entry_failure_stage,
+                    base,
+                    i,
+                    entry_addr,
+                    0,
+                );
+                return Err(error);
+            }
+        };
         if str_ptr == 0 {
             return Ok(result);
         }
-        let s = read_user_cstr(str_ptr as *const u8)?;
+        let s = match read_user_cstr(str_ptr as *const u8) {
+            Ok(value) => value,
+            Err(error) => {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                note_exec_failure_boundary(
+                    error,
+                    path_ptr,
+                    argv_ptr,
+                    envp_ptr,
+                    _string_failure_stage,
+                    base,
+                    i,
+                    entry_addr,
+                    str_ptr,
+                );
+                return Err(error);
+            }
+        };
         total_bytes = total_bytes
             .checked_add(s.len() + 1)
             .ok_or(SysErrNo::E2BIG)?;
@@ -546,12 +683,43 @@ fn setup_user_stack_with_credentials(
 ///
 /// 加载并执行新程序
 pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallRet {
-    let path_str = read_user_path(path)?;
+    let path_str = match read_user_path(path) {
+        Ok(value) => value,
+        Err(error) => {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            note_exec_failure_boundary(
+                error,
+                path as usize,
+                argv_ptr,
+                envp_ptr,
+                crate::buildstorm_diagnostics::EXEC_FAILURE_STAGE_PATH,
+                0,
+                0,
+                path as usize,
+                path as usize,
+            );
+            return Err(error);
+        }
+    };
     log::info!("[syscall] execve(path='{}')", path_str);
 
     // 在替换地址空间之前，从旧地址空间读取 argv/envp
-    let argv = read_user_str_array(argv_ptr)?;
-    let mut envp = read_user_str_array(envp_ptr)?;
+    let argv = read_user_str_array(
+        argv_ptr,
+        path as usize,
+        argv_ptr,
+        envp_ptr,
+        EXEC_FAILURE_STAGE_ARGV_ENTRY,
+        EXEC_FAILURE_STAGE_ARGV_STRING,
+    )?;
+    let mut envp = read_user_str_array(
+        envp_ptr,
+        path as usize,
+        argv_ptr,
+        envp_ptr,
+        EXEC_FAILURE_STAGE_ENVP_ENTRY,
+        EXEC_FAILURE_STAGE_ENVP_STRING,
+    )?;
     if envp.is_empty() {
         envp.push(String::from("PATH=/bin:/basic:/"));
         envp.push(String::from("LD_LIBRARY_PATH=/lib"));
@@ -802,7 +970,10 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             // the stable kernel root before replacing it so PageTableWrapper
             // can release the old root and all of its user page-table frames.
             crate::trap::restore_kernel_page_table();
-            let mut ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+            let mut ms = crate::buildstorm_memory_set_lock!(
+                crate::buildstorm_diagnostics::MemorySetLockSite::ExecReplace,
+                &task.memory_set,
+            );
             log::info!("[syscall] execve: replacing memory set");
             *ms = new_memory_set;
         }
@@ -832,6 +1003,9 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     }
 
     // 通知 trap 处理：execve 已替换地址空间，跳过 syscall_ok() PC 前进
+    if let Some(task) = current_task() {
+        release_vfork_parent(&task);
+    }
     crate::trap::signal_execve_done();
     Ok(0)
 }
@@ -1146,7 +1320,10 @@ pub fn sys_clone(
 
     if log::log_enabled!(log::Level::Info) {
         let (area_count, page_count) = {
-            let ms = crate::buildstorm_memory_set_lock!(&parent.memory_set);
+            let ms = crate::buildstorm_memory_set_lock!(
+                crate::buildstorm_diagnostics::MemorySetLockSite::ForkCow,
+                &parent.memory_set,
+            );
             let pages = ms.areas.iter().fold(0usize, |sum, area| {
                 let start = area.start_va.raw() / crate::config::PAGE_SIZE;
                 let end =
@@ -1186,7 +1363,11 @@ pub fn sys_clone(
         // fork_cow copies backing frames through physical mappings while the
         // syscall remains on the kernel page table.  The parent address space
         // is reactivated by the scheduler before its next user-mode entry.
-        let child_memory = crate::buildstorm_memory_set_lock!(&parent.memory_set).fork_cow()?;
+        let child_memory = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::ForkCow,
+            &parent.memory_set,
+        )
+        .fork_cow()?;
         new_shared_memory_set(child_memory)
     };
     let mm = if share_vm {
@@ -1357,7 +1538,10 @@ pub fn sys_clone(
     }
     if (clone_bits & CLONE_CHILD_SETTID) != 0 && child_tid != 0 {
         let bytes = (child_pid as i32).to_ne_bytes();
-        let mut child_memory = crate::buildstorm_memory_set_lock!(&child.memory_set);
+        let mut child_memory = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyWrite,
+            &child.memory_set,
+        );
         super::user::copy_to_user_in_memory_set(&mut child_memory, child_tid, &bytes)?;
     }
 
@@ -1365,9 +1549,19 @@ pub fn sys_clone(
         parent.inner.lock().children.push(child.clone());
     }
     if is_vfork {
+        crate::task::prepare_current_deferred_block(
+            crate::task::wait_queue::BlockReason::ChildExit,
+        );
+    }
+    if is_vfork {
         crate::task::manager::add_task_front(child);
     } else {
         crate::task::manager::add_task(child);
+    }
+    if is_vfork {
+        crate::task::commit_current_deferred_block(
+            crate::task::wait_queue::BlockReason::ChildExit,
+        );
     }
     if crate::trap::foreground_driver_active() && !is_vfork {
         crate::task::request_foreground_requeue_front(parent.pid.0);

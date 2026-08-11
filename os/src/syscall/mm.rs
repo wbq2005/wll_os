@@ -133,33 +133,16 @@ fn ranges_overlap(
     left_start < right_end && right_start < left_end
 }
 
-fn read_area_bytes(area: &MapArea, src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
-    let mut copied = 0usize;
-    while copied < dst.len() {
-        let addr = src.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
-        if !area.contains(VirtAddr::new(addr)) {
-            return Err(SysErrNo::EFAULT);
-        }
-        let page_idx = (align_down(addr) - area.start_va.raw()) / PAGE_SIZE;
-        let page_off = addr % PAGE_SIZE;
-        let copy_len = (dst.len() - copied).min(PAGE_SIZE - page_off);
-        let frame = area.resident.lookup(page_idx).ok_or(SysErrNo::EFAULT)?;
-        let src_ptr = (frame.ppn().addr() + page_off) as *const u8;
-        unsafe {
-            core::ptr::copy_nonoverlapping(src_ptr, dst[copied..].as_mut_ptr(), copy_len);
-        }
-        copied += copy_len;
-    }
-    Ok(())
-}
-
 fn collect_shared_file_writes_for(
     task: &crate::task::TaskControlBlock,
     start: usize,
     end: usize,
     target_file: Option<&FileDescriptor>,
 ) -> Result<Vec<(FileDescriptor, usize, Vec<u8>)>, SysErrNo> {
-    let ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+    let ms = crate::buildstorm_memory_set_lock!(
+        crate::buildstorm_diagnostics::MemorySetLockSite::FileWriteback,
+        &task.memory_set,
+    );
     let mut writes = Vec::new();
     for area in &ms.areas {
         if !ranges_overlap(start, end, area.start_va.raw(), area.end_va.raw()) {
@@ -182,18 +165,34 @@ fn collect_shared_file_writes_for(
         {
             continue;
         }
-        if area.resident.is_empty() {
+        if area.resident().is_empty() {
             continue;
         }
         let copy_start = start.max(area.start_va.raw());
         let copy_end = end.min(area.end_va.raw());
-        let mut data = alloc::vec![0u8; copy_end - copy_start];
-        read_area_bytes(area, copy_start, &mut data)?;
-        writes.push((
-            file.clone(),
-            offset.saturating_add(copy_start - area.start_va.raw()),
-            data,
-        ));
+        let first_vpn = (align_down(copy_start) - area.start_va.raw()) / PAGE_SIZE;
+        let end_vpn = copy_end
+            .saturating_sub(area.start_va.raw())
+            .saturating_add(PAGE_SIZE - 1)
+            / PAGE_SIZE;
+        for (vpn, page) in area.resident().iter_range(first_vpn, end_vpn) {
+            let page_start = area.start_va.raw().saturating_add(vpn * PAGE_SIZE);
+            let write_start = copy_start.max(page_start);
+            let write_end = copy_end.min(page_start.saturating_add(PAGE_SIZE));
+            if write_start >= write_end {
+                continue;
+            }
+            let mut data = alloc::vec![0u8; write_end - write_start];
+            let src_ptr = (page.ppn().addr() + write_start - page_start) as *const u8;
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_ptr, data.as_mut_ptr(), data.len());
+            }
+            writes.push((
+                file.clone(),
+                offset.saturating_add(write_start - area.start_va.raw()),
+                data,
+            ));
+        }
     }
     Ok(writes)
 }
@@ -255,7 +254,10 @@ fn shm_alloc_frames(size: usize) -> Result<Vec<FrameTracker>, SysErrNo> {
 
 // A single shmat attachment can split into several VMAs after mprotect/munmap.
 fn task_shared_memory_attachments(task: &crate::task::TaskControlBlock) -> Vec<(usize, usize)> {
-    let ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+    let ms = crate::buildstorm_memory_set_lock!(
+        crate::buildstorm_diagnostics::MemorySetLockSite::SharedMemory,
+        &task.memory_set,
+    );
     let mut attachments = Vec::new();
     for area in &ms.areas {
         let MapAreaBacking::SharedMemory { shmid, base, .. } = &area.backing else {
@@ -423,7 +425,10 @@ pub fn sys_brk(new_brk: usize) -> SyscallRet {
     }
 
     if new_mapped_end != mapped_break {
-        let mut ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::Brk,
+            &task.memory_set,
+        );
         if new_mapped_end > mapped_break {
             if ms.range_overlaps(mapped_break, new_mapped_end) {
                 return Ok(current_break);
@@ -523,7 +528,10 @@ pub fn sys_mmap(
 
     let next_hint = task.mm.lock().next_mmap;
     let mut start = {
-        let ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::Mmap,
+            &task.memory_set,
+        );
         if fixed_addr {
             addr
         } else if addr != 0 {
@@ -593,7 +601,10 @@ pub fn sys_mmap(
     }
 
     {
-        let mut ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::Mmap,
+            &task.memory_set,
+        );
         if no_replace && ms.range_overlaps(start, end) {
             return Err(SysErrNo::EEXIST);
         }
@@ -655,7 +666,10 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallRet {
     let (start, end) = checked_range(addr, len)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     {
-        let mut ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::Mprotect,
+            &task.memory_set,
+        );
         ms.protect_range(VirtAddr::new(start), VirtAddr::new(end), pte_flags)?;
     }
     Ok(0)
@@ -676,7 +690,10 @@ pub fn sys_munmap(addr: usize, length: usize) -> SyscallRet {
     let writes = collect_shared_file_writes(&task, start, end)?;
     write_back_shared_files(writes)?;
     {
-        let mut ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::Munmap,
+            &task.memory_set,
+        );
         ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
     }
     Ok(0)
@@ -703,7 +720,10 @@ pub fn sys_msync(addr: usize, length: usize, flags: usize) -> SyscallRet {
     let end = align_up(addr.checked_add(length).ok_or(SysErrNo::EINVAL)?)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     {
-        let ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::FileWriteback,
+            &task.memory_set,
+        );
         if !ms.range_covered(start, end) {
             return Err(SysErrNo::ENOMEM);
         }
@@ -711,7 +731,10 @@ pub fn sys_msync(addr: usize, length: usize, flags: usize) -> SyscallRet {
     let writes = collect_shared_file_writes(&task, start, end)?;
     write_back_shared_files(writes)?;
     if (flags & MS_INVALIDATE) != 0 {
-        let mut ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::FileInvalidate,
+            &task.memory_set,
+        );
         ms.invalidate_file_range(VirtAddr::new(start), VirtAddr::new(end))?;
     }
     Ok(0)
@@ -805,7 +828,10 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SyscallRet {
     let attach_result = (|| -> Result<usize, SysErrNo> {
         let start = if shmaddr == 0 {
             let next_hint = task.mm.lock().next_mmap;
-            let ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+            let ms = crate::buildstorm_memory_set_lock!(
+                crate::buildstorm_diagnostics::MemorySetLockSite::SharedMemory,
+                &task.memory_set,
+            );
             find_mmap_area(&ms, next_hint, map_len).ok_or(SysErrNo::ENOMEM)?
         } else if (shmflg & SHM_RND) != 0 {
             align_down(shmaddr)
@@ -840,7 +866,10 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SyscallRet {
         }
 
         {
-            let mut ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+            let mut ms = crate::buildstorm_memory_set_lock!(
+                crate::buildstorm_diagnostics::MemorySetLockSite::SharedMemory,
+                &task.memory_set,
+            );
             if remap {
                 ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
             } else if ms.range_overlaps(start, end) {
@@ -883,7 +912,10 @@ pub fn sys_shmdt(shmaddr: usize) -> SyscallRet {
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let (shmid, ranges) = {
-        let ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::SharedMemory,
+            &task.memory_set,
+        );
         let area = ms
             .areas
             .iter()
@@ -916,7 +948,10 @@ pub fn sys_shmdt(shmaddr: usize) -> SyscallRet {
         (shmid, ranges)
     };
     {
-        let mut ms = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::SharedMemory,
+            &task.memory_set,
+        );
         for (start, end) in ranges {
             ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
         }

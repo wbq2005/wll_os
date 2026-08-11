@@ -1,0 +1,142 @@
+{
+  "compiling_lines": 23,
+  "last_crate": "ax-posix-api v0.5.29 (/work/tgoskits/os/arceos/api/arceos_posix_api)",
+  "finished_lines": 2,
+  "buildstorm_result_lines": [
+    "BUILDSTORM_TOOLCHAIN ok",
+    "BUILDSTORM_MINIBUILD ok",
+    "BUILDSTORM_BEGIN mode=multi"
+  ],
+  "guest_aggregate_lines": [],
+  "guest_aggregate_snapshot_count": 0,
+  "guest_aggregate_complete_snapshot_count": 0,
+  "guest_aggregate_before_marker": null,
+  "guest_aggregate_final": null,
+  "panic_seen": false,
+  "qemu_exit_code_before_termination": -9,
+  "marker_seen": true,
+  "host_elapsed_seconds": 350.842229739,
+  "marker_window_elapsed_seconds": 300.18339814499996,
+  "progress_timeline": [
+    {
+      "kind": "finished",
+      "after_marker_seconds": 39.44877104600005,
+      "value": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.45s"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 177.41328695800007,
+      "value": "compiler_builtins v0.1.160 (/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 177.41328695800007,
+      "value": "core v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/lib/rustlib/src/rust/library/core)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 178.01417100700007,
+      "value": "libc v0.2.185"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 178.01417100700007,
+      "value": "std v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/lib/rustlib/src/rust/library/std)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 178.615076027,
+      "value": "thiserror v2.0.18"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 178.615076027,
+      "value": "heapless v0.9.3"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 179.416109808,
+      "value": "ax-errno v0.6.1 (/work/tgoskits/components/axerrno)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 179.81667265200008,
+      "value": "num-traits v0.2.19"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 179.81667265200008,
+      "value": "ax-percpu v0.4.14 (/work/tgoskits/components/percpu/percpu)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 180.61782738099998,
+      "value": "radium v0.7.0"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 180.61782738099998,
+      "value": "libc v0.2.186"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 181.81953337000004,
+      "value": "anyhow v1.0.103"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 181.81953337000004,
+      "value": "rust_decimal v1.42.1"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 182.62066825099998,
+      "value": "ax-alloc v0.8.12 (/work/tgoskits/os/arceos/modules/axalloc)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 183.221688051,
+      "value": "someboot v0.3.5 (/work/tgoskits/platforms/someboot)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 183.62226303300008,
+      "value": "somehal v0.8.0 (/work/tgoskits/platforms/somehal)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 184.22310736600002,
+      "value": "ax-driver v0.12.0 (/work/tgoskits/drivers/ax-driver)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 184.22310736600002,
+      "value": "axplat-dyn v0.7.12 (/work/tgoskits/platforms/axplat-dyn)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 184.22310736600002,
+      "value": "ax-hal v0.5.28 (/work/tgoskits/os/arceos/modules/axhal)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 186.22578140299993,
+      "value": "ax-task v0.6.4 (/work/tgoskits/os/arceos/modules/axtask)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 186.82659703900003,
+      "value": "ax-runtime v0.10.4 (/work/tgoskits/os/arceos/modules/axruntime)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 186.82659703900003,
+      "value": "scope-local v0.4.2 (/work/tgoskits/components/scope-local)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 187.22717919799993,
+      "value": "ax-posix-api v0.5.29 (/work/tgoskits/os/arceos/api/arceos_posix_api)"
+    }
+  ]
+}

@@ -27,7 +27,10 @@ pub fn copy_to_user(dst: usize, src: &[u8]) -> Result<(), SysErrNo> {
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     super::with_kernel_page_table(|| {
-        let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut memory_set = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyWrite,
+            &task.memory_set,
+        );
         copy_to_user_in_memory_set(&mut memory_set, dst, src)
     })
 }
@@ -88,7 +91,10 @@ pub fn copy_from_user(src: usize, dst: &mut [u8]) -> Result<(), SysErrNo> {
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     super::with_kernel_page_table(|| {
-        let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut memory_set = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyRead,
+            &task.memory_set,
+        );
         copy_from_user_in_memory_set(&mut memory_set, src, dst)
     })
 }
@@ -98,7 +104,10 @@ pub fn check_user_readable(src: usize, len: usize) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EFAULT);
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
-    let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+    let mut memory_set = crate::buildstorm_memory_set_lock!(
+        crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyRead,
+        &task.memory_set,
+    );
     memory_set.prepare_read(src, len)
 }
 
@@ -108,7 +117,10 @@ pub fn clear_user(dst: usize, len: usize) -> Result<(), SysErrNo> {
     }
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     super::with_kernel_page_table(|| {
-        let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut memory_set = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyWrite,
+            &task.memory_set,
+        );
         memory_set.prepare_write(dst, len)?;
         let mut copied = 0usize;
         while copied < len {
@@ -173,7 +185,10 @@ fn read_cstr_inner(
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     super::with_kernel_page_table(|| {
         let mut bytes = Vec::new();
-        let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+        let mut memory_set = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyRead,
+            &task.memory_set,
+        );
         let mut offset = 0usize;
         while offset < MAX_CSTR_LEN {
             let va = addr.checked_add(offset).ok_or(SysErrNo::EFAULT)?;

@@ -128,9 +128,12 @@ pub type SharedMemorySet = Arc<Mutex<MemorySet>>;
 #[cfg(feature = "buildstorm-diagnostics")]
 #[macro_export]
 macro_rules! buildstorm_memory_set_lock {
-    ($mutex:expr) => {
-        $crate::buildstorm_diagnostics::lock(
-            $crate::buildstorm_diagnostics::LockClass::MemorySet,
+    ($site:expr, $mutex:expr $(,)?) => {
+        $crate::buildstorm_diagnostics::lock_memory_set($site, $mutex)
+    };
+    ($mutex:expr $(,)?) => {
+        $crate::buildstorm_diagnostics::lock_memory_set(
+            $crate::buildstorm_diagnostics::MemorySetLockSite::Other,
             $mutex,
         )
     };
@@ -142,11 +145,8 @@ macro_rules! buildstorm_memory_set_lock {
 #[cfg(feature = "buildstorm-diagnostics")]
 #[macro_export]
 macro_rules! buildstorm_memory_set_activation_lock {
-    ($mutex:expr) => {
-        $crate::buildstorm_diagnostics::lock(
-            $crate::buildstorm_diagnostics::LockClass::MemorySetActivation,
-            $mutex,
-        )
+    ($mutex:expr $(,)?) => {
+        $crate::buildstorm_diagnostics::lock_memory_set_activation($mutex)
     };
 }
 
@@ -161,6 +161,9 @@ macro_rules! buildstorm_memory_set_activation_lock {
 #[cfg(not(feature = "buildstorm-diagnostics"))]
 #[macro_export]
 macro_rules! buildstorm_memory_set_lock {
+    ($site:expr, $mutex:expr $(,)?) => {
+        $mutex.lock()
+    };
     ($mutex:expr) => {
         $mutex.lock()
     };
@@ -761,6 +764,76 @@ pub fn block_current_for_reason(reason: wait_queue::BlockReason) {
     block_current_for_reason_until(reason, None);
 }
 
+/// Announce a block that takes effect after the current syscall result has
+/// been committed to its trap frame.  This is used by vfork: restarting clone
+/// after a foreground-driver park would create a second child.
+pub(crate) fn prepare_current_deferred_block(reason: wait_queue::BlockReason) {
+    if let Some(task) = current_task() {
+        *task.wait_outcome.lock() = None;
+        *task.block_reason.lock() = Some(reason);
+    }
+}
+
+/// Publish the deferred Blocked state without parking/restarting the syscall.
+/// A racing completion records an early wake in `wait_outcome`; the recheck
+/// below consumes it before the trap wrapper releases CPU ownership.
+pub(crate) fn commit_current_deferred_block(reason: wait_queue::BlockReason) {
+    let Some(task) = current_task() else {
+        return;
+    };
+    if !matches!(*task.block_reason.lock(), Some(active) if active == reason) {
+        return;
+    }
+    if task.wait_outcome.lock().take().is_some() {
+        *task.block_reason.lock() = None;
+        return;
+    }
+    task.blocking_cpu
+        .store(crate::platform::current_cpu_index(), Ordering::Release);
+    if !task.set_status_if(TaskStatus::Running, TaskStatus::Blocked) {
+        task.blocking_cpu.store(NO_CPU, Ordering::Release);
+        *task.block_reason.lock() = None;
+        return;
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_block_start(&task, reason);
+    if task.wait_outcome.lock().take().is_some() {
+        task.blocking_cpu.store(NO_CPU, Ordering::Release);
+        let _ = task.set_status_if(TaskStatus::Blocked, TaskStatus::Running)
+            || task.set_status_if(TaskStatus::Ready, TaskStatus::Running);
+        *task.block_reason.lock() = None;
+    }
+}
+
+/// Complete a deferred block.  Before Blocked is visible, record the wake for
+/// the commit-side recheck; afterwards publish Ready without leaving a stale
+/// wait outcome for an unrelated future wait queue operation.
+pub(crate) fn wake_deferred_block(
+    task: &Arc<TaskControlBlock>,
+    reason: wait_queue::BlockReason,
+) -> bool {
+    let mut status = task.status.lock();
+    if !matches!(*task.block_reason.lock(), Some(active) if active == reason) {
+        return false;
+    }
+    if *status != TaskStatus::Blocked {
+        *task.wait_outcome.lock() = Some(wait_queue::WaitOutcome::Woken);
+        return true;
+    }
+    *status = TaskStatus::Ready;
+    *task.block_reason.lock() = None;
+    drop(status);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_block_end(task, wait_queue::WaitOutcome::Woken);
+    let owner = task.blocking_cpu.load(Ordering::Acquire);
+    if owner == NO_CPU {
+        manager::add_task(task.clone());
+    } else {
+        crate::platform::notify_cpu(owner);
+    }
+    true
+}
+
 pub fn block_current_for_reason_until(reason: wait_queue::BlockReason, deadline_us: Option<usize>) {
     if let Some(task) = current_task() {
         if task.wait_outcome.lock().is_some() {
@@ -1320,7 +1393,10 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     if clear_child_tid != 0 {
         let bytes = 0i32.to_ne_bytes();
         {
-            let mut memory_set = crate::buildstorm_memory_set_lock!(&task.memory_set);
+            let mut memory_set = crate::buildstorm_memory_set_lock!(
+                crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyWrite,
+                &task.memory_set,
+            );
             if let Err(err) = crate::syscall::user::copy_to_user_in_memory_set(
                 &mut memory_set,
                 clear_child_tid,
@@ -1422,6 +1498,7 @@ fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     // 先记录父进程。后续 release_process_runtime_resources 会关闭 fd、释放
     // 地址空间等资源；父子关系本身仍需保留给 wait4/waitpid 回收 zombie。
     let parent = task.inner.lock().parent.clone();
+    crate::syscall::process::release_vfork_parent(task);
     let members = task.thread_group.user_members();
     crate::syscall::fs::release_file_locks_for_pid(task.thread_group.tgid());
     detach_thread_group_shared_memory(&members);

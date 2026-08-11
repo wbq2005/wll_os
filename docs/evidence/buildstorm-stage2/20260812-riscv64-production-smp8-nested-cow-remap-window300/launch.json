@@ -1,0 +1,51 @@
+{
+  "arch": "riscv64",
+  "memory": "8G",
+  "smp": 8,
+  "window_seconds": 300,
+  "begin_timeout_seconds": 1800,
+  "production_diagnostics_disabled": true,
+  "image": "/srv/buildstorm/images/sdcard-rv-pub.img",
+  "image_sha256": "d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c",
+  "kernel": "/srv/buildstorm/worktrees/wll_os-50c9bd3-relative-audit/target/riscv64gc-unknown-none-elf/release/wll_OS",
+  "kernel_sha256": "a86c8e958861404f4b5ff60ab4e4f4ac065c0e3c5a5d6d351919a52a44fc9f26",
+  "source": {
+    "commit": "50c9bd348f13cd845880bdcf1ccf3a1e84eac0ea",
+    "branch": "",
+    "status": "## HEAD (no branch)\n M os/src/buildstorm_diagnostics.rs\n M os/src/mm/map_area.rs\n M os/src/mm/memory_set.rs\n M os/src/smp_regression.rs\n M os/src/syscall/mm.rs\n M os/src/syscall/mod.rs\n M os/src/syscall/other.rs\n M os/src/syscall/process.rs\n M os/src/syscall/user.rs\n M os/src/task/harness.rs\n M os/src/task/mod.rs\n M os/src/trap/mod.rs\n M scripts/run_buildstorm_window.py\n?? scripts/__pycache__/\n",
+    "dirty_diff_sha256": "3b070754d619d33381ad991ec099b293d8ddb65bfd76c48905dfacdc70841c8f"
+  },
+  "build_command": null,
+  "build_elapsed_seconds": null,
+  "build_log": null,
+  "qemu_version": "QEMU emulator version 11.0.3",
+  "qemu_args": [
+    "/usr/local/bin/qemu-system-riscv64",
+    "-snapshot",
+    "-kernel",
+    "/srv/buildstorm/worktrees/wll_os-50c9bd3-relative-audit/target/riscv64gc-unknown-none-elf/release/wll_OS",
+    "-m",
+    "8G",
+    "-smp",
+    "8",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "stdio",
+    "-drive",
+    "file=/srv/buildstorm/images/sdcard-rv-pub.img,if=none,format=raw,id=x0",
+    "-no-reboot",
+    "-machine",
+    "virt",
+    "-bios",
+    "default",
+    "-device",
+    "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0"
+  ],
+  "target_snapshot_stats": {
+    "available": false,
+    "reason": "-snapshot keeps guest target writes in an ephemeral QEMU overlay; host does not mount or inspect the official image"
+  }
+}
