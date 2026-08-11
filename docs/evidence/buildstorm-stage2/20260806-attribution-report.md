@@ -1278,3 +1278,44 @@ image SHA-256
 Complete launch arguments and host `pidstat`, `iostat`, `vmstat`, and QEMU
 thread samples are in the archived window directory. The guest aggregate file
 is empty because production diagnostics were disabled.
+
+### 20260812 production complete run: repeated 33-crate high-CPU stall
+
+The post-correctness production complete run is archived at
+`20260812-riscv64-production-complete-15000-official/`. It used the unmodified
+official glibc image and suite, a production release kernel with diagnostics
+disabled, and `-snapshot -m 8G -smp 8`. The outer runner was allowed its full
+15,000-second deadline and terminated normally through the evidence wrapper.
+
+The raw serial contains `BUILDSTORM_TOOLCHAIN ok`, `BUILDSTORM_MINIBUILD ok`,
+and `BUILDSTORM_BEGIN mode=multi`, but no `BUILDSTORM_COMPILE` result. It has
+33 `Compiling` lines, two `Finished` lines, and ends at
+`rustc-literal-escaper v0.0.7`. There is no exact kernel panic or OOM marker.
+The serial stopped growing near the 33rd event and remained unchanged for the
+rest of the four-hour run. This repeats the prior 33-event long-baseline
+boundary and is therefore classified as a **deterministic high-CPU
+stall/livelock boundary**, not successful compilation and not demonstrated
+slow forward progress. Production evidence does not identify the internal
+lock or loop, so the mechanism remains unverified.
+
+`runner.json` records `host_elapsed_seconds=15000.108831100002`, QEMU 11.0.3,
+and the complete arguments. GNU time records `4:10:07`, 773% aggregate CPU,
+maximum RSS 3,304,856 KiB, zero swaps, and exit status 1. Late `vmstat`
+samples show `swpd/si/so=0`, `wa=0`, and six to eight runnable host tasks;
+late `iostat` samples show effectively zero device utilization. During live
+observation all eight TCG vCPU threads were busy. The host therefore did not
+swap, saturate storage, or reduce execution to one QEMU thread. The requested
+`host-pidstat.log` exists but contains only headers because `pidstat -C`
+failed to match the truncated Linux QEMU comm; CPU evidence comes from GNU
+time, `vmstat`, and the recorded live thread samples. This sampler defect does
+not change the guest result but must be fixed in the runner before another
+long run.
+
+Official judge output is 20.0/180.0 scripted points: toolchain 8, minibuild
+12, compile 0, compile-time 0. Provenance is source commit
+`50c9bd348f13cd845880bdcf1ccf3a1e84eac0ea`, kernel SHA-256
+`433a501d926119de1adf17eb8683c6e4ffa70fc6c52b95ecec92a73b6705f8e8`, image
+SHA-256 `d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`,
+suite commit `b5ec6ef8497e1818cbdec3b54bb722f036e57972`, and serial SHA-256
+`a5efe1cc04bbb6efc0597b4796f7f2c74d512e56ab7fc3b24a9026e0344d463a`.
+There is still no official compile pass.

@@ -1,0 +1,4 @@
+[riscv64] stage=complete reached=False log=/srv/buildstorm/worktrees/wll_os-50c9bd3-relative-audit/_tmp/buildstorm-riscv64-complete.log
+BUILDSTORM_TOOLCHAIN ok
+BUILDSTORM_MINIBUILD ok
+BUILDSTORM_BEGIN mode=multi

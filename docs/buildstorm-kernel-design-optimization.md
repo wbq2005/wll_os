@@ -1125,3 +1125,24 @@ drafting. Developer-verifiable evidence consists of the source diff, dual-
 architecture builds/regressions, raw serial logs, hashes, exact QEMU arguments,
 and host metrics; official compile and judge success remain unverified until
 the exact successful marker is present.
+
+### Complete-run outcome
+
+The corresponding production complete run used the unmodified official image
+and suite, diagnostics disabled, `-snapshot -m 8G -smp 8`, and the full
+15,000-second outer timeout. It again stopped at 33 `Compiling` events and
+produced no `BUILDSTORM_COMPILE` result, panic, or OOM. Serial output remained
+unchanged for most of the 4:10:07 run while QEMU consumed 773% aggregate host
+CPU; all eight TCG threads were observed busy, with zero swap and no storage
+saturation. Because this repeats the prior 33-event long-run boundary, the
+result is classified as a deterministic high-CPU stall/livelock boundary.
+The exact internal mechanism is not proven by the feature-off run.
+
+The official judge awarded 20/180 scripted points (toolchain 8, minibuild 12,
+compile 0, compile-time 0). Raw evidence is in
+`docs/evidence/buildstorm-stage2/20260812-riscv64-production-complete-15000-official/`.
+The next diagnostic must isolate this stable late boundary using existing
+feature-gated aggregate counters; it must not combine scheduler, MM, VFS, or
+block-cache production changes. The long-run `pidstat -C` filter also needs a
+host-runner-only correction because Linux truncated the QEMU comm and the log
+contains headers only.

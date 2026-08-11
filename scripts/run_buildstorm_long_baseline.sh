@@ -64,7 +64,18 @@ stop_samplers() {
 }
 trap stop_samplers EXIT
 
-start_sampler "$evidence/host-pidstat.log" pidstat -d -r -u -w -h -C "qemu-system-$arch" 1
+(
+    qemu_pid=
+    for _ in $(seq 1 600); do
+        qemu_pid=$(pgrep -n -f "/qemu-system-$arch .* -kernel " || true)
+        if [[ -n $qemu_pid ]]; then
+            exec pidstat -d -r -u -w -h -p "$qemu_pid" 1
+        fi
+        sleep 1
+    done
+    echo "unavailable: qemu-system-$arch pid was not observed"
+) >"$evidence/host-pidstat.log" 2>&1 &
+pids+=("$!")
 start_sampler "$evidence/host-iostat.log" iostat -dx 1
 start_sampler "$evidence/host-vmstat.log" vmstat 1
 
