@@ -1388,3 +1388,19 @@ not a verified explanation for the BuildStorm stall. Evidence is archived at
 `20260812-riscv64-production-smp8-activation-token-window300/`, including
 `derived-comparison.md`. Complete BuildStorm remains `unverified`: no exact
 `BUILDSTORM_COMPILE mode=multi ok=true` marker exists.
+### 20260812 rejected munmap range-drain window
+
+A second isolated MM candidate replaced the `unmap_range` whole-vector
+rebuild and per-VMA remote shootdowns with one contiguous drain, one remote
+shootdown, and post-shootdown resident release. Four cfg checks and both
+architectures' production release/SMP gates passed.
+
+The comparable production result was 23/23 `Compiling` lines with the same
+`ax-posix-api` boundary. The last crate arrived 1.16% earlier, which is below
+the 5% retention floor. Host swap and storage saturation were absent and all
+eight TCG threads were active. The candidate was reverted. This demonstrates
+that munmap's local vector reconstruction and repeated shootdown are not, by
+themselves, the production change that crosses the stable late boundary.
+Evidence is in
+`20260812-riscv64-production-smp8-unmap-range-drain-window300-run2/`.
+Complete BuildStorm remains unverified.

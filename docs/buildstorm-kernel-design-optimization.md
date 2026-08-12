@@ -1231,3 +1231,30 @@ absent. AI assisted with semantic lifetime auditing, regression design,
 measurement comparison, and documentation. Developer-verifiable artifacts
 are the source diff, dual-architecture build/SMP logs, raw serial, launch
 metadata, and host samplers.
+
+## 31. Rejected munmap range-drain candidate (2026-08-12)
+
+The next isolated hypothesis targeted the measured 414 seconds of `munmap`
+MemorySet hold time. `unmap_range` was changed to drain only the contiguous
+VMA interval, withdraw every affected PTE, issue one remote shootdown, and
+drop removed resident owners after shootdown completion. This eliminated the
+whole-vector rebuild, global sort/coalesce, and per-VMA remote shootdown while
+preserving the existing MemorySet lock and architecture-neutral PTE ordering.
+
+Four cfg checks, dual production release builds, and dual eight-CPU SMP
+regressions passed. The official-image production window nevertheless reached
+the same 23 `Compiling` lines and final `ax-posix-api` crate. The 23rd crate
+improved only from 187.227 to 185.047 seconds (1.16%), below the mandatory 5%
+floor, so the candidate and its dedicated regression were immediately
+reverted.
+
+Raw evidence is under
+`docs/evidence/buildstorm-stage2/20260812-riscv64-production-smp8-unmap-range-drain-window300-run2/`.
+The host did not swap or saturate storage and all eight TCG threads were
+active. Candidate kernel SHA-256 was
+`0dc6c3e5469a7e28ef439c01058141d8418a6893701cc1092496cc3867a5d914`.
+This result narrows the hotspot: local VMA removal mechanics alone do not
+explain the late high-CPU boundary. Complete BuildStorm remains unverified.
+AI assisted with lifecycle auditing, regression design, controlled remote
+measurement, and evidence comparison; all claims are reproducible from the
+saved launch, summary, serial, and host sampler files.
