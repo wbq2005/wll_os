@@ -1146,3 +1146,88 @@ feature-gated aggregate counters; it must not combine scheduler, MM, VFS, or
 block-cache production changes. The long-run `pidstat -C` filter also needs a
 host-runner-only correction because Linux truncated the QEMU comm and the log
 contains headers only.
+
+## 29. Late-boundary MemorySet attribution (2026-08-12)
+
+An 1,800-second RISC-V64 diagnostic window reached the repeated late compile
+phase with up to ten runnable rustc tasks and user execution on all eight
+vCPUs. Over the final 835.85 seconds, `memory_set_activation` accumulated
+1,327.84 seconds of cross-task lock wait, followed by 1,120.44 seconds for the
+aggregate MemorySet class. Direct address-space activation and TLB shootdown
+work totaled only about 11.6 seconds. Host swap, host storage saturation,
+virtio lock wait, and block-cache lock wait were absent. The first measured
+kernel bottleneck is therefore shared MemorySet lock contention at user entry
+and mmap/munmap, not scheduling, raw TLB instructions, or block I/O.
+
+The historical lockless candidate `cc7d0f7` is not reusable as written. It
+copied raw root and ASID values into every TCB, while exec replaces the shared
+MemorySet after merely marking peer threads Zombie. The current peer-exit path
+does not synchronously wait for each peer's `running_cpu` ownership to drain;
+therefore a peer may still retain the old execution identity while the old
+page table and resident frames are destroyed. Independent root and ASID
+atomics also do not define a transactional identity pair. These are
+source-derived lifetime hazards, not a demonstrated explanation for the
+BuildStorm stall.
+
+The next candidate gate is an independent lifecycle regression covering
+concurrent `CLONE_VM` mapping edits and user return, exec peer quiescence,
+address-space replacement/drop, ASID reuse, and remote shootdown publication.
+Only after that gate passes may a RISC-V lockless activation snapshot be
+considered. The preferred boundary is one immutable address-space identity
+value, published transactionally, whose owning MemorySet and resident frames
+remain alive until no CPU can execute the old identity. LoongArch keeps its
+existing conservative activation/flush path unless separate measurements
+justify an architecture-specific change. No production optimization or
+complete-build timing is claimed from this diagnostic run.
+
+Raw and derived evidence is under
+`docs/evidence/buildstorm-stage2/20260812-riscv64-diagnostics-smp8-late-boundary-window1800/`.
+The run used source commit `50c9bd348f13cd845880bdcf1ccf3a1e84eac0ea`
+plus diagnostic diff SHA-256
+`3b070754d619d33381ad991ec099b293d8ddb65bfd76c48905dfacdc70841c8f`,
+kernel SHA-256
+`6697a8971432d34a801c51be0a95ae5a1c7b782081a560bd59fe6d284489be7f`,
+the official image SHA-256
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`,
+and QEMU 11.0.3 with `-snapshot -m 8G -smp 8`. AI assisted with aggregate
+delta calculation, source cross-checking, and lifecycle review. All numbers
+are reproducible from the saved raw JSON and serial/host logs. There is still
+no exact `BUILDSTORM_COMPILE mode=multi ok=true` marker.
+
+## 30. Rejected RISC-V activation-token candidate (2026-08-12)
+
+The late diagnostic justified testing one architecture-specific hypothesis:
+remove the shared `MemorySet` lock from the RISC-V user-entry identity read.
+The candidate published root and ASID as one SATP token, retained the existing
+mapping mutex, kept LoongArch on its conservative locked activation path, and
+added address-space retirement and activation-identity regressions. Four cfg
+builds, both production release builds, and both eight-CPU SMP regressions
+passed before the performance window.
+
+The official-image production window rejected the candidate. Baseline and
+candidate both reached 23 `Compiling` lines, two `Finished` lines, and the
+same last crate, `ax-posix-api`; coarse progress improvement was 0%. The first
+timed crate moved from 177.413 to 193.633 seconds (9.14% slower), and the 23rd
+crate moved from 187.227 to 205.649 seconds (9.84% slower). Both hosts had zero
+swap, negligible storage utilization, and activity on all eight TCG threads.
+The production candidate and its dedicated kernel regression were therefore
+reverted. The corrected host SMP runner remains: it now waits for the final
+`[smp-regression] pass cpus=` marker instead of accepting an intermediate
+phase pass.
+
+The lifecycle audit exposed but did not solve a broader ownership issue:
+`CLONE_VM` without `CLONE_THREAD` shares the current address-space owner, so
+exec detachment cannot safely be modeled as an in-place replacement visible
+to all sharing processes. That source-derived risk prevents reusing the token
+design without a per-process view/backing ownership model. It is not a proven
+cause of the BuildStorm boundary.
+
+Raw evidence and the exact comparison are in
+`docs/evidence/buildstorm-stage2/20260812-riscv64-production-smp8-activation-token-window300/`.
+The candidate kernel SHA-256 was
+`f7349c21c1421b89c6cdc3655b9395daa240e9416f159a0dc9f2dd3d9e4dc4ea`.
+No official compile success is claimed; the exact successful marker remains
+absent. AI assisted with semantic lifetime auditing, regression design,
+measurement comparison, and documentation. Developer-verifiable artifacts
+are the source diff, dual-architecture build/SMP logs, raw serial, launch
+metadata, and host samplers.

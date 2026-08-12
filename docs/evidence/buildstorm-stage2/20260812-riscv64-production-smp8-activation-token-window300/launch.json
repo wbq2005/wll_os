@@ -1,0 +1,60 @@
+{
+  "arch": "riscv64",
+  "memory": "8G",
+  "smp": 8,
+  "window_seconds": 300,
+  "begin_timeout_seconds": 1800,
+  "production_diagnostics_disabled": true,
+  "image": "/srv/buildstorm/images/sdcard-rv-pub.img",
+  "image_sha256": "d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c",
+  "kernel": "/srv/buildstorm/worktrees/wll_os-activation-token-20260812/target/riscv64gc-unknown-none-elf/release/wll_OS",
+  "kernel_sha256": "f7349c21c1421b89c6cdc3655b9395daa240e9416f159a0dc9f2dd3d9e4dc4ea",
+  "source": {
+    "commit": "50c9bd348f13cd845880bdcf1ccf3a1e84eac0ea",
+    "branch": "",
+    "status": "## HEAD (no branch)\n M os/src/buildstorm_diagnostics.rs\n M os/src/mm/map_area.rs\n M os/src/mm/memory_set.rs\n M os/src/platform.rs\n M os/src/smp_regression.rs\n M os/src/syscall/mm.rs\n M os/src/syscall/mod.rs\n M os/src/syscall/other.rs\n M os/src/syscall/process.rs\n M os/src/syscall/user.rs\n M os/src/task/harness.rs\n M os/src/task/mod.rs\n M os/src/trap/mod.rs\n M patch/polyhal/src/pagetable/mod.rs\n M scripts/run_buildstorm_long_baseline.sh\n M scripts/run_buildstorm_window.py\n M scripts/run_smp_regression.py\n?? scripts/__pycache__/\n",
+    "dirty_diff_sha256": "8406cf597b6f8a2a3e1f792615a0c94a72b8dd83b7031c9e647e147bc8d6678d"
+  },
+  "build_command": [
+    "/root/.cargo/bin/cargo",
+    "+nightly-2025-01-18",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--target",
+    "riscv64gc-unknown-none-elf"
+  ],
+  "build_elapsed_seconds": 11.496278847000212,
+  "build_log": "/srv/buildstorm/worktrees/wll_os-activation-token-20260812/_tmp/release-build-riscv64.log",
+  "qemu_version": "QEMU emulator version 11.0.3",
+  "qemu_args": [
+    "/usr/local/bin/qemu-system-riscv64",
+    "-snapshot",
+    "-kernel",
+    "/srv/buildstorm/worktrees/wll_os-activation-token-20260812/target/riscv64gc-unknown-none-elf/release/wll_OS",
+    "-m",
+    "8G",
+    "-smp",
+    "8",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "stdio",
+    "-drive",
+    "file=/srv/buildstorm/images/sdcard-rv-pub.img,if=none,format=raw,id=x0",
+    "-no-reboot",
+    "-machine",
+    "virt",
+    "-bios",
+    "default",
+    "-device",
+    "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0"
+  ],
+  "target_snapshot_stats": {
+    "available": false,
+    "reason": "-snapshot keeps guest target writes in an ephemeral QEMU overlay; host does not mount or inspect the official image"
+  }
+}

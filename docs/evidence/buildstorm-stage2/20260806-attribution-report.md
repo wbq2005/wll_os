@@ -1319,3 +1319,72 @@ SHA-256 `d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`,
 suite commit `b5ec6ef8497e1818cbdec3b54bb722f036e57972`, and serial SHA-256
 `a5efe1cc04bbb6efc0597b4796f7f2c74d512e56ab7fc3b24a9026e0344d463a`.
 There is still no official compile pass.
+
+### 20260812 late-boundary diagnostic classification
+
+The follow-up feature-gated run is archived at
+`20260812-riscv64-diagnostics-smp8-late-boundary-window1800/`. It used the
+unmodified official image, QEMU 11.0.3, `-snapshot -m 8G -smp 8`, and an
+explicit diagnostics build. The 1,800-second marker window reached 32
+`Compiling` lines and two `Finished` lines, ending at `cfg-if v1.0.4`. It did
+not emit a successful compile, panic, or OOM marker. Diagnostic overhead
+changes the crate boundary, so this is classification evidence rather than a
+production progress comparison.
+
+Across all 181 snapshots, at most two rustc process groups, 20 rustc tasks,
+and ten runnable rustc tasks were observed. The final snapshot had two rustc
+process groups, 17 rustc tasks, and eight runnable rustc tasks. Every one of
+the eight vCPUs accumulated substantial user execution in the late interval;
+the host neither swapped nor saturated storage, and all eight TCG threads
+were active.
+
+Snapshot 100 through 181 isolates 835,852,201 us around and after the final
+visible crate transition. `memory_set_activation` accumulated 1,327,840,468
+us of lock wait over 1,196,513 acquisitions, while its hold time was only
+3,190,936 us. Aggregate `memory_set` wait was 1,120,439,870 us. The largest
+site deltas were user-entry activation at 1,327,814,365 us wait, mmap at
+694,396,637 us, file writeback at 194,731,069 us, munmap at 124,441,372 us,
+and hardware page fault at 106,797,451 us.
+
+The interval contained 666,717 `mmap` calls and 204,951 `munmap` calls. Source
+cross-checking confirms each work counter is created once at syscall entry;
+`mmap` separately locks for address selection and validation/commit, so the
+larger lock count is expected rather than duplicate syscall counting. Direct
+address-space activation plus TLB shootdown work was only about 11.6 seconds
+over the same interval. Block/virtio lock wait was zero, host device use was
+negligible, and the highest aggregate task blocking class, pipe readiness,
+coexisted with eight runnable rustc tasks.
+
+The first actionable performance hypothesis is therefore the shared
+MemorySet lock required only to read activation identity on every user
+return. This does not authorize restoring commit `cc7d0f7` unchanged. Current
+source shows that exec marks peer threads Zombie but does not wait for their
+`running_cpu` ownership to drain before replacing and dropping the shared
+MemorySet. Any lockless identity cache must first prove root, ASID,
+page-table, resident-frame, exec-peer, and ASID-reuse lifetime. The compact
+derivation and verified/inferred boundary are in the diagnostic directory's
+`derived-classification.md`. Complete BuildStorm remains unverified.
+
+### 20260812 rejected activation-token window
+
+The gated RISC-V candidate replaced the locked user-entry identity read with
+one atomically published SATP token while leaving mapping edits under the
+existing `MemorySet` mutex. Four cfg checks, dual production release builds,
+and corrected-runner SMP regressions passed on both architectures. These are
+capability gates only.
+
+The production comparison failed the retention threshold. The `b6f518f`
+baseline and candidate each reached 23 `Compiling` lines and ended at
+`ax-posix-api`; measured progress improvement was 0%. First timed output
+regressed from 177.413 to 193.633 seconds, and the 23rd crate regressed from
+187.227 to 205.649 seconds. There was no panic, OOM, swap, host I/O saturation,
+or single-TCG-thread condition. The candidate production changes were
+reverted immediately.
+
+The source audit additionally found that non-thread `CLONE_VM` users need a
+detachable per-process address-space view before exec can replace ownership
+without affecting another process. This remains an inferred correctness risk,
+not a verified explanation for the BuildStorm stall. Evidence is archived at
+`20260812-riscv64-production-smp8-activation-token-window300/`, including
+`derived-comparison.md`. Complete BuildStorm remains `unverified`: no exact
+`BUILDSTORM_COMPILE mode=multi ok=true` marker exists.

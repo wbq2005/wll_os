@@ -141,7 +141,7 @@ def main() -> int:
                     chunk = stream.read()
                     offset = stream.tell()
                 scan = tail + chunk
-                if b"[smp-regression] pass" in scan:
+                if b"[smp-regression] pass cpus=" in scan:
                     passed = True
                     break
                 if b"[smp-regression] fail" in scan or b"panicked at" in scan:
@@ -154,7 +154,7 @@ def main() -> int:
             process.wait(timeout=10)
 
     text = log.read_text(encoding="utf-8", errors="replace")
-    if not passed and "[smp-regression] pass" in text:
+    if not passed and "[smp-regression] pass cpus=" in text:
         passed = True
     result_lines = [line for line in text.splitlines() if "[smp-regression]" in line]
     metadata.write_text(
