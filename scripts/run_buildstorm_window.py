@@ -228,6 +228,7 @@ def parse_guest_aggregate_block(
         "memory_set_sites": {},
         "memory_set_pairs": [],
         "heap_sizes": {},
+        "heap_cache": None,
         "mmap_shape": None,
         "mmap_result": None,
         "mmap_failure_shape": None,
@@ -330,6 +331,8 @@ def parse_guest_aggregate_block(
             bucket = fields.get("bucket")
             if isinstance(bucket, int):
                 result["heap_sizes"][str(bucket)] = fields
+        elif body.startswith("heap_cache "):
+            result["heap_cache"] = fields
         elif body.startswith("mmap_shape "):
             result["mmap_shape"] = fields
         elif body.startswith("mmap_result "):

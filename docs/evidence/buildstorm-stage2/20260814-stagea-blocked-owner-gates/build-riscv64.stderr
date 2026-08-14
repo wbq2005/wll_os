@@ -1,0 +1,12 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/os/Cargo.toml
+workspace: /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/Cargo.toml
+warning: patch for the non root package will be ignored, specify patch at the workspace root:
+package:   /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/os/Cargo.toml
+workspace: /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/Cargo.toml
+warning: /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/os/Cargo.toml: unused manifest key: target.loongarch64-unknown-none.rustflags
+warning: /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/os/Cargo.toml: unused manifest key: target.riscv64gc-unknown-none-elf.rustflags
+error: could not execute process `rustc -vV` (never executed)
+
+Caused by:
+  No such file or directory (os error 2)

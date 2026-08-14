@@ -1,0 +1,520 @@
+diff --git a/os/src/buildstorm_diagnostics.rs b/os/src/buildstorm_diagnostics.rs
+index fb5b9fb..dbbfb2a 100644
+--- a/os/src/buildstorm_diagnostics.rs
++++ b/os/src/buildstorm_diagnostics.rs
+@@ -2364,6 +2364,7 @@ pub(crate) fn maybe_report() {
+     let sequence = REPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+     let task_counts = crate::task::manager::diagnostic_task_counts();
+     crate::println!("BUILDSTORM_DIAG snapshot={} now_us={} cpu={} user_tasks_live={} user_tasks_runnable={} user_tasks_blocked={} rustc_tasks_live={} rustc_tasks_runnable={} user_processes_live={} user_processes_runnable={} user_processes_blocked={} rustc_processes_live={} rustc_processes_runnable={} rq_current={}", sequence, now, crate::platform::current_cpu_index(), task_counts.0, task_counts.1, task_counts.2, task_counts.3, task_counts.4, task_counts.5, task_counts.6, task_counts.7, task_counts.8, task_counts.9, crate::task::manager::queue_len());
++    crate::mm::heap_allocator::report_cache_diagnostics();
+     for cpu in 0..CPU_SLOTS {
+         crate::println!("BUILDSTORM_DIAG cpu={} user_ticks={} kernel_ticks={} idle_ticks={} context_switches={} migrations={} runqueue_max={}", cpu, USER_TICKS[cpu].load(Ordering::Relaxed), KERNEL_TICKS[cpu].load(Ordering::Relaxed), IDLE_TICKS[cpu].load(Ordering::Relaxed), CONTEXT_SWITCHES[cpu].load(Ordering::Relaxed), TASK_MIGRATIONS[cpu].load(Ordering::Relaxed), RUNQUEUE_MAX[cpu].load(Ordering::Relaxed));
+     }
+diff --git a/os/src/mm/heap_allocator.rs b/os/src/mm/heap_allocator.rs
+index a36e059..229ee6d 100644
+--- a/os/src/mm/heap_allocator.rs
++++ b/os/src/mm/heap_allocator.rs
+@@ -1,71 +1,327 @@
+-#[cfg(feature = "buildstorm-diagnostics")]
+ use buddy_system_allocator::Heap;
+-#[cfg(not(feature = "buildstorm-diagnostics"))]
+-use buddy_system_allocator::LockedHeap;
+-#[cfg(feature = "buildstorm-diagnostics")]
+ use core::alloc::{GlobalAlloc, Layout};
+-#[cfg(feature = "buildstorm-diagnostics")]
+-use core::ops::Deref;
+-#[cfg(feature = "buildstorm-diagnostics")]
+ use core::ptr::NonNull;
+ #[cfg(feature = "buildstorm-diagnostics")]
++use core::sync::atomic::{AtomicUsize, Ordering};
+ use spin::Mutex;
+ 
+ /// 内核堆大小: 128MB（预加载的测试用例和大 ELF exec 缓冲可能占数十 MB）
+ const KERNEL_HEAP_SIZE: usize = 0x800_0000;
+ const MAX_DYNAMIC_HEAP_SIZE: usize = 0x4000_0000;
+ 
++const MIN_CACHE_SHIFT: usize = 3;
++const MAX_CACHE_SHIFT: usize = 12;
++const SMALL_CLASS_COUNT: usize = MAX_CACHE_SHIFT - MIN_CACHE_SHIFT + 1;
++const CACHE_CAPACITY: usize = 64;
++const REFILL_BATCH: usize = 16;
++const FLUSH_BATCH: usize = 16;
++
+ /// 内核堆空间
+ static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
+ 
+-/// 全局堆分配器
+-#[global_allocator]
+-#[cfg(not(feature = "buildstorm-diagnostics"))]
+-static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
+-
+-#[cfg(feature = "buildstorm-diagnostics")]
+-struct DiagnosticLockedHeap(Mutex<Heap<32>>);
++struct SmallCache {
++    blocks: [[usize; CACHE_CAPACITY]; SMALL_CLASS_COUNT],
++    lengths: [u8; SMALL_CLASS_COUNT],
++}
+ 
+-#[cfg(feature = "buildstorm-diagnostics")]
+-impl DiagnosticLockedHeap {
++impl SmallCache {
+     const fn empty() -> Self {
+-        Self(Mutex::new(Heap::empty()))
++        Self {
++            blocks: [[0; CACHE_CAPACITY]; SMALL_CLASS_COUNT],
++            lengths: [0; SMALL_CLASS_COUNT],
++        }
++    }
++
++    #[inline]
++    fn pop(&mut self, class: usize) -> Option<usize> {
++        let len = self.lengths[class] as usize;
++        if len == 0 {
++            return None;
++        }
++        let next = len - 1;
++        self.lengths[class] = next as u8;
++        Some(self.blocks[class][next])
++    }
++
++    #[inline]
++    fn push(&mut self, class: usize, ptr: usize) -> bool {
++        let len = self.lengths[class] as usize;
++        if len == CACHE_CAPACITY {
++            return false;
++        }
++        self.blocks[class][len] = ptr;
++        self.lengths[class] = (len + 1) as u8;
++        true
++    }
++
++    fn drain_class(&mut self, class: usize, output: &mut [usize]) -> usize {
++        let mut count = 0;
++        while count < output.len() {
++            let Some(ptr) = self.pop(class) else {
++                break;
++            };
++            output[count] = ptr;
++            count += 1;
++        }
++        count
+     }
+ }
+ 
+-#[cfg(feature = "buildstorm-diagnostics")]
+-impl Deref for DiagnosticLockedHeap {
+-    type Target = Mutex<Heap<32>>;
++struct KernelHeapAllocator {
++    central: Mutex<Heap<32>>,
++    caches: [Mutex<SmallCache>; crate::config::MAX_CPUS],
++}
++
++struct InterruptGuard {
++    restore_enabled: bool,
++}
+ 
+-    fn deref(&self) -> &Self::Target {
+-        &self.0
++impl InterruptGuard {
++    #[inline]
++    fn new() -> Self {
++        let restore_enabled = crate::trap::interrupts::is_interrupt_enabled();
++        if restore_enabled {
++            crate::trap::interrupts::disable_interrupt();
++        }
++        Self { restore_enabled }
+     }
+ }
+ 
+-#[cfg(feature = "buildstorm-diagnostics")]
+-unsafe impl GlobalAlloc for DiagnosticLockedHeap {
++impl Drop for InterruptGuard {
++    #[inline]
++    fn drop(&mut self) {
++        if self.restore_enabled {
++            crate::trap::interrupts::enable_interrupt();
++        }
++    }
++}
++
++impl KernelHeapAllocator {
++    const fn empty() -> Self {
++        Self {
++            central: Mutex::new(Heap::empty()),
++            caches: [const { Mutex::new(SmallCache::empty()) }; crate::config::MAX_CPUS],
++        }
++    }
++
++    #[inline]
++    fn cache_class(layout: Layout) -> Option<usize> {
++        let block_size = layout
++            .size()
++            .next_power_of_two()
++            .max(layout.align())
++            .max(core::mem::size_of::<usize>());
++        let shift = block_size.trailing_zeros() as usize;
++        (shift <= MAX_CACHE_SHIFT).then_some(shift - MIN_CACHE_SHIFT)
++    }
++
++    #[inline]
++    fn class_layout(class: usize) -> Layout {
++        let block_size = 1usize << (class + MIN_CACHE_SHIFT);
++        unsafe { Layout::from_size_align_unchecked(block_size, block_size) }
++    }
++
++    #[inline]
++    fn cpu_index() -> usize {
++        crate::platform::current_cpu_index().min(crate::config::MAX_CPUS - 1)
++    }
++
++    fn central_alloc_batch(&self, layout: Layout, output: &mut [usize]) -> usize {
++        #[cfg(feature = "buildstorm-diagnostics")]
++        let mut central =
++            crate::buildstorm_diagnostics::lock_heap(&self.central, layout.size(), true);
++        #[cfg(not(feature = "buildstorm-diagnostics"))]
++        let mut central = self.central.lock();
++
++        let mut count = 0;
++        while count < output.len() {
++            let Ok(ptr) = central.alloc(layout) else {
++                break;
++            };
++            output[count] = ptr.as_ptr() as usize;
++            count += 1;
++        }
++        #[cfg(feature = "buildstorm-diagnostics")]
++        CENTRAL_ALLOCS.fetch_add(count, Ordering::Relaxed);
++        count
++    }
++
++    unsafe fn central_dealloc_batch(&self, layout: Layout, blocks: &[usize]) {
++        if blocks.is_empty() {
++            return;
++        }
++        #[cfg(feature = "buildstorm-diagnostics")]
++        let mut central =
++            crate::buildstorm_diagnostics::lock_heap(&self.central, layout.size(), false);
++        #[cfg(not(feature = "buildstorm-diagnostics"))]
++        let mut central = self.central.lock();
++
++        for &ptr in blocks {
++            central.dealloc(NonNull::new_unchecked(ptr as *mut u8), layout);
++        }
++        #[cfg(feature = "buildstorm-diagnostics")]
++        CENTRAL_FREES.fetch_add(blocks.len(), Ordering::Relaxed);
++    }
++
++    fn drain_all_caches(&self) {
++        #[cfg(feature = "buildstorm-diagnostics")]
++        let mut drained_total = 0;
++        for cpu in 0..crate::config::MAX_CPUS {
++            for class in 0..SMALL_CLASS_COUNT {
++                let mut blocks = [0usize; CACHE_CAPACITY];
++                let count = {
++                    let mut cache = self.caches[cpu].lock();
++                    cache.drain_class(class, &mut blocks)
++                };
++                if count != 0 {
++                    unsafe {
++                        self.central_dealloc_batch(Self::class_layout(class), &blocks[..count]);
++                    }
++                    #[cfg(feature = "buildstorm-diagnostics")]
++                    {
++                        drained_total += count;
++                    }
++                }
++            }
++        }
++        #[cfg(feature = "buildstorm-diagnostics")]
++        DRAINED_BLOCKS.fetch_add(drained_total, Ordering::Relaxed);
++    }
++
++    fn alloc_small(&self, class: usize) -> *mut u8 {
++        let cpu = Self::cpu_index();
++        if let Some(ptr) = self.caches[cpu].lock().pop(class) {
++            #[cfg(feature = "buildstorm-diagnostics")]
++            CACHE_HITS.fetch_add(1, Ordering::Relaxed);
++            return ptr as *mut u8;
++        }
++        #[cfg(feature = "buildstorm-diagnostics")]
++        CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
++
++        let layout = Self::class_layout(class);
++        let mut blocks = [0usize; REFILL_BATCH];
++        let mut count = self.central_alloc_batch(layout, &mut blocks);
++        if count == 0 {
++            self.drain_all_caches();
++            count = self.central_alloc_batch(layout, &mut blocks);
++        }
++        if count == 0 {
++            return core::ptr::null_mut();
++        }
++        #[cfg(feature = "buildstorm-diagnostics")]
++        REFILL_BLOCKS.fetch_add(count, Ordering::Relaxed);
++
++        let result = blocks[0] as *mut u8;
++        let mut returned = [0usize; REFILL_BATCH];
++        let returned_count = {
++            let mut cache = self.caches[cpu].lock();
++            let mut returned_count = 0;
++            for &ptr in &blocks[1..count] {
++                if !cache.push(class, ptr) {
++                    returned[returned_count] = ptr;
++                    returned_count += 1;
++                }
++            }
++            returned_count
++        };
++        if returned_count != 0 {
++            unsafe {
++                self.central_dealloc_batch(layout, &returned[..returned_count]);
++            }
++        }
++        result
++    }
++
++    unsafe fn dealloc_small(&self, ptr: *mut u8, class: usize) {
++        let cpu = Self::cpu_index();
++        let mut flushed = [0usize; FLUSH_BATCH];
++        let flushed_count = {
++            let mut cache = self.caches[cpu].lock();
++            if cache.push(class, ptr as usize) {
++                0
++            } else {
++                let count = cache.drain_class(class, &mut flushed);
++                let inserted = cache.push(class, ptr as usize);
++                debug_assert!(inserted);
++                count
++            }
++        };
++        #[cfg(feature = "buildstorm-diagnostics")]
++        CACHED_FREES.fetch_add(1, Ordering::Relaxed);
++        if flushed_count != 0 {
++            self.central_dealloc_batch(Self::class_layout(class), &flushed[..flushed_count]);
++        }
++    }
++}
++
++unsafe impl GlobalAlloc for KernelHeapAllocator {
+     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+-        crate::buildstorm_diagnostics::lock_heap(&self.0, layout.size(), true)
+-            .alloc(layout)
+-            .ok()
+-            .map_or(core::ptr::null_mut(), |allocation| allocation.as_ptr())
++        let _interrupt_guard = InterruptGuard::new();
++        if let Some(class) = Self::cache_class(layout) {
++            return self.alloc_small(class);
++        }
++
++        let mut block = [0usize; 1];
++        if self.central_alloc_batch(layout, &mut block) == 0 {
++            self.drain_all_caches();
++            if self.central_alloc_batch(layout, &mut block) == 0 {
++                return core::ptr::null_mut();
++            }
++        }
++        block[0] as *mut u8
+     }
+ 
+     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+-        crate::buildstorm_diagnostics::lock_heap(&self.0, layout.size(), false)
+-            .dealloc(NonNull::new_unchecked(ptr), layout);
++        let _interrupt_guard = InterruptGuard::new();
++        if let Some(class) = Self::cache_class(layout) {
++            self.dealloc_small(ptr, class);
++        } else {
++            self.central_dealloc_batch(layout, &[ptr as usize]);
++        }
+     }
+ }
+ 
++/// 全局堆分配器
+ #[global_allocator]
++static HEAP_ALLOCATOR: KernelHeapAllocator = KernelHeapAllocator::empty();
++
++#[cfg(feature = "buildstorm-diagnostics")]
++static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static REFILL_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+ #[cfg(feature = "buildstorm-diagnostics")]
+-static HEAP_ALLOCATOR: DiagnosticLockedHeap = DiagnosticLockedHeap::empty();
++static CACHED_FREES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CENTRAL_ALLOCS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CENTRAL_FREES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static DRAINED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
++
++#[cfg(feature = "buildstorm-diagnostics")]
++pub(crate) fn report_cache_diagnostics() {
++    crate::println!(
++        "BUILDSTORM_DIAG heap_cache hits={} misses={} refill_blocks={} cached_frees={} central_allocs={} central_frees={} drained_blocks={}",
++        CACHE_HITS.load(Ordering::Relaxed),
++        CACHE_MISSES.load(Ordering::Relaxed),
++        REFILL_BLOCKS.load(Ordering::Relaxed),
++        CACHED_FREES.load(Ordering::Relaxed),
++        CENTRAL_ALLOCS.load(Ordering::Relaxed),
++        CENTRAL_FREES.load(Ordering::Relaxed),
++        DRAINED_BLOCKS.load(Ordering::Relaxed),
++    );
++}
+ 
+ /// 初始化内核堆
+ pub fn init_heap() {
+     unsafe {
+         let heap_start = core::ptr::addr_of!(HEAP_SPACE) as usize;
+-        HEAP_ALLOCATOR.lock().init(heap_start, KERNEL_HEAP_SIZE);
++        HEAP_ALLOCATOR
++            .central
++            .lock()
++            .init(heap_start, KERNEL_HEAP_SIZE);
+     }
+ }
+ 
+@@ -103,15 +359,16 @@ pub fn grow_from_frame_allocator(total_memory_bytes: usize) -> usize {
+     let start = start_phys;
+     let end = start + requested;
+     unsafe {
+-        HEAP_ALLOCATOR.lock().add_to_heap(start, end);
++        HEAP_ALLOCATOR.central.lock().add_to_heap(start, end);
+     }
+     requested
+ }
+ 
+ /// 内存不足处理
+ #[alloc_error_handler]
+-pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
+-    let heap = HEAP_ALLOCATOR.lock();
++pub fn handle_alloc_error(layout: Layout) -> ! {
++    let _interrupt_guard = InterruptGuard::new();
++    let heap = HEAP_ALLOCATOR.central.lock();
+     panic!(
+         "Heap allocation error, layout = {:?}, heap_user={}, heap_actual={}, heap_total={}",
+         layout,
+diff --git a/os/src/task/mod.rs b/os/src/task/mod.rs
+index b68b2c0..24eb613 100644
+--- a/os/src/task/mod.rs
++++ b/os/src/task/mod.rs
+@@ -1138,7 +1138,6 @@ pub fn yield_current_once() -> bool {
+ }
+ 
+ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
+-    const FOREGROUND_NO_RUNNABLE_SPINS: usize = 1024;
+     let Some(task) = current_task() else {
+         return;
+     };
+@@ -1183,7 +1182,6 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
+         return;
+     }
+ 
+-    let mut no_runnable_spins = 0usize;
+     #[cfg(feature = "buildstorm-diagnostics")]
+     let blocked_owner_loop_started = crate::timer::get_time_us();
+     #[cfg(feature = "buildstorm-diagnostics")]
+@@ -1201,17 +1199,14 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
+         }
+         if crate::trap::foreground_driver_active() {
+             if run_ready_task_once_for_blocked_owner() {
+-                no_runnable_spins = 0;
+                 continue;
+             }
+         }
+         if !crate::trap::foreground_driver_active() {
+             if run_ready_task_once_for_blocked_owner() {
+-                no_runnable_spins = 0;
+                 continue;
+             }
+             if drain_kernel_ready_once() {
+-                no_runnable_spins = 0;
+                 continue;
+             }
+         }
+@@ -1220,11 +1215,9 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
+             {
+                 blocked_owner_empty_iterations = blocked_owner_empty_iterations.saturating_add(1);
+             }
+-            no_runnable_spins += 1;
+-            if no_runnable_spins >= FOREGROUND_NO_RUNNABLE_SPINS {
+-                core::hint::spin_loop();
++            if let Some(active) = wait_for_blocked_owner_event(&task) {
++                run_blocked_owner_task(active);
+             }
+-            core::hint::spin_loop();
+         } else {
+             wait_for_interrupt();
+         }
+@@ -1697,6 +1690,39 @@ fn wait_for_interrupt() {
+         crate::platform::finish_idle();
+         return;
+     }
++    idle_until_interrupt();
++}
++
++/// Park a synchronous blocked-syscall owner without losing a concurrent wake.
++///
++/// Publishing the idle bit before the second ready-queue check closes both
++/// sides of the enqueue race: an earlier enqueue is consumed here, while a
++/// later enqueue observes the idle bit and sends this CPU an IPI.  A direct
++/// wake of the blocked task follows the same rule through `blocking_cpu`.
++fn wait_for_blocked_owner_event(blocked: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
++    crate::platform::prepare_idle();
++    if blocked.status() != TaskStatus::Blocked {
++        crate::platform::finish_idle();
++        return None;
++    }
++    if let Some(active) = fetch_dispatchable_user_task() {
++        crate::platform::finish_idle();
++        if blocked.status() != TaskStatus::Blocked {
++            manager::add_task_local(active);
++            return None;
++        }
++        return Some(active);
++    }
++    if blocked.status() != TaskStatus::Blocked {
++        crate::platform::finish_idle();
++        return None;
++    }
++    idle_until_interrupt();
++    None
++}
++
++/// Commit a previously published idle state and return with interrupts off.
++fn idle_until_interrupt() {
+     crate::trap::interrupts::enable_interrupt();
+     #[cfg(target_arch = "riscv64")]
+     unsafe {
+@@ -1750,6 +1776,10 @@ fn run_ready_task_once_for_blocked_owner() -> bool {
+     let Some(active) = fetch_dispatchable_user_task() else {
+         return false;
+     };
++    run_blocked_owner_task(active)
++}
++
++fn run_blocked_owner_task(active: Arc<TaskControlBlock>) -> bool {
+     if matches!(
+         active.status(),
+         TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped
+diff --git a/scripts/run_buildstorm_window.py b/scripts/run_buildstorm_window.py
+index 269182d..b11e0ee 100644
+--- a/scripts/run_buildstorm_window.py
++++ b/scripts/run_buildstorm_window.py
+@@ -228,6 +228,7 @@ def parse_guest_aggregate_block(
+         "memory_set_sites": {},
+         "memory_set_pairs": [],
+         "heap_sizes": {},
++        "heap_cache": None,
+         "mmap_shape": None,
+         "mmap_result": None,
+         "mmap_failure_shape": None,
+@@ -330,6 +331,8 @@ def parse_guest_aggregate_block(
+             bucket = fields.get("bucket")
+             if isinstance(bucket, int):
+                 result["heap_sizes"][str(bucket)] = fields
++        elif body.startswith("heap_cache "):
++            result["heap_cache"] = fields
+         elif body.startswith("mmap_shape "):
+             result["mmap_shape"] = fields
+         elif body.startswith("mmap_result "):

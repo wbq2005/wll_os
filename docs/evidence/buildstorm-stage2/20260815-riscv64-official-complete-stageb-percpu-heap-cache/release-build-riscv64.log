@@ -1,0 +1,1078 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/os/Cargo.toml
+workspace: /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/Cargo.toml
+warning: patch for the non root package will be ignored, specify patch at the workspace root:
+package:   /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/os/Cargo.toml
+workspace: /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/Cargo.toml
+warning: /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/os/Cargo.toml: unused manifest key: target.loongarch64-unknown-none.rustflags
+warning: /srv/buildstorm/worktrees/stagea-blocked-owner-20260814/os/Cargo.toml: unused manifest key: target.riscv64gc-unknown-none-elf.rustflags
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> vendor/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `ext4_rs` (lib) generated 1 warning
+   Compiling wll_OS v0.1.0 (/srv/buildstorm/worktrees/stagea-blocked-owner-20260814/os)
+warning: unknown lint: `function_casts_as_integer`
+  --> patch/polyhal/src/ctor.rs:69:9
+   |
+69 | #[allow(function_casts_as_integer)]
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unknown_lints)]` on by default
+
+warning: unknown lint: `function_casts_as_integer`
+  --> patch/polyhal/src/utils/percpu.rs:14:9
+   |
+14 | #[allow(function_casts_as_integer)]
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `function_casts_as_integer`
+ --> patch/polyhal/src/components/percpu/mod.rs:3:10
+  |
+3 | #![allow(function_casts_as_integer)]
+  |          ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `function_casts_as_integer`
+   --> patch/polyhal/src/mem.rs:380:9
+    |
+380 | #[allow(function_casts_as_integer)]
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `Barrier` is never constructed
+ --> patch/polyhal/src/components/mem/mod.rs:8:12
+  |
+8 | pub struct Barrier;
+  |            ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` on by default
+
+warning: associated functions `complete_sync` and `ordering_sync` are never used
+ --> patch/polyhal/src/components/mem/riscv64.rs:5:12
+  |
+3 | impl Barrier {
+  | ------------ associated functions in this implementation
+4 |     #[inline]
+5 |     pub fn complete_sync() {}
+  |            ^^^^^^^^^^^^^
+...
+8 |     pub fn ordering_sync() {}
+  |            ^^^^^^^^^^^^^
+
+warning: associated constants `VADDR_BITS`, `USER_VADDR_END`, and `KERNEL_VADDR_START` are never used
+   --> patch/polyhal/src/pagetable/riscv64.rs:180:22
+    |
+171 | impl PageTable {
+    | -------------- associated constants in this implementation
+...
+180 |     pub(crate) const VADDR_BITS: usize = 39;
+    |                      ^^^^^^^^^^
+181 |     pub(crate) const USER_VADDR_END: usize = (1 << Self::VADDR_BITS) - 1;
+    |                      ^^^^^^^^^^^^^^
+182 |     pub(crate) const KERNEL_VADDR_START: usize = !Self::USER_VADDR_END;
+    |                      ^^^^^^^^^^^^^^^^^^
+
+warning: `polyhal` (lib) generated 7 warnings
+warning: unused import: `arch::naked_asm`
+ --> patch/polyhal-boot/src/arch/riscv64.rs:1:12
+  |
+1 | use core::{arch::naked_asm, ptr::addr_of_mut};
+  |            ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `PhysAddr`, `consts::VIRT_ADDR_START`, `init_dtb_once`, and `parse_system_info`
+ --> patch/polyhal-boot/src/arch/riscv64.rs:3:5
+  |
+3 |     consts::VIRT_ADDR_START,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+4 |     ctor::{ph_init_iter, CtorType},
+5 |     mem::{init_dtb_once, parse_system_info},
+  |           ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+...
+8 |     PageTable, PhysAddr,
+  |                ^^^^^^^^
+
+warning: function `clear_bss` is never used
+  --> patch/polyhal-boot/src/arch/mod.rs:28:15
+   |
+28 | pub(crate) fn clear_bss() {
+   |               ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `call_real_main` is never used
+  --> patch/polyhal-boot/src/arch/mod.rs:42:4
+   |
+42 | fn call_real_main(hartid: usize) {
+   |    ^^^^^^^^^^^^^^
+
+warning: static `BOOT_PT` is never used
+  --> patch/polyhal-boot/src/arch/riscv64.rs:13:12
+   |
+13 | static mut BOOT_PT: [PTE; PageTable::PTE_NUM_IN_PAGE] = [PTE::empty(); PageTable::PTE_NUM_IN_PAGE];
+   |            ^^^^^^^
+
+warning: function `init_boot_page_table` is never used
+  --> patch/polyhal-boot/src/arch/riscv64.rs:15:22
+   |
+15 | unsafe extern "C" fn init_boot_page_table() {
+   |                      ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `init_mmu` is never used
+  --> patch/polyhal-boot/src/arch/riscv64.rs:28:22
+   |
+28 | unsafe extern "C" fn init_mmu() {
+   |                      ^^^^^^^^
+
+warning: function `rust_secondary_main` is never used
+   --> patch/polyhal-boot/src/arch/riscv64.rs:125:26
+    |
+125 | pub(crate) extern "C" fn rust_secondary_main(hartid: usize) {
+    |                          ^^^^^^^^^^^^^^^^^^^
+
+warning: function `init_cpu` is never used
+   --> patch/polyhal-boot/src/arch/riscv64.rs:141:4
+    |
+141 | fn init_cpu() {
+    |    ^^^^^^^^
+
+warning: static `TRAP_FRAME_PTR` is never used
+  --> patch/polyhal-trap/src/trap/riscv64.rs:24:12
+   |
+24 | static mut TRAP_FRAME_PTR: usize = 0;
+   |            ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: `polyhal-boot` (lib) generated 9 warnings (run `cargo fix --lib -p polyhal-boot` to apply 2 suggestions)
+warning: `polyhal-trap` (lib) generated 1 warning
+warning: wll_OS@0.1.0: skip libc-test runtime lib /glibc/lib/libgcc_s.so.1: no candidate found
+warning: wll_OS@0.1.0: skip /musl/libctest-extra-static.exe: no musl compiler for target riscv64gc-unknown-none-elf
+warning: wll_OS@0.1.0: skip /musl/libctest-extra-dynamic.exe: no musl compiler for target riscv64gc-unknown-none-elf
+warning: unused import: `TLB`
+ --> os/src/mm/memory_set.rs:3:82
+  |
+3 | use polyhal::pagetable::{MappingFlags, MappingSize, PageTable, PageTableWrapper, TLB};
+  |                                                                                  ^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused doc comment
+ --> os/src/mm/page_table.rs:7:1
+  |
+7 | /// 页表项标志位
+  | ^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+  |
+  = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+  = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: unused import: `sleep_on_io_if`
+ --> os/src/syscall/fs.rs:4:5
+  |
+4 |     sleep_on_io_if, sleep_on_io_key_if, sleep_on_pipe_fd_ready_key_if, sleep_on_poll_if,
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `MapArea`
+ --> os/src/syscall/mm.rs:9:27
+  |
+9 | use crate::mm::map_area::{MapArea, MapAreaBacking};
+  |                           ^^^^^^^
+
+warning: unused variable: `woken`
+  --> os/src/fs/fd.rs:91:9
+   |
+91 |     let woken =
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_woken`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `woken`
+  --> os/src/fs/fd.rs:98:9
+   |
+98 |     let woken =
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_woken`
+
+warning: unused variable: `is_pipe`
+   --> os/src/syscall/fs.rs:535:30
+    |
+535 |     let (wait_key, deadline, is_pipe) = {
+    |                              ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_is_pipe`
+
+warning: unused variable: `is_pipe`
+   --> os/src/syscall/fs.rs:600:20
+    |
+600 |     let (wait_key, is_pipe) = {
+    |                    ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_is_pipe`
+
+warning: unused variable: `path_ptr`
+   --> os/src/syscall/process.rs:272:5
+    |
+272 |     path_ptr: usize,
+    |     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_path_ptr`
+
+warning: unused variable: `argv_ptr`
+   --> os/src/syscall/process.rs:273:5
+    |
+273 |     argv_ptr: usize,
+    |     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_argv_ptr`
+
+warning: unused variable: `envp_ptr`
+   --> os/src/syscall/process.rs:274:5
+    |
+274 |     envp_ptr: usize,
+    |     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_envp_ptr`
+
+warning: variable does not need to be mutable
+   --> os/src/syscall/process.rs:788:9
+    |
+788 |     let mut interp_path_opt = elf.interp_path();
+    |         ----^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: variable does not need to be mutable
+   --> os/src/task/task.rs:192:13
+    |
+192 |         let mut launch_argv = spec.argv.clone();
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> os/src/task/task.rs:194:13
+    |
+194 |         let mut interp_path_opt = target_elf.interp_path();
+    |             ----^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `elf_data`
+   --> os/src/task/task.rs:417:16
+    |
+417 |     pub fn new(elf_data: &[u8]) -> Arc<Self> {
+    |                ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_elf_data`
+
+warning: unused variable: `reason`
+   --> os/src/task/mod.rs:764:9
+    |
+764 |     let reason = run_user_task(ctx);
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reason`
+
+warning: constant `KERNEL_BASE` is never used
+ --> os/src/config/la.rs:2:11
+  |
+2 | pub const KERNEL_BASE: usize = 0x9000_0000_9000_0000;
+  |           ^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` on by default
+
+warning: constant `PAGE_SIZE` is never used
+ --> os/src/config/la.rs:3:11
+  |
+3 | pub const PAGE_SIZE: usize = 4096;
+  |           ^^^^^^^^^
+
+warning: constant `PAGE_SIZE_BITS` is never used
+ --> os/src/config/la.rs:4:11
+  |
+4 | pub const PAGE_SIZE_BITS: usize = 12;
+  |           ^^^^^^^^^^^^^^
+
+warning: constant `VIRT_ADDR_START` is never used
+ --> os/src/config/la.rs:5:11
+  |
+5 | pub const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
+  |           ^^^^^^^^^^^^^^^
+
+warning: constant `USER_START_ADDR` is never used
+ --> os/src/config/la.rs:9:11
+  |
+9 | pub const USER_START_ADDR: usize = 0x1000;
+  |           ^^^^^^^^^^^^^^^
+
+warning: constant `USER_STACK_TOP` is never used
+  --> os/src/config/la.rs:11:11
+   |
+11 | pub const USER_STACK_TOP: usize = 0x8000_0000;
+   |           ^^^^^^^^^^^^^^
+
+warning: constant `USER_STACK_SIZE` is never used
+  --> os/src/config/la.rs:14:11
+   |
+14 | pub const USER_STACK_SIZE: usize = 0x40_0000;
+   |           ^^^^^^^^^^^^^^^
+
+warning: constant `USER_HEAP_START` is never used
+  --> os/src/config/la.rs:16:11
+   |
+16 | pub const USER_HEAP_START: usize = 0x1000_0000;
+   |           ^^^^^^^^^^^^^^^
+
+warning: constant `KERNEL_BASE` is never used
+ --> os/src/config/rv.rs:2:11
+  |
+2 | pub const KERNEL_BASE: usize = 0x8020_0000;
+  |           ^^^^^^^^^^^
+
+warning: constant `PAGE_SIZE_BITS` is never used
+ --> os/src/config/rv.rs:4:11
+  |
+4 | pub const PAGE_SIZE_BITS: usize = 12;
+  |           ^^^^^^^^^^^^^^
+
+warning: constant `VIRT_ADDR_START` is never used
+ --> os/src/config/rv.rs:8:11
+  |
+8 | pub const VIRT_ADDR_START: usize = 0xffff_ffff_8000_0000;
+  |           ^^^^^^^^^^^^^^^
+
+warning: constant `USER_VADDR_START` is never used
+  --> os/src/config/rv.rs:13:11
+   |
+13 | pub const USER_VADDR_START: usize = 0;
+   |           ^^^^^^^^^^^^^^^^
+
+warning: constant `USER_VADDR_END` is never used
+  --> os/src/config/rv.rs:14:11
+   |
+14 | pub const USER_VADDR_END: usize = 0x0000_7fff_ffff_ffff;
+   |           ^^^^^^^^^^^^^^
+
+warning: constant `KERNEL_VADDR_START` is never used
+  --> os/src/config/rv.rs:15:11
+   |
+15 | pub const KERNEL_VADDR_START: usize = 0xffff_ffff_8000_0000;
+   |           ^^^^^^^^^^^^^^^^^^
+
+warning: constant `KERNEL_VADDR_END` is never used
+  --> os/src/config/rv.rs:16:11
+   |
+16 | pub const KERNEL_VADDR_END: usize = 0xffff_ffff_ffffffff;
+   |           ^^^^^^^^^^^^^^^^
+
+warning: constant `USER_START_ADDR` is never used
+  --> os/src/config/rv.rs:20:11
+   |
+20 | pub const USER_START_ADDR: usize = 0x1000;
+   |           ^^^^^^^^^^^^^^^
+
+warning: constant `HAS_HIGH_MMAP_ARENA` is never used
+  --> os/src/config/user_va.rs:50:11
+   |
+50 | pub const HAS_HIGH_MMAP_ARENA: bool = true;
+   |           ^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `with_times` and `snapshot` are never used
+   --> os/src/fs/mod.rs:233:12
+    |
+223 | impl MemFile {
+    | ------------ associated items in this implementation
+...
+233 |     pub fn with_times(name: &str, content: Vec<u8>, times: FileTimes) -> Self {
+    |            ^^^^^^^^^^
+...
+278 |     pub fn snapshot(&self) -> (FileContent, FileTimes) {
+    |            ^^^^^^^^
+
+warning: methods `add_file_with_metadata`, `list_files`, and `list_file_names` are never used
+   --> os/src/fs/mod.rs:429:12
+    |
+334 | impl MemFileSystem {
+    | ------------------ methods in this implementation
+...
+429 |     pub fn add_file_with_metadata(
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+893 |     pub fn list_files(&self) -> Vec<&str> {
+    |            ^^^^^^^^^^
+...
+897 |     pub fn list_file_names(&self) -> Vec<String> {
+    |            ^^^^^^^^^^^^^^^
+
+warning: function `add_user_program` is never used
+    --> os/src/fs/mod.rs:1574:8
+     |
+1574 | pub fn add_user_program(name: &str, data: &[u8]) {
+     |        ^^^^^^^^^^^^^^^^
+
+warning: function `minor_for_path` is never used
+   --> os/src/fs/block_dev.rs:588:8
+    |
+588 | pub fn minor_for_path(path: &str) -> Option<u32> {
+    |        ^^^^^^^^^^^^^^
+
+warning: constant `DEFAULT_WRITEBACK_WORKER_ENABLED` is never used
+  --> os/src/fs/ext4_vol.rs:35:7
+   |
+35 | const DEFAULT_WRITEBACK_WORKER_ENABLED: bool = false;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `WRITEBACK_WORKER_STARTED` is never used
+  --> os/src/fs/ext4_vol.rs:36:8
+   |
+36 | static WRITEBACK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `pop` and `has_work` are never used
+   --> os/src/fs/ext4_vol.rs:155:8
+    |
+141 | impl WritebackQueue {
+    | ------------------- methods in this implementation
+...
+155 |     fn pop(&mut self) -> Option<u32> {
+    |        ^^^
+...
+168 |     fn has_work(&self) -> bool {
+    |        ^^^^^^^^
+
+warning: function `start_writeback_worker_explicit` is never used
+   --> os/src/fs/ext4_vol.rs:801:8
+    |
+801 | pub fn start_writeback_worker_explicit() -> Result<(), SysErrNo> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `writeback_worker_main` is never used
+   --> os/src/fs/ext4_vol.rs:830:4
+    |
+830 | fn writeback_worker_main() -> ! {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `opportunistic_drain_one_queued_writeback` is never used
+   --> os/src/fs/ext4_vol.rs:846:4
+    |
+846 | fn opportunistic_drain_one_queued_writeback() {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `opportunistic_drain_queued_writeback_ino` is never used
+   --> os/src/fs/ext4_vol.rs:853:4
+    |
+853 | fn opportunistic_drain_queued_writeback_ino(ino: u32) {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `clean_page_cache_frame` is never used
+    --> os/src/fs/ext4_vol.rs:1179:8
+     |
+1179 | pub fn clean_page_cache_frame(ino: u32, file_offset: usize) -> Result<FrameTracker, SysErrNo> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `drain_queued_writeback_ino` is never used
+    --> os/src/fs/ext4_vol.rs:1842:4
+     |
+1842 | fn drain_queued_writeback_ino(ino: u32) -> Result<(), SysErrNo> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `unmount_root` is never used
+    --> os/src/fs/ext4_vol.rs:2114:8
+     |
+2114 | pub fn unmount_root() {
+     |        ^^^^^^^^^^^^
+
+warning: function `unlink_regular_file` is never used
+    --> os/src/fs/ext4_vol.rs:2210:8
+     |
+2210 | pub fn unlink_regular_file(path: &str) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_regular_ext4` is never used
+    --> os/src/fs/ext4_vol.rs:2346:8
+     |
+2346 | pub fn create_regular_ext4(path: &str) -> Result<u32, SysErrNo> {
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `merged_list_all_file_paths` is never used
+    --> os/src/fs/ext4_vol.rs:3246:8
+     |
+3246 | pub fn merged_list_all_file_paths(mem_paths: Vec<String>) -> Vec<String> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `STDIN_FD` is never used
+  --> os/src/fs/fd.rs:23:11
+   |
+23 | pub const STDIN_FD: usize = 0;
+   |           ^^^^^^^^
+
+warning: constant `STDOUT_FD` is never used
+  --> os/src/fs/fd.rs:24:11
+   |
+24 | pub const STDOUT_FD: usize = 1;
+   |           ^^^^^^^^^
+
+warning: constant `STDERR_FD` is never used
+  --> os/src/fs/fd.rs:25:11
+   |
+25 | pub const STDERR_FD: usize = 2;
+   |           ^^^^^^^^^
+
+warning: method `clear` is never used
+   --> os/src/fs/fd.rs:171:12
+    |
+141 | impl MemFileContent {
+    | ------------------- method in this implementation
+...
+171 |     pub fn clear(&mut self) {
+    |            ^^^^^
+
+warning: method `seek` is never used
+    --> os/src/fs/fd.rs:1573:12
+     |
+653  | impl FileDescriptor {
+     | ------------------- method in this implementation
+...
+1573 |     pub fn seek(&mut self, offset: FileOffset, whence: usize) -> Result<FileOffset, SysErrNo> {
+     |            ^^^^
+
+warning: methods `alloc`, `alloc_from`, `alloc_from_with_flags`, `alloc_at`, `dup`, and `dup2` are never used
+    --> os/src/fs/fd.rs:2038:12
+     |
+1946 | impl FileDescriptorTable {
+     | ------------------------ methods in this implementation
+...
+2038 |     pub fn alloc(&mut self, fd: FileDescriptor) -> Option<usize> {
+     |            ^^^^^
+...
+2055 |     pub fn alloc_from(&mut self, start: usize, fd: FileDescriptor) -> Option<usize> {
+     |            ^^^^^^^^^^
+...
+2059 |     pub fn alloc_from_with_flags(
+     |            ^^^^^^^^^^^^^^^^^^^^^
+...
+2078 |     pub fn alloc_at(&mut self, index: usize, fd: FileDescriptor) -> Result<(), SysErrNo> {
+     |            ^^^^^^^^
+...
+2213 |     pub fn dup(&mut self, old_fd: usize) -> Result<usize, SysErrNo> {
+     |            ^^^
+...
+2228 |     pub fn dup2(&mut self, old_fd: usize, new_fd: usize) -> Result<usize, SysErrNo> {
+     |            ^^^^
+
+warning: function `open_file` is never used
+    --> os/src/fs/fd.rs:2311:8
+     |
+2311 | pub fn open_file(
+     |        ^^^^^^^^^
+
+warning: function `block_device_minor` is never used
+   --> os/src/fs/vfs.rs:718:4
+    |
+718 | fn block_device_minor(path: &str) -> Option<u32> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `cpu_list` is never used
+   --> os/src/fs/vfs.rs:798:4
+    |
+798 | fn cpu_list(count: usize) -> String {
+    |    ^^^^^^^^
+
+warning: function `metadata_for_block_device` is never used
+   --> os/src/fs/vfs.rs:948:4
+    |
+948 | fn metadata_for_block_device(path: &str, minor: u32) -> VfsMetadata {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `check_metadata_access` is never used
+    --> os/src/fs/vfs.rs:1742:8
+     |
+1742 | pub fn check_metadata_access(meta: &VfsMetadata, access_mode: usize) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `check_metadata_access_with_effective` is never used
+    --> os/src/fs/vfs.rs:1746:8
+     |
+1746 | pub fn check_metadata_access_with_effective(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `check_access` is never used
+    --> os/src/fs/vfs.rs:1805:8
+     |
+1805 | pub fn check_access(path: &str, follow_symlink: bool, access_mode: usize) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^^^
+
+warning: function `check_fd_access` is never used
+    --> os/src/fs/vfs.rs:1856:8
+     |
+1856 | pub fn check_fd_access(file: &fd::FileDescriptor, access_mode: usize) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^^^^^^
+
+warning: function `read_interpreter_host` is never used
+    --> os/src/fs/vfs.rs:2143:4
+     |
+2143 | fn read_interpreter_host(logical: &str, host: &str) -> Option<(String, String, Arc<Vec<u8>>)> {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `filesystem_magic` is never used
+    --> os/src/fs/vfs.rs:2239:8
+     |
+2239 | pub fn filesystem_magic() -> usize {
+     |        ^^^^^^^^^^^^^^^^
+
+warning: function `create_dir` is never used
+    --> os/src/fs/vfs.rs:3404:8
+     |
+3404 | pub fn create_dir(path: &str) -> Result<(), SysErrNo> {
+     |        ^^^^^^^^^^
+
+warning: function `list_files` is never used
+    --> os/src/fs/vfs.rs:4137:8
+     |
+4137 | pub fn list_files() -> Vec<String> {
+     |        ^^^^^^^^^^
+
+warning: constant `PT_NULL` is never used
+   --> os/src/mm/elf_loader.rs:108:11
+    |
+108 | pub const PT_NULL: u32 = 0; // 忽略
+    |           ^^^^^^^
+
+warning: constant `PT_DYNAMIC` is never used
+   --> os/src/mm/elf_loader.rs:110:11
+    |
+110 | pub const PT_DYNAMIC: u32 = 2; // 动态链接信息
+    |           ^^^^^^^^^^
+
+warning: constant `PT_NOTE` is never used
+   --> os/src/mm/elf_loader.rs:112:11
+    |
+112 | pub const PT_NOTE: u32 = 4; // 辅助信息
+    |           ^^^^^^^
+
+warning: constant `PT_SHLIB` is never used
+   --> os/src/mm/elf_loader.rs:113:11
+    |
+113 | pub const PT_SHLIB: u32 = 5; // 保留
+    |           ^^^^^^^^
+
+warning: struct `DynamicEntry` is never constructed
+   --> os/src/mm/elf_loader.rs:127:8
+    |
+127 | struct DynamicEntry {
+    |        ^^^^^^^^^^^^
+
+warning: method `can_enter_without_interpreter` is never used
+   --> os/src/mm/elf_loader.rs:316:12
+    |
+132 | impl<'a> ElfFile<'a> {
+    | -------------------- method in this implementation
+...
+316 |     pub fn can_enter_without_interpreter(&self) -> bool {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_elf_file` is never used
+   --> os/src/mm/elf_loader.rs:568:8
+    |
+568 | pub fn is_elf_file(data: &[u8]) -> bool {
+    |        ^^^^^^^^^^^
+
+warning: method `frame` is never used
+  --> os/src/mm/map_area.rs:48:12
+   |
+28 | impl ResidentPage {
+   | ----------------- method in this implementation
+...
+48 |     pub fn frame(&self) -> &FrameTracker {
+   |            ^^^^^
+
+warning: methods `capacity`, `merge_from`, and `into_frames` are never used
+   --> os/src/mm/map_area.rs:97:12
+    |
+81  | impl ResidentSet {
+    | ---------------- methods in this implementation
+...
+97  |     pub fn capacity(&self) -> usize {
+    |            ^^^^^^^^
+...
+237 |     pub fn merge_from(&mut self, mut other: Self) {
+    |            ^^^^^^^^^^
+...
+284 |     pub fn into_frames(self) -> Vec<FrameTracker> {
+    |            ^^^^^^^^^^^
+
+warning: associated items `new`, `contains`, and `has_full_frames` are never used
+   --> os/src/mm/map_area.rs:441:12
+    |
+440 | impl MapArea {
+    | ------------ associated items in this implementation
+441 |     pub fn new(start_va: VirtAddr, end_va: VirtAddr, flags: PTEFlags) -> Self {
+    |            ^^^
+...
+464 |     pub fn contains(&self, va: VirtAddr) -> bool {
+    |            ^^^^^^^^
+...
+586 |     fn has_full_frames(&self) -> bool {
+    |        ^^^^^^^^^^^^^^^
+
+warning: function `copy_area_frames` is never used
+   --> os/src/mm/memory_set.rs:144:4
+    |
+144 | fn copy_area_frames(area: &mut MapArea) -> Result<Vec<FrameTracker>, SysErrNo> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: methods `insert_framed_area_with_frames`, `address_space_id`, `satp_token`, `remove_area`, `unmap_area`, and `release_user_areas` are never used
+   --> os/src/mm/memory_set.rs:321:12
+    |
+186 | impl MemorySet {
+    | -------------- methods in this implementation
+...
+321 |     pub fn insert_framed_area_with_frames(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+440 |     pub fn address_space_id(&self) -> usize {
+    |            ^^^^^^^^^^^^^^^^
+...
+448 |     pub fn satp_token(&self) -> usize {
+    |            ^^^^^^^^^^
+...
+453 |     pub fn remove_area(&mut self, start_va: VirtAddr) {
+    |            ^^^^^^^^^^^
+...
+458 |     pub fn unmap_area(&mut self, start_va: VirtAddr) {
+    |            ^^^^^^^^^^
+...
+587 |     pub fn release_user_areas(&mut self) {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: function `map_page` is never used
+  --> os/src/mm/page_table.rs:60:8
+   |
+60 | pub fn map_page(vpn: usize, ppn: crate::mm::frame_allocator::PhysPageNum, flags: PTEFlags) {
+   |        ^^^^^^^^
+
+warning: function `unmap_page` is never used
+  --> os/src/mm/page_table.rs:70:8
+   |
+70 | pub fn unmap_page(vpn: usize) {
+   |        ^^^^^^^^^^
+
+warning: function `translate` is never used
+  --> os/src/mm/page_table.rs:78:8
+   |
+78 | pub fn translate(vaddr: VirtAddr) -> Option<PhysAddr> {
+   |        ^^^^^^^^^
+
+warning: static `TLB_SHOOTDOWN_LOCK` is never used
+  --> os/src/platform.rs:35:8
+   |
+35 | static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
+   |        ^^^^^^^^^^^^^^^^^^
+
+warning: constant `IPI_TLB_SHOOTDOWN` is never used
+  --> os/src/platform.rs:38:7
+   |
+38 | const IPI_TLB_SHOOTDOWN: u32 = 1 << 2;
+   |       ^^^^^^^^^^^^^^^^^
+
+warning: constant `SYSCALL_CLOCK_SETTIME` is never used
+   --> os/src/syscall/mod.rs:102:11
+    |
+102 | pub const SYSCALL_CLOCK_SETTIME: usize = 112;
+    |           ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FD_STDOUT` is never used
+  --> os/src/syscall/fs.rs:17:7
+   |
+17 | const FD_STDOUT: usize = 1;
+   |       ^^^^^^^^^
+
+warning: constant `FD_STDERR` is never used
+  --> os/src/syscall/fs.rs:18:7
+   |
+18 | const FD_STDERR: usize = 2;
+   |       ^^^^^^^^^
+
+warning: function `parse_utimens_times` is never used
+   --> os/src/syscall/fs.rs:980:4
+    |
+980 | fn parse_utimens_times(
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `sys_write_kernel` is never used
+    --> os/src/syscall/fs.rs:5274:8
+     |
+5274 | pub fn sys_write_kernel(fd: usize, buf: &[u8]) -> SyscallRet {
+     |        ^^^^^^^^^^^^^^^^
+
+warning: function `find_mmap_area` is never used
+  --> os/src/syscall/mm.rs:98:4
+   |
+98 | fn find_mmap_area(
+   |    ^^^^^^^^^^^^^^
+
+warning: constant `SIGCANCEL` is never used
+  --> os/src/syscall/signal.rs:36:7
+   |
+36 | const SIGCANCEL: i32 = 32;
+   |       ^^^^^^^^^
+
+warning: constant `SIGSETXID` is never used
+  --> os/src/syscall/signal.rs:37:7
+   |
+37 | const SIGSETXID: i32 = 33;
+   |       ^^^^^^^^^
+
+warning: static `RUNNING_FROM_ECANCELED` is never used
+  --> os/src/task/mod.rs:61:19
+   |
+61 | pub(crate) static RUNNING_FROM_ECANCELED: AtomicUsize = AtomicUsize::new(0);
+   |                   ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `marker_name` is never read
+  --> os/src/task/mod.rs:93:9
+   |
+81 | pub struct UserProgramSpec {
+   |            --------------- field in this struct
+...
+93 |     pub marker_name: Option<String>,
+   |         ^^^^^^^^^^^
+
+warning: method `marker` is never used
+   --> os/src/task/mod.rs:114:12
+    |
+112 | impl UserProgramSpec {
+    | -------------------- method in this implementation
+113 |     /// Returns the marker name: explicit marker_name or argv[0]
+114 |     pub fn marker(&self) -> String {
+    |            ^^^^^^
+
+warning: function `block_current_for_reason` is never used
+   --> os/src/task/mod.rs:781:8
+    |
+781 | pub fn block_current_for_reason(reason: wait_queue::BlockReason) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `init_kernel_page` is never used
+   --> os/src/task/mod.rs:904:8
+    |
+904 | pub fn init_kernel_page() {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: function `return_to_user` is never used
+    --> os/src/task/mod.rs:1656:11
+     |
+1656 | unsafe fn return_to_user(_ctx: TrapFrame) {
+     |           ^^^^^^^^^^^^^^
+
+warning: field `root` is never read
+    --> os/src/task/mod.rs:2028:9
+     |
+2021 | pub struct TaskControlBlockInner {
+     |            --------------------- field in this struct
+...
+2028 |     pub root: String,
+     |         ^^^^
+
+warning: associated function `goto_restore` is never used
+  --> os/src/task/context.rs:26:12
+   |
+13 | impl TaskContext {
+   | ---------------- associated function in this implementation
+...
+26 |     pub fn goto_restore() -> Self {
+   |            ^^^^^^^^^^^^
+
+warning: function `fetch_task` is never used
+   --> os/src/task/manager.rs:165:8
+    |
+165 | pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
+    |        ^^^^^^^^^^
+
+warning: function `remove_task` is never used
+   --> os/src/task/manager.rs:281:8
+    |
+281 | pub fn remove_task(pid: usize) -> Option<Arc<TaskControlBlock>> {
+    |        ^^^^^^^^^^^
+
+warning: function `remove_task_from_queue` is never used
+   --> os/src/task/manager.rs:286:4
+    |
+286 | fn remove_task_from_queue(queue: &Mutex<ReadyQueue>, pid: usize) -> Option<Arc<TaskControlBlock>> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `retain_tasks` is never used
+   --> os/src/task/manager.rs:316:8
+    |
+316 | pub fn retain_tasks(mut keep: impl FnMut(&Arc<TaskControlBlock>) -> bool) {
+    |        ^^^^^^^^^^^^
+
+warning: function `retain_queue` is never used
+   --> os/src/task/manager.rs:321:4
+    |
+321 | fn retain_queue(queue: &Mutex<ReadyQueue>, keep: &mut impl FnMut(&Arc<TaskControlBlock>) -> bool) {
+    |    ^^^^^^^^^^^^
+
+warning: function `queue_len` is never used
+   --> os/src/task/manager.rs:382:8
+    |
+382 | pub fn queue_len() -> usize {
+    |        ^^^^^^^^^
+
+warning: function `kernel_queue_len` is never used
+   --> os/src/task/manager.rs:518:8
+    |
+518 | pub fn kernel_queue_len() -> usize {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: field `current` is never read
+ --> os/src/task/processor.rs:8:5
+  |
+7 | pub struct Processor {
+  |            --------- field in this struct
+8 |     current: Option<Arc<TaskControlBlock>>,
+  |     ^^^^^^^
+
+warning: methods `take_current`, `current`, and `set_current` are never used
+  --> os/src/task/processor.rs:16:12
+   |
+11 | impl Processor {
+   | -------------- methods in this implementation
+...
+16 |     pub fn take_current(&mut self) -> Option<Arc<TaskControlBlock>> {
+   |            ^^^^^^^^^^^^
+...
+20 |     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
+   |            ^^^^^^^
+...
+24 |     pub fn set_current(&mut self, task: Arc<TaskControlBlock>) {
+   |            ^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> os/src/task/task.rs:417:12
+    |
+33  | impl TaskControlBlock {
+    | --------------------- associated items in this implementation
+...
+417 |     pub fn new(elf_data: &[u8]) -> Arc<Self> {
+    |            ^^^
+...
+677 |     pub fn task_ctx(&self) -> super::context::TaskContext {
+    |            ^^^^^^^^
+...
+682 |     pub fn set_task_ctx(&self, ctx: super::context::TaskContext) {
+    |            ^^^^^^^^^^^^
+...
+689 |     pub fn exit_code(&self) -> i32 {
+    |            ^^^^^^^^^
+...
+700 |     pub fn take_trap_frame(&self) -> polyhal_trap::trapframe::TrapFrame {
+    |            ^^^^^^^^^^^^^^^
+...
+708 |     pub fn put_trap_frame(&self, ctx: polyhal_trap::trapframe::TrapFrame) {
+    |            ^^^^^^^^^^^^^^
+...
+713 |     pub fn has_trap_frame(&self) -> bool {
+    |            ^^^^^^^^^^^^^^
+
+warning: variants `PipeFdReady` and `Poll` are never constructed
+  --> os/src/task/wait_queue.rs:13:5
+   |
+10 | pub enum BlockReason {
+   |          ----------- variants in this enum
+...
+13 |     PipeFdReady,
+   |     ^^^^^^^^^^^
+14 |     /// Diagnostic-only attribution for poll, ppoll, select, and epoll waits.
+15 |     Poll,
+   |     ^^^^
+   |
+   = note: `BlockReason` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `sleep`, `wake_one`, `wake_n`, `wake_key_n`, and `remove_waiter` are never used
+   --> os/src/task/wait_queue.rs:61:12
+    |
+53  | impl WaitQueue {
+    | -------------- methods in this implementation
+...
+61  |     pub fn sleep(&self) -> Result<WaitOutcome, SysErrNo> {
+    |            ^^^^^
+...
+219 |     pub fn wake_one(&self) -> usize {
+    |            ^^^^^^^^
+...
+223 |     pub fn wake_n(&self, n: usize) -> usize {
+    |            ^^^^^^
+...
+269 |     pub fn wake_key_n(&self, key: WaitKey, n: usize) -> usize {
+    |            ^^^^^^^^^^
+...
+324 |     fn remove_waiter(&self, pid: usize, token: usize) -> bool {
+    |        ^^^^^^^^^^^^^
+
+warning: function `sleep_on_io` is never used
+   --> os/src/task/wait_queue.rs:403:8
+    |
+403 | pub fn sleep_on_io(deadline_us: Option<usize>) -> Result<WaitOutcome, SysErrNo> {
+    |        ^^^^^^^^^^^
+
+warning: function `sleep_on_io_keys_if` is never used
+   --> os/src/task/wait_queue.rs:449:8
+    |
+449 | pub fn sleep_on_io_keys_if<F>(
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `wake_io_keyed_waiter` is never used
+   --> os/src/task/wait_queue.rs:509:8
+    |
+509 | pub fn wake_io_keyed_waiter(key: WaitKey) -> usize {
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `sleep_on_child_exit` is never used
+   --> os/src/task/wait_queue.rs:513:8
+    |
+513 | pub fn sleep_on_child_exit() -> Result<WaitOutcome, SysErrNo> {
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `sleep_ms` is never used
+   --> os/src/timer.rs:205:8
+    |
+205 | pub fn sleep_ms(ms: usize) {
+    |        ^^^^^^^^
+
+warning: function `save_current_trapframe` is never used
+   --> os/src/trap/mod.rs:169:8
+    |
+169 | pub fn save_current_trapframe(tf: &TrapFrame) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `handle_exit` is never used
+   --> os/src/trap/mod.rs:535:8
+    |
+535 | pub fn handle_exit(exit_code: i32) {
+    |        ^^^^^^^^^^^
+
+warning: function `str_from_raw_ptr` is never used
+ --> os/src/utils/mod.rs:4:8
+  |
+4 | pub fn str_from_raw_ptr(ptr: *const u8) -> &'static str {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: variants `ENFILE`, `ETXTBSY`, `EDOM`, `ECANCELED`, `EALREADY`, and `EINPROGRESS` are never constructed
+  --> os/src/utils/error.rs:26:5
+   |
+3  | pub enum SysErrNo {
+   |          -------- variants in this enum
+...
+26 |     ENFILE = 23,          // File table overflow
+   |     ^^^^^^
+...
+29 |     ETXTBSY = 26,         // Text file busy
+   |     ^^^^^^^
+...
+36 |     EDOM = 33,            // Math argument out of domain of func
+   |     ^^^^
+...
+42 |     ECANCELED = 47,       // Operation canceled (used by exit in foreground mode)
+   |     ^^^^^^^^^
+...
+57 |     EALREADY = 114,       // Operation already in progress
+   |     ^^^^^^^^
+58 |     EINPROGRESS = 115,    // Operation now in progress
+   |     ^^^^^^^^^^^
+   |
+   = note: `SysErrNo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `wll_OS` (bin "wll_OS") generated 122 warnings (run `cargo fix --bin "wll_OS"` to apply 6 suggestions)
+    Finished `release` profile [optimized] target(s) in 7.62s

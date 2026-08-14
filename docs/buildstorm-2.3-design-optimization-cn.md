@@ -29,13 +29,13 @@ BUILDSTORM_COMPILE mode=multi ok=true
 - RISC-V64 镜像 SHA-256：`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`。
 - LoongArch64 镜像 SHA-256：`d1410544e677e11efb1c240be6ffb201c89d6de58c9675e73314a696e4cefdc5`。
 - QEMU：11.0.3。
-- 完整运行时源码 dirty diff SHA-256：`c22bc0a79e78a72a0c3c8dd13bf23c33692c5fe0991cc57ef0b1ce91c3c2a22d`。
+- Stage B 完整运行时源码 dirty diff SHA-256：`af84c6980faa9b3aef986a1a0c14f382d4f0c4f756de6641d24532eb5ce611ca`。
 
 原始串口、runner JSON、构建日志、镜像/内核/源码哈希和 judge 输出保存在：
 
-- `docs/evidence/buildstorm-stage2/20260814-riscv64-official-complete-stage2/`
-- `docs/evidence/buildstorm-stage2/20260814-loongarch64-official-complete-stage2/`
-- `docs/evidence/buildstorm-stage2/20260814-stage2-buildstorm-official-completion.md`
+- `docs/evidence/buildstorm-stage2/20260815-riscv64-official-complete-stageb-percpu-heap-cache/`
+- `docs/evidence/buildstorm-stage2/20260815-loongarch64-official-complete-stageb-percpu-heap-cache/`
+- `docs/evidence/buildstorm-stage2/20260815-stageb-percpu-heap-cache-conclusion-cn.md`
 
 ## 3. 问题定位方法
 
@@ -121,6 +121,12 @@ QMP 返回地址把周期性内核热点定位到 `live_tasks()`：每个 timer 
 
 根因不是单个 ext4 API，而是缺少从解析到修改再到缓存失效的统一命名空间事务。
 
+### 4.9 kernel heap 中央锁与小对象 buddy 合并
+
+Stage A 完成后，900 秒 diagnostics 已能走到 `flatten_objects`，但仍记录到 33,741,372 次 heap 锁获取和 5,004 次竞争。QMP 寄存器样本中反复出现中央 `buddy_system_allocator::Heap::dealloc` 合并与自旋簇。BuildStorm 的 cargo/rustc 生命周期产生大量 8 B 至 4 KiB 短命内核对象；旧 `LockedHeap` 让每次分配和释放都进入同一个中央 buddy 锁，并在释放时执行可能跨多个 order 的合并。
+
+该热点不是 guest 某个 crate 的特例，而是通用 kernel heap 架构问题。因果模型是：小对象高频分配 -> 全局锁串行化 -> buddy split/merge 放大临界区 -> 多 vCPU 在 TCG 下反复自旋。若模型成立，批量化中央交互应显著降低锁获取和 QMP 自旋，并同时改善两个架构的完整 production 时间。
+
 ## 5. 当前修复与优化设计
 
 ### 5.1 地址空间与页帧所有权
@@ -174,6 +180,18 @@ rename 的目标替换和 exchange 的三步重命名位于一个 outer transact
 
 锁等待、阶段计数、frame owner shadow、namespace crossing 和 QMP 归因只在 `buildstorm-diagnostics` feature 下启用。production 默认关闭，不按测试名、crate、路径、命令、输出或 marker 改变内核行为。
 
+### 5.8 IRQ-safe per-CPU kernel heap cache
+
+kernel heap 在中央 buddy 之上增加 8 B 至 4 KiB 的 canonical size class cache：
+
+- 每 CPU、每 class 最多缓存 64 个 block；miss 时最多批量 refill 16 个，满时批量 flush 16 个；
+- cache 命中只获取当前 CPU 的小锁，中央 buddy 仍唯一拥有底层 heap range、大对象、动态扩展和最终 OOM 判断；
+- 所有回中央的 block 都使用 `Layout(block_size, block_size)`，避免以原请求 layout 释放 canonical buddy block；
+- cache 锁与中央锁不同时持有，跨 CPU free 进入执行 dealloc 的当前 CPU cache；
+- 中央分配失败时 drain 全部有界 cache 后重试，避免可用内存被永久困在 CPU-local 层。
+
+第一次实现扩大了中央批处理临界区，但没有约束本地中断，在 ext4 mount 前暴露同 CPU 中断递归进入 `spin::Mutex` 的风险。最终实现采用等价于 Linux `local_irq_save/restore` 的 `InterruptGuard`：进入全局 allocator 前保存本地 IRQ 状态并关中断，退出时按原状态恢复。它既固定 CPU 身份，也阻止 timer/VirtIO 中断在同一 CPU 递归获取 cache 或中央锁。
+
 ## 6. 被证伪或降级的候选
 
 以下候选没有达到独立性能门槛，因此没有作为“性能成功”陈述：
@@ -193,10 +211,10 @@ rename 的目标替换和 exchange 的三步重命名位于一个 outer transact
 
 | 架构 | guest 编译时间 | 产物大小 | kernel SHA-256 | 官方 judge 自动项 |
 | --- | ---: | ---: | --- | ---: |
-| RISC-V64 | 1322.99 s | 1,683,456 B | `071116d...9311fe` | 180/180 |
-| LoongArch64 | 1103.14 s | 1,716,224 B | `deaa5ce...14adbf9` | 180/180 |
+| RISC-V64 | 800.55 s | 1,683,456 B | `ad49e2d...603210` | 180/180 |
+| LoongArch64 | 660.71 s | 1,716,224 B | `a8395d2...09592a` | 180/180 |
 
-两次串口都包含 toolchain、minibuild 和完整 compile 成功 marker，无 panic、OOM、filesystem error。RISC-V64 host runner elapsed 为 1402.73 秒，LoongArch64 为 1156.19 秒。
+两次串口都包含 toolchain、minibuild 和完整 compile 成功 marker，无 panic、OOM、filesystem error。RISC-V64 host runner elapsed 为 841.52 秒，LoongArch64 为 695.39 秒。LoongArch64 judge 仍输出其旧的“expected 12”警告，但官方 2026 BuildStorm 计分配置规定为 8 vCPU；本次 QEMU 参数、marker 和 runner JSON 均为 `-smp 8`，judge 自动项仍为 180/180。
 
 ### 7.2 与本次 judge 基线比较
 
@@ -204,8 +222,8 @@ rename 的目标替换和 exchange 的三步重命名位于一个 outer transact
 
 | 架构 | judge 基线 B | wll_OS 时间 t | 时间降低 | B/t |
 | --- | ---: | ---: | ---: | ---: |
-| RISC-V64 | 1616 s | 1322.99 s | 18.13% | 1.22x |
-| LoongArch64 | 1985 s | 1103.14 s | 44.43% | 1.80x |
+| RISC-V64 | 1616 s | 800.55 s | 50.46% | 2.02x |
+| LoongArch64 | 1985 s | 660.71 s | 66.71% | 3.00x |
 
 正式评测机会在同机重测 Linux 基线，因此以上时间分只表示本次 `official-pass` 环境，不能替代最终评测机成绩。
 
@@ -216,9 +234,25 @@ rename 的目标替换和 exchange 的三步重命名位于一个 outer transact
 - 修改前：仅 toolchain/minibuild 通过，full clean build 超时或在后期出现 ENOENT/生命周期错误；
 - namespace 修复前 900 秒：129 个 compile 事件，`bitmaps` metadata ENOENT；
 - namespace 修复后 900 秒：131 个 compile 事件，越过 `bitmaps` 到 `flatten_objects`，无 filesystem error；
+- Stage A RISC-V64 完整成功：1322.58 秒；Stage B 为 800.55 秒，降低 522.03 秒、39.47%；
+- LoongArch64 可比完整成功样本：1103.14 秒；Stage B 为 660.71 秒，降低 442.43 秒、40.11%；
 - 最终：两架构均在 15000 秒官方窗口内完成并通过 judge。
 
 调度器单 idle wakeup 优化把早期 QEMU aggregate CPU 从约 718%-720% 降至 105%-108%，idle vCPU 自愿切换从约 52K-70K/s 降至约 95-131/s；晚期有用并行工作时 aggregate CPU 约 215%-217%。它显著减少宿主浪费，但 1800 秒 crate 边界只改善约 0.05%，所以不把它夸大为编译吞吐主因。
+
+### 7.4 Stage B allocator 归因
+
+同为 RISC-V64 diagnostics、SMP8、900 秒窗口：
+
+| 指标 | Stage A | Stage B | 变化 |
+| --- | ---: | ---: | ---: |
+| compile marker 数 | 129 | 136 并完整成功 | +7，且跨越终点 |
+| 中央 heap 锁获取 | 33,741,372 | 929,604 | -97.24% |
+| 中央 heap 锁竞争 | 5,004 | 7 | -99.86% |
+| 小对象 cache hit/miss | 不适用 | 20,032,390 / 53,030 | 99.74% hit |
+| QMP 中央 allocator 自旋簇 | 35/192 samples | 0/192 samples | 消失 |
+
+Stage B diagnostics 在 864.74 秒输出完整成功 marker。`drained_blocks=0` 表明该次运行没有依赖 OOM drain 才完成；它只证明本次压力范围，不表示 drain 路径可以删除。完整数据和首次无 IRQ 约束的失败证据见 Stage B 结论文档。
 
 ## 8. AI 使用说明
 

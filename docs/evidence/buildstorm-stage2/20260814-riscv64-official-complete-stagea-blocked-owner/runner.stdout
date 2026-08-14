@@ -1,0 +1,5 @@
+[riscv64] stage=complete reached=True log=/srv/buildstorm/worktrees/stagea-blocked-owner-20260814/_tmp/buildstorm-riscv64-complete.log
+BUILDSTORM_TOOLCHAIN ok
+BUILDSTORM_MINIBUILD ok
+BUILDSTORM_BEGIN mode=multi
+BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=1322.58 cores=8 bytes=1683456 arch=riscv64

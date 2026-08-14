@@ -1,0 +1,12 @@
+    PID     TID PSR %CPU STAT     ELAPSED COMMAND
+  13881   13881   9  0.0 Sl         04:38 qemu-system-ris
+  13881   13882  14  0.0 Sl         04:38 call_rcu
+  13881   13884  11  0.0 Sl         04:38 IO mon_iothread
+  13881   13885   8  0.0 Sl         04:38 CPU 0/TCG
+  13881   13886  12  0.0 Sl         04:38 CPU 1/TCG
+  13881   13887   3 99.7 Rl         04:38 CPU 2/TCG
+  13881   13888  15  0.0 Sl         04:38 CPU 3/TCG
+  13881   13889   5  0.0 Sl         04:38 CPU 4/TCG
+  13881   13890   7  0.0 Sl         04:38 CPU 5/TCG
+  13881   13891   2  0.0 Sl         04:38 CPU 6/TCG
+  13881   13892  10  0.0 Sl         04:38 CPU 7/TCG

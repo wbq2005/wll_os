@@ -1138,7 +1138,6 @@ pub fn yield_current_once() -> bool {
 }
 
 pub fn block_current_and_run_next(deadline_us: Option<usize>) {
-    const FOREGROUND_NO_RUNNABLE_SPINS: usize = 1024;
     let Some(task) = current_task() else {
         return;
     };
@@ -1183,7 +1182,6 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
         return;
     }
 
-    let mut no_runnable_spins = 0usize;
     #[cfg(feature = "buildstorm-diagnostics")]
     let blocked_owner_loop_started = crate::timer::get_time_us();
     #[cfg(feature = "buildstorm-diagnostics")]
@@ -1201,17 +1199,14 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
         }
         if crate::trap::foreground_driver_active() {
             if run_ready_task_once_for_blocked_owner() {
-                no_runnable_spins = 0;
                 continue;
             }
         }
         if !crate::trap::foreground_driver_active() {
             if run_ready_task_once_for_blocked_owner() {
-                no_runnable_spins = 0;
                 continue;
             }
             if drain_kernel_ready_once() {
-                no_runnable_spins = 0;
                 continue;
             }
         }
@@ -1220,11 +1215,9 @@ pub fn block_current_and_run_next(deadline_us: Option<usize>) {
             {
                 blocked_owner_empty_iterations = blocked_owner_empty_iterations.saturating_add(1);
             }
-            no_runnable_spins += 1;
-            if no_runnable_spins >= FOREGROUND_NO_RUNNABLE_SPINS {
-                core::hint::spin_loop();
+            if let Some(active) = wait_for_blocked_owner_event(&task) {
+                run_blocked_owner_task(active);
             }
-            core::hint::spin_loop();
         } else {
             wait_for_interrupt();
         }
@@ -1697,6 +1690,39 @@ fn wait_for_interrupt() {
         crate::platform::finish_idle();
         return;
     }
+    idle_until_interrupt();
+}
+
+/// Park a synchronous blocked-syscall owner without losing a concurrent wake.
+///
+/// Publishing the idle bit before the second ready-queue check closes both
+/// sides of the enqueue race: an earlier enqueue is consumed here, while a
+/// later enqueue observes the idle bit and sends this CPU an IPI.  A direct
+/// wake of the blocked task follows the same rule through `blocking_cpu`.
+fn wait_for_blocked_owner_event(blocked: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
+    crate::platform::prepare_idle();
+    if blocked.status() != TaskStatus::Blocked {
+        crate::platform::finish_idle();
+        return None;
+    }
+    if let Some(active) = fetch_dispatchable_user_task() {
+        crate::platform::finish_idle();
+        if blocked.status() != TaskStatus::Blocked {
+            manager::add_task_local(active);
+            return None;
+        }
+        return Some(active);
+    }
+    if blocked.status() != TaskStatus::Blocked {
+        crate::platform::finish_idle();
+        return None;
+    }
+    idle_until_interrupt();
+    None
+}
+
+/// Commit a previously published idle state and return with interrupts off.
+fn idle_until_interrupt() {
     crate::trap::interrupts::enable_interrupt();
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -1750,6 +1776,10 @@ fn run_ready_task_once_for_blocked_owner() -> bool {
     let Some(active) = fetch_dispatchable_user_task() else {
         return false;
     };
+    run_blocked_owner_task(active)
+}
+
+fn run_blocked_owner_task(active: Arc<TaskControlBlock>) -> bool {
     if matches!(
         active.status(),
         TaskStatus::Zombie | TaskStatus::Blocked | TaskStatus::Stopped

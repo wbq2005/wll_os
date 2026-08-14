@@ -173,18 +173,24 @@ insert、split、mprotect、munmap 和 coalesce 都先维护 VMA 元数据，再
 
 diagnostics feature 额外维护 free/tracked/page-table/contiguous 原子状态机；production 只保留实际引用计数。
 
-### 6.6 Demand fault 与预取
+### 6.6 Kernel heap 分层分配器
+
+kernel heap 使用两层结构：中央 `buddy_system_allocator::Heap` 唯一拥有静态/动态扩展的 heap range 和大对象；每个 CPU 在 8 B 至 4 KiB 的 canonical class 上维护有界 cache。cache 容量为每 class 64 个 block，中央 refill/flush 各以最多 16 个 block 批处理。
+
+cache 只改变分配路径，不改变底层所有权：所有回中央的 block 使用 canonical `Layout(block_size, block_size)`；中央 OOM 前 drain 全部 CPU cache 后重试；cache 锁与中央锁不同时持有。全局 allocator 入口使用本地 IRQ save/disable/restore，保证当前 CPU 身份稳定，并避免 timer/VirtIO 中断在同 CPU 递归获取 `spin::Mutex`。
+
+### 6.7 Demand fault 与预取
 
 匿名和文件 lazy area 在首次访问时分配/读取页。匿名 fault 可按小窗口批量建立连续 resident，clean file fault 使用受限 read-ahead；窗口始终截断到 VMA 边界，失败时保持所有权可回收。
 
-### 6.7 fork/COW/shared/file
+### 6.8 fork/COW/shared/file
 
 - private writable mapping：parent/child 共享 `FrameTracker`，PTE 清 W，page state 设 Cow；写 fault 分配并复制私有页。
 - readonly mapping：共享 frame，无需写时复制。
 - shared memory 与 shared file：保持 shared state，写入对共享 owner 可见。
 - file dirty page 在 msync/unmap/exit 的 writeback 责任路径处理；clean page 可直接丢弃并在下次 fault 重读。
 
-### 6.8 exec 与析构顺序
+### 6.9 exec 与析构顺序
 
 exec 先在独立 `MemorySet` 中加载 ELF、解释器、stack 和 auxv。全部成功后替换 TCB 的 shared memory set；旧空间不再可运行后才退休 address-space identity，释放页表树，最后释放 VMA resident frames。
 
@@ -264,6 +270,7 @@ ext4 数据路径包含：
 5. page-table mutation 在 `MemorySet` 锁内，shootdown 不重新获取同一 `MemorySet`。
 6. exec/exit 先取消可运行性，再退休 identity/page table/resident owner。
 7. `FrameTracker` 最后引用才归还 allocator；raw/contiguous 域必须走各自释放接口。
+8. kernel heap cache 锁与中央 buddy 锁不同时持有；allocator 临界区内本地中断保持关闭并在退出时恢复原状态。
 
 这些规则是 correctness 边界，不因 production/diagnostics cfg 改变。
 
@@ -277,6 +284,7 @@ ext4 数据路径包含：
 - MM、exec、fault、mmap 和 scheduler 阶段计数；
 - namespace generation crossing；
 - frame owner shadow；
+- per-CPU heap cache hit/miss、refill/flush 与中央交互计数；
 - 周期性固定大小 snapshot。
 
 所有诊断状态都由 feature gate 包围，production 默认关闭。诊断只观测，不修改 syscall 结果、调度策略、时间和 marker。
@@ -300,13 +308,13 @@ ext4 数据路径包含：
 RISC-V64：
 
 ```text
-BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=1322.99 cores=8 bytes=1683456 arch=riscv64
+BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=800.55 cores=8 bytes=1683456 arch=riscv64
 ```
 
 LoongArch64：
 
 ```text
-BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=1103.14 cores=8 bytes=1716224 arch=loongarch64
+BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=660.71 cores=8 bytes=1716224 arch=loongarch64
 ```
 
 两架构官方 judge 自动项均为 180/180。完整实验、AI 披露和复现步骤见 `docs/buildstorm-2.3-design-optimization-cn.md`。
@@ -316,5 +324,6 @@ BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=1103.14 cores=8 bytes=1716224 ar
 - VMA metadata 当前是 Vec，超大集合可演进为带 gap augmentation 的有序索引，但必须保持 ResidentSet 所有权边界。
 - 页表缺少已被实测证明有收益的通用 edit transaction；在没有新证据前不增加复杂度。
 - kernel stack 的完整显式 owner/回收审计仍值得继续。
+- per-CPU heap cache 当前按固定上限和批量参数工作；后续若调整参数，必须保持 canonical layout、OOM drain、IRQ 状态和锁序不变量，并重新执行双架构压力与完整官方运行。
 - 实板支持必须分别验证 boot、interrupt、timer、SMP、DMA、storage、cache maintenance；QEMU 通过不能代替 VisionFive 2 或 Loongson 2K1000LA gate。
 - 初赛回归仍是提交要求，BuildStorm 完成不替代其他测例。

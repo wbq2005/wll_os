@@ -1,0 +1,19 @@
+[DTB] ptr = 0x9000000000100000
+[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+[kernel] Hello, OS!
+[kernel] Memory init
+[VIRTIO] Probing...
+[VIRTIO] found
+[EXT4] mounted successfully
+[smp-regression] pass phase=interval-timer-state-machine
+[smp-regression] pass phase=resident-memory-lifecycle
+[smp-regression] pass phase=high-arena-memory-lifecycle
+[smp-regression] pass phase=namespace-lifecycle iterations=64 readers=7
+[smp-regression] pass phase=user-memory-lifecycle
+[smp-regression] pass cpus=8 mask=0xff dispatch=0xff tlb_targets=0x7f asid_pair=1/2 reused_asid=1 asid_check=root-csr isolation_iters=64 heap_stress_mib=160 checksum=90
+
+[boot-error] No runnable init task.
+[boot-error] reason: init not found in MemFS
+[boot-error] hint: ensure ext4 root on virtio-blk is available at boot (e.g. /init on the disk).
+[boot-error] hint: default builds do not embed sdcard tests; local fallback requires the dev-preload feature.
+[boot-error] hint: with virtio disk, kernel mounts ext4 at boot and the harness discovers scripts from that disk.

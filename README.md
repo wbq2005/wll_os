@@ -33,12 +33,12 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 
 ## BuildStorm 决赛状态
 
-2026-08-14，当前 production 内核在 QEMU 11.0.3、官方 `final-2026` glibc 镜像、`-snapshot -m 8G -smp 8` 配置下完成双架构 clean build，证据等级为 `official-pass`：
+2026-08-15，当前 production 内核在 QEMU 11.0.3、官方 `final-2026` glibc 镜像、`-snapshot -m 8G -smp 8` 配置下完成双架构 clean build，证据等级为 `official-pass`：
 
 | 架构 | 官方成功标记 | guest 编译时间 | 官方 judge 自动项 |
 | --- | --- | ---: | ---: |
-| RISC-V64 | `BUILDSTORM_COMPILE mode=multi ok=true` | 1322.99 s | 180/180 |
-| LoongArch64 | `BUILDSTORM_COMPILE mode=multi ok=true` | 1103.14 s | 180/180 |
+| RISC-V64 | `BUILDSTORM_COMPILE mode=multi ok=true` | 800.55 s | 180/180 |
+| LoongArch64 | `BUILDSTORM_COMPILE mode=multi ok=true` | 660.71 s | 180/180 |
 
 自动项包括 toolchain 8 分、minibuild 12 分、完整编译 40 分和本次 judge 基线下的时间分 120 分。内核设计优化文档 20 分由人工评审，不在上述自动结果中自行计分。正式评测机会重新测量同机 Linux 基线，因此最终时间分以评测机输出为准。
 
@@ -48,6 +48,7 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 - [当前内核架构总设计](docs/kernel-architecture-overview-cn.md)
 - [历史累计设计记录](docs/buildstorm-kernel-design-optimization.md)
 - [双架构 official-pass 证据结论](docs/evidence/buildstorm-stage2/20260814-stage2-buildstorm-official-completion.md)
+- [Stage B per-CPU heap cache 结论与证据索引](docs/evidence/buildstorm-stage2/20260815-stageb-percpu-heap-cache-conclusion-cn.md)
 
 完整运行命令如下，两个架构必须顺序执行，不能并发 QEMU：
 
