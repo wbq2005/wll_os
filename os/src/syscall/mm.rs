@@ -1,4 +1,8 @@
 use super::SyscallRet;
+use crate::config::user_va::{
+    is_user_mappable_range, mmap_arena_containing, DEFAULT_MMAP_BASE, MMAP_ARENAS,
+    USER_ADDRESS_LIMIT,
+};
 use crate::config::{PAGE_SIZE, USER_HEAP_START, USER_STACK_TOP};
 use crate::fs::{ext4_vol, fd::FileDescriptor};
 use crate::mm::frame_allocator::{self, FrameTracker};
@@ -17,11 +21,6 @@ const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
 const PROT_EXEC: i32 = 0x4;
 const PROT_MASK: i32 = PROT_READ | PROT_WRITE | PROT_EXEC;
-// Keep a guard above the traditional brk base while allowing large sparse
-// reservations (thread stacks and allocator arenas) to reuse the otherwise
-// empty lower half of the 2 GiB user window.
-const MMAP_BASE: usize = 0x2000_0000;
-
 const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
 const MAP_SHARED_VALIDATE: usize = 0x03;
@@ -101,17 +100,83 @@ fn find_mmap_area(
     hint: usize,
     length: usize,
 ) -> Option<usize> {
-    let search_start = hint.max(MMAP_BASE);
-    memory_set
-        .find_free_area(search_start, length, USER_STACK_TOP)
-        .or_else(|| {
-            let wrap_limit = search_start.min(USER_STACK_TOP);
-            if MMAP_BASE < wrap_limit {
-                memory_set.find_free_area(MMAP_BASE, length, wrap_limit)
-            } else {
-                None
+    find_mmap_area_with_hints(
+        memory_set,
+        hint,
+        crate::config::user_va::DEFAULT_HIGH_MMAP_BASE,
+        length,
+    )
+}
+
+fn find_mmap_area_with_hints(
+    memory_set: &crate::mm::memory_set::MemorySet,
+    low_hint: usize,
+    high_hint: usize,
+    length: usize,
+) -> Option<usize> {
+    let hinted_arena = mmap_arena_containing(low_hint);
+    if let Some(arena) = hinted_arena {
+        let aligned_hint = align_up(low_hint).ok()?.max(arena.start);
+        if let Some(start) = memory_set.find_free_area(aligned_hint, length, arena.end) {
+            return Some(start);
+        }
+        if arena.start < aligned_hint {
+            if let Some(start) = memory_set.find_free_area(arena.start, length, aligned_hint) {
+                return Some(start);
             }
-        })
+        }
+    }
+
+    for arena in MMAP_ARENAS {
+        if Some(arena) == hinted_arena {
+            continue;
+        }
+        let arena_hint = if arena == crate::config::user_va::HIGH_MMAP_ARENA {
+            high_hint.max(arena.start)
+        } else {
+            arena.start
+        };
+        if let Some(start) = memory_set.find_free_area(arena_hint, length, arena.end) {
+            return Some(start);
+        }
+        if arena_hint > arena.start {
+            if let Some(start) = memory_set.find_free_area(arena.start, length, arena_hint) {
+                return Some(start);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+fn mmap_max_free_gap(memory_set: &crate::mm::memory_set::MemorySet) -> usize {
+    fn max_gap_in(
+        memory_set: &crate::mm::memory_set::MemorySet,
+        start: usize,
+        end: usize,
+    ) -> usize {
+        let mut cursor = start;
+        let mut max_gap = 0usize;
+        for area in &memory_set.areas {
+            if area.end_va.raw() <= start {
+                continue;
+            }
+            if area.start_va.raw() >= end {
+                break;
+            }
+            let area_start = area.start_va.raw().max(start).min(end);
+            if area_start > cursor {
+                max_gap = max_gap.max(area_start - cursor);
+            }
+            cursor = cursor.max(area.end_va.raw().min(end));
+        }
+        max_gap.max(end.saturating_sub(cursor))
+    }
+    MMAP_ARENAS
+        .iter()
+        .map(|arena| max_gap_in(memory_set, arena.start, arena.end))
+        .max()
+        .unwrap_or(0)
 }
 
 fn current_time_sec() -> isize {
@@ -221,7 +286,7 @@ fn write_back_shared_files(writes: Vec<(FileDescriptor, usize, Vec<u8>)>) -> Res
 
 pub(crate) fn write_back_shared_mappings_for_file(file: &FileDescriptor) -> Result<(), SysErrNo> {
     for task in crate::task::manager::all_user_tasks() {
-        let writes = collect_shared_file_writes_for(&task, 0, USER_STACK_TOP, Some(file))?;
+        let writes = collect_shared_file_writes_for(&task, 0, USER_ADDRESS_LIMIT, Some(file))?;
         write_back_shared_files(writes)?;
     }
     Ok(())
@@ -229,7 +294,7 @@ pub(crate) fn write_back_shared_mappings_for_file(file: &FileDescriptor) -> Resu
 
 pub(crate) fn write_back_all_shared_file_mappings() -> Result<(), SysErrNo> {
     for task in crate::task::manager::all_user_tasks() {
-        let writes = collect_shared_file_writes(&task, 0, USER_STACK_TOP)?;
+        let writes = collect_shared_file_writes(&task, 0, USER_ADDRESS_LIMIT)?;
         write_back_shared_files(writes)?;
     }
     Ok(())
@@ -490,7 +555,9 @@ pub fn sys_mmap(
     offset: usize,
 ) -> SyscallRet {
     #[cfg(feature = "buildstorm-diagnostics")]
-    let _diag = crate::buildstorm_diagnostics::WorkScope::new(crate::buildstorm_diagnostics::WorkClass::Mmap);
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::Mmap,
+    );
     log::info!(
         "[syscall] mmap(addr={:#x}, len={:#x}, prot={:#x}, flags={:#x}, fd={}, off={:#x})",
         addr,
@@ -515,6 +582,16 @@ pub fn sys_mmap(
     let anonymous = (flags & MAP_ANONYMOUS) != 0;
     let pte_flags = prot_to_pte_flags(prot)?;
     let map_len = align_up(length)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_mmap_request(map_len);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let mut mmap_protocol_attempt = (anonymous
+        && !shared
+        && !fixed_addr
+        && addr == 0
+        && (flags & (MAP_POPULATE | MAP_LOCKED)) == 0
+        && map_len > 16 * 1024 * 1024)
+        .then(|| crate::buildstorm_diagnostics::begin_mmap_protocol(&task.thread_group, map_len));
 
     if !anonymous && offset % PAGE_SIZE != 0 {
         return Err(SysErrNo::EINVAL);
@@ -526,10 +603,13 @@ pub fn sys_mmap(
         return Err(SysErrNo::EINVAL);
     }
 
-    let next_hint = task.mm.lock().next_mmap;
+    let mm_snapshot = *task.mm.lock();
+    let next_hint = mm_snapshot.next_mmap;
+    let next_high_hint = mm_snapshot.next_mmap_high;
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
     let mut start = {
         let ms = crate::buildstorm_memory_set_lock!(
-            crate::buildstorm_diagnostics::MemorySetLockSite::Mmap,
+            crate::buildstorm_diagnostics::MemorySetLockSite::MmapSelect,
             &task.memory_set,
         );
         if fixed_addr {
@@ -537,20 +617,53 @@ pub fn sys_mmap(
         } else if addr != 0 {
             let hint = align_up(addr)?;
             let end = hint.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
-            if end <= USER_STACK_TOP && !ms.range_overlaps(hint, end) {
+            if is_user_mappable_range(hint, end) && !ms.range_overlaps(hint, end) {
                 hint
             } else {
-                find_mmap_area(&ms, next_hint, map_len).ok_or(SysErrNo::ENOMEM)?
+                find_mmap_area_with_hints(&ms, next_hint, next_high_hint, map_len)
+                    .ok_or(SysErrNo::ENOMEM)?
             }
         } else {
-            find_mmap_area(&ms, next_hint, map_len).ok_or(SysErrNo::ENOMEM)?
+            find_mmap_area_with_hints(&ms, next_hint, next_high_hint, map_len)
+                .ok_or(SysErrNo::ENOMEM)?
         }
     };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let mut start = {
+        let ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::MmapSelect,
+            &task.memory_set,
+        );
+        let selected = if fixed_addr {
+            Some(addr)
+        } else if addr != 0 {
+            let hint = align_up(addr)?;
+            let end = hint.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
+            if is_user_mappable_range(hint, end) && !ms.range_overlaps(hint, end) {
+                Some(hint)
+            } else {
+                find_mmap_area_with_hints(&ms, next_hint, next_high_hint, map_len)
+            }
+        } else {
+            find_mmap_area_with_hints(&ms, next_hint, next_high_hint, map_len)
+        };
+        if selected.is_none() {
+            if crate::buildstorm_diagnostics::note_mmap_select_enomem(map_len, ms.areas.len()) {
+                crate::buildstorm_diagnostics::note_mmap_failed_gap(mmap_max_free_gap(&ms));
+            }
+            if let Some(attempt) = mmap_protocol_attempt.take() {
+                attempt.select_enomem();
+            }
+        }
+        selected.ok_or(SysErrNo::ENOMEM)?
+    };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_mmap_select_ok();
     let mut end = start.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
     if start < PAGE_SIZE {
         return Err(SysErrNo::EPERM);
     }
-    if end > USER_STACK_TOP {
+    if !is_user_mappable_range(start, end) {
         return Err(SysErrNo::ENOMEM);
     }
 
@@ -600,9 +713,18 @@ pub fn sys_mmap(
         write_back_shared_files(writes)?;
     }
 
+    let lazy_private_anonymous = anonymous && !shared && (flags & (MAP_POPULATE | MAP_LOCKED)) == 0;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_mmap_shape(
+        anonymous,
+        fixed_addr,
+        addr != 0,
+        lazy_clean_mmap || lazy_private_anonymous,
+    );
+
     {
         let mut ms = crate::buildstorm_memory_set_lock!(
-            crate::buildstorm_diagnostics::MemorySetLockSite::Mmap,
+            crate::buildstorm_diagnostics::MemorySetLockSite::MmapCommit,
             &task.memory_set,
         );
         if no_replace && ms.range_overlaps(start, end) {
@@ -611,16 +733,33 @@ pub fn sys_mmap(
         if map_fixed && !no_replace {
             ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
         } else if !fixed_addr && ms.range_overlaps(start, end) {
-            start = find_mmap_area(&ms, MMAP_BASE, map_len).ok_or(SysErrNo::ENOMEM)?;
+            #[cfg(not(feature = "buildstorm-diagnostics"))]
+            {
+                start = find_mmap_area_with_hints(
+                    &ms,
+                    DEFAULT_MMAP_BASE,
+                    crate::config::user_va::DEFAULT_HIGH_MMAP_BASE,
+                    map_len,
+                )
+                .ok_or(SysErrNo::ENOMEM)?;
+            }
+            #[cfg(feature = "buildstorm-diagnostics")]
+            {
+                let reselected = find_mmap_area_with_hints(
+                    &ms,
+                    DEFAULT_MMAP_BASE,
+                    crate::config::user_va::DEFAULT_HIGH_MMAP_BASE,
+                    map_len,
+                );
+                crate::buildstorm_diagnostics::note_mmap_commit_reselect(reselected.is_some());
+                start = reselected.ok_or(SysErrNo::ENOMEM)?;
+            }
             end = start.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
-            if end > USER_STACK_TOP || ms.range_overlaps(start, end) {
+            if !is_user_mappable_range(start, end) || ms.range_overlaps(start, end) {
                 return Err(SysErrNo::ENOMEM);
             }
         }
 
-        let lazy_private_anonymous = anonymous
-            && !shared
-            && (flags & (MAP_POPULATE | MAP_LOCKED)) == 0;
         if lazy_clean_mmap || lazy_private_anonymous {
             ms.insert_lazy_area_with_backing(
                 VirtAddr::new(start),
@@ -641,8 +780,19 @@ pub fn sys_mmap(
         }
     }
 
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_mmap_placement(start);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if let Some(attempt) = mmap_protocol_attempt.take() {
+        attempt.success(start, end);
+    }
+
     let mut mm = task.mm.lock();
-    if mm.next_mmap < end {
+    if crate::config::user_va::HIGH_MMAP_ARENA.contains_range(start, end) {
+        if mm.next_mmap_high < end {
+            mm.next_mmap_high = end;
+        }
+    } else if mm.next_mmap < end {
         mm.next_mmap = end;
     }
     Ok(start)
@@ -651,7 +801,9 @@ pub fn sys_mmap(
 /// mprotect system call.
 pub fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallRet {
     #[cfg(feature = "buildstorm-diagnostics")]
-    let _diag = crate::buildstorm_diagnostics::WorkScope::new(crate::buildstorm_diagnostics::WorkClass::Mprotect);
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::Mprotect,
+    );
     log::debug!(
         "[syscall] mprotect(addr={:#x}, len={:#x}, prot={:#x})",
         addr,
@@ -678,7 +830,9 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallRet {
 /// munmap system call.
 pub fn sys_munmap(addr: usize, length: usize) -> SyscallRet {
     #[cfg(feature = "buildstorm-diagnostics")]
-    let _diag = crate::buildstorm_diagnostics::WorkScope::new(crate::buildstorm_diagnostics::WorkClass::Munmap);
+    let _diag = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::Munmap,
+    );
     log::info!("[syscall] munmap(addr={:#x}, len={:#x})", addr, length);
     if addr % PAGE_SIZE != 0 || length == 0 {
         return Err(SysErrNo::EINVAL);
@@ -689,12 +843,34 @@ pub fn sys_munmap(addr: usize, length: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let writes = collect_shared_file_writes(&task, start, end)?;
     write_back_shared_files(writes)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let unmapped_existing = {
+        let mut ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::Munmap,
+            &task.memory_set,
+        );
+        let overlaps = ms.range_overlaps(start, end);
+        ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
+        overlaps
+    };
+    #[cfg(not(feature = "buildstorm-diagnostics"))]
     {
         let mut ms = crate::buildstorm_memory_set_lock!(
             crate::buildstorm_diagnostics::MemorySetLockSite::Munmap,
             &task.memory_set,
         );
         ms.unmap_range(VirtAddr::new(start), VirtAddr::new(end))?;
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if unmapped_existing {
+        let mm = *task.mm.lock();
+        let cursor = if crate::config::user_va::HIGH_MMAP_ARENA.contains_addr(start) {
+            mm.next_mmap_high
+        } else {
+            mm.next_mmap
+        };
+        crate::buildstorm_diagnostics::note_munmap_cursor(start, end, cursor);
+        crate::buildstorm_diagnostics::note_munmap_protocol(&task.thread_group, start, end);
     }
     Ok(0)
 }
@@ -827,12 +1003,15 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SyscallRet {
 
     let attach_result = (|| -> Result<usize, SysErrNo> {
         let start = if shmaddr == 0 {
-            let next_hint = task.mm.lock().next_mmap;
+            let mm_snapshot = *task.mm.lock();
+            let next_hint = mm_snapshot.next_mmap;
+            let next_high_hint = mm_snapshot.next_mmap_high;
             let ms = crate::buildstorm_memory_set_lock!(
                 crate::buildstorm_diagnostics::MemorySetLockSite::SharedMemory,
                 &task.memory_set,
             );
-            find_mmap_area(&ms, next_hint, map_len).ok_or(SysErrNo::ENOMEM)?
+            find_mmap_area_with_hints(&ms, next_hint, next_high_hint, map_len)
+                .ok_or(SysErrNo::ENOMEM)?
         } else if (shmflg & SHM_RND) != 0 {
             align_down(shmaddr)
         } else {
@@ -845,7 +1024,7 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SyscallRet {
             return Err(SysErrNo::EINVAL);
         }
         let end = start.checked_add(map_len).ok_or(SysErrNo::EINVAL)?;
-        if end > USER_STACK_TOP {
+        if !is_user_mappable_range(start, end) {
             return Err(SysErrNo::ENOMEM);
         }
 
@@ -889,7 +1068,11 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SyscallRet {
         }
         {
             let mut mm = task.mm.lock();
-            if mm.next_mmap < end {
+            if crate::config::user_va::HIGH_MMAP_ARENA.contains_range(start, end) {
+                if mm.next_mmap_high < end {
+                    mm.next_mmap_high = end;
+                }
+            } else if mm.next_mmap < end {
                 mm.next_mmap = end;
             }
         }

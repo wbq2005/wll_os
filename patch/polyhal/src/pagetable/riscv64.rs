@@ -173,14 +173,18 @@ impl PageTable {
     pub const PAGE_SIZE: usize = 0x1000;
     pub const PAGE_LEVEL: usize = 3;
     pub const PTE_NUM_IN_PAGE: usize = 0x200;
-    /// Root entries 0 and 1 are user space in this kernel
-    /// (0x0000_0000..0x8000_0000). Kernel identity mappings start at
-    /// 0x8000_0000, so fresh process page tables must not inherit low entries
-    /// from the currently running user page table.
-    pub(crate) const USER_ROOT_PTE_END: usize = 2;
+    /// User mappings occupy the legacy low roots 0..1 and the optional high
+    /// arena roots 128..255.  Root 2 and the remaining entries are shared
+    /// kernel mappings copied from the boot root.  Keep this ownership rule in
+    /// one helper so restore() and release() cannot diverge.
     pub(crate) const VADDR_BITS: usize = 39;
     pub(crate) const USER_VADDR_END: usize = (1 << Self::VADDR_BITS) - 1;
     pub(crate) const KERNEL_VADDR_START: usize = !Self::USER_VADDR_END;
+
+    #[inline]
+    pub(crate) const fn is_user_root_entry(index: usize) -> bool {
+        index < 2 || index >= 128
+    }
 
     #[inline]
     pub fn current() -> Self {
@@ -200,7 +204,13 @@ impl PageTable {
         if current.raw() == 0 {
             arr[2] = PTE::new_page(
                 PhysAddr::new(0x8000_0000),
-                PTEFlags::V | PTEFlags::R | PTEFlags::W | PTEFlags::X | PTEFlags::G | PTEFlags::A | PTEFlags::D,
+                PTEFlags::V
+                    | PTEFlags::R
+                    | PTEFlags::W
+                    | PTEFlags::X
+                    | PTEFlags::G
+                    | PTEFlags::A
+                    | PTEFlags::D,
             );
             return;
         }
@@ -211,8 +221,10 @@ impl PageTable {
         // Copy only kernel/global root entries. Copying user entries from the
         // active task aliases its lower-level page tables; when the old address
         // space is dropped, the new one would keep dangling mappings.
-        for i in Self::USER_ROOT_PTE_END..Self::PTE_NUM_IN_PAGE {
-            arr[i] = kernel_arr[i];
+        for i in 0..Self::PTE_NUM_IN_PAGE {
+            if !Self::is_user_root_entry(i) {
+                arr[i] = kernel_arr[i];
+            }
         }
     }
 

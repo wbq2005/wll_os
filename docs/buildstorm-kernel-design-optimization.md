@@ -2,16 +2,17 @@
 
 ## 1. 阶段范围与结论
 
-本文是 BuildStorm 的累计设计与优化文档。本轮只验收阶段一环境能力：在 RISC-V64 和 LoongArch64 上，使用未修改的官方 glibc 镜像和镜像内原始脚本，跑通工具链检查以及 `cargo new/build/run` 的 minibuild。完整 tgoskits 编译、真实 SMP 调度和编译性能优化不属于本轮完成项。
+本文是 BuildStorm 的累计设计与优化文档。阶段一先在 RISC-V64 和 LoongArch64 上跑通未修改官方 glibc 镜像中的工具链与 `cargo new/build/run` minibuild；后续阶段完成真实 SMP、内存与文件系统生命周期修复、热点归因、双架构回归和完整 tgoskits clean build。
 
-本轮最高证据等级为 `official-pass`。2026-07-21 的最终正式运行均使用 QEMU `-snapshot -m 8G -smp 8`，两个架构都输出：
+当前最高证据等级为 `official-pass`。2026-08-14 的最终正式运行使用 QEMU 11.0.3、未修改的官方镜像与脚本、官方 `final-2026` judge，以及 `-snapshot -m 8G -smp 8`。两个架构都输出完整成功 marker：
 
 ```text
 BUILDSTORM_TOOLCHAIN ok
 BUILDSTORM_MINIBUILD ok
+BUILDSTORM_COMPILE mode=multi ok=true
 ```
 
-官方 `judge_buildstorm-glibc.py` 对两个架构均给出环境项 20.0 分：toolchain 8.0，minibuild 12.0。`compile ok` 与 `compile time` 尚未执行完成，均为 0；不能据此主张后续 160 分。
+RISC-V64 guest 编译耗时 1322.99 秒，LoongArch64 为 1103.14 秒。官方 `judge_buildstorm-glibc.py` 对两个架构均通过全部脚本项，给出 180/180；设计文档 20 分仍由人工评审。完整身份、原始日志、哈希和复现命令见第 39 节及 `docs/evidence/buildstorm-stage2/20260814-stage2-buildstorm-official-completion.md`。
 
 ## 2. 权威输入与发布差异
 
@@ -1258,3 +1259,431 @@ explain the late high-CPU boundary. Complete BuildStorm remains unverified.
 AI assisted with lifecycle auditing, regression design, controlled remote
 measurement, and evidence comparison; all claims are reproducible from the
 saved launch, summary, serial, and host sampler files.
+
+## 32. Rejected eager large-mmap segregation candidate (2026-08-12)
+
+Late diagnostics showed repeated 128-MiB mapping failures after the low user
+range fragmented below an 85.37-MiB maximum sampled gap. A new RISC-V-only
+address-layout candidate therefore differed from the previously rejected
+fallback: no-hint mappings of at least 128 MiB were sent to a separate
+positive-Sv39 window before low-range fragmentation formed. Low mappings and
+LoongArch behavior were unchanged. Architecture-defined root ownership kept
+the kernel identity range shared and made only the high user root entries
+process-owned. No TLB policy, VFS, scheduler, official script, image, marker,
+or guest time behavior changed.
+
+Four cfg checks, dual production release builds, and dual eight-CPU SMP
+regressions passed. The independent regression exercised address selection,
+high-range demand fault, fork/COW, partial unmap, drop, and new-root isolation.
+Both unchanged official images also reached the exact toolchain and minibuild
+success markers with production diagnostics disabled.
+
+The comparable RISC-V production window reached 23 `Compiling` lines, two
+`Finished` lines, and the same final `ax-posix-api` crate as the control: 0%
+coarse progress improvement. Against the current-commit high-window control,
+the first crate regressed from 171.810 to 194.230 seconds (13.05%) and the
+23rd crate from 182.424 to 204.443 seconds (12.07%). Host swap and I/O wait
+were zero, storage was not saturated, and all eight TCG threads were active.
+The candidate and its dedicated regression were therefore reverted under the
+mandatory below-5% rule.
+
+Raw evidence is in
+`docs/evidence/buildstorm-stage2/20260812-riscv64-production-smp8-mmap-large-segregation-window300/`.
+The candidate kernel SHA-256 was
+`e8280e6e504586199c85bd2e994bc4567a072f7bc42c7df9990b8bbc7ea9ddf9`;
+the unchanged official image SHA-256 was
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`.
+No exact compile-success marker was emitted, so complete BuildStorm remains
+unverified. AI assisted with semantic auditing, regression design, execution,
+and evidence comparison; developer-verifiable artifacts include the source
+diff, dual-architecture logs, raw serial, launch JSON, and host samplers.
+
+## 33. Per-frame ownership table (2026-08-12)
+
+Three feature-gated runs refined the first synchronous exec hotspot. Publishing
+the new address space cost 64 us across 79 marker-window execs, while dropping
+the old `MemorySet` cost 27.584 seconds. A second run attributed 30.414 of
+30.448 seconds (99.89%) to dropping VMA/resident owners; ASID retirement cost
+56 us and page-table owner destruction 32.876 ms. A third, attribution-only
+heap-instrumented run recorded 68.49 million heap acquisitions, 4.37 million
+contended acquisitions, 126.89 seconds wait, and 185.90 seconds hold during
+the marker window. These runs identify per-resident-frame ownership teardown
+as the first actionable representation cost. The global heap counters do not
+prove that every heap event came from resident destruction.
+
+The architecture-neutral change replaces one heap-allocated
+`Arc<FrameTrackerInner>` per tracked frame with fixed refcount metadata. After
+all platform memory regions are registered, each managed region receives an
+immutable array containing one `AtomicUsize` per frame. `FrameTracker` holds
+only a physical page number. Clone increments that frame's count; drop
+decrements it and returns the frame to the existing buddy allocator only for
+the last owner. This keeps page-level COW, shared mapping, and clean file-cache
+ownership unchanged.
+
+The ownership boundary is explicit. Only the frame allocator constructs
+trackers. Page-table allocation transfers an exclusively tracked frame into
+raw `PageAlloc` ownership through `into_raw_ppn`; contiguous DMA frames retain
+their existing raw allocation/free API. Overflow, underflow, non-exclusive
+raw transfer, and deallocation while tracked are asserted. Initialization is
+shared by RISC-V64 and LoongArch64 after DTB memory discovery; no
+architecture-specific fast path was added. Exec replacement, VMA topology,
+PTE publication, TLB/shootdown ordering, scheduler, VFS, and block-cache
+behavior are unchanged.
+
+Both targets passed production and diagnostic cfg checks. Both eight-vCPU SMP
+regressions passed resident and user-memory lifecycles plus the final all-CPU
+gate, and both unchanged official images passed exact toolchain/minibuild
+markers. In comparable RISC-V64 production windows, the first `Compiling`
+event moved from 171.810 to 49.057 seconds (71.45% earlier) and the 23rd from
+182.424 to 57.669 seconds (68.39% earlier). Both runs still had 23 compiling
+events after 300 seconds, so coarse crate-count improvement was 0%. The
+candidate is retained under the declared >=15% latency threshold, but final
+compile-time improvement is not measured.
+
+Evidence is in
+`docs/evidence/buildstorm-stage2/20260812-riscv64-diagnostics-smp8-exec-replace-phase-window300/`,
+`20260812-riscv64-diagnostics-smp8-exec-drop-owner-phase-window300/`,
+`20260812-riscv64-diagnostics-smp8-heap-lock-phase-window300/`, and
+`20260812-riscv64-production-smp8-frame-refcount-table-window300/`.
+Candidate kernel SHA-256 is
+`399a39a25a67b3b6edf1733f294ba552004e317c8fcb263a35704393fdad842d`;
+the unchanged official image SHA-256 is
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`.
+The re-fetched official suite commit is
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`.
+
+Reproduce the short candidate window with the command in its evidence
+`README.md`. Reproduce the final gate with diagnostics disabled and:
+
+```text
+BUILDSTORM_SUITE_DIR=/srv/buildstorm/src/testsuits-for-oskernel \
+  scripts/run_buildstorm_long_baseline.sh riscv64 \
+  /srv/buildstorm/images/sdcard-rv-pub.img \
+  docs/evidence/buildstorm-stage2/20260812-riscv64-production-frame-refcount-complete-15000-official
+```
+
+The long-run host harness takes a nonblocking host-wide `flock` and rejects
+launch when another kernel QEMU process is already active. This prevents a
+restarted supervisor or overlapping monitor from contaminating the single-run
+evidence. Its `pidstat -t` sampler records QEMU thread-level CPU and context
+switch activity. These controls change neither the official guest script nor
+kernel behavior.
+
+AI assisted with diagnostic design, source and ownership auditing, candidate
+implementation, regression construction, controlled execution, and evidence
+comparison. Developer-verifiable artifacts are the source diff, dual-target
+logs, official marker logs, raw serial, hashes, exact QEMU arguments, and host
+samplers. Complete BuildStorm remains `unverified / not completed`; there is
+no exact `BUILDSTORM_COMPILE mode=multi ok=true` marker yet.
+
+## 34. Stage 1 retained high mmap arena (2026-08-14)
+
+The independent global audit corrected the late-boundary model. The per-frame
+ownership table removed a startup destructor cost, but a 1,800-second
+diagnostic interval later recorded up to 2,305 VMAs and a maximum free mmap gap
+of only 85.37 MiB while userspace requested lazy reservations as large as
+128 MiB. In one 70.088-second late interval, 56,625 of 88,498 mmap selections
+returned `ENOMEM`. mmap/munmap topology changes, PTE/TLB commits and the shared
+`MemorySet` lock were downstream multipliers of this address-capacity failure.
+
+Stage 1 introduced an architecture-neutral user-VA policy with a historical
+low arena and a disjoint high arena at
+`0x20_0000_0000..0x40_0000_0000`. `MmContext` owns independent cursors for the
+two arenas. Reservations remain lazy. RISC-V restore and release share one
+non-contiguous root-ownership predicate: roots `0..1` and `128..255` are owned
+by the process, while the kernel identity root and other global roots remain
+shared. LoongArch uses the same logical user arena while keeping PLV0 DMW
+state platform-owned. Fixed mappings, shared memory and shared-file writeback
+use the common legal-range policy.
+
+The high-arena diagnostic recorded 5,542 successful selections and zero
+selection `ENOMEM` by snapshot 67. RISC-V production still had 23 compile
+events at 300 seconds, but its 1,800-second run crossed the old 33-event
+`rustc-literal-escaper` boundary and reached event 34, `hashbrown`, at
+430.325 seconds. A separate diagnostics run reached 65 events and
+`rdif-reset`; that count is attribution evidence, not comparable production
+throughput. Four release cfg builds and dual-architecture eight-CPU resident,
+high-arena, user-memory, COW/shared/file, ASID/TLB and heap-stress regressions
+passed as `capability-pass`.
+
+The retained production kernel SHA-256 is
+`56870ac6589aaa62a6e5ce8cbbd4071aee5faa44c7af61d9615da742256d4fb0`.
+Raw evidence and the full causal decision are under
+`docs/evidence/buildstorm-stage2/20260814-riscv64-production-stage1-high-arena-window300/`,
+`20260814-riscv64-production-stage1-high-arena-window1800/`,
+`20260814-riscv64-diagnostics-stage1-high-arena-window1800/`, and
+`20260814-stage1-high-mmap-arena-conclusion.md`. AI assisted with evidence
+reconciliation, cfg ownership auditing, implementation, regression design and
+comparison. Complete BuildStorm remains `unverified / not completed`.
+
+## 35. Stage 2 single-idle-CPU runnable publication (2026-08-14)
+
+Host thread sampling exposed a scheduler/virtualization interaction hidden by
+guest counters. Before Stage 2, one useful QEMU vCPU was near 100% host CPU,
+while seven nominally idle vCPU threads each consumed about 88% and generated
+roughly 52,000-70,000 voluntary context switches per second. The cause was a
+broadcast reschedule IPI on every ready-queue publication, including ordinary
+local time-slice and syscall requeues. Under QEMU TCG this formed a persistent
+idle-vCPU wakeup herd.
+
+The scheduler now distinguishes external publication from local requeue.
+External insertion samples task affinity, inserts and deduplicates while
+holding the ready-queue lock, then atomically claims one eligible bit from the
+published idle mask and sends one IPI. Local time-slice, syscall and kernel
+task requeues do not wake another CPU when the current CPU is eligible; an
+affinity mismatch automatically falls back to external notification. A
+duplicate PID insertion sends no IPI. Control events that may change several
+tasks, including thread-group state and affinity changes, retain broadcast
+notification.
+
+The lost-wakeup invariant is preserved: an idle CPU publishes its bit before
+rechecking the affinity-filtered ready queue. A producer publishes the queue
+entry before claiming that bit. Therefore either the idle-side recheck sees
+the task, or the producer claims the bit and sends the interrupt. Blocked-task
+completion, fork/vfork and new-task paths remain external publications. MM,
+VFS, PTE/TLB, frame ownership and official runner semantics are unchanged.
+
+At 300 seconds, production still reached 23 compile events and `ax-posix-api`;
+the last-event timestamp was 56.871 seconds versus Stage 1's 56.870 seconds.
+This is no measured crate-boundary gain. The direct hotspot nevertheless
+collapsed: final QEMU use fell from about 718-720% to 105-108%, idle vCPU use
+fell to 0-2%, and their voluntary context switches fell to about 95-131 per
+second. Diagnostics later used two useful vCPUs near 100% each and recorded
+user execution on all eight CPUs. Under the retained-positive-optimization
+rule this resource-efficiency correction stays.
+
+The completed 1,800-second production comparison reached the same 34 compile
+events and the same final `hashbrown` crate as Stage 1. The final event moved
+from 430.325 to 430.123 seconds, only about 0.05%. In the late phase, two useful
+TCG threads ran near 100% and the other six stayed near 1-4%, for about 215-217%
+aggregate QEMU CPU instead of the previous 718-720%. Thus the stage preserved
+real parallelism and eliminated the host wakeup herd, but it did not move the
+compile dependency boundary. The next hotspot must be re-attributed from the
+post-`hashbrown` useful-vCPU work rather than inferred from scheduler wakeups.
+
+Four release cfg builds and both eight-CPU architecture regression matrices
+passed as `capability-pass`. The RISC-V production, RISC-V diagnostics,
+LoongArch production and LoongArch diagnostics kernel SHA-256 values were
+`404040dbaae5b0e2f22c72a3eaa7e110cfe45cd57089b55a7d6bf5562a7823ad`,
+`438f23a83eb99338b7c4bcaeed45a2f9eecd97559167376e5721e517495d20b0`,
+`3228003211a6f06f4eef9a5ce796bf176a5070ac62e4bf18718656487e29030b`,
+and `69b3cdab51c687c5e8c5711abc2efb1086d7649215ebbf3e51fdaa3d265b5235`.
+AI assisted with host/guest timeline correlation, wakeup-protocol auditing,
+implementation, regression design and measurement. No official pass or full
+compile is claimed without `BUILDSTORM_COMPILE mode=multi ok=true`.
+
+## 36. Stage 2 raw-frame ownership invariant (2026-08-14)
+
+After the ext4 directory insertion lockup was fixed, a delayed-QMP production
+window reached 48 compile events and then glibc aborted with
+`malloc_consolidate(): unaligned fastbin chunk detected`. An Arc frame-owner
+control did not reproduce that signature in 600 seconds but only reached the
+old 23-event boundary. This changes the attribution weight of the per-frame
+`AtomicUsize` candidate, but does not prove it is the unique corruption source.
+
+The ownership audit separates three allocation domains. `FrameTracker` owns
+resident user and file-cache pages. PolyHAL's page allocator transfers a sole
+tracker into raw ownership for page-table roots and intermediate tables.
+Kernel heap extension, VirtIO DMA and kernel stacks use raw contiguous ranges.
+The production refcount table protects only the first domain, so its existing
+assertions cannot detect a duplicate raw free or an overlap between domains.
+
+A diagnostics-only byte shadow now records each managed page as free, tracked,
+page-table, or contiguous. Every allocation/transfer/free performs an atomic
+expected-state transition and panics with the PPN, expected/actual states and
+tracked count on a mismatch. Periodic diagnostics report active totals and
+transition count. Production cfg contains none of this shadow state or branch.
+The experiment is falsifiable: the raw-owner hypothesis requires an invariant
+failure before the userspace abort; reproducing the abort with all transitions
+valid rejects it and redirects the audit to heap metadata writes or another
+subsystem.
+
+Static review also found that kernel stacks are allocated as 16-page
+contiguous ranges but their ownership is not stored in `TaskControlBlock` and
+no matching release path exists. This is a real lifetime leak and can cause
+long-run pressure, but it is not evidence of a duplicate free and is not mixed
+into the current diagnostic experiment.
+
+All four remote release configurations passed: RISC-V64 and LoongArch64,
+production and diagnostics. Both architectures also passed the SMP8 resident,
+high-arena and user-memory lifecycle regressions, 64 isolation iterations,
+ASID/root checks and 160-MiB heap stress (`capability-pass`). `git diff
+--check` passed.
+
+Two diagnostics windows exercised the owner shadow. The 700-second window
+recorded 1,623,609 legal transitions and eight compile events; after about 430
+seconds it entered a cargo-only userspace stall. A separate 600-second delayed
+QMP window recorded 2,887,086 legal transitions and 54 compile events. Its
+sampled user PCs changed and later snapshots contained eight or more runnable
+rustc threads, so the cargo-only stall did not reproduce and is not a stable
+hotspot. Neither run reported an ownership violation, panic, OOM, fastbin
+error, or successful result marker.
+
+A production control using the same source identity reached 112 compile events
+and `uguid` in 700 seconds, with its last event at about 699 seconds. It did not
+reproduce the historical SIGABRT, but it also did not emit
+`BUILDSTORM_COMPILE mode=multi ok=true`. The one fastbin abort is therefore
+downgraded to a non-stable anomaly; raw allocator overlap is weakened but not
+formally disproved. A longer production delayed-QMP window is the next
+attribution gate, and no production MM/TLB candidate follows from the shadow
+alone. Full evidence and hashes are in
+`docs/evidence/buildstorm-stage2/20260814-stage2-raw-frame-ownership-audit.md`.
+BuildStorm remains `unverified / not completed`.
+
+## 37. Stage 2 interval-timer owner index candidate (2026-08-14)
+
+The 1,800-second refcount control reached 131 compile events and
+`flatten_objects` without the historical fastbin abort. Delayed QMP sampled
+the same `task::manager::live_tasks()` PC on most CPUs. Return addresses
+resolved to `next_interval_timer_deadline_us` and
+`wake_expired_interval_timers`, which were scanning the entire weak task
+registry on every timer tick. `pidstat` showed roughly 81--93% CPU on each of
+the eight TCG vCPU threads during this shape, with no fixed user PC. The
+stable residual hotspot is therefore a timer bookkeeping architecture issue,
+not raw frame ownership.
+
+The candidate adds an active interval-timer owner index containing only weak
+TCB references. `TaskInner.interval_timers` remains the sole timer state. A
+`setitimer` update registers or removes the TCB after releasing its inner lock;
+process teardown clears timer state and then removes the owner. Timer deadline
+and expiry scans hold the owner index lock, inspect only active owners, remove
+stale or disarmed entries, and release the lock before delivering signals.
+The lock order is registry then TCB inner on timer paths; syscall and teardown
+paths release TCB inner before acquiring the registry, so no reverse lock edge
+is introduced. With no active interval timers, the tick path is a short empty
+scan instead of an allocation plus a full historical-task walk.
+
+This is a single production hypothesis. It does not modify scheduling policy,
+VmaMap/ResidentSet/PageTableOps/TlbProtocol, VFS, block cache, or guest time.
+The four release cfg builds passed (`capability-pass`), and RISC-V64 SMP8
+resident/high-arena/user-memory lifecycle passed. The LoongArch64 lifecycle
+gate remained `unverified` after 120 seconds at the pre-existing high-arena
+phase with no failure marker. A same-image RISC-V64 production 300-second
+window is the next gate; success requires a measurable progress improvement,
+no correctness regression, and still does not claim BuildStorm completion
+without `BUILDSTORM_COMPILE mode=multi ok=true`.
+
+The 300-second RISC-V64 candidate window completed without panic/OOM and
+reached 23 compile events, exactly the prior early boundary. Measured progress
+gain is therefore 0%, below the optimization threshold. QMP still gives a
+useful falsification result: `live_tasks()` disappeared from sampled PCs, and
+the residual samples moved to the scheduler's `wfi`/idle-mask publication
+path. The interval-timer index remains as a structural, semantics-preserving
+cleanup, but it is not a measured performance win. A regression-only timer
+state-machine probe passed one-shot disable and periodic catch-up semantics on
+RISC-V64 together with the SMP8 lifecycle suite (`capability-pass`). The next
+candidate must isolate idle/wakeup behavior and must not mix scheduler changes
+into this timer/MM experiment.
+
+## 38. Stage 2 ext4 namespace transaction architecture (2026-08-14)
+
+A same-image 900-second production window crossed the old `hashbrown` boundary
+but rustc failed `bitmaps` with `failed to create file encoder: No such file or
+directory`. The failure was intermittent and QMP did not show a stable MM,
+allocator, scheduler, or VFS PC. Static audit instead found that unlink and
+rename resolved names before serializing the complete namespace mutation, and
+that a reader could retain an old directory snapshot, cross writer cache
+invalidation, then republish a stale positive or negative path result.
+
+Diagnostics confirmed the race window. The pre-fix 900-second run recorded 146
+positive and 170 negative namespace-generation crossings before an encoded
+metadata ENOENT. The fix introduces one architecture-neutral namespace
+transaction boundary in `ext4_vol`: concurrent lookups hold a shared `RwLock`
+from cache acceptance through traversal and publication; create, mkdir,
+symlink, hardlink, unlink, rmdir, rename and exchange hold exclusive ownership
+from first resolution through ext4 mutation, invalidation and generation
+increment. Writer entry uses the `spin` upgradeable slot so new readers stop
+while existing readers drain. Already-locked helpers prevent recursive lock
+acquisition. Rename destination removal and three-step exchange remain inside
+one outer write transaction. Regular-file data/writeback and the MM,
+scheduler, PTE/TLB, frame and guest-time protocols are unchanged.
+
+The independent `smp-regression` probe runs only under its explicit feature.
+Seven pinned readers stress one lookup while a writer performs 64
+negative-to-positive/create-unlink transitions with epoch acknowledgements,
+then verifies same-parent and cross-parent rename, open-unlink inode lifetime,
+and final cache invalidation. RISC-V64 and LoongArch64 both passed this probe
+and the existing interval-timer, resident/high-arena/user-memory,
+COW/shared/file, ASID/TLB, heap-stress and SMP8 gates (`capability-pass`). All
+four production/diagnostics release cfg builds passed. A post-fix 300-second
+diagnostics run produced 34 complete snapshots with zero positive and zero
+negative generation crossings.
+
+The comparable RISC-V64 production counts were 23/23 compile events at 300
+seconds, 90/91 at 600 seconds and 129/131 at 900 seconds. The candidate crossed
+`bitmaps`, reached `flatten_objects`, and did not reproduce ENOENT, panic or
+OOM. The 900-second count change is about 1.6%, so no performance success is
+claimed and this is not the next throughput candidate. The correction is
+retained under the user-directed positive roll-forward rule because it closes
+a general namespace consistency defect without a measured regression or new
+QMP lock hotspot.
+
+Evidence is under
+`docs/evidence/buildstorm-stage2/20260814-stage2-post-hashbrown-namespace-audit.md`,
+`20260814-stage2-namespace-transaction-gates/`,
+`20260814-riscv64-diagnostics-stage2-namespace-transaction-window300/`, and
+`20260814-riscv64-production-stage2-namespace-transaction-window900/`. The
+production serial SHA-256 is
+`1256c1ad4911f5e8d9fbf1e6e8b2ffaaa65a618977bf2900a4dac1a409a1d83d`;
+the unchanged RISC-V image SHA-256 is
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`.
+The rechecked official `final-2026` ref is
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`.
+
+AI assisted with evidence correlation, namespace/cache race modeling, lock
+architecture, implementation, regression design, controlled dual-architecture
+execution, and timeline comparison. Developer-verifiable artifacts include
+the exact dirty diff, source/kernel/image hashes, four build logs, dual-arch
+SMP logs and JSON, raw serial logs, QMP samples, and runner arguments.
+Complete BuildStorm remains `unverified / not completed`; there is no exact
+`BUILDSTORM_COMPILE mode=multi ok=true` marker.
+
+## 39. Dual-architecture official full-build completion (2026-08-14)
+
+The Stage 38 namespace transaction architecture crossed the prior intermittent
+rustc metadata ENOENT boundary in complete production runs. Both runs used the
+clean official `final-2026` suite at
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`, QEMU 11.0.3, the original public
+images in snapshot mode, production kernels with diagnostics disabled, and
+the required `-m 8G -smp 8` configuration. No QEMU instances overlapped.
+
+RISC-V64 completed with the exact marker
+`BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=1322.99 cores=8
+bytes=1683456 arch=riscv64`. Its kernel SHA-256 is
+`071116d8e795e2340ea2de65d515508f26fb4aecc91ec41248d88a007a9311fe`,
+and the official judge passed all scripted entries for 180/180 using its
+1616-second baseline. LoongArch64 completed with
+`BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=1103.14 cores=8
+bytes=1716224 arch=loongarch64`. Its kernel SHA-256 is
+`deaa5ce7b492783e6cdabeaae8ddba767ad791170a049d6f7a29f79eb14adbf9`,
+and the official judge passed all scripted entries for 180/180 using its
+1985-second baseline.
+
+The LoongArch judge emitted a non-failing warning that it expected 12 cores.
+The warning is retained verbatim. The published BuildStorm gate and this
+campaign require eight vCPUs and 8 GiB, and the runner JSON records exactly
+that resource identity; a future evaluator rule change would require a new
+run rather than reinterpretation of this evidence.
+
+The RISC-V and LoongArch public image SHA-256 values are respectively
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`
+and `d1410544e677e11efb1c240be6ffb201c89d6de58c9675e73314a696e4cefdc5`.
+The detached dirty source remains based on
+`055df99ff554441f7699c3518b1a4b204bd9c265`; its retained raw binary diff
+SHA-256 is
+`c22bc0a79e78a72a0c3c8dd13bf23c33692c5fe0991cc57ef0b1ce91c3c2a22d`.
+
+All four production/diagnostics release cfg builds and both architecture SMP8
+namespace, resident/high-arena/user-memory, COW/shared/file, ASID/TLB, timer,
+heap-stress and CPU-execution regressions had already passed as
+`capability-pass`. The two complete official image/script/judge runs now raise
+full BuildStorm clean compilation to `official-pass`. The manual 20-point
+design-document review is not asserted by the automated result.
+
+Raw evidence is under
+`docs/evidence/buildstorm-stage2/20260814-riscv64-official-complete-stage2/`,
+`20260814-loongarch64-official-complete-stage2/`, and the consolidated report
+`20260814-stage2-buildstorm-official-completion.md`. AI assisted with audit,
+implementation, regression design, controlled execution and evidence capture;
+the source diff, serial logs, kernel/image/suite hashes, runner arguments and
+official judge outputs are retained for developer verification.

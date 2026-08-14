@@ -12,6 +12,7 @@ image=$2
 evidence=$3
 repo=$(cd "$(dirname "$0")/.." && pwd)
 suite=${BUILDSTORM_SUITE_DIR:-"$repo/../testsuits-for-oskernel"}
+host_lock=${BUILDSTORM_HOST_LOCK:-/tmp/wll-buildstorm-qemu.lock}
 
 if [[ $arch != riscv64 && $arch != loongarch64 ]]; then
     echo "unsupported architecture: $arch" >&2
@@ -20,6 +21,20 @@ fi
 if [[ ! -f $image || ! -d $suite/.git ]]; then
     echo "image or official suite is unavailable" >&2
     exit 2
+fi
+if ! command -v flock >/dev/null 2>&1; then
+    echo "flock is required to serialize BuildStorm QEMU runs" >&2
+    exit 2
+fi
+
+exec 9>"$host_lock"
+if ! flock -n 9; then
+    echo "another BuildStorm QEMU run holds $host_lock" >&2
+    exit 3
+fi
+if pgrep -f '[/]qemu-system-(riscv64|loongarch64).* -kernel ' >/dev/null; then
+    echo "a QEMU kernel workload is already active" >&2
+    exit 3
 fi
 
 mkdir -p "$evidence"
@@ -69,7 +84,7 @@ trap stop_samplers EXIT
     for _ in $(seq 1 600); do
         qemu_pid=$(pgrep -n -f "/qemu-system-$arch .* -kernel " || true)
         if [[ -n $qemu_pid ]]; then
-            exec pidstat -d -r -u -w -h -p "$qemu_pid" 1
+            exec pidstat -t -d -r -u -w -h -p "$qemu_pid" 1
         fi
         sleep 1
     done

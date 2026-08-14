@@ -6,7 +6,7 @@ use crate::task::{
 };
 use crate::timer;
 use crate::utils::error::SysErrNo;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -36,6 +36,11 @@ const FUTEX_SHARED_KEY: usize = usize::MAX;
 
 lazy_static! {
     static ref FUTEX_WAITERS: Mutex<Vec<FutexWaiter>> = Mutex::new(Vec::new());
+    // Only tasks with an armed interval timer participate in timer-tick
+    // deadline and expiry scans. The weak index never extends task lifetime;
+    // TaskInner remains the source of truth for timer state.
+    static ref ACTIVE_INTERVAL_TIMER_TASKS: Mutex<Vec<Weak<crate::task::TaskControlBlock>>> =
+        Mutex::new(Vec::new());
 }
 
 #[repr(C)]
@@ -131,6 +136,33 @@ impl IntervalTimer {
         }
         true
     }
+}
+
+fn sync_interval_timer_owner(task: &Arc<crate::task::TaskControlBlock>, active: bool) {
+    let task_ptr = Arc::as_ptr(task);
+    let mut owners = ACTIVE_INTERVAL_TIMER_TASKS.lock();
+    let mut found = false;
+    owners.retain(|owner| {
+        if owner.strong_count() == 0 {
+            return false;
+        }
+        if owner.as_ptr() != task_ptr {
+            return true;
+        }
+        if active && !found {
+            found = true;
+            true
+        } else {
+            false
+        }
+    });
+    if active && !found {
+        owners.push(Arc::downgrade(task));
+    }
+}
+
+pub(crate) fn remove_interval_timer_owner(task: &Arc<crate::task::TaskControlBlock>) {
+    sync_interval_timer_owner(task, false);
 }
 
 pub(crate) const EMPTY_INTERVAL_TIMERS: [IntervalTimer; 3] = [IntervalTimer::disabled(); 3];
@@ -409,7 +441,15 @@ pub fn sys_setitimer(which: isize, new_value: usize, old_value: usize) -> Syscal
         copy_object_to_user(old_value, &old_timer.to_user_value(now_us))?;
     }
 
-    task.inner.lock().interval_timers[index] = IntervalTimer::from_value(interval_us, value_us);
+    let active = {
+        let mut inner = task.inner.lock();
+        inner.interval_timers[index] = IntervalTimer::from_value(interval_us, value_us);
+        inner
+            .interval_timers
+            .iter()
+            .any(|timer| timer.next_deadline_us().is_some())
+    };
+    sync_interval_timer_owner(&task, active);
     timer::set_next_trigger();
     Ok(0)
 }
@@ -434,39 +474,83 @@ pub fn sys_getitimer(which: isize, current_value: usize) -> SyscallRet {
 }
 
 pub(crate) fn next_interval_timer_deadline_us() -> Option<usize> {
-    crate::task::manager::all_user_tasks()
-        .into_iter()
-        .filter(|task| task.status() != crate::task::TaskStatus::Zombie)
-        .filter_map(|task| {
-            task.inner
-                .lock()
-                .interval_timers
-                .iter()
-                .filter_map(|timer| timer.next_deadline_us())
-                .min()
-        })
-        .min()
+    let mut next_deadline = None;
+    let mut owners = ACTIVE_INTERVAL_TIMER_TASKS.lock();
+    owners.retain(|owner| {
+        let Some(task) = owner.upgrade() else {
+            return false;
+        };
+        if task.status() == crate::task::TaskStatus::Zombie {
+            return false;
+        }
+        let task_deadline = task
+            .inner
+            .lock()
+            .interval_timers
+            .iter()
+            .filter_map(|timer| timer.next_deadline_us())
+            .min();
+        if let Some(deadline) = task_deadline {
+            next_deadline =
+                Some(next_deadline.map_or(deadline, |current: usize| current.min(deadline)));
+            true
+        } else {
+            false
+        }
+    });
+    next_deadline
 }
 
 pub(crate) fn wake_expired_interval_timers() {
     let now_us = timer::get_time_us();
     let mut expired = alloc::vec::Vec::new();
-    for task in crate::task::manager::all_user_tasks() {
-        if task.status() == crate::task::TaskStatus::Zombie {
-            continue;
-        }
-        {
+    {
+        let mut owners = ACTIVE_INTERVAL_TIMER_TASKS.lock();
+        owners.retain(|owner| {
+            let Some(task) = owner.upgrade() else {
+                return false;
+            };
+            if task.status() == crate::task::TaskStatus::Zombie {
+                return false;
+            }
             let mut inner = task.inner.lock();
             for which in 0..inner.interval_timers.len() {
                 if inner.interval_timers[which].expire_at(now_us) {
                     expired.push((task.clone(), which));
                 }
             }
-        }
+            inner
+                .interval_timers
+                .iter()
+                .any(|timer| timer.next_deadline_us().is_some())
+        });
     }
     for (task, which) in expired {
         crate::syscall::signal::send_interval_timer_signal(&task, which);
     }
+}
+
+#[cfg(feature = "smp-regression")]
+pub(crate) fn verify_interval_timer_state_machine() {
+    let mut one_shot = IntervalTimer {
+        interval_us: 0,
+        deadline_us: Some(100),
+    };
+    assert!(!one_shot.expire_at(99));
+    assert_eq!(one_shot.next_deadline_us(), Some(100));
+    assert!(one_shot.expire_at(100));
+    assert_eq!(one_shot.next_deadline_us(), None);
+
+    let mut periodic = IntervalTimer {
+        interval_us: 10,
+        deadline_us: Some(100),
+    };
+    assert!(!periodic.expire_at(99));
+    assert!(periodic.expire_at(135));
+    assert_eq!(periodic.next_deadline_us(), Some(140));
+    assert!(periodic.expire_at(140));
+    assert_eq!(periodic.next_deadline_us(), Some(150));
+    crate::println!("[smp-regression] pass phase=interval-timer-state-machine");
 }
 
 /// gettimeofday 系统调用

@@ -249,24 +249,13 @@ impl PageTable {
     /// The page table entry in the user space address will be released.
     /// Only releases user-space mappings, keeps kernel mappings intact.
     ///
-    /// SV39 address space layout:
-    /// - VPN[2] = 0x000 ~ 0x07F: User space (0x0000_0000 ~ 0x3FFF_FFFF)
-    /// - VPN[2] = 0x080 ~ 0x0FF: I/O/Device region (0x4000_0000 ~ 0x7FFF_FFFF)
-    /// - VPN[2] = 0x100 ~ 0x1FF: Kernel space (0x8000_0000 ~ 0xBFFF_FFFF)
-    /// - VPN[2] = 0x200 ~ 0x2FF: Extended kernel space (0xC000_0000 ~ 0xFFFF_FFFF)
-    ///
-    /// This function only frees sub-page-tables for user space (VPN[2] < GLOBAL_ROOT_PTE_START).
-    /// Kernel mappings are preserved as they may be shared.
+    /// Release every architecture-owned user branch while preserving shared
+    /// kernel/global branches. User root entries need not be contiguous.
     pub fn release(&self) {
         // Skip if frame allocator is not initialized yet
         if self.0.raw() == 0 {
             return;
         }
-
-        // Architecture-specific end of user root entries. On RISC-V this is 2
-        // because the kernel runs from the 0x8000_0000 root entry while still
-        // using the outgoing user page table during exec/drop.
-        let user_end_index = PageTable::USER_ROOT_PTE_END;
 
         // Helper: recursively release sub-page-tables
         let release_sub_pt = |pte_list: &[PTE]| {
@@ -295,16 +284,15 @@ impl PageTable {
             }
         };
 
-        // 释放用户空间区域 (VPN[2] < 0x100) 的子页表
-        let pte_list = &mut Self::get_pte_list(self.0)[..user_end_index];
-        release_sub_pt(pte_list);
+        let pte_list = Self::get_pte_list(self.0);
 
-        // 清零用户空间条目
-        for i in 0..user_end_index {
-            pte_list[i] = PTE(0);
+        for index in 0..PageTable::PTE_NUM_IN_PAGE {
+            if !PageTable::is_user_root_entry(index) {
+                continue;
+            }
+            release_sub_pt(&pte_list[index..index + 1]);
+            pte_list[index] = PTE(0);
         }
-
-        // 注意：内核区域 (VPN[2] >= 0x100) 保持不变
     }
 }
 

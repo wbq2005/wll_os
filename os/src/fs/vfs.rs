@@ -1173,8 +1173,16 @@ fn linked_mem_file_backing(path: &str) -> Result<Arc<Mutex<super::MemFileBacking
 }
 
 pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrNo> {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     let norm = normalize_path(path);
-    if is_removed(&norm) {
+    let removed = is_removed(&norm);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        40,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    if removed {
         return Err(SysErrNo::ENOENT);
     }
     #[cfg(feature = "buildstorm-diagnostics")]
@@ -1190,9 +1198,30 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
             .metadata(&backend_path)
             .map(|meta| metadata_from_vfat(&norm, meta));
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     let tmpfs_path = is_tmpfs_path(&norm);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        41,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     let ext_norm = ext4_lookup_path(&norm);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        42,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at = crate::timer::get_time_us();
     let mounted_ext4 = mounted_ext4_backend_path(&norm).is_some();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_phase(
+        43,
+        crate::timer::get_time_us().saturating_sub(started_at),
+    );
 
     #[cfg(feature = "buildstorm-diagnostics")]
     let started_at = crate::timer::get_time_us();
@@ -1265,7 +1294,15 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
     );
 
     if tmpfs_path {
-        return Err(missing_path_errno(&norm));
+        #[cfg(feature = "buildstorm-diagnostics")]
+        let started_at = crate::timer::get_time_us();
+        let error = missing_path_errno(&norm);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(
+            44,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
+        return Err(error);
     }
 
     #[cfg(feature = "buildstorm-diagnostics")]
@@ -1278,7 +1315,17 @@ pub fn metadata(path: &str, follow_symlink: bool) -> Result<VfsMetadata, SysErrN
     );
     let (ext_meta, ext_kind) = match ext_metadata {
         Ok(result) => result,
-        Err(SysErrNo::ENOENT) => return Err(missing_path_errno(&norm)),
+        Err(SysErrNo::ENOENT) => {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            let started_at = crate::timer::get_time_us();
+            let error = missing_path_errno(&norm);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(
+                44,
+                crate::timer::get_time_us().saturating_sub(started_at),
+            );
+            return Err(error);
+        }
         Err(error) => return Err(error),
     };
     if ext_kind == ext4_vol::Ext4NodeKind::Symlink && follow_symlink {
@@ -3962,7 +4009,12 @@ pub fn open_path(
             let create_path = ext4_lookup_path(&open_norm);
             #[cfg(feature = "buildstorm-diagnostics")]
             let started_at = crate::timer::get_time_us();
-            let ino = ext4_vol::create_regular_ext4_with_mode(&create_path, mode)?;
+            let created = ext4_vol::create_regular_ext4_with_mode(&create_path, mode);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            if matches!(created, Err(SysErrNo::ENOENT)) {
+                crate::buildstorm_diagnostics::note_phase(51, 0);
+            }
+            let ino = created?;
             clear_whiteout(&open_norm);
             ext4_vol::open_regular_ino(ino);
             #[cfg(feature = "buildstorm-diagnostics")]
@@ -4007,6 +4059,8 @@ pub fn open_path(
         }
         #[cfg(feature = "buildstorm-diagnostics")]
         let started_at = crate::timer::get_time_us();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(50, 0);
         let err = missing_path_errno(&open_norm);
         #[cfg(feature = "buildstorm-diagnostics")]
         crate::buildstorm_diagnostics::note_phase(

@@ -32,15 +32,21 @@ impl ReadyQueue {
         }
     }
 
-    fn push_back(&mut self, task: Arc<TaskControlBlock>) {
+    fn push_back(&mut self, task: Arc<TaskControlBlock>) -> bool {
         if self.queued_pids.insert(task.pid.0) {
             self.tasks.push_back(task);
+            true
+        } else {
+            false
         }
     }
 
-    fn push_front(&mut self, task: Arc<TaskControlBlock>) {
+    fn push_front(&mut self, task: Arc<TaskControlBlock>) -> bool {
         if self.queued_pids.insert(task.pid.0) {
             self.tasks.push_front(task);
+            true
+        } else {
+            false
         }
     }
 
@@ -74,20 +80,34 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
     }
 }
 
+/// Requeue work for the scheduler already running on this CPU.
+///
+/// The caller must continue into a scheduling decision after publishing the
+/// task, so no remote idle CPU needs an IPI for this queue transition.
+pub fn add_task_local(task: Arc<TaskControlBlock>) {
+    let notify = !task.can_run_on_cpu(crate::platform::current_cpu_index());
+    if task.is_kernel {
+        push_task_back(&KERNEL_READY_QUEUE, task, notify);
+    } else {
+        push_task_back(&USER_READY_QUEUE, task, notify);
+    }
+}
+
 pub fn add_user_task(task: Arc<TaskControlBlock>) {
     debug_assert!(!task.is_kernel);
-    push_task_back(&USER_READY_QUEUE, task);
+    push_task_back(&USER_READY_QUEUE, task, true);
 }
 
 pub fn add_kernel_task(task: Arc<TaskControlBlock>) {
     debug_assert!(task.is_kernel);
-    push_task_back(&KERNEL_READY_QUEUE, task);
+    push_task_back(&KERNEL_READY_QUEUE, task, true);
 }
 
-fn push_task_back(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
+fn push_task_back(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>, notify: bool) {
     if task.status() != TaskStatus::Ready {
         return;
     }
+    let affinity = task.affinity_mask();
     #[cfg(feature = "buildstorm-diagnostics")]
     let mut queue = crate::buildstorm_diagnostics::lock(
         crate::buildstorm_diagnostics::LockClass::TaskManager,
@@ -95,25 +115,37 @@ fn push_task_back(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
     );
     #[cfg(not(feature = "buildstorm-diagnostics"))]
     let mut queue = queue.lock();
-    queue.push_back(task);
+    let inserted = queue.push_back(task);
     #[cfg(feature = "buildstorm-diagnostics")]
     crate::buildstorm_diagnostics::note_runqueue_len(queue.len());
     drop(queue);
-    crate::platform::notify_runnable();
+    if inserted && notify {
+        crate::platform::notify_runnable_for(affinity);
+    }
 }
 
 pub fn add_task_front(task: Arc<TaskControlBlock>) {
     if task.is_kernel {
-        push_task_front(&KERNEL_READY_QUEUE, task);
+        push_task_front(&KERNEL_READY_QUEUE, task, true);
     } else {
-        push_task_front(&USER_READY_QUEUE, task);
+        push_task_front(&USER_READY_QUEUE, task, true);
     }
 }
 
-fn push_task_front(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
+pub fn add_task_front_local(task: Arc<TaskControlBlock>) {
+    let notify = !task.can_run_on_cpu(crate::platform::current_cpu_index());
+    if task.is_kernel {
+        push_task_front(&KERNEL_READY_QUEUE, task, notify);
+    } else {
+        push_task_front(&USER_READY_QUEUE, task, notify);
+    }
+}
+
+fn push_task_front(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>, notify: bool) {
     if task.status() != TaskStatus::Ready {
         return;
     }
+    let affinity = task.affinity_mask();
     #[cfg(feature = "buildstorm-diagnostics")]
     let mut queue = crate::buildstorm_diagnostics::lock(
         crate::buildstorm_diagnostics::LockClass::TaskManager,
@@ -121,11 +153,13 @@ fn push_task_front(queue: &Mutex<ReadyQueue>, task: Arc<TaskControlBlock>) {
     );
     #[cfg(not(feature = "buildstorm-diagnostics"))]
     let mut queue = queue.lock();
-    queue.push_front(task);
+    let inserted = queue.push_front(task);
     #[cfg(feature = "buildstorm-diagnostics")]
     crate::buildstorm_diagnostics::note_runqueue_len(queue.len());
     drop(queue);
-    crate::platform::notify_runnable();
+    if inserted && notify {
+        crate::platform::notify_runnable_for(affinity);
+    }
 }
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
@@ -471,6 +505,9 @@ pub(crate) fn diagnostic_dump_user_comm() {
             task.diagnostic_vma_max.load(Ordering::Relaxed),
             inner.exec_path,
         );
+        if task.pid.0 == task.thread_group.tgid() {
+            crate::buildstorm_diagnostics::report_mmap_protocol(&task.thread_group);
+        }
     }
 }
 

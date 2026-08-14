@@ -968,8 +968,8 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
         root: String::from("/glibc"),
         marker_name: None,
     };
-    let exit_code = run_user_program_spec_foreground_exit_code(&spec)
-        .expect("user-memory lifecycle launch");
+    let exit_code =
+        run_user_program_spec_foreground_exit_code(&spec).expect("user-memory lifecycle launch");
     #[cfg(feature = "buildstorm-diagnostics")]
     {
         if let Some(failure) = crate::buildstorm_diagnostics::take_first_page_fault_failure() {
@@ -1029,18 +1029,21 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
                 kind, vaddr, sepc
             ));
         }
-        panic!("[smp-regression] fail phase=user-memory-lifecycle exit={}", exit_code);
+        panic!(
+            "[smp-regression] fail phase=user-memory-lifecycle exit={}",
+            exit_code
+        );
     }
     console_write("[smp-regression] pass phase=user-memory-lifecycle\n");
 
     // The busybox probe is intentionally static/self-contained.  A separate
     // diagnostic-only dynamic ELF probe exercises the glibc interpreter and
     // fork/exec path without changing production harness behavior.
-    #[cfg(feature = "buildstorm-diagnostics")]
+    #[cfg(all(feature = "buildstorm-diagnostics", feature = "smp-regression"))]
     run_dynamic_user_memory_lifecycle_probe();
 }
 
-#[cfg(feature = "buildstorm-diagnostics")]
+#[cfg(all(feature = "buildstorm-diagnostics", feature = "smp-regression"))]
 fn run_dynamic_user_memory_lifecycle_probe() {
     crate::smp_regression::reset_user_memory_lifecycle_diagnostic();
     let spec = UserProgramSpec {
@@ -1449,8 +1452,7 @@ fn run_script(script_path: &str) -> Result<(), ScriptLaunchError> {
         // completed harness item regardless of its user exit status.
         let exit_code = run_user_program_spec_foreground_exit_code(&spec)
             .map_err(ScriptLaunchError::CreateTask)?;
-        if let Some(failure) = crate::buildstorm_diagnostics::take_first_page_fault_failure()
-        {
+        if let Some(failure) = crate::buildstorm_diagnostics::take_first_page_fault_failure() {
             console_write(&format!(
                 "BUILDSTORM_DIAG page_fault_failure stage={} errno={} vaddr={:#x}\n",
                 failure.stage, failure.errno, failure.vaddr,
@@ -1500,10 +1502,7 @@ fn run_script(script_path: &str) -> Result<(), ScriptLaunchError> {
                 trap.page_state,
             ));
         }
-        console_write(&format!(
-            "BUILDSTORM_DIAG script_exit code={}\n",
-            exit_code
-        ));
+        console_write(&format!("BUILDSTORM_DIAG script_exit code={}\n", exit_code));
         return Ok(());
     }
     #[cfg(not(feature = "buildstorm-diagnostics"))]

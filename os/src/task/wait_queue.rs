@@ -522,7 +522,10 @@ where
 }
 
 pub fn wake_child_waiters() -> usize {
-    CHILD_WAIT_QUEUE.wake_all()
+    let woken = CHILD_WAIT_QUEUE.wake_all();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_child_wake(woken);
+    woken
 }
 
 pub(crate) fn remove_core_waiters_for_task(task: &Arc<TaskControlBlock>) -> usize {

@@ -8,9 +8,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-#[cfg(feature = "buildstorm-diagnostics")]
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ext4_rs::{Errno, Ext4, Ext4Error, InodeFileType, BLOCK_SIZE};
 
@@ -40,6 +38,7 @@ static WRITEBACK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static EXECUTABLE_IMAGE_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "buildstorm-diagnostics")]
 static EXECUTABLE_IMAGE_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+static NAMESPACE_GENERATION: AtomicUsize = AtomicUsize::new(0);
 fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
     let end = offset.checked_add(len).ok_or(SysErrNo::EFBIG)?;
     if end > MAX_FILE_OFFSET {
@@ -100,9 +99,22 @@ lazy_static! {
     /// Keep cache updates parallel, but commit each filesystem mutation as one
     /// transaction so concurrent writers cannot allocate the same blocks.
     static ref EXT4_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+    /// Readers hold a shared transaction across lookup and cache publication;
+    /// writers hold an exclusive transaction from their first path resolution
+    /// through directory/inode updates and cache invalidation. Regular file
+    /// data and writeback stay outside this lock.
+    static ref NAMESPACE_LOCK: RwLock<()> = RwLock::new(());
 }
 
 type RegularCacheEntry = Arc<Mutex<CachedRegularFile>>;
+
+// spin::RwLock::write() does not advertise a waiting writer. Taking the
+// upgradeable slot first blocks new readers while existing readers drain.
+macro_rules! namespace_write_lock {
+    () => {
+        NAMESPACE_LOCK.upgradeable_read().upgrade()
+    };
+}
 
 #[cfg(feature = "buildstorm-diagnostics")]
 macro_rules! ext4_mutation_lock {
@@ -1961,6 +1973,7 @@ fn clear_namespace_cache() {
     NEGATIVE_PATH_CACHE.write().clear();
     DIR_CACHE.write().clear();
     clear_metadata_cache();
+    NAMESPACE_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 fn invalidate_path_cache(path: &str) {
@@ -1997,6 +2010,7 @@ fn invalidate_namespace_entry(parent_ino: u32, path: &str) {
     DIR_CACHE.write().remove(&parent_ino);
     invalidate_metadata_ino(parent_ino);
     invalidate_path_cache(path);
+    NAMESPACE_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 fn invalidate_namespace_rename(
@@ -2014,6 +2028,7 @@ fn invalidate_namespace_rename(
     invalidate_metadata_ino(new_parent_ino);
     invalidate_path_cache(old_path);
     invalidate_path_cache(new_path);
+    NAMESPACE_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 fn clear_all_caches() {
@@ -2046,6 +2061,7 @@ pub fn statfs_info() -> Option<Ext4StatFs> {
 }
 
 pub fn mount_block_device(device: Arc<dyn ext4_rs::BlockDevice>) {
+    let _namespace = namespace_write_lock!();
     log::info!("[fs] Attempting to mount ext4 from block device...");
 
     // Read first block. For 4KB block ext4: block0 = boot(1024) + superblock(1024) + bgd(2048).
@@ -2096,6 +2112,7 @@ pub fn mount_block_device(device: Arc<dyn ext4_rs::BlockDevice>) {
 
 /// 卸载运行时 ext4 根（`umount2` / 回退 MemFS）。
 pub fn unmount_root() {
+    let _namespace = namespace_write_lock!();
     let _ = flush_all_cached();
     clear_all_caches();
     *ROOT_EXT4.lock() = None;
@@ -2118,18 +2135,27 @@ fn split_parent_name(norm: &str) -> Result<(String, String), SysErrNo> {
     }
 }
 
-/// 删除 ext4 上的普通文件（非目录）。
 pub fn unlink_non_dir(path: &str) -> Result<(), SysErrNo> {
+    let _namespace = namespace_write_lock!();
+    unlink_non_dir_locked(path)
+}
+
+/// The caller serializes the complete namespace transaction.
+fn unlink_non_dir_locked(path: &str) -> Result<(), SysErrNo> {
     let mut fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
     let (parent_path, name) = split_parent_name(&norm)?;
-    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
+    let Some((parent_ino, parent_kind)) = resolve_existing_locked(&fs, &parent_path) else {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(55, 0);
         return Err(SysErrNo::ENOENT);
     };
     if parent_kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    let Some((child_ino, child_kind)) = resolve_existing(&fs, &norm) else {
+    let Some((child_ino, child_kind)) = resolve_existing_locked(&fs, &norm) else {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(56, 0);
         return Err(SysErrNo::ENOENT);
     };
     if child_kind == Ext4NodeKind::Directory {
@@ -2186,17 +2212,18 @@ pub fn unlink_regular_file(path: &str) -> Result<(), SysErrNo> {
 }
 
 pub fn mkdir_ext4_with_mode(path: &str, mode: u32) -> Result<(), SysErrNo> {
+    let _namespace = namespace_write_lock!();
     let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
     let (parent_path, name) = split_parent_name(&norm)?;
-    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
+    let Some((parent_ino, parent_kind)) = resolve_existing_locked(&fs, &parent_path) else {
         return Err(SysErrNo::ENOENT);
     };
     if parent_kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    if resolve_existing(&fs, &norm).is_some() {
+    if resolve_existing_locked(&fs, &norm).is_some() {
         return Err(SysErrNo::EEXIST);
     }
     let (uid, gid, perm) = new_child_ids_and_mode(&fs, parent_ino, mode, true);
@@ -2224,6 +2251,12 @@ pub fn mkdir_ext4(path: &str) -> Result<(), SysErrNo> {
 }
 
 pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
+    let _namespace = namespace_write_lock!();
+    remove_empty_dir_ext4_locked(path)
+}
+
+/// The caller serializes the complete namespace transaction.
+fn remove_empty_dir_ext4_locked(path: &str) -> Result<(), SysErrNo> {
     let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
@@ -2231,19 +2264,19 @@ pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
         return Err(SysErrNo::EINVAL);
     }
     let (parent_path, name) = split_parent_name(&norm)?;
-    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
+    let Some((parent_ino, parent_kind)) = resolve_existing_locked(&fs, &parent_path) else {
         return Err(SysErrNo::ENOENT);
     };
     if parent_kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    let Some((child_ino, child_kind)) = resolve_existing(&fs, &norm) else {
+    let Some((child_ino, child_kind)) = resolve_existing_locked(&fs, &norm) else {
         return Err(SysErrNo::ENOENT);
     };
     if child_kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    if !cached_dir_entries(&fs, child_ino).is_empty() {
+    if !cached_dir_entries_locked(&fs, child_ino).is_empty() {
         return Err(SysErrNo::ENOTEMPTY);
     }
     let mut parent_ref = fs.get_inode_ref(parent_ino);
@@ -2273,17 +2306,20 @@ pub fn remove_empty_dir_ext4(path: &str) -> Result<(), SysErrNo> {
 
 /// 创建普通文件（已存在则由 `generic_open` 语义处理）。
 pub fn create_regular_ext4_with_mode(path: &str, mode: u32) -> Result<u32, SysErrNo> {
+    let _namespace = namespace_write_lock!();
     let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
     let (parent_path, name) = split_parent_name(&norm)?;
-    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
+    let Some((parent_ino, parent_kind)) = resolve_existing_locked(&fs, &parent_path) else {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(50, 0);
         return Err(SysErrNo::ENOENT);
     };
     if parent_kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    if resolve_existing(&fs, &norm).is_some() {
+    if resolve_existing_locked(&fs, &norm).is_some() {
         return Err(SysErrNo::EEXIST);
     }
     let (uid, gid, perm) = new_child_ids_and_mode(&fs, parent_ino, mode, false);
@@ -2561,7 +2597,8 @@ pub fn regular_file_size(ino: u32) -> Result<usize, SysErrNo> {
     Ok(fs.get_inode_ref(ino).inode.size() as usize)
 }
 
-fn cached_dir_entries(fs: &Ext4, ino: u32) -> Arc<BTreeMap<String, (u32, bool)>> {
+/// The caller holds either the shared or exclusive namespace transaction.
+fn cached_dir_entries_locked(fs: &Ext4, ino: u32) -> Arc<BTreeMap<String, (u32, bool)>> {
     if let Some(entries) = DIR_CACHE.read().get(&ino).cloned() {
         #[cfg(feature = "buildstorm-diagnostics")]
         crate::buildstorm_diagnostics::note_dir_cache(true);
@@ -2592,8 +2629,8 @@ fn cached_dir_entries(fs: &Ext4, ino: u32) -> Arc<BTreeMap<String, (u32, bool)>>
     out
 }
 
-fn find_child_ino(fs: &Ext4, parent_ino: u32, name: &str) -> Option<u32> {
-    cached_dir_entries(fs, parent_ino)
+fn find_child_ino_locked(fs: &Ext4, parent_ino: u32, name: &str) -> Option<u32> {
+    cached_dir_entries_locked(fs, parent_ino)
         .get(name)
         .map(|(child_ino, _)| *child_ino)
 }
@@ -2616,9 +2653,15 @@ fn resolve_link_target(link_path: &str, target: &str) -> String {
 }
 
 pub fn readlink_ext4(path: &str) -> Result<String, SysErrNo> {
+    let _namespace = NAMESPACE_LOCK.read();
+    readlink_ext4_locked(path)
+}
+
+/// The caller holds either the shared or exclusive namespace transaction.
+fn readlink_ext4_locked(path: &str) -> Result<String, SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(path);
-    let Some((ino, kind)) = resolve_existing(&fs, &norm) else {
+    let Some((ino, kind)) = resolve_existing_locked(&fs, &norm) else {
         return Err(SysErrNo::ENOENT);
     };
     if kind != Ext4NodeKind::Symlink {
@@ -2648,6 +2691,12 @@ pub fn readlink_ext4(path: &str) -> Result<String, SysErrNo> {
 }
 
 pub fn resolve_symlinks(path: &str) -> Result<String, SysErrNo> {
+    let _namespace = NAMESPACE_LOCK.read();
+    resolve_symlinks_locked(path)
+}
+
+/// The caller holds either the shared or exclusive namespace transaction.
+fn resolve_symlinks_locked(path: &str) -> Result<String, SysErrNo> {
     let mut pending: VecDeque<String> = normalize_path(path)
         .trim_matches('/')
         .split('/')
@@ -2670,7 +2719,10 @@ pub fn resolve_symlinks(path: &str) -> Result<String, SysErrNo> {
         }
         candidate.push_str(&component);
 
-        let Some((_ino, kind)) = lookup_kind(&candidate) else {
+        let Some(fs) = ROOT_EXT4.lock().clone() else {
+            return Err(SysErrNo::ENOENT);
+        };
+        let Some((_ino, kind)) = resolve_existing_locked(&fs, &candidate) else {
             return Err(SysErrNo::ENOENT);
         };
         if kind == Ext4NodeKind::Symlink {
@@ -2678,7 +2730,7 @@ pub fn resolve_symlinks(path: &str) -> Result<String, SysErrNo> {
             if followed > 40 {
                 return Err(SysErrNo::ELOOP);
             }
-            let target = readlink_ext4(&candidate)?;
+            let target = readlink_ext4_locked(&candidate)?;
             let target_path = resolve_link_target(&candidate, &target);
             let mut target_components: VecDeque<String> = target_path
                 .trim_matches('/')
@@ -2714,17 +2766,18 @@ fn path_is_descendant(parent: &str, child: &str) -> bool {
 }
 
 pub fn create_symlink_ext4(target: &str, link_path: &str) -> Result<(), SysErrNo> {
+    let _namespace = namespace_write_lock!();
     let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let norm = normalize_path(link_path);
     let (parent_path, name) = split_parent_name(&norm)?;
-    let Some((parent_ino, parent_kind)) = resolve_existing(&fs, &parent_path) else {
+    let Some((parent_ino, parent_kind)) = resolve_existing_locked(&fs, &parent_path) else {
         return Err(SysErrNo::ENOENT);
     };
     if parent_kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    if resolve_existing(&fs, &norm).is_some() {
+    if resolve_existing_locked(&fs, &norm).is_some() {
         return Err(SysErrNo::EEXIST);
     }
     let (uid, gid, perm) = new_child_ids_and_mode(&fs, parent_ino, 0o777, false);
@@ -2756,25 +2809,27 @@ pub fn create_symlink_ext4(target: &str, link_path: &str) -> Result<(), SysErrNo
 }
 
 pub fn link_ext4(old_path: &str, new_path: &str, follow_old: bool) -> Result<(), SysErrNo> {
+    let _namespace = namespace_write_lock!();
     let _mutation = ext4_mutation_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let old = if follow_old {
-        resolve_symlinks(old_path)?
+        resolve_symlinks_locked(old_path)?
     } else {
         normalize_path(old_path)
     };
     let new = normalize_path(new_path);
     let (new_parent_path, new_name) = split_parent_name(&new)?;
-    let Some((new_parent_ino, new_parent_kind)) = resolve_existing(&fs, &new_parent_path) else {
+    let Some((new_parent_ino, new_parent_kind)) = resolve_existing_locked(&fs, &new_parent_path)
+    else {
         return Err(SysErrNo::ENOENT);
     };
     if new_parent_kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    if resolve_existing(&fs, &new).is_some() {
+    if resolve_existing_locked(&fs, &new).is_some() {
         return Err(SysErrNo::EEXIST);
     }
-    let Some((old_ino, old_kind)) = resolve_existing(&fs, &old) else {
+    let Some((old_ino, old_kind)) = resolve_existing_locked(&fs, &old) else {
         return Err(SysErrNo::ENOENT);
     };
     if old_kind == Ext4NodeKind::Directory {
@@ -2797,6 +2852,13 @@ pub fn link_ext4(old_path: &str, new_path: &str, follow_old: bool) -> Result<(),
 }
 
 pub fn rename_ext4(old_path: &str, new_path: &str, no_replace: bool) -> Result<(), SysErrNo> {
+    let _namespace = namespace_write_lock!();
+    rename_ext4_locked(old_path, new_path, no_replace)
+}
+
+/// The caller holds the exclusive namespace transaction. This permits rename
+/// replacement and exchange to compose without recursively acquiring the lock.
+fn rename_ext4_locked(old_path: &str, new_path: &str, no_replace: bool) -> Result<(), SysErrNo> {
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let old = normalize_path(old_path);
     let new = normalize_path(new_path);
@@ -2809,22 +2871,30 @@ pub fn rename_ext4(old_path: &str, new_path: &str, no_replace: bool) -> Result<(
 
     let (old_parent_path, old_name) = split_parent_name(&old)?;
     let (new_parent_path, new_name) = split_parent_name(&new)?;
-    let Some((old_parent_ino, old_parent_kind)) = resolve_existing(&fs, &old_parent_path) else {
+    let Some((old_parent_ino, old_parent_kind)) = resolve_existing_locked(&fs, &old_parent_path)
+    else {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(52, 0);
         return Err(SysErrNo::ENOENT);
     };
-    let Some((new_parent_ino, new_parent_kind)) = resolve_existing(&fs, &new_parent_path) else {
+    let Some((new_parent_ino, new_parent_kind)) = resolve_existing_locked(&fs, &new_parent_path)
+    else {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(53, 0);
         return Err(SysErrNo::ENOENT);
     };
     if old_parent_kind != Ext4NodeKind::Directory || new_parent_kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
-    let Some((old_ino, old_kind)) = resolve_existing(&fs, &old) else {
+    let Some((old_ino, old_kind)) = resolve_existing_locked(&fs, &old) else {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_phase(54, 0);
         return Err(SysErrNo::ENOENT);
     };
     if old_kind == Ext4NodeKind::Directory && path_is_descendant(&old, &new) {
         return Err(SysErrNo::EINVAL);
     }
-    let new_existing = resolve_existing(&fs, &new);
+    let new_existing = resolve_existing_locked(&fs, &new);
     if no_replace && new_existing.is_some() {
         return Err(SysErrNo::EEXIST);
     }
@@ -2834,17 +2904,17 @@ pub fn rename_ext4(old_path: &str, new_path: &str, no_replace: bool) -> Result<(
         }
         match (old_kind, new_kind) {
             (Ext4NodeKind::Directory, Ext4NodeKind::Directory) => {
-                if !cached_dir_entries(&fs, new_ino).is_empty() {
+                if !cached_dir_entries_locked(&fs, new_ino).is_empty() {
                     return Err(SysErrNo::ENOTEMPTY);
                 }
                 drop(fs);
-                remove_empty_dir_ext4(&new)?;
+                remove_empty_dir_ext4_locked(&new)?;
             }
             (Ext4NodeKind::Directory, _) => return Err(SysErrNo::ENOTDIR),
             (_, Ext4NodeKind::Directory) => return Err(SysErrNo::EISDIR),
             _ => {
                 drop(fs);
-                unlink_non_dir(&new)?;
+                unlink_non_dir_locked(&new)?;
             }
         }
     }
@@ -2897,6 +2967,14 @@ pub fn rename_ext4(old_path: &str, new_path: &str, no_replace: bool) -> Result<(
 
 /// 解析已存在的绝对路径 → (inode, 是否为目录)。不存在或非法则 `None`。
 fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, Ext4NodeKind)> {
+    let _namespace = NAMESPACE_LOCK.read();
+    resolve_existing_locked(fs, path)
+}
+
+/// The caller holds either the shared or exclusive namespace transaction, so
+/// cache acceptance, backend traversal, and cache publication are one lookup.
+fn resolve_existing_locked(fs: &Ext4, path: &str) -> Option<(u32, Ext4NodeKind)> {
+    let generation = NAMESPACE_GENERATION.load(Ordering::Acquire);
     let n = normalize_path(path);
     if !n.starts_with('/') {
         return None;
@@ -2904,11 +2982,21 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, Ext4NodeKind)> {
     if let Some(found) = PATH_CACHE.read().get(&n).copied() {
         #[cfg(feature = "buildstorm-diagnostics")]
         crate::buildstorm_diagnostics::note_path_cache(true, false);
+        if NAMESPACE_GENERATION.load(Ordering::Acquire) != generation {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(57, 0);
+            return resolve_existing_locked(fs, path);
+        }
         return Some(found);
     }
     if NEGATIVE_PATH_CACHE.read().contains(&n) {
         #[cfg(feature = "buildstorm-diagnostics")]
         crate::buildstorm_diagnostics::note_path_cache(false, true);
+        if NAMESPACE_GENERATION.load(Ordering::Acquire) != generation {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(58, 0);
+            return resolve_existing_locked(fs, path);
+        }
         return None;
     }
     #[cfg(feature = "buildstorm-diagnostics")]
@@ -2922,18 +3010,33 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, Ext4NodeKind)> {
 
     if parts.is_empty() {
         let found = (ROOT_INODE, inode_kind(fs, ROOT_INODE));
+        if NAMESPACE_GENERATION.load(Ordering::Acquire) != generation {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_phase(57, 0);
+            return resolve_existing_locked(fs, path);
+        }
         PATH_CACHE.write().insert(n, found);
         return Some(found);
     }
 
     let mut parent = ROOT_INODE;
     for (i, comp) in parts.iter().enumerate() {
-        let Some(ino) = find_child_ino(fs, parent, comp) else {
+        let Some(ino) = find_child_ino_locked(fs, parent, comp) else {
+            if NAMESPACE_GENERATION.load(Ordering::Acquire) != generation {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_phase(58, 0);
+                return resolve_existing_locked(fs, path);
+            }
             cache_negative_path(&n);
             return None;
         };
         if i + 1 == parts.len() {
             let found = (ino, inode_kind(fs, ino));
+            if NAMESPACE_GENERATION.load(Ordering::Acquire) != generation {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_phase(57, 0);
+                return resolve_existing_locked(fs, path);
+            }
             PATH_CACHE.write().insert(n, found);
             return Some(found);
         }
@@ -2948,6 +3051,7 @@ fn resolve_existing(fs: &Ext4, path: &str) -> Option<(u32, Ext4NodeKind)> {
 
 /// 整块读入普通文件（用于 `execve` / harness）。目录或不存在返回 `None`。
 pub fn exchange_ext4(old_path: &str, new_path: &str) -> Result<(), SysErrNo> {
+    let _namespace = namespace_write_lock!();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let old = normalize_path(old_path);
     let new = normalize_path(new_path);
@@ -2959,10 +3063,10 @@ pub fn exchange_ext4(old_path: &str, new_path: &str) -> Result<(), SysErrNo> {
     }
 
     let (old_parent_path, _) = split_parent_name(&old)?;
-    let Some((old_ino, old_kind)) = resolve_existing(&fs, &old) else {
+    let Some((old_ino, old_kind)) = resolve_existing_locked(&fs, &old) else {
         return Err(SysErrNo::ENOENT);
     };
-    let Some((new_ino, new_kind)) = resolve_existing(&fs, &new) else {
+    let Some((new_ino, new_kind)) = resolve_existing_locked(&fs, &new) else {
         return Err(SysErrNo::ENOENT);
     };
     if old_kind == Ext4NodeKind::Directory && path_is_descendant(&old, &new) {
@@ -2982,7 +3086,7 @@ pub fn exchange_ext4(old_path: &str, new_path: &str) -> Result<(), SysErrNo> {
                 old_parent_path, old_ino, new_ino, attempt
             )
         };
-        if resolve_existing(&fs, &temp).is_none() {
+        if resolve_existing_locked(&fs, &temp).is_none() {
             break;
         }
         temp.clear();
@@ -2992,24 +3096,26 @@ pub fn exchange_ext4(old_path: &str, new_path: &str) -> Result<(), SysErrNo> {
     }
     drop(fs);
 
-    rename_ext4(&old, &temp, true)?;
-    if let Err(e) = rename_ext4(&new, &old, true) {
-        let _ = rename_ext4(&temp, &old, true);
+    rename_ext4_locked(&old, &temp, true)?;
+    if let Err(e) = rename_ext4_locked(&new, &old, true) {
+        let _ = rename_ext4_locked(&temp, &old, true);
         return Err(e);
     }
-    if let Err(e) = rename_ext4(&temp, &new, true) {
+    if let Err(e) = rename_ext4_locked(&temp, &new, true) {
         return Err(e);
     }
     Ok(())
 }
 
 pub fn slurp_regular_file_shared(path: &str) -> Option<Arc<Vec<u8>>> {
-    let resolved = resolve_symlinks(path).ok()?;
+    let namespace = NAMESPACE_LOCK.read();
+    let resolved = resolve_symlinks_locked(path).ok()?;
     let fs = ROOT_EXT4.lock().clone()?;
-    let (ino, kind) = resolve_existing(&fs, &resolved)?;
+    let (ino, kind) = resolve_existing_locked(&fs, &resolved)?;
     if kind != Ext4NodeKind::Regular {
         return None;
     }
+    drop(namespace);
 
     if let Some(data) = cached_executable_image(ino) {
         return Some(data);
@@ -3083,13 +3189,14 @@ pub fn ext4_dir_path_exists(path: &str) -> bool {
 
 /// 枚举目录单层子项（文件名 + 是否为目录）。
 pub fn ext4_list_dir(dir_path: &str) -> Result<Vec<(String, bool)>, SysErrNo> {
+    let _namespace = NAMESPACE_LOCK.read();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    let (ino, kind) = resolve_existing(&fs, dir_path).ok_or(SysErrNo::ENOENT)?;
+    let (ino, kind) = resolve_existing_locked(&fs, dir_path).ok_or(SysErrNo::ENOENT)?;
     if kind != Ext4NodeKind::Directory {
         return Err(SysErrNo::ENOTDIR);
     }
 
-    let out: Vec<(String, bool)> = cached_dir_entries(&fs, ino)
+    let out: Vec<(String, bool)> = cached_dir_entries_locked(&fs, ino)
         .iter()
         .map(|(name, (_, is_dir))| (name.clone(), *is_dir))
         .collect();
@@ -3099,15 +3206,16 @@ pub fn ext4_list_dir(dir_path: &str) -> Result<Vec<(String, bool)>, SysErrNo> {
 /// 枚举 ext4 目录项（按 inode 号），用于 `getdents64` 对 `Ext4Dir` fd 的支持。
 /// 返回 `(child_ino, name, is_dir)` 元组的 `Vec`，跳过 `.` 和 `..`。
 pub fn ext4_list_dir_by_ino(ino: u32) -> Result<Vec<(u32, String, bool)>, SysErrNo> {
+    let _namespace = NAMESPACE_LOCK.read();
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
-    Ok(cached_dir_entries(&fs, ino)
+    Ok(cached_dir_entries_locked(&fs, ino)
         .iter()
         .map(|(name, (child_ino, is_dir))| (*child_ino, name.clone(), *is_dir))
         .collect())
 }
 
 fn ext4_gather_file_paths(fs: &Ext4, dir_path: &str, parent_ino: u32, out: &mut Vec<String>) {
-    for (name, (child_ino, is_dir)) in cached_dir_entries(fs, parent_ino).iter() {
+    for (name, (child_ino, is_dir)) in cached_dir_entries_locked(fs, parent_ino).iter() {
         let full_path = if dir_path == "/" {
             format!("/{}", name)
         } else {
@@ -3124,6 +3232,7 @@ fn ext4_gather_file_paths(fs: &Ext4, dir_path: &str, parent_ino: u32, out: &mut 
 
 /// 枚举卷上全部普通文件的绝对路径（用于 harness 发现测试脚本）。
 pub fn ext4_list_all_file_paths() -> Vec<String> {
+    let _namespace = NAMESPACE_LOCK.read();
     let Some(fs) = ROOT_EXT4.lock().clone() else {
         return Vec::new();
     };

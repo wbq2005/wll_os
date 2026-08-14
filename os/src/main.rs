@@ -50,9 +50,8 @@ impl PageAlloc for KernelPageAlloc {
     fn alloc(&self) -> PhysAddr {
         mm::frame_allocator::alloc_frame()
             .map(|frame| {
-                let paddr = PhysAddr::new(frame.ppn().addr());
+                let paddr = PhysAddr::new(frame.into_raw_ppn().addr());
                 paddr.clear_len(crate::config::PAGE_SIZE);
-                core::mem::forget(frame);
                 paddr
             })
             .unwrap_or_else(|| PhysAddr::new(0))
@@ -189,6 +188,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
         }
         log::info!("[mm] Memory regions added: {}", count);
     }
+
+    mm::frame_allocator::finalize_frame_refcounts();
 
     // The heap allocator converts physical frames through the architecture's
     // normal RAM mapping (LoongArch DMW1 or RISC-V identity mapping).

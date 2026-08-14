@@ -46,6 +46,8 @@ STAGE_MARKERS = {
         "BUILDSTORM_COMPILE mode=multi ok=true",
     ),
 }
+PANIC_MARKERS = (b"Kernel panic", b"panicked at")
+OOM_MARKERS = (b"Heap allocation error", b"Out of memory")
 
 
 def qemu_path(config: dict[str, object]) -> str:
@@ -173,7 +175,7 @@ def run(
     started = time.monotonic()
     reached = False
     pending_markers = {marker.encode() for marker in markers}
-    stop_patterns = (b"Kernel panic", b"panicked at")
+    stop_patterns = (*PANIC_MARKERS, *OOM_MARKERS)
     overlap = max(len(pattern) for pattern in (*pending_markers, *stop_patterns)) - 1
     scan_tail = b""
     log_offset = 0
@@ -201,8 +203,20 @@ def run(
             process.wait(timeout=10)
 
     text = read_output(log)
+    panic_seen = any(marker.decode() in text for marker in PANIC_MARKERS)
+    oom_seen = any(marker.decode() in text for marker in OOM_MARKERS)
     if not reached and all(marker in text for marker in markers):
         reached = True
+    if reached:
+        termination_reason = "stage_marker"
+    elif panic_seen:
+        termination_reason = "panic"
+    elif oom_seen:
+        termination_reason = "oom"
+    elif process.returncode is not None and process.returncode != -9:
+        termination_reason = "qemu_exit"
+    else:
+        termination_reason = "timeout"
     result_lines = [
         line for line in text.splitlines()
         if line.startswith("BUILDSTORM_")
@@ -223,6 +237,10 @@ def run(
                 "qemu_version": qemu_version,
                 "host_elapsed_seconds": time.monotonic() - started,
                 "reached_stage_marker": reached,
+                "panic_seen": panic_seen,
+                "oom_seen": oom_seen,
+                "termination_reason": termination_reason,
+                "qemu_exit_code": process.returncode,
                 "result_lines": result_lines,
                 "qemu_args": args,
             },

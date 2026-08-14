@@ -1,5 +1,6 @@
 pub mod la;
 pub mod rv;
+pub mod user_va;
 
 pub use rv::*;
 

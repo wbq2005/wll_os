@@ -5,3 +5,11 @@ docs/evidence/buildstorm-stage1/*.json text eol=lf
 docs/evidence/buildstorm-stage1/*.txt text eol=lf
 docs/evidence/buildstorm-stage1/*.md text eol=lf
 docs/evidence/buildstorm-stage1/*.log binary
+docs/evidence/buildstorm-stage2/20260814-riscv64-official-complete-stage2/*.log binary
+docs/evidence/buildstorm-stage2/20260814-riscv64-official-complete-stage2/*.diff binary
+docs/evidence/buildstorm-stage2/20260814-riscv64-official-complete-stage2/official-judge.stderr binary
+docs/evidence/buildstorm-stage2/20260814-loongarch64-official-complete-stage2/*.log binary
+docs/evidence/buildstorm-stage2/20260814-loongarch64-official-complete-stage2/*.diff binary
+docs/evidence/buildstorm-stage2/20260814-loongarch64-official-complete-stage2/official-judge.stderr binary
+docs/evidence/buildstorm-stage2/20260814-prepush-release-gates/*.log binary
+docs/evidence/buildstorm-stage2/20260814-prepush-smp-gates/*.serial.log binary

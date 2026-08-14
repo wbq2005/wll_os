@@ -193,14 +193,16 @@ impl Ext4 {
             let mut ext4block =
                 Block::load(&self.block_device, pblock as usize * BLOCK_SIZE);
 
-            let result = self.try_insert_to_existing_block(&mut ext4block, name, child.inode_num);
+            match self.try_insert_to_existing_block(&mut ext4block, name, child.inode_num) {
+                Ok(_) => {
+                    // set checksum
+                    self.dir_set_csum(&mut ext4block, parent.inode.generation());
+                    ext4block.sync_blk_to_disk(&self.block_device);
 
-            if result.is_ok() {
-                // set checksum
-                self.dir_set_csum(&mut ext4block, parent.inode.generation());
-                ext4block.sync_blk_to_disk(&self.block_device);
-
-                return Ok(EOK);
+                    return Ok(EOK);
+                }
+                Err(error) if error.error() == Errno::ENOSPC => {}
+                Err(error) => return Err(error),
             }
 
             // go ot next block
@@ -241,59 +243,14 @@ impl Ext4 {
         name: &str,
         child_inode: u32,
     ) -> Result<usize> {
-        // required length aligned to 4 bytes
-        let required_len = {
-            let mut len = size_of::<Ext4DirEntry>() + name.len();
-            if len % 4 != 0 {
-                len += 4 - (len % 4);
-            }
-            len
-        };
-
-        let mut offset = 0;
-
-        // Start from the first entry
-        while offset < BLOCK_SIZE - size_of::<Ext4DirEntryTail>() {
-            let mut de = Ext4DirEntry::try_from(&block.data[offset..]).unwrap();
-
-            if de.unused() {
-                continue;
-            }
-
-            let inode = de.inode;
-            let rec_len = de.entry_len;
-
-            let used_len = de.name_len as usize;
-            let mut sz = core::mem::size_of::<Ext4FakeDirEntry>() + used_len;
-            if used_len % 4 != 0 {
-                sz += 4 - used_len % 4;
-            }
-
-            let free_space = rec_len as usize - sz;
-
-            // If there is enough free space
-            if free_space >= required_len {
-                // Create new directory entry
-                let mut new_entry = Ext4DirEntry::default();
-
-                // Update existing entry length and copy both entries back to block data
-                de.entry_len = sz as u16;
-
-                let de_type = DirEntryType::EXT4_DE_DIR;
-                new_entry.write_entry(free_space as u16, child_inode, name, de_type);
-
-                // update parent_de and new_de to blk_data
-                de.copy_to_slice(&mut block.data, offset);
-                new_entry.copy_to_slice(&mut block.data, offset + sz);
-
-                // Sync to disk
-                block.sync_blk_to_disk(&self.block_device);
-
-                return Ok(EOK);
-            }
-
-            // Move to the next entry
-            offset += de.entry_len() as usize;
+        if insert_dir_entry_into_block(
+            &mut block.data,
+            name,
+            child_inode,
+            DirEntryType::EXT4_DE_DIR.bits(),
+        )? {
+            block.sync_blk_to_disk(&self.block_device);
+            return Ok(EOK);
         }
 
         return_errno_with_message!(Errno::ENOSPC, "No space in block for new entry");
@@ -447,11 +404,180 @@ impl Ext4 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DirEntryHeader {
+    inode: u32,
+    rec_len: usize,
+    name_len: usize,
+}
+
+fn aligned_dir_entry_len(name_len: usize) -> Result<usize> {
+    if name_len > u8::MAX as usize {
+        return_errno_with_message!(Errno::ENAMETOOLONG, "Directory entry name is too long");
+    }
+
+    Ok((size_of::<Ext4FakeDirEntry>() + name_len + 3) & !3)
+}
+
+fn read_dir_entry_header(data: &[u8], offset: usize, end: usize) -> Result<DirEntryHeader> {
+    let header_len = size_of::<Ext4FakeDirEntry>();
+    let remaining = end.checked_sub(offset).unwrap_or(0);
+    if end > data.len() || remaining < header_len {
+        return_errno_with_message!(Errno::EIO, "Truncated directory entry header");
+    }
+
+    let inode = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    let rec_len = u16::from_le_bytes(data[offset + 4..offset + 6].try_into().unwrap()) as usize;
+    let name_len = data[offset + 6] as usize;
+    if rec_len < header_len || rec_len > remaining || rec_len % 4 != 0 {
+        return_errno_with_message!(Errno::EIO, "Invalid directory entry length");
+    }
+    if inode != 0 && aligned_dir_entry_len(name_len)? > rec_len {
+        return_errno_with_message!(Errno::EIO, "Directory entry name exceeds record length");
+    }
+
+    Ok(DirEntryHeader {
+        inode,
+        rec_len,
+        name_len,
+    })
+}
+
+fn write_dir_entry(
+    data: &mut [u8],
+    offset: usize,
+    rec_len: usize,
+    inode: u32,
+    name: &str,
+    entry_type: u8,
+) -> Result<()> {
+    let required_len = aligned_dir_entry_len(name.len())?;
+    let end = offset.checked_add(rec_len).unwrap_or(usize::MAX);
+    if required_len > rec_len || end > data.len() || rec_len > u16::MAX as usize {
+        return_errno_with_message!(Errno::EIO, "Directory entry does not fit in record");
+    }
+
+    data[offset..end].fill(0);
+    data[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
+    data[offset + 4..offset + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+    data[offset + 6] = name.len() as u8;
+    data[offset + 7] = entry_type;
+    data[offset + size_of::<Ext4FakeDirEntry>()
+        ..offset + size_of::<Ext4FakeDirEntry>() + name.len()]
+        .copy_from_slice(name.as_bytes());
+    Ok(())
+}
+
+fn insert_dir_entry_into_block(
+    data: &mut [u8],
+    name: &str,
+    child_inode: u32,
+    entry_type: u8,
+) -> Result<bool> {
+    let end = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
+    if data.len() < BLOCK_SIZE {
+        return_errno_with_message!(Errno::EIO, "Truncated directory block");
+    }
+
+    let required_len = aligned_dir_entry_len(name.len())?;
+    let mut offset = 0;
+    while offset < end {
+        let entry = read_dir_entry_header(data, offset, end)?;
+        if entry.inode == 0 {
+            if entry.rec_len >= required_len {
+                write_dir_entry(data, offset, entry.rec_len, child_inode, name, entry_type)?;
+                return Ok(true);
+            }
+            offset += entry.rec_len;
+            continue;
+        }
+
+        let used_len = aligned_dir_entry_len(entry.name_len)?;
+        let free_space = entry.rec_len - used_len;
+        if free_space >= required_len {
+            data[offset + 4..offset + 6].copy_from_slice(&(used_len as u16).to_le_bytes());
+            write_dir_entry(
+                data,
+                offset + used_len,
+                free_space,
+                child_inode,
+                name,
+                entry_type,
+            )?;
+            return Ok(true);
+        }
+
+        offset += entry.rec_len;
+    }
+
+    Ok(false)
+}
+
 pub fn copy_dir_entry_to_array(header: &Ext4DirEntry, array: &mut [u8], offset: usize) {
     unsafe {
         let de_ptr = header as *const Ext4DirEntry as *const u8;
         let array_ptr = array as *mut [u8] as *mut u8;
         let count = core::mem::size_of::<Ext4DirEntry>() / core::mem::size_of::<u8>();
         core::ptr::copy_nonoverlapping(de_ptr, array_ptr.add(offset), count);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_block() -> Vec<u8> {
+        vec![0; BLOCK_SIZE]
+    }
+
+    fn header(data: &[u8], offset: usize) -> DirEntryHeader {
+        read_dir_entry_header(data, offset, BLOCK_SIZE - size_of::<Ext4DirEntryTail>()).unwrap()
+    }
+
+    #[test]
+    fn reuses_unused_first_entry() {
+        let mut data = empty_block();
+        write_dir_entry(&mut data, 0, 32, 0, "", 0).unwrap();
+        write_dir_entry(&mut data, 32, 4052, 7, "occupied", 1).unwrap();
+
+        assert!(insert_dir_entry_into_block(&mut data, "new", 42, 1).unwrap());
+        let inserted = header(&data, 0);
+        assert_eq!(inserted.inode, 42);
+        assert_eq!(inserted.rec_len, 32);
+        assert_eq!(&data[8..11], b"new");
+        assert_eq!(header(&data, 32).inode, 7);
+    }
+
+    #[test]
+    fn advances_past_an_unused_entry_that_is_too_small() {
+        let mut data = empty_block();
+        write_dir_entry(&mut data, 0, 8, 0, "", 0).unwrap();
+        write_dir_entry(&mut data, 8, 4076, 7, "x", 1).unwrap();
+
+        assert!(insert_dir_entry_into_block(&mut data, "new", 42, 1).unwrap());
+        assert_eq!(header(&data, 0).inode, 0);
+        assert_eq!(header(&data, 8).rec_len, 12);
+        assert_eq!(header(&data, 20).inode, 42);
+    }
+
+    #[test]
+    fn rejects_a_zero_length_entry() {
+        let mut data = empty_block();
+        let error = insert_dir_entry_into_block(&mut data, "new", 42, 1).unwrap_err();
+        assert_eq!(error.error(), Errno::EIO);
+    }
+
+    #[test]
+    fn splits_normal_occupied_entry_without_overwriting_successor() {
+        let mut data = empty_block();
+        write_dir_entry(&mut data, 0, 32, 7, "old", 1).unwrap();
+        write_dir_entry(&mut data, 32, 4052, 9, "successor", 1).unwrap();
+
+        assert!(insert_dir_entry_into_block(&mut data, "new", 42, 1).unwrap());
+        assert_eq!(header(&data, 0).rec_len, 12);
+        assert_eq!(header(&data, 12).inode, 42);
+        assert_eq!(header(&data, 12).rec_len, 20);
+        assert_eq!(header(&data, 32).inode, 9);
+        assert_eq!(&data[40..49], b"successor");
     }
 }

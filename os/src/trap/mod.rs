@@ -294,6 +294,17 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 ///
 /// 用户态陷入内核时的处理入口
 pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let _trap_scope = crate::buildstorm_diagnostics::note_user_trap_enter(match &trap_type {
+        TrapType::SysCall => 1,
+        TrapType::Timer => 2,
+        TrapType::Ipi(_) => 3,
+        TrapType::StorePageFault(_) => 4,
+        TrapType::LoadPageFault(_) => 5,
+        TrapType::InstructionPageFault(_) => 6,
+        TrapType::PagePrivilegeFault(_) => 7,
+        _ => 8,
+    });
     // LoongArch keeps its conservative kernel-root trap boundary. RISC-V user
     // roots already share the kernel RAM mappings, so ordinary syscall work can
     // retain the current ASID; low-address MMIO drivers switch roots explicitly.
@@ -541,6 +552,13 @@ pub fn restore_kernel_page_table() {
         #[cfg(feature = "buildstorm-diagnostics")]
         crate::buildstorm_diagnostics::note_root_activation(false, false);
         kpt.change_with_asid(0);
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // LoongArch changes PGDL and ASID independently.  Switching from
+            // a user root back to the kernel root therefore needs a local
+            // invalidation even when the previous ASID was nonzero.
+            polyhal::pagetable::TLB::flush_all();
+        }
         if reused_kernel_asid {
             #[cfg(feature = "buildstorm-diagnostics")]
             crate::buildstorm_diagnostics::note_local_tlb_flush();

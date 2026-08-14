@@ -265,7 +265,12 @@ pub struct FsContext {
 pub struct MmContext {
     pub program_break: usize,
     pub mapped_break: usize,
+    /// Cursor for the historical low mmap arena.  Keep it independent from
+    /// the overflow arena so one failed large reservation cannot move normal
+    /// mappings into a different address regime.
     pub next_mmap: usize,
+    /// Cursor for the high overflow arena.
+    pub next_mmap_high: usize,
 }
 
 pub struct ThreadGroup {
@@ -275,6 +280,8 @@ pub struct ThreadGroup {
     process_zombie: AtomicUsize,
     stopped: AtomicUsize,
     child_wait: Mutex<ChildWaitState>,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub(crate) diagnostic_mmap_protocol: crate::buildstorm_diagnostics::MmapProtocol,
 }
 
 #[derive(Clone, Copy)]
@@ -310,6 +317,8 @@ impl ThreadGroup {
             process_zombie: AtomicUsize::new(0),
             stopped: AtomicUsize::new(0),
             child_wait: Mutex::new(ChildWaitState::new()),
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_mmap_protocol: crate::buildstorm_diagnostics::MmapProtocol::new(),
         })
     }
 
@@ -444,13 +453,14 @@ pub fn new_shared_mm_context(
         program_break,
         mapped_break,
         next_mmap,
+        next_mmap_high: crate::config::user_va::DEFAULT_HIGH_MMAP_BASE,
     }))
 }
 
 #[inline]
 pub fn dup_mm_context(src: &SharedMmContext) -> SharedMmContext {
     let ctx = *src.lock();
-    new_shared_mm_context(ctx.program_break, ctx.mapped_break, ctx.next_mmap)
+    Arc::new(Mutex::new(ctx))
 }
 
 /// 拷贝一份 fd 表（`fork` 未带 `CLONE_FILES` 时使用）
@@ -514,7 +524,7 @@ fn fetch_dispatchable_user_task() -> Option<Arc<TaskControlBlock>> {
     loop {
         let Some(task) = manager::fetch_user_task_for_foreground() else {
             for task in skipped_active {
-                manager::add_task(task);
+                manager::add_task_local(task);
             }
             return None;
         };
@@ -523,7 +533,7 @@ fn fetch_dispatchable_user_task() -> Option<Arc<TaskControlBlock>> {
             continue;
         }
         for task in skipped_active {
-            manager::add_task(task);
+            manager::add_task_local(task);
         }
         return Some(task);
     }
@@ -637,7 +647,7 @@ pub(crate) fn requeue_after_user_run(task: Arc<TaskControlBlock>) {
             task.blocking_cpu.store(NO_CPU, Ordering::Release);
             fence(Ordering::SeqCst);
             if task.status() == TaskStatus::Ready {
-                manager::add_task(task);
+                manager::add_task_local(task);
             }
         }
         TaskStatus::Running | TaskStatus::Ready => {
@@ -651,9 +661,9 @@ pub(crate) fn requeue_after_user_run(task: Arc<TaskControlBlock>) {
                 *status = TaskStatus::Ready;
             }
             if take_foreground_requeue_front(task.pid.0) {
-                manager::add_task_front(task);
+                manager::add_task_front_local(task);
             } else {
-                manager::add_task(task);
+                manager::add_task_local(task);
             }
         }
     }
@@ -706,7 +716,11 @@ pub(crate) fn run_current_user_task_until_reschedule(
         crate::trap::interrupts::disable_interrupt();
         #[cfg(feature = "buildstorm-diagnostics")]
         let user_run_started = crate::timer::get_time_us();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_user_run_enter(task.pid.0);
         let reason = run_user_task(ctx);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_user_run_exit();
         #[cfg(feature = "buildstorm-diagnostics")]
         crate::buildstorm_diagnostics::note_user_run(
             crate::timer::get_time_us().saturating_sub(user_run_started),
@@ -745,7 +759,11 @@ fn run_current_user_task_one_boundary(task: &Arc<TaskControlBlock>, ctx: &mut Tr
     crate::trap::interrupts::disable_interrupt();
     #[cfg(feature = "buildstorm-diagnostics")]
     let user_run_started = crate::timer::get_time_us();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_user_run_enter(task.pid.0);
     let reason = run_user_task(ctx);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_user_run_exit();
     #[cfg(feature = "buildstorm-diagnostics")]
     crate::buildstorm_diagnostics::note_user_run(
         crate::timer::get_time_us().saturating_sub(user_run_started),
@@ -1094,7 +1112,7 @@ pub fn suspend_current_and_run_next() {
         *CURRENT_TASK.lock() = None;
         task.release_running_cpu();
         task.set_status(TaskStatus::Ready);
-        manager::add_task(task.clone());
+        manager::add_task_local(task.clone());
         if crate::trap::foreground_driver_active() {
             return;
         }
@@ -1460,18 +1478,21 @@ fn release_process_runtime_resources(members: &[Arc<TaskControlBlock>]) {
             let mut mm = member.mm.lock();
             mm.program_break = crate::config::USER_HEAP_START;
             mm.mapped_break = crate::config::USER_HEAP_START;
-            mm.next_mmap = 0x2000_0000;
+            mm.next_mmap = crate::config::user_va::DEFAULT_MMAP_BASE;
+            mm.next_mmap_high = crate::config::user_va::DEFAULT_HIGH_MMAP_BASE;
         }
 
         let mut inner = member.inner.lock();
         inner.program_break = crate::config::USER_HEAP_START;
         inner.mapped_break = crate::config::USER_HEAP_START;
-        inner.next_mmap = 0x2000_0000;
+        inner.next_mmap = crate::config::user_va::DEFAULT_MMAP_BASE;
         inner.clear_child_tid = 0;
         inner.robust_list_head = 0;
         inner.robust_list_len = 0;
         inner.interval_timers = crate::syscall::other::EMPTY_INTERVAL_TIMERS;
         inner.default_timer_slack_ns = inner.current_timer_slack_ns;
+        drop(inner);
+        crate::syscall::other::remove_interval_timer_owner(member);
     }
 }
 
@@ -1493,6 +1514,11 @@ fn purge_wait_state_for_task(task: &Arc<TaskControlBlock>) {
 fn finish_process_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     if !task.thread_group.mark_process_zombie(exit_code) {
         return;
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        crate::buildstorm_diagnostics::archive_mmap_protocol(&task.thread_group);
+        crate::buildstorm_diagnostics::note_process_exit();
     }
 
     // 先记录父进程。后续 release_process_runtime_resources 会关闭 fd、释放
@@ -1790,7 +1816,7 @@ fn finish_kernel_task_switch(task: Arc<TaskControlBlock>) {
     task.blocking_cpu.store(NO_CPU, Ordering::Release);
     fence(Ordering::SeqCst);
     if task.status() == TaskStatus::Ready {
-        manager::add_task(task);
+        manager::add_task_local(task);
     }
 }
 

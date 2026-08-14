@@ -119,10 +119,14 @@ impl PageTable {
     pub const PAGE_LEVEL: usize = 3;
     pub const PTE_NUM_IN_PAGE: usize = 0x200;
     pub(crate) const GLOBAL_ROOT_PTE_RANGE: usize = 0x100;
-    pub(crate) const USER_ROOT_PTE_END: usize = 0x100;
     pub(crate) const VADDR_BITS: usize = 39;
     pub(crate) const USER_VADDR_END: usize = (1 << Self::VADDR_BITS) - 1;
     pub(crate) const KERNEL_VADDR_START: usize = !Self::USER_VADDR_END;
+
+    #[inline]
+    pub(crate) const fn is_user_root_entry(index: usize) -> bool {
+        index < Self::GLOBAL_ROOT_PTE_RANGE
+    }
 
     #[inline]
     pub fn restore(&self) {
@@ -134,8 +138,10 @@ impl PageTable {
             return;
         }
         let current_arr = Self::get_pte_list(current);
-        for i in Self::USER_ROOT_PTE_END..Self::PTE_NUM_IN_PAGE {
-            arr[i] = current_arr[i];
+        for i in 0..Self::PTE_NUM_IN_PAGE {
+            if !Self::is_user_root_entry(i) {
+                arr[i] = current_arr[i];
+            }
         }
         TLB::flush_all();
     }

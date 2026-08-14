@@ -184,6 +184,38 @@ pub struct MemorySet {
 }
 
 impl MemorySet {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    pub(crate) fn diagnostic_drop_after_exec(self) {
+        let this = mem::ManuallyDrop::new(self);
+
+        let started_at = crate::timer::get_time_us();
+        retire_address_space_id(this.address_space_id);
+        crate::buildstorm_diagnostics::note_phase(
+            47,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
+
+        // Match Rust's field-drop order after MemorySet::drop: page table
+        // ownership is released before the VMA resident-frame owners.
+        let started_at = crate::timer::get_time_us();
+        unsafe {
+            drop(core::ptr::read(&this.page_table));
+        }
+        crate::buildstorm_diagnostics::note_phase(
+            48,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
+
+        let started_at = crate::timer::get_time_us();
+        unsafe {
+            drop(core::ptr::read(&this.areas));
+        }
+        crate::buildstorm_diagnostics::note_phase(
+            49,
+            crate::timer::get_time_us().saturating_sub(started_at),
+        );
+    }
+
     /// Create a fresh address space with an independent root page table.
     pub fn new_bare() -> Self {
         Self {
@@ -678,8 +710,7 @@ impl MemorySet {
             let Some(frame) = frame_allocator::alloc_frame() else {
                 return Err(SysErrNo::ENOMEM);
             };
-            let backing_offset = page_start
-                .saturating_sub(self.areas[source_index].start_va.raw());
+            let backing_offset = page_start.saturating_sub(self.areas[source_index].start_va.raw());
             let data = read_backing_page(&backing, backing_offset)?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -1013,7 +1044,9 @@ impl MemorySet {
                 return Err(SysErrNo::EFAULT);
             }
             let _mapped_pages = frames.len();
-            let idx = self.area_index_containing(page_start).ok_or(SysErrNo::EFAULT)?;
+            let idx = self
+                .area_index_containing(page_start)
+                .ok_or(SysErrNo::EFAULT)?;
             self.areas[idx]
                 .insert_resident_run(page_idx, frames, PageState::Private)
                 .map_err(|_| SysErrNo::EFAULT)?;
@@ -1144,15 +1177,17 @@ impl MemorySet {
             MapAreaBacking::File { shared: false, .. } => PageState::FileClean,
             MapAreaBacking::Anonymous => PageState::Private,
         };
-        self.areas[idx].insert_resident_page(page_idx, frame, state).map_err(|_| {
-            #[cfg(feature = "buildstorm-diagnostics")]
-            crate::buildstorm_diagnostics::note_first_page_fault_failure(
-                crate::buildstorm_diagnostics::PAGE_FAULT_FAILURE_RESIDENT_INSERT,
-                SysErrNo::EFAULT as usize,
-                page_start,
-            );
-            SysErrNo::EFAULT
-        })?;
+        self.areas[idx]
+            .insert_resident_page(page_idx, frame, state)
+            .map_err(|_| {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_first_page_fault_failure(
+                    crate::buildstorm_diagnostics::PAGE_FAULT_FAILURE_RESIDENT_INSERT,
+                    SysErrNo::EFAULT as usize,
+                    page_start,
+                );
+                SysErrNo::EFAULT
+            })?;
         map_area_page(&self.page_table, &self.areas[idx], page_idx);
         #[cfg(feature = "buildstorm-diagnostics")]
         fault_resolution.finish(

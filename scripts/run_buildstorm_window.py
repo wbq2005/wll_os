@@ -11,22 +11,68 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
+import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from run_buildstorm import ARCHES, build, qemu_path, sha256
 
 
 BEGIN_MARKER = b"BUILDSTORM_BEGIN mode=multi"
 PANIC_MARKERS = (b"Kernel panic", b"panicked at")
+OOM_MARKERS = (b"Heap allocation error", b"Out of memory")
 COMPILING_RE = re.compile(r"^\s*Compiling\s+(.+?)\s*$", re.MULTILINE)
 FINISHED_RE = re.compile(r"^\s*Finished\s+", re.MULTILINE)
 COMPILING_LINE_RE = re.compile(r"^\s*Compiling\s+(.+?)\s*$")
 FINISHED_LINE_RE = re.compile(r"^\s*Finished\s+")
+
+
+def acquire_host_qemu_lock() -> BinaryIO:
+    default_lock = "/tmp/wll-buildstorm-qemu.lock" if os.name == "posix" else str(
+        Path(tempfile.gettempdir()) / "wll-buildstorm-qemu.lock"
+    )
+    path = Path(os.environ.get("BUILDSTORM_HOST_LOCK", default_lock))
+    lock = path.open("a+b")
+    try:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            import msvcrt
+
+            if path.stat().st_size == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+    except (BlockingIOError, OSError) as error:
+        lock.close()
+        raise RuntimeError(f"another BuildStorm QEMU run holds {path}") from error
+    return lock
+
+
+def reject_active_qemu() -> None:
+    if os.name != "posix":
+        return
+    if shutil.which("pgrep") is None:
+        raise RuntimeError("pgrep is required to exclude concurrent QEMU workloads")
+    result = subprocess.run(
+        ["pgrep", "-f", r"[/]qemu-system-(riscv64|loongarch64).* -kernel "],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if result.returncode == 0:
+        raise RuntimeError("a QEMU kernel workload is already active")
+    if result.returncode != 1:
+        raise RuntimeError("unable to determine whether QEMU is active")
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
@@ -83,6 +129,70 @@ def capture(command: list[str], path: Path) -> None:
         subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, check=False)
 
 
+class QmpClient:
+    def __init__(self, path: Path) -> None:
+        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._socket.settimeout(5)
+        self._socket.connect(str(path))
+        self._stream = self._socket.makefile("rwb", buffering=0)
+        self._read_response()
+        self.command("qmp_capabilities")
+
+    def _read_response(self) -> dict[str, Any]:
+        while True:
+            line = self._stream.readline()
+            if not line:
+                raise EOFError("QMP socket closed")
+            response = json.loads(line)
+            if "event" not in response:
+                return response
+
+    def command(self, execute: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        request: dict[str, Any] = {"execute": execute}
+        if arguments is not None:
+            request["arguments"] = arguments
+        self._stream.write(json.dumps(request).encode("ascii") + b"\n")
+        return self._read_response()
+
+    def close(self) -> None:
+        self._stream.close()
+        self._socket.close()
+
+
+def connect_qmp(path: Path, deadline: float) -> QmpClient:
+    while True:
+        try:
+            return QmpClient(path)
+        except (FileNotFoundError, ConnectionRefusedError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def sample_qmp_registers(
+    client: QmpClient,
+    output: BinaryIO,
+    smp: int,
+    marker_at: float,
+) -> None:
+    observed_at = time.monotonic() - marker_at
+    record: dict[str, Any] = {
+        "after_marker_seconds": observed_at,
+        "cpus": client.command("query-cpus-fast"),
+        "registers": [],
+    }
+    for cpu in range(smp):
+        record["registers"].append({
+            "cpu": cpu,
+            "response": client.command(
+                "human-monitor-command",
+                {"command-line": "info registers", "cpu-index": cpu},
+            ),
+        })
+    output.write(json.dumps(record, ensure_ascii=True).encode("ascii") + b"\n")
+    output.flush()
+
+
 def diag_fields(line: str) -> dict[str, int | str]:
     """Parse one fixed-format aggregate diagnostic line without log heuristics."""
     fields: dict[str, int | str] = {}
@@ -105,6 +215,7 @@ def parse_guest_aggregate_block(
         "snapshot": None,
         "cpus": {},
         "user_runs": {},
+        "user_active": {},
         "work": {},
         "phases": {},
         "fault_sources": {},
@@ -115,6 +226,16 @@ def parse_guest_aggregate_block(
         "blocked_owners": {},
         "locks": [],
         "memory_set_sites": {},
+        "memory_set_pairs": [],
+        "heap_sizes": {},
+        "mmap_shape": None,
+        "mmap_result": None,
+        "mmap_failure_shape": None,
+        "frame_ownership": None,
+        "process_progress": None,
+        "mmap_protocols": {},
+        "mmap_protocol_exits": [],
+        "mmap_protocol_archive": None,
         "actors": [],
         "vma_slots": None,
         "serial_line_index": start,
@@ -135,8 +256,14 @@ def parse_guest_aggregate_block(
             cpu = fields.get("cpu")
             if isinstance(cpu, int):
                 result["user_runs"][str(cpu)] = fields
+        elif body.startswith("user_active "):
+            cpu = fields.get("cpu")
+            if isinstance(cpu, int):
+                result["user_active"][str(cpu)] = fields
         elif body.startswith("mm "):
             result["mm"] = fields
+        elif body.startswith("frame_ownership "):
+            result["frame_ownership"] = fields
         elif body.startswith("vma "):
             result["vma"] = fields
         elif body.startswith("anonymous_vma "):
@@ -197,6 +324,28 @@ def parse_guest_aggregate_block(
             name = fields.get("memory_set_site")
             if isinstance(name, str):
                 result["memory_set_sites"][name] = fields
+        elif body.startswith("memory_set_pair "):
+            result["memory_set_pairs"].append(fields)
+        elif body.startswith("heap_size "):
+            bucket = fields.get("bucket")
+            if isinstance(bucket, int):
+                result["heap_sizes"][str(bucket)] = fields
+        elif body.startswith("mmap_shape "):
+            result["mmap_shape"] = fields
+        elif body.startswith("mmap_result "):
+            result["mmap_result"] = fields
+        elif body.startswith("mmap_failure_shape "):
+            result["mmap_failure_shape"] = fields
+        elif body.startswith("process_progress "):
+            result["process_progress"] = fields
+        elif body.startswith("mmap_protocol "):
+            tgid = fields.get("tgid")
+            if isinstance(tgid, int):
+                result["mmap_protocols"][str(tgid)] = fields
+        elif body.startswith("mmap_protocol_exit "):
+            result["mmap_protocol_exits"].append(fields)
+        elif body.startswith("mmap_protocol_archive "):
+            result["mmap_protocol_archive"] = fields
     return result
 
 
@@ -260,6 +409,7 @@ def summarize_serial(
         "guest_aggregate_before_marker": before_marker,
         "guest_aggregate_final": complete_aggregates[-1] if complete_aggregates else None,
         "panic_seen": any(marker.decode() in text for marker in PANIC_MARKERS),
+        "oom_seen": any(marker.decode() in text for marker in OOM_MARKERS),
     }
 
 
@@ -305,6 +455,9 @@ def run(args: argparse.Namespace) -> int:
     if args.window <= 0 or args.begin_timeout <= 0 or args.smp <= 0:
         raise ValueError("window, begin timeout, and smp must be positive")
 
+    host_qemu_lock = acquire_host_qemu_lock()
+    reject_active_qemu()
+
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     serial = output / "serial.log"
@@ -322,12 +475,15 @@ def run(args: argparse.Namespace) -> int:
         raise FileNotFoundError(kernel)
 
     qemu = qemu_path(config)
+    qmp_path = Path(tempfile.gettempdir()) / f"wll-buildstorm-{os.getpid()}.qmp"
     qemu_args = [
         qemu, "-snapshot", "-kernel", str(kernel), "-m", args.memory,
         "-smp", str(args.smp), "-display", "none", "-monitor", "none",
         "-serial", "stdio", "-drive", f"file={image},if=none,format=raw,id=x0",
         "-no-reboot", *config["args"],
     ]
+    if args.qmp_sample_interval > 0:
+        qemu_args.extend(["-qmp", f"unix:{qmp_path},server=on,wait=off"])
     qemu_version = subprocess.run(
         [qemu, "--version"], text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
@@ -338,6 +494,8 @@ def run(args: argparse.Namespace) -> int:
         "smp": args.smp,
         "window_seconds": args.window,
         "begin_timeout_seconds": args.begin_timeout,
+        "qmp_sample_interval_seconds": args.qmp_sample_interval,
+        "qmp_sample_delay_seconds": args.qmp_sample_delay,
         "production_diagnostics_disabled": not bool(args.build_features),
         "image": str(image),
         "image_sha256": sha256(image),
@@ -364,10 +522,16 @@ def run(args: argparse.Namespace) -> int:
     progress_timeline: list[dict[str, Any]] = []
     samplers: list[subprocess.Popen[bytes] | None] = []
     process: subprocess.Popen[bytes] | None = None
+    qmp_client: QmpClient | None = None
+    qmp_output: BinaryIO | None = None
+    next_qmp_sample: float | None = None
     try:
         with serial.open("wb") as serial_out:
             process = subprocess.Popen(qemu_args, stdin=subprocess.DEVNULL, stdout=serial_out,
                                        stderr=subprocess.STDOUT)
+            if args.qmp_sample_interval > 0:
+                qmp_client = connect_qmp(qmp_path, time.monotonic() + 5)
+                qmp_output = (output / "host-qmp-registers.jsonl").open("wb")
             while process.poll() is None:
                 data, serial_offset = read_after(serial, serial_offset)
                 if marker_at is None:
@@ -383,10 +547,11 @@ def run(args: argparse.Namespace) -> int:
                             )
                         pid = str(process.pid)
                         samplers = [
-                            start_sampler(["pidstat", "-d", "-r", "-u", "-w", "-h", "-p", pid, "1"], output / "host-pidstat.log"),
+                            start_sampler(["pidstat", "-t", "-d", "-r", "-u", "-w", "-h", "-p", pid, "1"], output / "host-pidstat.log"),
                             start_sampler(["iostat", "-dx", "1"], output / "host-iostat.log"),
                             start_sampler(["vmstat", "1"], output / "host-vmstat.log"),
                         ]
+                        next_qmp_sample = marker_at + args.qmp_sample_delay
                     elif time.monotonic() - start >= args.begin_timeout:
                         break
                     marker_scan_tail = marker_scan[-(len(BEGIN_MARKER) - 1):]
@@ -396,6 +561,15 @@ def run(args: argparse.Namespace) -> int:
                     progress_pending = record_progress_lines(
                         data, progress_pending, marker_at, progress_timeline,
                     )
+                if (
+                    marker_at is not None
+                    and qmp_client is not None
+                    and qmp_output is not None
+                    and next_qmp_sample is not None
+                    and time.monotonic() >= next_qmp_sample
+                ):
+                    sample_qmp_registers(qmp_client, qmp_output, args.smp, marker_at)
+                    next_qmp_sample = time.monotonic() + args.qmp_sample_interval
                 time.sleep(0.20)
     finally:
         if process is not None:
@@ -405,6 +579,11 @@ def run(args: argparse.Namespace) -> int:
         if process is not None and process.poll() is None:
             process.kill()
             process.wait(timeout=10)
+        if qmp_output is not None:
+            qmp_output.close()
+        if qmp_client is not None:
+            qmp_client.close()
+        qmp_path.unlink(missing_ok=True)
 
     serial_text = serial.read_bytes().decode("utf-8", errors="replace")
     guest_aggregates = parse_guest_aggregates(serial_text)
@@ -419,7 +598,9 @@ def run(args: argparse.Namespace) -> int:
     })
     write_json(output / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if marker_at is not None and not summary["panic_seen"] else 1
+    host_qemu_lock.close()
+    fatal_seen = summary["panic_seen"] or summary["oom_seen"]
+    return 0 if marker_at is not None and not fatal_seen else 1
 
 
 def main() -> int:
@@ -438,7 +619,24 @@ def main() -> int:
         help="prebuilt kernel artifact; bypasses the local build without changing guest inputs",
     )
     parser.add_argument("--build-features", help="explicit diagnostic-only kernel features")
-    return run(parser.parse_args())
+    parser.add_argument(
+        "--qmp-sample-interval",
+        type=float,
+        default=0,
+        help="host-side vCPU register sampling interval in seconds (disabled by default)",
+    )
+    parser.add_argument(
+        "--qmp-sample-delay",
+        type=float,
+        default=0,
+        help="delay QMP register sampling until this many seconds after the marker",
+    )
+    args = parser.parse_args()
+    if args.qmp_sample_delay < 0:
+        parser.error("--qmp-sample-delay must be non-negative")
+    if args.qmp_sample_delay > 0 and args.qmp_sample_interval <= 0:
+        parser.error("--qmp-sample-delay requires --qmp-sample-interval")
+    return run(args)
 
 
 if __name__ == "__main__":

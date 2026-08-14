@@ -1,0 +1,7 @@
+[smp-regression] pass phase=interval-timer-state-machine
+[smp-regression] pass phase=resident-memory-lifecycle
+[smp-regression] pass phase=high-arena-memory-lifecycle
+[smp-regression] pass phase=namespace-lifecycle iterations=64 readers=7
+[smp-regression] pass phase=user-memory-lifecycle
+[smp-regression] pass cpus=8 mask=0xff dispatch=0xff tlb_targets=0xfe asid_pair=1/2 reused_asid=1 asid_check=translation isolation_iters=64 heap_stress_mib=160 checksum=90
+[riscv64] passed=True log=/srv/buildstorm/worktrees/stage0-attribution-20260813/_tmp/smp-regression-riscv64.log

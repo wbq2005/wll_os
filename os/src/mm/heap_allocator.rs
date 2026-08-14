@@ -1,4 +1,15 @@
+#[cfg(feature = "buildstorm-diagnostics")]
+use buddy_system_allocator::Heap;
+#[cfg(not(feature = "buildstorm-diagnostics"))]
 use buddy_system_allocator::LockedHeap;
+#[cfg(feature = "buildstorm-diagnostics")]
+use core::alloc::{GlobalAlloc, Layout};
+#[cfg(feature = "buildstorm-diagnostics")]
+use core::ops::Deref;
+#[cfg(feature = "buildstorm-diagnostics")]
+use core::ptr::NonNull;
+#[cfg(feature = "buildstorm-diagnostics")]
+use spin::Mutex;
 
 /// 内核堆大小: 128MB（预加载的测试用例和大 ELF exec 缓冲可能占数十 MB）
 const KERNEL_HEAP_SIZE: usize = 0x800_0000;
@@ -9,7 +20,46 @@ static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 
 /// 全局堆分配器
 #[global_allocator]
+#[cfg(not(feature = "buildstorm-diagnostics"))]
 static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
+
+#[cfg(feature = "buildstorm-diagnostics")]
+struct DiagnosticLockedHeap(Mutex<Heap<32>>);
+
+#[cfg(feature = "buildstorm-diagnostics")]
+impl DiagnosticLockedHeap {
+    const fn empty() -> Self {
+        Self(Mutex::new(Heap::empty()))
+    }
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+impl Deref for DiagnosticLockedHeap {
+    type Target = Mutex<Heap<32>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+unsafe impl GlobalAlloc for DiagnosticLockedHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        crate::buildstorm_diagnostics::lock_heap(&self.0, layout.size(), true)
+            .alloc(layout)
+            .ok()
+            .map_or(core::ptr::null_mut(), |allocation| allocation.as_ptr())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        crate::buildstorm_diagnostics::lock_heap(&self.0, layout.size(), false)
+            .dealloc(NonNull::new_unchecked(ptr), layout);
+    }
+}
+
+#[global_allocator]
+#[cfg(feature = "buildstorm-diagnostics")]
+static HEAP_ALLOCATOR: DiagnosticLockedHeap = DiagnosticLockedHeap::empty();
 
 /// 初始化内核堆
 pub fn init_heap() {

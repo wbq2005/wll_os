@@ -962,7 +962,8 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             let mut mm = task.mm.lock();
             mm.program_break = crate::config::USER_HEAP_START;
             mm.mapped_break = crate::config::USER_HEAP_START;
-            mm.next_mmap = 0x4000_0000;
+            mm.next_mmap = crate::config::user_va::DEFAULT_MMAP_BASE;
+            mm.next_mmap_high = crate::config::user_va::DEFAULT_HIGH_MMAP_BASE;
         }
 
         {
@@ -975,7 +976,26 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
                 &task.memory_set,
             );
             log::info!("[syscall] execve: replacing memory set");
-            *ms = new_memory_set;
+            #[cfg(not(feature = "buildstorm-diagnostics"))]
+            {
+                *ms = new_memory_set;
+            }
+            #[cfg(feature = "buildstorm-diagnostics")]
+            {
+                let swap_started_at = crate::timer::get_time_us();
+                let old_memory_set = core::mem::replace(&mut *ms, new_memory_set);
+                crate::buildstorm_diagnostics::note_phase(
+                    45,
+                    crate::timer::get_time_us().saturating_sub(swap_started_at),
+                );
+
+                let drop_started_at = crate::timer::get_time_us();
+                old_memory_set.diagnostic_drop_after_exec();
+                crate::buildstorm_diagnostics::note_phase(
+                    46,
+                    crate::timer::get_time_us().saturating_sub(drop_started_at),
+                );
+            }
         }
 
         {

@@ -344,6 +344,32 @@ pub fn notify_runnable() {
     }
 }
 
+/// Wake one idle CPU that can run the newly published task.
+///
+/// The idle side publishes its bit before checking the ready queue. Claiming
+/// that bit before sending the IPI closes the check-to-WFI race while avoiding
+/// a broadcast wakeup for every scheduler requeue.
+pub fn notify_runnable_for(eligible_mask: usize) {
+    let current = current_cpu_index();
+    let allowed = eligible_mask & online_cpu_mask() & !(1usize << current);
+    loop {
+        let idle = IDLE_MASK.load(Ordering::Acquire);
+        let targets = idle & allowed;
+        if targets == 0 {
+            return;
+        }
+        let cpu = targets.trailing_zeros() as usize;
+        let bit = 1usize << cpu;
+        if IDLE_MASK
+            .compare_exchange_weak(idle, idle & !bit, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            send_ipi_to_cpu(cpu, IPI_RESCHEDULE);
+            return;
+        }
+    }
+}
+
 pub fn prepare_idle() {
     IDLE_MASK.fetch_or(1usize << current_cpu_index(), Ordering::Release);
     fence(Ordering::SeqCst);

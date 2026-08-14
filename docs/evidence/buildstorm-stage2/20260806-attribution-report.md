@@ -1404,3 +1404,313 @@ themselves, the production change that crosses the stable late boundary.
 Evidence is in
 `20260812-riscv64-production-smp8-unmap-range-drain-window300-run2/`.
 Complete BuildStorm remains unverified.
+
+### 20260812 mmap select/commit late-boundary diagnostic run2
+
+The second 1,800-second feature-gated classification window is archived at
+`20260812-riscv64-diagnostics-smp8-mmap-lock-phase-window1800-run2/`.  It
+used the unmodified official image, QEMU 11.0.3, and `-snapshot -m 8G -smp
+8`.  The marker window lasted `1800.623433918` seconds and the complete host
+run lasted `1859.093524787` seconds.  It reached 33 `Compiling` lines and two
+pre-main-build `Finished` lines, ending at `rustc-literal-escaper v0.0.7`.
+The raw serial contains no exact `BUILDSTORM_COMPILE mode=multi ok=true`,
+kernel panic, `panicked at`, or OOM marker.  QEMU exit `-9` is the runner's
+intentional end-of-window termination, not a guest crash.  Complete
+BuildStorm therefore remains `unverified / not completed`.
+
+The launch record identifies source commit
+`50c9bd348f13cd845880bdcf1ccf3a1e84eac0ea`, dirty-diff SHA-256
+`b861650df8afecf6510456ce10440f349789314e66b8a3fe20ead17f20aa9a74`,
+kernel SHA-256
+`6c593b0bd88a45e8c98c746dbe3c2f09a869c1f0841a584f7dcabc3517df42d5`,
+and image SHA-256
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`.
+
+### 20260812 failure-only mmap shape gate
+
+The final diagnostic gate is archived at
+`20260812-riscv64-diagnostics-smp8-mmap-failure-shape-window900/`.  Its
+900.283-second marker window reached 29 `Compiling` lines, ending at
+`hashbrown v0.17.1`, with no successful compile, panic, or OOM marker.
+Marker-to-final counters recorded 389,285 initial-selection failures.  Every
+failure was in the 16--256 MiB bucket; all four other failure buckets were
+zero.  The largest failed request remained exactly 128 MiB and the sampled
+maximum free gap remained 85.37 MiB.  This verifies that large contiguous
+virtual-address requests, rather than small mmap failures or scan-only cost,
+drive the retry storm.
+
+The same interval recorded 184,055 successful munmaps that actually
+overlapped an existing VMA.  All were below `next_mmap`: 110,911 up to 64
+KiB, 267 up to 1 MiB, 145 up to 16 MiB, and 72,732 up to 256 MiB.  None
+overlapped or started above the cursor.  This confirms that the cursor moves
+past released holes, but source audit also confirms address selection already
+wraps to `MMAP_BASE`; cursor rollback cannot merge the observed sub-128-MiB
+holes and is therefore rejected as the production candidate.
+
+The selected design direction is a general RISC-V user-address-space
+extension that preserves root entry 2 (`0x8000_0000..0xbfff_ffff`) for the
+kernel identity mapping while allowing mmap fallback in user root entries
+3--255.  It must not be implemented as a `USER_STACK_TOP` increase: the stack
+and ELF layout remain below the kernel hole.  The page-table owner must first
+express user root indices as a non-contiguous architecture policy so new
+roots do not copy user entries 3--255 and drop releases them exactly once.
+High-address mapping, fork/COW, exec/drop, ASID reuse, and both architectures'
+existing lifecycle regressions are mandatory before a production window.
+The launch JSON's `production_diagnostics_disabled=true` field conflicts with
+the recorded dirty diagnostic source and 183 complete `BUILDSTORM_DIAG`
+snapshots.  That field is a runner metadata defect and is not used to
+classify this run as production evidence.
+
+Marker-to-final aggregate deltas were 1,262,953 `mmap` calls, 1,262,983
+`mmap_select` lock acquisitions, and 465,696 `mmap_commit` acquisitions.
+Thus approximately 797,287 selections did not reach the commit lock.  Source
+cross-checking shows the reachable initial-selection failure is
+`find_mmap_area(...)=None -> ENOMEM`; this is evidence of a high-rate late
+selection failure/retry storm, not evidence that calls are stuck between the
+two locks.  The same interval recorded 464,477 anonymous and 1,219 file mmap
+commits and 107,783 commit-time reselections.  This kernel did not yet emit
+request-length, selection-result, or maximum-free-gap counters, so the run
+cannot distinguish a legal large reservation from fragmentation, leaked VMA
+topology, or a too-small contiguous hole.  No production candidate is
+authorized from this run alone.
+
+The MemorySet site deltas were: `mmap_select` 978,855,888 us wait and
+46,767,579 us hold; `mmap_commit` 330,999,434 us wait and 336,230,797 us
+hold; `munmap` 248,168,673 us wait and 668,249,315 us hold; and
+`hardware_page_fault` 187,890,814 us wait and 237,072,823 us hold.  Aggregate
+`memory_set_activation` wait was 2,450,846,926 us while direct activation and
+TLB-shootdown work totaled only about 22.1 seconds.  The previously measured
+activation-token and munmap-only candidates both failed the retention gate,
+so these large cumulative values do not justify retrying either local change.
+
+The final snapshot had two rustc process groups, 17 rustc tasks, seven
+running and one ready rustc task.  All eight guest CPUs accumulated user
+ticks.  The final host thread sample showed all eight TCG vCPU threads at
+74.2--98.3% CPU and aggregate QEMU usage near 800%.  Host `vmstat` had
+`swpd/si/so=0`, `wa=0`; `iostat` showed negligible device utilization; and
+QEMU RSS was about 3.34 GiB.  Host swap, storage saturation, and a
+single-busy-QEMU-thread explanation are therefore rejected for this window.
+The next diagnostic must measure failed request size and sampled maximum free
+gap before selecting one production MM hypothesis.
+
+### 20260812 mmap request-size versus free-gap classification
+
+The follow-up feature-gated window is archived at
+`20260812-riscv64-diagnostics-smp8-mmap-result-window1800/`.  It used the
+unmodified official image, QEMU 11.0.3, and `-snapshot -m 8G -smp 8` for
+`1800.53675658` seconds after `BUILDSTORM_BEGIN`.  It reached 31 `Compiling`
+lines and two pre-main-build `Finished` lines.  The last event,
+`rustc-literal-escaper v0.0.7`, appeared 1330.49 seconds after the marker.
+There was no exact successful compile, panic, or OOM marker; QEMU exit `-9`
+was intentional window termination.  This run demonstrates very slow
+continued progress rather than a proven deterministic deadlock, but complete
+BuildStorm remains `unverified / not completed`.
+
+Marker-to-final mmap-result deltas were 452,272 successful initial selections,
+783,110 initial-selection ENOMEM results, 38,228 successful commit-time
+reselections, and 59,787 failed commit-time reselections.  The largest failed
+request was exactly 134,217,728 bytes (128 MiB).  Rate-limited scans made on
+the first and every 4096th initial failure never observed a free gap larger
+than 89,518,080 bytes (85.37 MiB), while the affected address space reached
+2,410 VMAs.  A different scan origin therefore cannot make these sampled
+128-MiB requests fit; the immediate boundary is insufficient contiguous
+virtual address space, not merely `next_mmap` scan overhead.
+
+The all-request length buckets contained 247,704 requests up to 64 KiB, 645
+up to 1 MiB, 457 up to 16 MiB, and 986,578 from 16 to 256 MiB.  Because these
+are all-request rather than failure-only buckets, they do not prove that all
+783,110 failures were 128-MiB requests.  They do prove a lower bound of
+534,304 failures from requests larger than 16 MiB: there were only 248,806
+requests of 16 MiB or less in the entire marker window.  Failure-only buckets
+are still required before selecting a production policy change.
+
+Source audit rules out three premature candidates.  `find_mmap_area` already
+wraps from the monotonic hint to `MMAP_BASE`, so resetting `next_mmap` can
+reduce scanning but cannot create a 128-MiB hole.  Lowering `MMAP_BASE` below
+512 MiB would allow mmap to consume the reserved brk-growth region and needs
+a general brk/mmap collision policy, not a BuildStorm-specific constant.
+Raising the RISC-V user ceiling above `0x8000_0000` is a cross-architecture
+page-table design change: root entry 2 currently holds the kernel identity
+mapping used while RISC-V handles ordinary user traps under the user root.
+Changing only `USER_STACK_TOP` would overlap live kernel mappings.
+
+The leading small hypothesis is now address-hole reuse after partial unmap.
+The source keeps a shared `MmContext::next_mmap` for `CLONE_VM`, advances it
+after successful mmap, and never moves it after munmap.  A 128-MiB anonymous
+reservation followed by partial trimming can therefore leave sub-128-MiB
+holes behind the cursor.  This matches the observed 128-MiB request and
+85.37-MiB maximum gap but remains inferred: the current diagnostics do not
+record failed-length buckets or whether munmap ranges lie below/overlap the
+cursor.  Those two aggregate counters are the remaining gate before any
+production cursor or address-layout candidate.
+
+Host evidence again excludes environmental saturation.  `vmstat` recorded
+zero swap-in/out and zero I/O wait, late `iostat` showed at most 0.40% device
+utilization, and all eight TCG vCPU threads were active at 74.6--97.7% CPU.
+The final guest snapshot had two rustc process groups, 17 rustc tasks, seven
+running and one ready.  Launch provenance is dirty-diff SHA-256
+`e790b55d2da0a7aa3bdcf6d02eb9d1aac2942be385ac1415fdf17514466bd72e`,
+kernel SHA-256
+`eed433b14bbd5e5a08f0423abac1de7abbabb851b9df339c2cf43add8d6b62fb`,
+and image SHA-256
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`.
+
+### 20260812 rejected high mmap window candidate
+
+The earlier proposal to give RISC-V user roots entries 3--255 is superseded
+by a wider page-table and physical-memory audit.  RISC-V kernel code and frame
+accesses dereference physical RAM through low-address identity mappings, the
+DTB registers the full 8 GiB guest RAM range with the frame allocator, and
+new user roots inherit those kernel mappings.  An 8 GiB guest therefore uses
+root entries beyond entry 2 for kernel-accessible RAM.  Treating entries
+3--255 as user-owned would overwrite or release live kernel mappings.  This
+was caught before QEMU validation and is not a runtime failure observation.
+
+A revised candidate kept entries 2--127 shared and used only Sv39 root
+entries 128--255, corresponding to the non-contiguous user mmap window
+`0x20_0000_0000..0x40_0000_0000`.  Stack, ELF, brk, the existing low mmap
+window, and TLB policy were unchanged.  Root creation copied only non-user
+entries, drop released only user-owned entries, and fixed ranges crossing the
+kernel/identity region remained invalid.  Independent RISC-V and LoongArch
+SMP regressions passed resident fault, COW, partial unmap, shared mapping,
+address-space isolation, drop, ASID reuse, and all-eight-CPU gates.  Both
+architectures also passed production and diagnostic release checks.
+
+The comparable production window is archived at
+`20260812-riscv64-production-smp8-mmap-high-window300/`.  It used source
+commit `055df99ff554441f7699c3518b1a4b204bd9c265` plus dirty-diff SHA-256
+`b0478ae5f2e40d91113d0664efdb801188054cf6d28464dbe9532df058c6df69`,
+kernel SHA-256
+`d650e3715e60b3af43e6269979bf8453fd19b8ed9a797a5ee4f3d70420d9010f`,
+the unchanged official image SHA-256
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`,
+QEMU 11.0.3, and `-snapshot -m 8G -smp 8` with production diagnostics
+disabled.
+
+At the exact 300-second marker boundary the candidate and retained control
+both reached 23 `Compiling` lines and ended at `ax-posix-api v0.5.29`.
+Progress improvement by the declared crate-count metric was therefore 0%.
+The first main-build compiling event moved from about 177.41 seconds to
+171.81 seconds (about 3.2%), but this auxiliary timing is below the 5% minimum
+and did not advance the completion boundary.  The candidate was immediately
+reverted under the retention rule.  No production address-space expansion is
+retained.
+
+The candidate emitted no kernel panic or OOM marker.  Host `vmstat` recorded
+`swpd/si/so=0` and `wa=0`; `iostat` was effectively idle; all eight TCG
+threads were active.  Environment pressure does not explain the null result.
+The serial log contains `BUILDSTORM_TOOLCHAIN ok`, `BUILDSTORM_MINIBUILD ok`,
+and `BUILDSTORM_BEGIN mode=multi`, but no exact
+`BUILDSTORM_COMPILE mode=multi ok=true`.  Complete BuildStorm remains
+`unverified / not completed`.
+
+### 20260812 rejected eager large-mmap segregation candidate
+
+The late 128-MiB `mmap` ENOMEM evidence justified one distinct follow-up to
+the rejected exhaustion-only high-window fallback. On RISC-V, mappings of at
+least 128 MiB with no explicit address hint were placed immediately in the
+process-owned positive-Sv39 range
+`0x20_0000_0000..0x40_0000_0000`; small mappings retained the low policy.
+Root entries 2--127 remained shared for the kernel's low identity mappings,
+while entries 128--255 were process-owned. LoongArch kept its contiguous low
+layout. The policy used mapping size only and contained no workload, path,
+command, crate, or output branch.
+
+Four production/diagnostic cfg checks, both production release builds, and
+both eight-CPU SMP regressions passed. The regressions covered the actual
+small/large address-selection policy plus high-range anonymous fault,
+fork/COW, partial unmap, drop, and fresh-root isolation. Both unchanged
+official images then emitted exact `BUILDSTORM_TOOLCHAIN ok` and
+`BUILDSTORM_MINIBUILD ok` markers under `-snapshot -m 8G -smp 8`.
+
+The production 300-second window rejected the candidate. It reached the same
+23 `Compiling` lines, two `Finished` lines, and final `ax-posix-api` crate as
+the current-commit exhaustion-fallback control. The first compiling event
+moved from 171.810 to 194.230 seconds and the 23rd event from 182.424 to
+204.443 seconds, regressions of 13.05% and 12.07%. Coarse crate-count
+progress improved 0%, below the mandatory 5% floor, so the seven production
+candidate files and their dedicated regression were reverted.
+
+The host was healthy: every `vmstat` sample had `swpd/si/so=0`, late samples
+had `wa=0`, storage utilization was negligible, aggregate QEMU CPU exceeded
+500% in sampled intervals, and the final thread snapshot showed activity on
+all eight TCG vCPU threads. Raw evidence and both official minibuild logs are
+under
+`20260812-riscv64-production-smp8-mmap-large-segregation-window300/`.
+Candidate kernel SHA-256 was
+`e8280e6e504586199c85bd2e994bc4567a072f7bc42c7df9990b8bbc7ea9ddf9`;
+official image SHA-256 remained
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`.
+There was no panic or OOM, but also no exact
+`BUILDSTORM_COMPILE mode=multi ok=true`; complete BuildStorm remains
+`unverified / not completed`. AI assisted with semantic boundary review,
+regression design, controlled execution, and evidence comparison; every
+claim is reproducible from the saved diff, serial log, JSON, and host metrics.
+
+### 20260812 exec-drop ownership attribution and retained frame-refcount candidate
+
+Three consecutive feature-gated 300-second runs isolated the previously
+stable early build-path delay without changing production behavior. The
+exec-replacement run measured 79 pointer publications at 64 us total and the
+same 79 synchronous old-`MemorySet` drops at 27,584,172 us. The owner-phase
+run split 30,447,665 us of old-set destruction into 56 us of ASID retirement,
+32,876 us of page-table owner destruction, and 30,414,417 us of
+VMA/resident owner destruction. The resident phase was 99.89% of measured
+old-set drop time, with a 27,469,086 us maximum individual event.
+
+The third run instrumented the global heap. Its marker-window delta was
+68,487,142 acquisitions, 4,369,406 contended acquisitions, 126,894,653 us
+wait, and 185,901,112 us hold. In that same interval resident destruction
+took 26,046,331 us, with a 24,007,677 us maximum. Because heap counters are
+global and instrumentation is heavy, these values are attribution evidence,
+not a production timing comparison. They verify that synchronous
+`areas -> ResidentSet -> ResidentPage -> FrameTracker` destruction reaches a
+high-rate heap serialization boundary; they do not prove every heap event was
+caused by frame destruction.
+
+The retained production candidate removes only the per-frame
+`Arc<FrameTrackerInner>` allocation. Immutable region-indexed arrays provide
+one `AtomicUsize` count per managed physical frame, and `FrameTracker` stores
+only the page number. Clone and last-owner drop preserve COW, shared mapping,
+and file-cache ownership semantics. The constructor is allocator-private;
+page-table adapters use an exclusive `into_raw_ppn` transfer; DMA contiguous
+frames remain raw owners. Assertions reject overflow, underflow,
+shared-to-raw transfer, and deallocation while tracked. No MemorySet lock,
+exec, VMA, PTE, TLB, scheduler, VFS, or block-cache policy changed.
+
+Four target/feature cfg checks passed. RISC-V64 and LoongArch64 eight-vCPU SMP
+regressions passed resident/user memory lifecycle and their final all-CPU
+markers. Both unchanged official images passed exact toolchain and minibuild
+markers. In the comparable RISC-V64 production window, the current-commit
+control reached its first and 23rd `Compiling` events at 171.810 and 182.424
+seconds; the candidate reached them at 49.057 and 57.669 seconds, 71.45% and
+68.39% earlier. Both reached 23 `Compiling` lines at 300 seconds, so the
+coarse crate-count improvement is 0%. The candidate is retained because its
+comparable early-boundary latency improvement exceeds 15%; this is not a
+claim about final compile time.
+
+Candidate kernel SHA-256 is
+`399a39a25a67b3b6edf1733f294ba552004e317c8fcb263a35704393fdad842d`;
+official image SHA-256 remains
+`d74e436522f5946ca17280a7a25f17dbb6604b71fe675bb8a021ce8e849b334c`.
+QEMU was 11.0.3 with `-snapshot -m 8G -smp 8`; production diagnostics were
+disabled. Host samples showed no swap or I/O wait, no storage saturation, and
+activity on all eight TCG vCPU threads. Raw evidence is under the three
+`20260812-riscv64-diagnostics-smp8-*phase-window300/` directories and
+`20260812-riscv64-production-smp8-frame-refcount-table-window300/`.
+
+The official `final-2026` branch was re-fetched on 2026-08-12 at
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`; the official script and judge
+SHA-256 values are `2f656a668076803fb465409374b6bcbb1fcbbc4f5c17a72b8ea4695668b9b33e`
+and `f9bc3c5c640217947775759b5b02aa4ceedfa76728d25d4f06d94ef5bc9d64dd`.
+AI assisted with aggregate analysis, source review, candidate implementation,
+and controlled validation. The complete production run and official judge
+remain pending. Until the exact `BUILDSTORM_COMPILE mode=multi ok=true`
+marker is recorded, complete BuildStorm is `unverified / not completed`.
+
+The final long-run host harness uses a nonblocking host-wide `flock` and an
+existing-QEMU check before creating launch evidence. This runner-only guard
+prevents monitor re-entry from starting concurrent QEMU workloads; it does
+not modify the official image, guest script, judge, marker, guest time, or
+production kernel. The host `pidstat` command uses `-t` so the evidence can
+distinguish activity across individual QEMU/TCG threads.

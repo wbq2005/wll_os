@@ -31,6 +31,38 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 
 更细的 syscall 状态、剩余风险和 suite 边界见 [docs/syscall-matrix.md](docs/syscall-matrix.md)。
 
+## BuildStorm 决赛状态
+
+2026-08-14，当前 production 内核在 QEMU 11.0.3、官方 `final-2026` glibc 镜像、`-snapshot -m 8G -smp 8` 配置下完成双架构 clean build，证据等级为 `official-pass`：
+
+| 架构 | 官方成功标记 | guest 编译时间 | 官方 judge 自动项 |
+| --- | --- | ---: | ---: |
+| RISC-V64 | `BUILDSTORM_COMPILE mode=multi ok=true` | 1322.99 s | 180/180 |
+| LoongArch64 | `BUILDSTORM_COMPILE mode=multi ok=true` | 1103.14 s | 180/180 |
+
+自动项包括 toolchain 8 分、minibuild 12 分、完整编译 40 分和本次 judge 基线下的时间分 120 分。内核设计优化文档 20 分由人工评审，不在上述自动结果中自行计分。正式评测机会重新测量同机 Linux 基线，因此最终时间分以评测机输出为准。
+
+评测和设计入口：
+
+- [BuildStorm 2.3 中文累计设计与优化记录](docs/buildstorm-2.3-design-optimization-cn.md)
+- [当前内核架构总设计](docs/kernel-architecture-overview-cn.md)
+- [历史累计设计记录](docs/buildstorm-kernel-design-optimization.md)
+- [双架构 official-pass 证据结论](docs/evidence/buildstorm-stage2/20260814-stage2-buildstorm-official-completion.md)
+
+完整运行命令如下，两个架构必须顺序执行，不能并发 QEMU：
+
+```bash
+python3 scripts/run_buildstorm.py --arch riscv64 \
+  --image /srv/buildstorm/images/sdcard-rv-pub.img \
+  --stage complete --timeout 15000 --memory 8G --smp 8
+
+python3 scripts/run_buildstorm.py --arch loongarch64 \
+  --image /srv/buildstorm/images/sdcard-la-pub.img \
+  --stage complete --timeout 15000 --memory 8G --smp 8
+```
+
+项目未修改官方镜像、suite、guest script、judge、marker 或 guest `/proc/uptime`，production 行为也不按 crate、测试路径、命令或输出分支。诊断聚合仅在 `buildstorm-diagnostics` feature 下启用，默认 production 关闭。
+
 ## 当前评测边界
 
 ### 默认构建特性
@@ -209,6 +241,8 @@ wll_os/
 AI 工具输出仅作为辅助建议使用。关键实现、调试验证、提交推送和最终设计取舍由参赛队成员确认完成。与 AI 工具相关的成果、交互记录和使用边界将在开发相关文档、项目设计文档及答辩 PPT 中单独章节继续说明；若后续新增 AI 工具或使用场景，将同步补充披露。
 
 本次 LTP/socket 边界扩展提交中，OpenAI Codex / GPT-5 主要用于辅助阅读现有 Makefile、评测脚本和内核 socket syscall 代码，整理 bounded LTP case 列表与文档说明，执行并汇总 scripts/perf_baseline_runner.py 的双架构 ltp / all 验证结果，以及辅助生成 Git 提交说明。AI 未替代最终工程判断；代码改动、验证结果、提交与推送由参赛队成员确认。
+
+BuildStorm 优化阶段中，OpenAI Codex / GPT-5 还用于交叉核对 dirty worktree、源码和官方 `final-2026` 脚本，建立 MM/调度/VFS/namespace 的可证伪根因模型，辅助实现通用内核修复与独立 SMP 回归，并组织单实例双架构 QEMU、原始日志和 provenance 留存。AI 没有生成或注入评测 marker，也没有修改官方镜像、judge 和 guest 时间。详细披露、人工可核验内容和完整复现步骤见 [BuildStorm 2.3 中文文档](docs/buildstorm-2.3-design-optimization-cn.md)。
 
 ## 非本队来源说明
 

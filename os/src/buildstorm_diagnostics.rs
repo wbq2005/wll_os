@@ -13,6 +13,187 @@ use crate::task::wait_queue::{BlockReason, WaitOutcome};
 
 const REPORT_INTERVAL_US: usize = 10 * 1_000_000;
 const CPU_SLOTS: usize = crate::config::MAX_CPUS;
+const MMAP_PROTOCOL_SLOTS: usize = 16;
+const EXITED_MMAP_PROTOCOL_SLOTS: usize = 128;
+
+struct MmapReservationSlot {
+    // Even values publish sequence << 1; the low bit is a transient writer lock.
+    state: AtomicUsize,
+    start: AtomicUsize,
+    end: AtomicUsize,
+    trims: AtomicUsize,
+}
+
+impl MmapReservationSlot {
+    const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            start: AtomicUsize::new(0),
+            end: AtomicUsize::new(0),
+            trims: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Fixed, thread-group-owned state for correlating generic large anonymous
+/// reservations with their subsequent prefix/suffix trims.
+pub(crate) struct MmapProtocol {
+    next_sequence: AtomicUsize,
+    attempts: AtomicUsize,
+    select_enomem: AtomicUsize,
+    commit_failures: AtomicUsize,
+    successes: AtomicUsize,
+    active: AtomicUsize,
+    evictions: AtomicUsize,
+    trim_first: AtomicUsize,
+    trim_second: AtomicUsize,
+    trim_extra: AtomicUsize,
+    trim_prefix: AtomicUsize,
+    trim_suffix: AtomicUsize,
+    full_release: AtomicUsize,
+    munmap_unmatched: AtomicUsize,
+    requested_bytes: AtomicUsize,
+    successful_bytes: AtomicUsize,
+    pending_slots: AtomicUsize,
+    slots: [MmapReservationSlot; MMAP_PROTOCOL_SLOTS],
+}
+
+impl MmapProtocol {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next_sequence: AtomicUsize::new(0),
+            attempts: AtomicUsize::new(0),
+            select_enomem: AtomicUsize::new(0),
+            commit_failures: AtomicUsize::new(0),
+            successes: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            evictions: AtomicUsize::new(0),
+            trim_first: AtomicUsize::new(0),
+            trim_second: AtomicUsize::new(0),
+            trim_extra: AtomicUsize::new(0),
+            trim_prefix: AtomicUsize::new(0),
+            trim_suffix: AtomicUsize::new(0),
+            full_release: AtomicUsize::new(0),
+            munmap_unmatched: AtomicUsize::new(0),
+            requested_bytes: AtomicUsize::new(0),
+            successful_bytes: AtomicUsize::new(0),
+            pending_slots: AtomicUsize::new(0),
+            slots: [const { MmapReservationSlot::new() }; MMAP_PROTOCOL_SLOTS],
+        }
+    }
+
+    fn snapshot(&self, tgid: usize) -> MmapProtocolSnapshot {
+        MmapProtocolSnapshot {
+            tgid,
+            last_sequence: self.next_sequence.load(Ordering::Relaxed),
+            attempts: self.attempts.load(Ordering::Relaxed),
+            select_enomem: self.select_enomem.load(Ordering::Relaxed),
+            commit_failures: self.commit_failures.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
+            active: self.active.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            trim_first: self.trim_first.load(Ordering::Relaxed),
+            trim_second: self.trim_second.load(Ordering::Relaxed),
+            trim_extra: self.trim_extra.load(Ordering::Relaxed),
+            trim_prefix: self.trim_prefix.load(Ordering::Relaxed),
+            trim_suffix: self.trim_suffix.load(Ordering::Relaxed),
+            full_release: self.full_release.load(Ordering::Relaxed),
+            munmap_unmatched: self.munmap_unmatched.load(Ordering::Relaxed),
+            requested_bytes: self.requested_bytes.load(Ordering::Relaxed),
+            successful_bytes: self.successful_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MmapProtocolSnapshot {
+    tgid: usize,
+    last_sequence: usize,
+    attempts: usize,
+    select_enomem: usize,
+    commit_failures: usize,
+    successes: usize,
+    active: usize,
+    evictions: usize,
+    trim_first: usize,
+    trim_second: usize,
+    trim_extra: usize,
+    trim_prefix: usize,
+    trim_suffix: usize,
+    full_release: usize,
+    munmap_unmatched: usize,
+    requested_bytes: usize,
+    successful_bytes: usize,
+}
+
+impl MmapProtocolSnapshot {
+    const EMPTY: Self = Self {
+        tgid: 0,
+        last_sequence: 0,
+        attempts: 0,
+        select_enomem: 0,
+        commit_failures: 0,
+        successes: 0,
+        active: 0,
+        evictions: 0,
+        trim_first: 0,
+        trim_second: 0,
+        trim_extra: 0,
+        trim_prefix: 0,
+        trim_suffix: 0,
+        full_release: 0,
+        munmap_unmatched: 0,
+        requested_bytes: 0,
+        successful_bytes: 0,
+    };
+}
+
+struct ExitedMmapProtocolArchive {
+    entries: [MmapProtocolSnapshot; EXITED_MMAP_PROTOCOL_SLOTS],
+    head: usize,
+    len: usize,
+    archived: usize,
+    reported: usize,
+    dropped: usize,
+}
+
+impl ExitedMmapProtocolArchive {
+    const fn new() -> Self {
+        Self {
+            entries: [MmapProtocolSnapshot::EMPTY; EXITED_MMAP_PROTOCOL_SLOTS],
+            head: 0,
+            len: 0,
+            archived: 0,
+            reported: 0,
+            dropped: 0,
+        }
+    }
+
+    fn push(&mut self, snapshot: MmapProtocolSnapshot) {
+        self.archived = self.archived.saturating_add(1);
+        if self.len == EXITED_MMAP_PROTOCOL_SLOTS {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        let index = (self.head + self.len) % EXITED_MMAP_PROTOCOL_SLOTS;
+        self.entries[index] = snapshot;
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<(usize, MmapProtocolSnapshot)> {
+        if self.len == 0 {
+            return None;
+        }
+        let snapshot = self.entries[self.head];
+        self.head = (self.head + 1) % EXITED_MMAP_PROTOCOL_SLOTS;
+        self.len -= 1;
+        self.reported = self.reported.saturating_add(1);
+        Some((self.reported, snapshot))
+    }
+}
+
+static EXITED_MMAP_PROTOCOLS: Mutex<ExitedMmapProtocolArchive> =
+    Mutex::new(ExitedMmapProtocolArchive::new());
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -68,7 +249,7 @@ const WORK_SLOTS: usize = WORK_NAMES.len();
 // VFS and ext4 paths already expose these stable phase boundaries.  Keep their
 // numeric IDs source-compatible while recording only fixed-size aggregates:
 // diagnostics must not log individual syscalls, path lookups, or block I/O.
-const PHASE_NAMES: [&str; 40] = [
+const PHASE_NAMES: [&str; 59] = [
     "readlink_user_path",
     "readlink_target",
     "readlink_copy_out",
@@ -109,6 +290,25 @@ const PHASE_NAMES: [&str; 40] = [
     "vfs_open_create_parent_probe",
     "vfs_open_create",
     "vfs_open_missing_errno",
+    "vfs_metadata_normalize_whiteout",
+    "vfs_metadata_tmpfs_route",
+    "vfs_metadata_ext4_path",
+    "vfs_metadata_mounted_ext4",
+    "vfs_metadata_missing_errno",
+    "exec_replace_swap",
+    "exec_replace_old_drop",
+    "exec_old_asid_retire",
+    "exec_old_page_table_drop",
+    "exec_old_resident_drop",
+    "namespace_create_parent_missing",
+    "namespace_create_backend_enoent",
+    "namespace_rename_old_parent_missing",
+    "namespace_rename_new_parent_missing",
+    "namespace_rename_source_missing",
+    "namespace_unlink_parent_missing",
+    "namespace_unlink_target_missing",
+    "namespace_positive_generation_crossing",
+    "namespace_negative_generation_crossing",
 ];
 const PHASE_SLOTS: usize = PHASE_NAMES.len();
 
@@ -186,6 +386,38 @@ const LOCK_NAMES: [&str; 11] = [
     "fd_table",
 ];
 const LOCK_SLOTS: usize = LOCK_NAMES.len();
+const HOT_LOCK_SAMPLE_SHIFT: usize = 10;
+const HOT_LOCK_SAMPLE_MASK: usize = (1 << HOT_LOCK_SAMPLE_SHIFT) - 1;
+const HOT_LOCK_SLOTS: usize = 6;
+const WORK_SAMPLE_SHIFT: usize = 10;
+const WORK_SAMPLE_MASK: usize = (1 << WORK_SAMPLE_SHIFT) - 1;
+const MEMORY_SET_OWNER_UNKNOWN: usize = MEMORY_SET_LOCK_SITE_SLOTS;
+const MEMORY_SET_OWNER_SLOTS: usize = MEMORY_SET_LOCK_SITE_SLOTS + 1;
+const HEAP_SIZE_BUCKETS: usize = 11;
+
+#[repr(align(64))]
+struct PerCpuCounter(AtomicUsize);
+
+impl PerCpuCounter {
+    const fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+
+    #[inline]
+    fn load(&self, ordering: Ordering) -> usize {
+        self.0.load(ordering)
+    }
+
+    #[inline]
+    fn store(&self, value: usize, ordering: Ordering) {
+        self.0.store(value, ordering);
+    }
+
+    #[inline]
+    fn fetch_add(&self, value: usize, ordering: Ordering) -> usize {
+        self.0.fetch_add(value, ordering)
+    }
+}
 
 /// Why a shared user address-space lock was acquired.
 ///
@@ -201,7 +433,8 @@ pub(crate) enum MemorySetLockSite {
     UserCopyRead,
     UserCopyWrite,
     Brk,
-    Mmap,
+    MmapSelect,
+    MmapCommit,
     Mprotect,
     Munmap,
     FileInvalidate,
@@ -212,14 +445,15 @@ pub(crate) enum MemorySetLockSite {
     Futex,
 }
 
-const MEMORY_SET_LOCK_SITE_NAMES: [&str; 15] = [
+const MEMORY_SET_LOCK_SITE_NAMES: [&str; 16] = [
     "other",
     "user_entry_activation",
     "hardware_page_fault",
     "user_copy_read",
     "user_copy_write",
     "brk",
-    "mmap",
+    "mmap_select",
+    "mmap_commit",
     "mprotect",
     "munmap",
     "file_invalidate",
@@ -230,6 +464,35 @@ const MEMORY_SET_LOCK_SITE_NAMES: [&str; 15] = [
     "futex",
 ];
 const MEMORY_SET_LOCK_SITE_SLOTS: usize = MEMORY_SET_LOCK_SITE_NAMES.len();
+
+static MMAP_ANONYMOUS: AtomicUsize = AtomicUsize::new(0);
+static MMAP_FILE: AtomicUsize = AtomicUsize::new(0);
+static MMAP_FIXED: AtomicUsize = AtomicUsize::new(0);
+static MMAP_HINTED: AtomicUsize = AtomicUsize::new(0);
+static MMAP_LAZY: AtomicUsize = AtomicUsize::new(0);
+static MMAP_EAGER: AtomicUsize = AtomicUsize::new(0);
+static MMAP_COMMIT_RESELECT: AtomicUsize = AtomicUsize::new(0);
+const MMAP_LENGTH_BUCKETS: usize = 5;
+static MMAP_LENGTH_COUNTS: [AtomicUsize; MMAP_LENGTH_BUCKETS] =
+    [const { AtomicUsize::new(0) }; MMAP_LENGTH_BUCKETS];
+static MMAP_FAILED_LENGTH_COUNTS: [AtomicUsize; MMAP_LENGTH_BUCKETS] =
+    [const { AtomicUsize::new(0) }; MMAP_LENGTH_BUCKETS];
+static MMAP_SELECT_OK: AtomicUsize = AtomicUsize::new(0);
+static MMAP_SELECT_ENOMEM: AtomicUsize = AtomicUsize::new(0);
+static MMAP_COMMIT_RESELECT_OK: AtomicUsize = AtomicUsize::new(0);
+static MMAP_COMMIT_RESELECT_ENOMEM: AtomicUsize = AtomicUsize::new(0);
+static MMAP_FAILED_LENGTH_MAX: AtomicUsize = AtomicUsize::new(0);
+static MMAP_FAILED_GAP_MAX: AtomicUsize = AtomicUsize::new(0);
+static MMAP_FAILED_VMAS_MAX: AtomicUsize = AtomicUsize::new(0);
+static MMAP_HIGH_ARENA_PLACEMENTS: AtomicUsize = AtomicUsize::new(0);
+static MMAP_LOW_ARENA_PLACEMENTS: AtomicUsize = AtomicUsize::new(0);
+static MUNMAP_BELOW_CURSOR_LENGTH_COUNTS: [AtomicUsize; MMAP_LENGTH_BUCKETS] =
+    [const { AtomicUsize::new(0) }; MMAP_LENGTH_BUCKETS];
+static MUNMAP_OVERLAPS_CURSOR: AtomicUsize = AtomicUsize::new(0);
+static MUNMAP_AT_OR_ABOVE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_EXITS: AtomicUsize = AtomicUsize::new(0);
+static CHILD_WAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CHILD_WOKEN: AtomicUsize = AtomicUsize::new(0);
 
 const BLOCK_NAMES: [&str; 7] = [
     "block_io",
@@ -616,7 +879,9 @@ static BLOCKED_OWNER_TIMED_MAX_US: [AtomicUsize; CPU_SLOTS] =
 static BLOCKED_OWNER_EMPTY_ITERATIONS: [AtomicUsize; CPU_SLOTS] =
     [const { AtomicUsize::new(0) }; CPU_SLOTS];
 
-static WORK_COUNTS: [AtomicUsize; WORK_SLOTS] = [const { AtomicUsize::new(0) }; WORK_SLOTS];
+static WORK_COUNTS_PER_CPU: [[PerCpuCounter; CPU_SLOTS]; WORK_SLOTS] =
+    [const { [const { PerCpuCounter::new() }; CPU_SLOTS] }; WORK_SLOTS];
+static WORK_SAMPLES: [AtomicUsize; WORK_SLOTS] = [const { AtomicUsize::new(0) }; WORK_SLOTS];
 static WORK_TOTAL_US: [AtomicUsize; WORK_SLOTS] = [const { AtomicUsize::new(0) }; WORK_SLOTS];
 static WORK_MAX_US: [AtomicUsize; WORK_SLOTS] = [const { AtomicUsize::new(0) }; WORK_SLOTS];
 static PHASE_COUNTS: [AtomicUsize; PHASE_SLOTS] = [const { AtomicUsize::new(0) }; PHASE_SLOTS];
@@ -773,8 +1038,10 @@ static LOCK_WAIT_TOTAL_US: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new
 static LOCK_WAIT_MAX_US: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new(0) }; LOCK_SLOTS];
 static LOCK_HOLD_TOTAL_US: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new(0) }; LOCK_SLOTS];
 static LOCK_HOLD_MAX_US: [AtomicUsize; LOCK_SLOTS] = [const { AtomicUsize::new(0) }; LOCK_SLOTS];
-static MEMORY_SET_LOCK_SITE_ACQUIRES: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
-    [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
+static HOT_LOCK_ACQUIRES: [[PerCpuCounter; CPU_SLOTS]; HOT_LOCK_SLOTS] =
+    [const { [const { PerCpuCounter::new() }; CPU_SLOTS] }; HOT_LOCK_SLOTS];
+static HOT_LOCK_SAMPLES: [AtomicUsize; HOT_LOCK_SLOTS] =
+    [const { AtomicUsize::new(0) }; HOT_LOCK_SLOTS];
 static MEMORY_SET_LOCK_SITE_CONTENDED: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
     [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
 static MEMORY_SET_LOCK_SITE_WAIT_TOTAL_US: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
@@ -785,6 +1052,33 @@ static MEMORY_SET_LOCK_SITE_HOLD_TOTAL_US: [AtomicUsize; MEMORY_SET_LOCK_SITE_SL
     [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
 static MEMORY_SET_LOCK_SITE_HOLD_MAX_US: [AtomicUsize; MEMORY_SET_LOCK_SITE_SLOTS] =
     [const { AtomicUsize::new(0) }; MEMORY_SET_LOCK_SITE_SLOTS];
+static MEMORY_SET_SITE_ACQUIRES_PER_CPU: [[PerCpuCounter; CPU_SLOTS]; MEMORY_SET_LOCK_SITE_SLOTS] =
+    [const { [const { PerCpuCounter::new() }; CPU_SLOTS] }; MEMORY_SET_LOCK_SITE_SLOTS];
+static MEMORY_SET_OWNER_MUTEX: [PerCpuCounter; CPU_SLOTS] =
+    [const { PerCpuCounter::new() }; CPU_SLOTS];
+static MEMORY_SET_OWNER_SITE: [PerCpuCounter; CPU_SLOTS] =
+    [const { PerCpuCounter::new() }; CPU_SLOTS];
+static MEMORY_SET_OWNER_WAITER_SAMPLES: [[AtomicUsize; MEMORY_SET_OWNER_SLOTS];
+    MEMORY_SET_LOCK_SITE_SLOTS] =
+    [const { [const { AtomicUsize::new(0) }; MEMORY_SET_OWNER_SLOTS] }; MEMORY_SET_LOCK_SITE_SLOTS];
+static HEAP_ALLOC_SAMPLES: [[AtomicUsize; CPU_SLOTS]; HEAP_SIZE_BUCKETS] =
+    [const { [const { AtomicUsize::new(0) }; CPU_SLOTS] }; HEAP_SIZE_BUCKETS];
+static HEAP_FREE_SAMPLES: [[AtomicUsize; CPU_SLOTS]; HEAP_SIZE_BUCKETS] =
+    [const { [const { AtomicUsize::new(0) }; CPU_SLOTS] }; HEAP_SIZE_BUCKETS];
+static HEAP_ALLOC_SAMPLE_BYTES: [[AtomicUsize; CPU_SLOTS]; HEAP_SIZE_BUCKETS] =
+    [const { [const { AtomicUsize::new(0) }; CPU_SLOTS] }; HEAP_SIZE_BUCKETS];
+static HEAP_FREE_SAMPLE_BYTES: [[AtomicUsize; CPU_SLOTS]; HEAP_SIZE_BUCKETS] =
+    [const { [const { AtomicUsize::new(0) }; CPU_SLOTS] }; HEAP_SIZE_BUCKETS];
+static ACTIVE_USER_PID: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_USER_SINCE_US: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_USER_LAST_EXIT_US: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_USER_ENTRIES: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_USER_TRAP_KIND: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_USER_TRAP_SINCE_US: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_USER_TRAP_ENTRIES: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
 
 #[inline]
 fn now_us() -> usize {
@@ -835,8 +1129,7 @@ pub(crate) fn note_user_tick() {
 pub(crate) fn note_kernel_tick() {
     KERNEL_TICKS[cpu_slot()].fetch_add(1, Ordering::Relaxed);
     if let Some(task) = crate::task::current_task() {
-        task.diagnostic_kernel_ticks
-            .fetch_add(1, Ordering::Relaxed);
+        task.diagnostic_kernel_ticks.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -865,6 +1158,40 @@ pub(crate) fn note_user_run(elapsed_us: usize, escape_kind: usize) {
         2 => USER_RUN_IRQ[cpu].fetch_add(1, Ordering::Relaxed),
         _ => USER_RUN_OTHER[cpu].fetch_add(1, Ordering::Relaxed),
     };
+}
+
+#[inline]
+pub(crate) fn note_user_run_enter(pid: usize) {
+    let cpu = cpu_slot();
+    ACTIVE_USER_SINCE_US[cpu].store(now_us(), Ordering::Relaxed);
+    ACTIVE_USER_ENTRIES[cpu].fetch_add(1, Ordering::Relaxed);
+    ACTIVE_USER_PID[cpu].store(pid, Ordering::Release);
+}
+
+#[inline]
+pub(crate) fn note_user_run_exit() {
+    let cpu = cpu_slot();
+    ACTIVE_USER_PID[cpu].store(0, Ordering::Release);
+    ACTIVE_USER_LAST_EXIT_US[cpu].store(now_us(), Ordering::Relaxed);
+}
+
+pub(crate) struct UserTrapScope {
+    cpu: usize,
+}
+
+impl Drop for UserTrapScope {
+    fn drop(&mut self) {
+        ACTIVE_USER_TRAP_KIND[self.cpu].store(0, Ordering::Release);
+    }
+}
+
+#[inline]
+pub(crate) fn note_user_trap_enter(kind: usize) -> UserTrapScope {
+    let cpu = cpu_slot();
+    ACTIVE_USER_TRAP_SINCE_US[cpu].store(now_us(), Ordering::Relaxed);
+    ACTIVE_USER_TRAP_ENTRIES[cpu].fetch_add(1, Ordering::Relaxed);
+    ACTIVE_USER_TRAP_KIND[cpu].store(kind, Ordering::Release);
+    UserTrapScope { cpu }
 }
 
 #[inline]
@@ -1144,8 +1471,7 @@ pub(crate) fn note_block_end(task: &crate::task::TaskControlBlock, outcome: Wait
     BLOCK_TOTAL_US[slot].fetch_add(elapsed, Ordering::Relaxed);
     BLOCK_MAX_US[slot].fetch_max(elapsed, Ordering::Relaxed);
     BLOCK_ACTOR_TOTAL_US[actor_slot].fetch_add(elapsed, Ordering::Relaxed);
-    task.diagnostic_block_count
-        .fetch_add(1, Ordering::Relaxed);
+    task.diagnostic_block_count.fetch_add(1, Ordering::Relaxed);
     task.diagnostic_block_total_us
         .fetch_add(elapsed, Ordering::Relaxed);
     match outcome {
@@ -1182,23 +1508,32 @@ pub(crate) fn note_woken_task_dispatched(task: &crate::task::TaskControlBlock) {
 pub(crate) struct WorkScope {
     class: WorkClass,
     started_at: usize,
+    sampled: bool,
 }
 
 impl WorkScope {
     #[inline]
     pub(crate) fn new(class: WorkClass) -> Self {
+        let slot = class as usize;
+        let cpu = cpu_slot();
+        let sampled =
+            WORK_COUNTS_PER_CPU[slot][cpu].fetch_add(1, Ordering::Relaxed) & WORK_SAMPLE_MASK == 0;
         Self {
             class,
-            started_at: now_us(),
+            started_at: sampled.then(now_us).unwrap_or(0),
+            sampled,
         }
     }
 }
 
 impl Drop for WorkScope {
     fn drop(&mut self) {
+        if !self.sampled {
+            return;
+        }
         let slot = self.class as usize;
         let elapsed = now_us().saturating_sub(self.started_at);
-        WORK_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
+        WORK_SAMPLES[slot].fetch_add(1, Ordering::Relaxed);
         WORK_TOTAL_US[slot].fetch_add(elapsed, Ordering::Relaxed);
         WORK_MAX_US[slot].fetch_max(elapsed, Ordering::Relaxed);
     }
@@ -1260,40 +1595,58 @@ impl PageFaultResolutionScope {
 }
 
 pub(crate) struct TimedLockGuard<'a, T> {
-    guard: MutexGuard<'a, T>,
+    guard: Option<MutexGuard<'a, T>>,
     class: LockClass,
     memory_set_site: Option<MemorySetLockSite>,
     acquired_at: usize,
+    sampled: bool,
+    owner_cpu: Option<usize>,
 }
 
 impl<T> Deref for TimedLockGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        self.guard.as_ref().expect("diagnostic lock guard missing")
     }
 }
 impl<T> DerefMut for TimedLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+        self.guard.as_mut().expect("diagnostic lock guard missing")
     }
 }
 impl<T> Drop for TimedLockGuard<'_, T> {
     fn drop(&mut self) {
-        let slot = self.class as usize;
-        let hold = now_us().saturating_sub(self.acquired_at);
-        LOCK_HOLD_TOTAL_US[slot].fetch_add(hold, Ordering::Relaxed);
-        LOCK_HOLD_MAX_US[slot].fetch_max(hold, Ordering::Relaxed);
-        if let Some(site) = self.memory_set_site {
-            let site = site as usize;
-            MEMORY_SET_LOCK_SITE_HOLD_TOTAL_US[site].fetch_add(hold, Ordering::Relaxed);
-            MEMORY_SET_LOCK_SITE_HOLD_MAX_US[site].fetch_max(hold, Ordering::Relaxed);
+        if self.sampled {
+            let slot = self.class as usize;
+            let hold = now_us().saturating_sub(self.acquired_at);
+            LOCK_HOLD_TOTAL_US[slot].fetch_add(hold, Ordering::Relaxed);
+            LOCK_HOLD_MAX_US[slot].fetch_max(hold, Ordering::Relaxed);
+            if let Some(site) = self.memory_set_site {
+                let site = site as usize;
+                MEMORY_SET_LOCK_SITE_HOLD_TOTAL_US[site].fetch_add(hold, Ordering::Relaxed);
+                MEMORY_SET_LOCK_SITE_HOLD_MAX_US[site].fetch_max(hold, Ordering::Relaxed);
+            }
+        }
+        drop(self.guard.take());
+        if let Some(cpu) = self.owner_cpu {
+            MEMORY_SET_OWNER_MUTEX[cpu].store(0, Ordering::Release);
+            MEMORY_SET_OWNER_SITE[cpu].store(0, Ordering::Relaxed);
         }
     }
 }
 
 #[inline]
 pub(crate) fn lock<'a, T>(class: LockClass, mutex: &'a Mutex<T>) -> TimedLockGuard<'a, T> {
-    lock_with_memory_set_site(class, None, mutex)
+    lock_with_memory_set_site(class, None, None, mutex)
+}
+
+#[inline]
+pub(crate) fn lock_heap<'a, T>(
+    mutex: &'a Mutex<T>,
+    size: usize,
+    allocation: bool,
+) -> TimedLockGuard<'a, T> {
+    lock_with_memory_set_site(LockClass::Heap, None, Some((size, allocation)), mutex)
 }
 
 #[inline]
@@ -1301,36 +1654,417 @@ pub(crate) fn lock_memory_set<'a, T>(
     site: MemorySetLockSite,
     mutex: &'a Mutex<T>,
 ) -> TimedLockGuard<'a, T> {
-    lock_with_memory_set_site(LockClass::MemorySet, Some(site), mutex)
+    lock_with_memory_set_site(LockClass::MemorySet, Some(site), None, mutex)
 }
 
 #[inline]
-pub(crate) fn lock_memory_set_activation<'a, T>(
-    mutex: &'a Mutex<T>,
-) -> TimedLockGuard<'a, T> {
+pub(crate) fn lock_memory_set_activation<'a, T>(mutex: &'a Mutex<T>) -> TimedLockGuard<'a, T> {
     lock_with_memory_set_site(
         LockClass::MemorySetActivation,
         Some(MemorySetLockSite::UserEntryActivation),
+        None,
         mutex,
     )
+}
+
+#[inline]
+pub(crate) fn note_mmap_shape(anonymous: bool, fixed: bool, hinted: bool, lazy: bool) {
+    if anonymous {
+        MMAP_ANONYMOUS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        MMAP_FILE.fetch_add(1, Ordering::Relaxed);
+    }
+    if fixed {
+        MMAP_FIXED.fetch_add(1, Ordering::Relaxed);
+    }
+    if hinted {
+        MMAP_HINTED.fetch_add(1, Ordering::Relaxed);
+    }
+    if lazy {
+        MMAP_LAZY.fetch_add(1, Ordering::Relaxed);
+    } else {
+        MMAP_EAGER.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn mmap_length_bucket(length: usize) -> usize {
+    if length <= 64 * 1024 {
+        0
+    } else if length <= 1024 * 1024 {
+        1
+    } else if length <= 16 * 1024 * 1024 {
+        2
+    } else if length <= 256 * 1024 * 1024 {
+        3
+    } else {
+        4
+    }
+}
+
+#[inline]
+pub(crate) fn note_mmap_request(length: usize) {
+    MMAP_LENGTH_COUNTS[mmap_length_bucket(length)].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn note_mmap_placement(start: usize) {
+    if crate::config::user_va::HIGH_MMAP_ARENA.contains_addr(start) {
+        MMAP_HIGH_ARENA_PLACEMENTS.fetch_add(1, Ordering::Relaxed);
+    } else if crate::config::user_va::LOW_MMAP_ARENA.contains_addr(start) {
+        MMAP_LOW_ARENA_PLACEMENTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn note_mmap_select_ok() {
+    MMAP_SELECT_OK.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn note_mmap_select_enomem(length: usize, vmas: usize) -> bool {
+    let prior = MMAP_SELECT_ENOMEM.fetch_add(1, Ordering::Relaxed);
+    MMAP_FAILED_LENGTH_COUNTS[mmap_length_bucket(length)].fetch_add(1, Ordering::Relaxed);
+    MMAP_FAILED_LENGTH_MAX.fetch_max(length, Ordering::Relaxed);
+    MMAP_FAILED_VMAS_MAX.fetch_max(vmas, Ordering::Relaxed);
+    prior == 0 || prior % 4096 == 0
+}
+
+#[inline]
+pub(crate) fn note_munmap_cursor(start: usize, end: usize, cursor: usize) {
+    if end <= cursor {
+        MUNMAP_BELOW_CURSOR_LENGTH_COUNTS[mmap_length_bucket(end.saturating_sub(start))]
+            .fetch_add(1, Ordering::Relaxed);
+    } else if start < cursor {
+        MUNMAP_OVERLAPS_CURSOR.fetch_add(1, Ordering::Relaxed);
+    } else {
+        MUNMAP_AT_OR_ABOVE_CURSOR.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn note_mmap_failed_gap(max_gap: usize) {
+    MMAP_FAILED_GAP_MAX.fetch_max(max_gap, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn note_mmap_commit_reselect(ok: bool) {
+    MMAP_COMMIT_RESELECT.fetch_add(1, Ordering::Relaxed);
+    if ok {
+        MMAP_COMMIT_RESELECT_OK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        MMAP_COMMIT_RESELECT_ENOMEM.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) struct MmapProtocolAttempt<'a> {
+    protocol: &'a MmapProtocol,
+    sequence: usize,
+    finished: bool,
+}
+
+impl MmapProtocolAttempt<'_> {
+    pub(crate) fn select_enomem(mut self) {
+        self.protocol.select_enomem.fetch_add(1, Ordering::Relaxed);
+        self.finished = true;
+    }
+
+    pub(crate) fn success(mut self, start: usize, end: usize) {
+        note_mmap_protocol_success(self.protocol, self.sequence, start, end);
+        self.finished = true;
+    }
+}
+
+impl Drop for MmapProtocolAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.protocol
+                .commit_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn begin_mmap_protocol(
+    group: &crate::task::ThreadGroup,
+    length: usize,
+) -> MmapProtocolAttempt<'_> {
+    let protocol = &group.diagnostic_mmap_protocol;
+    let sequence = protocol.next_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    protocol.attempts.fetch_add(1, Ordering::Relaxed);
+    protocol
+        .requested_bytes
+        .fetch_add(length, Ordering::Relaxed);
+    MmapProtocolAttempt {
+        protocol,
+        sequence,
+        finished: false,
+    }
+}
+
+fn note_mmap_protocol_success(protocol: &MmapProtocol, sequence: usize, start: usize, end: usize) {
+    let slot_index = (sequence - 1) % MMAP_PROTOCOL_SLOTS;
+    let slot = &protocol.slots[slot_index];
+    let mut previous = slot.state.load(Ordering::Acquire);
+    let mut acquired = false;
+    for _ in 0..4 {
+        if previous & 1 != 0 {
+            core::hint::spin_loop();
+            previous = slot.state.load(Ordering::Acquire);
+            continue;
+        }
+        match slot.state.compare_exchange(
+            previous,
+            previous | 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                acquired = true;
+                break;
+            }
+            Err(value) => previous = value,
+        }
+    }
+    if !acquired {
+        protocol.evictions.fetch_add(1, Ordering::Relaxed);
+        protocol.successes.fetch_add(1, Ordering::Relaxed);
+        protocol
+            .successful_bytes
+            .fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+        return;
+    }
+    if previous == 0 {
+        protocol.active.fetch_add(1, Ordering::Relaxed);
+    } else {
+        protocol.evictions.fetch_add(1, Ordering::Relaxed);
+    }
+    slot.start.store(start, Ordering::Relaxed);
+    slot.end.store(end, Ordering::Relaxed);
+    slot.trims.store(0, Ordering::Relaxed);
+    slot.state.store(sequence << 1, Ordering::Release);
+    protocol
+        .pending_slots
+        .fetch_or(1usize << slot_index, Ordering::Release);
+    protocol.successes.fetch_add(1, Ordering::Relaxed);
+    protocol
+        .successful_bytes
+        .fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+}
+
+pub(crate) fn note_munmap_protocol(group: &crate::task::ThreadGroup, start: usize, end: usize) {
+    let protocol = &group.diagnostic_mmap_protocol;
+    let pending = protocol.pending_slots.load(Ordering::Acquire);
+    if pending == 0 {
+        if protocol.attempts.load(Ordering::Relaxed) != 0 {
+            protocol.munmap_unmatched.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    for slot_index in 0..MMAP_PROTOCOL_SLOTS {
+        if pending & (1usize << slot_index) == 0 {
+            continue;
+        }
+        let slot = &protocol.slots[slot_index];
+        let state = slot.state.load(Ordering::Acquire);
+        if state == 0 || state & 1 != 0 {
+            continue;
+        }
+        if slot
+            .state
+            .compare_exchange(state, state | 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+
+        let reservation_start = slot.start.load(Ordering::Relaxed);
+        let reservation_end = slot.end.load(Ordering::Relaxed);
+        if start == reservation_start && end == reservation_end {
+            protocol
+                .pending_slots
+                .fetch_and(!(1usize << slot_index), Ordering::Release);
+            protocol.active.fetch_sub(1, Ordering::Relaxed);
+            slot.state.store(0, Ordering::Release);
+            protocol.full_release.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let prefix = start == reservation_start && end > start && end < reservation_end;
+        let suffix = end == reservation_end && start > reservation_start && start < end;
+        if prefix || suffix {
+            if prefix {
+                slot.start.store(end, Ordering::Relaxed);
+                protocol.trim_prefix.fetch_add(1, Ordering::Relaxed);
+            } else {
+                slot.end.store(start, Ordering::Relaxed);
+                protocol.trim_suffix.fetch_add(1, Ordering::Relaxed);
+            }
+            let prior_trims = slot.trims.fetch_add(1, Ordering::Relaxed);
+            match prior_trims {
+                0 => &protocol.trim_first,
+                1 => &protocol.trim_second,
+                _ => &protocol.trim_extra,
+            }
+            .fetch_add(1, Ordering::Relaxed);
+            if prior_trims >= 1 {
+                protocol
+                    .pending_slots
+                    .fetch_and(!(1usize << slot_index), Ordering::Release);
+                protocol.active.fetch_sub(1, Ordering::Relaxed);
+                slot.state.store(0, Ordering::Release);
+            } else {
+                slot.state.store(state, Ordering::Release);
+            }
+            return;
+        }
+        slot.state.store(state, Ordering::Release);
+    }
+    protocol.munmap_unmatched.fetch_add(1, Ordering::Relaxed);
+}
+
+fn print_mmap_protocol(label: &str, archive_sequence: usize, snapshot: MmapProtocolSnapshot) {
+    if snapshot.attempts == 0 {
+        return;
+    }
+    crate::println!(
+        "BUILDSTORM_DIAG {} archive_sequence={} tgid={} last_sequence={} attempts={} select_enomem={} commit_failures={} successes={} active={} evictions={} trim_first={} trim_second={} trim_extra={} trim_prefix={} trim_suffix={} full_release={} munmap_unmatched={} requested_bytes={} successful_bytes={}",
+        label,
+        archive_sequence,
+        snapshot.tgid,
+        snapshot.last_sequence,
+        snapshot.attempts,
+        snapshot.select_enomem,
+        snapshot.commit_failures,
+        snapshot.successes,
+        snapshot.active,
+        snapshot.evictions,
+        snapshot.trim_first,
+        snapshot.trim_second,
+        snapshot.trim_extra,
+        snapshot.trim_prefix,
+        snapshot.trim_suffix,
+        snapshot.full_release,
+        snapshot.munmap_unmatched,
+        snapshot.requested_bytes,
+        snapshot.successful_bytes,
+    );
+}
+
+pub(crate) fn report_mmap_protocol(group: &crate::task::ThreadGroup) {
+    print_mmap_protocol(
+        "mmap_protocol",
+        0,
+        group.diagnostic_mmap_protocol.snapshot(group.tgid()),
+    );
+}
+
+pub(crate) fn archive_mmap_protocol(group: &crate::task::ThreadGroup) {
+    let snapshot = group.diagnostic_mmap_protocol.snapshot(group.tgid());
+    if snapshot.attempts != 0 {
+        EXITED_MMAP_PROTOCOLS.lock().push(snapshot);
+    }
+}
+
+fn report_exited_mmap_protocols() {
+    loop {
+        let archived = { EXITED_MMAP_PROTOCOLS.lock().pop() };
+        let Some((archive_sequence, snapshot)) = archived else {
+            break;
+        };
+        print_mmap_protocol("mmap_protocol_exit", archive_sequence, snapshot);
+    }
+    let (archived, reported, dropped, pending) = {
+        let archive = EXITED_MMAP_PROTOCOLS.lock();
+        (
+            archive.archived,
+            archive.reported,
+            archive.dropped,
+            archive.len,
+        )
+    };
+    crate::println!(
+        "BUILDSTORM_DIAG mmap_protocol_archive archived={} reported={} dropped={} pending={} capacity={}",
+        archived,
+        reported,
+        dropped,
+        pending,
+        EXITED_MMAP_PROTOCOL_SLOTS,
+    );
+}
+
+#[inline]
+pub(crate) fn note_process_exit() {
+    PROCESS_EXITS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn note_child_wake(woken: usize) {
+    CHILD_WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+    CHILD_WOKEN.fetch_add(woken, Ordering::Relaxed);
 }
 
 #[inline]
 fn lock_with_memory_set_site<'a, T>(
     class: LockClass,
     memory_set_site: Option<MemorySetLockSite>,
+    heap_layout: Option<(usize, bool)>,
     mutex: &'a Mutex<T>,
 ) -> TimedLockGuard<'a, T> {
     let slot = class as usize;
-    let started = now_us();
-    let (guard, contended) = match mutex.try_lock() {
-        Some(guard) => (guard, false),
-        None => (mutex.lock(), true),
+    let cpu = cpu_slot();
+    let hot_slot = match class {
+        LockClass::Heap => Some(0),
+        LockClass::MemorySet => Some(1),
+        LockClass::MemorySetActivation => Some(2),
+        LockClass::TaskManager => Some(3),
+        LockClass::FrameAllocator => Some(4),
+        LockClass::BlockCache => Some(5),
+        _ => None,
     };
-    let acquired = now_us();
-    LOCK_ACQUIRES[slot].fetch_add(1, Ordering::Relaxed);
+    let sampled = if let Some(hot_slot) = hot_slot {
+        HOT_LOCK_ACQUIRES[hot_slot][cpu].fetch_add(1, Ordering::Relaxed) & HOT_LOCK_SAMPLE_MASK == 0
+    } else {
+        LOCK_ACQUIRES[slot].fetch_add(1, Ordering::Relaxed);
+        true
+    };
     if let Some(site) = memory_set_site {
-        MEMORY_SET_LOCK_SITE_ACQUIRES[site as usize].fetch_add(1, Ordering::Relaxed);
+        MEMORY_SET_SITE_ACQUIRES_PER_CPU[site as usize][cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    if sampled {
+        if let Some((size, allocation)) = heap_layout {
+            let bucket = heap_size_bucket(size);
+            let (counts, bytes) = if allocation {
+                (&HEAP_ALLOC_SAMPLES, &HEAP_ALLOC_SAMPLE_BYTES)
+            } else {
+                (&HEAP_FREE_SAMPLES, &HEAP_FREE_SAMPLE_BYTES)
+            };
+            counts[bucket][cpu].fetch_add(1, Ordering::Relaxed);
+            bytes[bucket][cpu].fetch_add(size, Ordering::Relaxed);
+        }
+    }
+
+    let mutex_addr = mutex as *const Mutex<T> as usize;
+    let started = sampled.then(now_us).unwrap_or(0);
+    let (guard, contended) = if sampled {
+        match mutex.try_lock() {
+            Some(guard) => (guard, false),
+            None => {
+                if let Some(waiter_site) = memory_set_site {
+                    note_memory_set_owner_waiter_sample(mutex_addr, waiter_site);
+                }
+                (mutex.lock(), true)
+            }
+        }
+    } else {
+        (mutex.lock(), false)
+    };
+    let acquired = sampled.then(now_us).unwrap_or(0);
+    if let Some(hot_slot) = hot_slot {
+        if sampled {
+            HOT_LOCK_SAMPLES[hot_slot].fetch_add(1, Ordering::Relaxed);
+        }
     }
     if contended {
         let waited = acquired.saturating_sub(started);
@@ -1344,11 +2078,81 @@ fn lock_with_memory_set_site<'a, T>(
             MEMORY_SET_LOCK_SITE_WAIT_MAX_US[site].fetch_max(waited, Ordering::Relaxed);
         }
     }
+    let owner_cpu = memory_set_site.map(|site| {
+        MEMORY_SET_OWNER_SITE[cpu].store(site as usize + 1, Ordering::Relaxed);
+        MEMORY_SET_OWNER_MUTEX[cpu].store(mutex_addr, Ordering::Release);
+        cpu
+    });
     TimedLockGuard {
-        guard,
+        guard: Some(guard),
         class,
         memory_set_site,
         acquired_at: acquired,
+        sampled,
+        owner_cpu,
+    }
+}
+
+#[inline]
+fn note_memory_set_owner_waiter_sample(mutex_addr: usize, waiter_site: MemorySetLockSite) {
+    let mut owner = MEMORY_SET_OWNER_UNKNOWN;
+    for cpu in 0..CPU_SLOTS {
+        if MEMORY_SET_OWNER_MUTEX[cpu].load(Ordering::Acquire) == mutex_addr {
+            let encoded = MEMORY_SET_OWNER_SITE[cpu].load(Ordering::Relaxed);
+            if encoded != 0 {
+                owner = (encoded - 1).min(MEMORY_SET_OWNER_UNKNOWN);
+            }
+            break;
+        }
+    }
+    MEMORY_SET_OWNER_WAITER_SAMPLES[waiter_site as usize][owner].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn hot_lock_slot(class: usize) -> Option<usize> {
+    match class {
+        value if value == LockClass::Heap as usize => Some(0),
+        value if value == LockClass::MemorySet as usize => Some(1),
+        value if value == LockClass::MemorySetActivation as usize => Some(2),
+        value if value == LockClass::TaskManager as usize => Some(3),
+        value if value == LockClass::FrameAllocator as usize => Some(4),
+        value if value == LockClass::BlockCache as usize => Some(5),
+        _ => None,
+    }
+}
+
+fn lock_acquire_count(slot: usize) -> usize {
+    if let Some(hot) = hot_lock_slot(slot) {
+        HOT_LOCK_ACQUIRES[hot]
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
+    } else {
+        LOCK_ACQUIRES[slot].load(Ordering::Relaxed)
+    }
+}
+
+fn memory_set_site_acquire_count(site: usize) -> usize {
+    MEMORY_SET_SITE_ACQUIRES_PER_CPU[site]
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .sum()
+}
+
+#[inline]
+fn heap_size_bucket(size: usize) -> usize {
+    match size.max(1).next_power_of_two().trailing_zeros() as usize {
+        0..=4 => 0,
+        5 => 1,
+        6 => 2,
+        7 => 3,
+        8 => 4,
+        9 => 5,
+        10 => 6,
+        11 => 7,
+        12 => 8,
+        13..=16 => 9,
+        _ => 10,
     }
 }
 
@@ -1567,23 +2371,48 @@ pub(crate) fn maybe_report() {
         crate::println!("BUILDSTORM_DIAG user_run cpu={} count={} total_us={} max_us={} syscall={} timer={} irq={} other={}", cpu, USER_RUN_COUNT[cpu].load(Ordering::Relaxed), USER_RUN_TOTAL_US[cpu].load(Ordering::Relaxed), USER_RUN_MAX_US[cpu].load(Ordering::Relaxed), USER_RUN_SYSCALL[cpu].load(Ordering::Relaxed), USER_RUN_TIMER[cpu].load(Ordering::Relaxed), USER_RUN_IRQ[cpu].load(Ordering::Relaxed), USER_RUN_OTHER[cpu].load(Ordering::Relaxed));
     }
     for cpu in 0..CPU_SLOTS {
+        let pid = ACTIVE_USER_PID[cpu].load(Ordering::Acquire);
+        let since_us = ACTIVE_USER_SINCE_US[cpu].load(Ordering::Relaxed);
+        let trap_kind = ACTIVE_USER_TRAP_KIND[cpu].load(Ordering::Acquire);
+        let trap_since_us = ACTIVE_USER_TRAP_SINCE_US[cpu].load(Ordering::Relaxed);
+        crate::println!("BUILDSTORM_DIAG user_active cpu={} pid={} since_us={} elapsed_us={} last_exit_us={} entries={} trap_kind={} trap_since_us={} trap_elapsed_us={} trap_entries={}", cpu, pid, since_us, if pid == 0 { 0 } else { now.saturating_sub(since_us) }, ACTIVE_USER_LAST_EXIT_US[cpu].load(Ordering::Relaxed), ACTIVE_USER_ENTRIES[cpu].load(Ordering::Relaxed), trap_kind, trap_since_us, if trap_kind == 0 { 0 } else { now.saturating_sub(trap_since_us) }, ACTIVE_USER_TRAP_ENTRIES[cpu].load(Ordering::Relaxed));
+    }
+    for cpu in 0..CPU_SLOTS {
         crate::println!("BUILDSTORM_DIAG blocked_owner cpu={} current={} max={} enters={} exits={} loop_dispatches={} timed_loops={} timed_total_us={} timed_max_us={} empty_iterations={} wake_to_owner={} wake_to_global={}", cpu, BLOCKED_OWNER_CURRENT[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_MAX[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_ENTERS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_EXITS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_LOOP_DISPATCHES[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_LOOPS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_TOTAL_US[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_MAX_US[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_EMPTY_ITERATIONS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_WAKES[cpu].load(Ordering::Relaxed), BLOCKED_GLOBAL_WAKES.load(Ordering::Relaxed));
     }
     crate::println!("BUILDSTORM_DIAG mm user_root={} kernel_root={} redundant_root={} page_table_writes={} local_flush={} remote_shootdown={} remote_targets={}", USER_ROOT_ACTIVATIONS.load(Ordering::Relaxed), KERNEL_ROOT_ACTIVATIONS.load(Ordering::Relaxed), REDUNDANT_ROOT_ACTIVATIONS.load(Ordering::Relaxed), PAGE_TABLE_WRITES.load(Ordering::Relaxed), LOCAL_TLB_FLUSHES.load(Ordering::Relaxed), REMOTE_SHOOTDOWNS.load(Ordering::Relaxed), REMOTE_SHOOTDOWN_TARGETS.load(Ordering::Relaxed));
+    let (tracked_frames, page_table_frames, contiguous_frames, owner_transitions) =
+        crate::mm::frame_allocator::diagnostic_ownership_snapshot();
+    crate::println!(
+        "BUILDSTORM_DIAG frame_ownership tracked={} page_table={} contiguous={} transitions={}",
+        tracked_frames,
+        page_table_frames,
+        contiguous_frames,
+        owner_transitions
+    );
     crate::println!("BUILDSTORM_DIAG anonymous_vma installs={} left={} right={} both={} neither={} current={} max={} pages={} pages_max={}", ANONYMOUS_VMA_INSTALLS.load(Ordering::Relaxed), ANONYMOUS_VMA_LEFT_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_RIGHT_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_BOTH_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_NEITHER_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_CURRENT.load(Ordering::Relaxed), ANONYMOUS_VMA_MAX.load(Ordering::Relaxed), ANONYMOUS_VMA_PAGES.load(Ordering::Relaxed), ANONYMOUS_VMA_PAGES_MAX.load(Ordering::Relaxed));
     crate::println!("BUILDSTORM_DIAG anonymous_move left_selected={} left_no_realloc={} left_shrink={} left_remove={} left_frame_relocate={} left_remove_suffix={} left_remove_suffix_max={} right_selected={} right_no_realloc={} right_shrink={} right_remove={} right_frame_move={} right_remove_suffix={} right_remove_suffix_max={} zero_metadata={}", ANONYMOUS_MOVE_LEFT_SELECTED.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_NO_REALLOC.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_SHRINK.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_FRAME_RELOCATE.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE_SUFFIX.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE_SUFFIX_MAX.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_SELECTED.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_NO_REALLOC.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_SHRINK.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_FRAME_MOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE_SUFFIX.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE_SUFFIX_MAX.load(Ordering::Relaxed), ANONYMOUS_MOVE_ZERO_METADATA.load(Ordering::Relaxed));
     crate::println!("BUILDSTORM_DIAG anonymous_coalesce calls={} areas={} areas_max={} sort_us={} scan_us={} total_us={} merges={} merged_frames={} frame_reallocs={} frame_relocate={}", ANONYMOUS_COALESCE_CALLS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_AREAS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_AREAS_MAX.load(Ordering::Relaxed), ANONYMOUS_COALESCE_SORT_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_SCAN_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_TOTAL_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_MERGES.load(Ordering::Relaxed), ANONYMOUS_COALESCE_MERGED_FRAMES.load(Ordering::Relaxed), ANONYMOUS_COALESCE_FRAME_REALLOCS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_FRAME_RELOCATE.load(Ordering::Relaxed));
-    crate::println!("BUILDSTORM_DIAG vma current={} max={}", LOGICAL_VMA_CURRENT.load(Ordering::Relaxed), LOGICAL_VMA_MAX.load(Ordering::Relaxed));
+    crate::println!(
+        "BUILDSTORM_DIAG vma current={} max={}",
+        LOGICAL_VMA_CURRENT.load(Ordering::Relaxed),
+        LOGICAL_VMA_MAX.load(Ordering::Relaxed)
+    );
     crate::println!("BUILDSTORM_DIAG cache path_components={} path_hit={} path_miss={} negative_path_hit={} dir_hit={} dir_miss={} inode_metadata_hit={} inode_metadata_miss={} inode_hit={} inode_miss={} metadata_hit={} metadata_miss={} block_hit={} block_miss={} virtio_requests={} virtio_bytes={} virtio_queue_us={} virtio_complete_us={}", PATH_COMPONENT_LOOKUPS.load(Ordering::Relaxed), PATH_CACHE_HITS.load(Ordering::Relaxed), PATH_CACHE_MISSES.load(Ordering::Relaxed), NEGATIVE_PATH_CACHE_HITS.load(Ordering::Relaxed), DIR_CACHE_HITS.load(Ordering::Relaxed), DIR_CACHE_MISSES.load(Ordering::Relaxed), INODE_METADATA_CACHE_HITS.load(Ordering::Relaxed), INODE_METADATA_CACHE_MISSES.load(Ordering::Relaxed), INODE_CACHE_HITS.load(Ordering::Relaxed), INODE_CACHE_MISSES.load(Ordering::Relaxed), METADATA_CACHE_HITS.load(Ordering::Relaxed), METADATA_CACHE_MISSES.load(Ordering::Relaxed), BLOCK_CACHE_HITS.load(Ordering::Relaxed), BLOCK_CACHE_MISSES.load(Ordering::Relaxed), VIRTIO_REQUESTS.load(Ordering::Relaxed), VIRTIO_BYTES.load(Ordering::Relaxed), VIRTIO_QUEUE_US.load(Ordering::Relaxed), VIRTIO_COMPLETE_US.load(Ordering::Relaxed));
     for slot in 0..WORK_SLOTS {
-        let count = WORK_COUNTS[slot].load(Ordering::Relaxed);
+        let count: usize = WORK_COUNTS_PER_CPU[slot]
+            .iter()
+            .map(|value| value.load(Ordering::Relaxed))
+            .sum();
         if count != 0 {
             crate::println!(
-                "BUILDSTORM_DIAG work={} count={} total_us={} max_us={}",
+                "BUILDSTORM_DIAG work={} count={} total_us={} max_us={} sample_count={} sample_shift={}",
                 WORK_NAMES[slot],
                 count,
                 WORK_TOTAL_US[slot].load(Ordering::Relaxed),
-                WORK_MAX_US[slot].load(Ordering::Relaxed)
+                WORK_MAX_US[slot].load(Ordering::Relaxed),
+                WORK_SAMPLES[slot].load(Ordering::Relaxed),
+                WORK_SAMPLE_SHIFT,
             );
         }
     }
@@ -1677,14 +2506,103 @@ pub(crate) fn maybe_report() {
             break;
         };
         selected[slot] = true;
-        crate::println!("BUILDSTORM_DIAG lock_rank={} name={} acquire_count={} contended_count={} wait_total_us={} wait_max_us={} hold_total_us={} hold_max_us={}", rank + 1, LOCK_NAMES[slot], LOCK_ACQUIRES[slot].load(Ordering::Relaxed), LOCK_CONTENDED[slot].load(Ordering::Relaxed), LOCK_WAIT_TOTAL_US[slot].load(Ordering::Relaxed), LOCK_WAIT_MAX_US[slot].load(Ordering::Relaxed), LOCK_HOLD_TOTAL_US[slot].load(Ordering::Relaxed), LOCK_HOLD_MAX_US[slot].load(Ordering::Relaxed));
+        let hot = hot_lock_slot(slot);
+        crate::println!("BUILDSTORM_DIAG lock_rank={} name={} acquire_count={} contended_count={} wait_total_us={} wait_max_us={} hold_total_us={} hold_max_us={} sample_count={} sample_shift={}", rank + 1, LOCK_NAMES[slot], lock_acquire_count(slot), LOCK_CONTENDED[slot].load(Ordering::Relaxed), LOCK_WAIT_TOTAL_US[slot].load(Ordering::Relaxed), LOCK_WAIT_MAX_US[slot].load(Ordering::Relaxed), LOCK_HOLD_TOTAL_US[slot].load(Ordering::Relaxed), LOCK_HOLD_MAX_US[slot].load(Ordering::Relaxed), hot.map(|index| HOT_LOCK_SAMPLES[index].load(Ordering::Relaxed)).unwrap_or_else(|| lock_acquire_count(slot)), hot.map(|_| HOT_LOCK_SAMPLE_SHIFT).unwrap_or(0));
     }
     for site in 0..MEMORY_SET_LOCK_SITE_SLOTS {
-        let acquires = MEMORY_SET_LOCK_SITE_ACQUIRES[site].load(Ordering::Relaxed);
+        let acquires = memory_set_site_acquire_count(site);
         if acquires != 0 {
-            crate::println!("BUILDSTORM_DIAG memory_set_site={} acquire_count={} contended_count={} wait_total_us={} wait_max_us={} hold_total_us={} hold_max_us={}", MEMORY_SET_LOCK_SITE_NAMES[site], acquires, MEMORY_SET_LOCK_SITE_CONTENDED[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_WAIT_TOTAL_US[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_WAIT_MAX_US[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_HOLD_TOTAL_US[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_HOLD_MAX_US[site].load(Ordering::Relaxed));
+            crate::println!("BUILDSTORM_DIAG memory_set_site={} acquire_count={} contended_count={} wait_total_us={} wait_max_us={} hold_total_us={} hold_max_us={} sample_shift={}", MEMORY_SET_LOCK_SITE_NAMES[site], acquires, MEMORY_SET_LOCK_SITE_CONTENDED[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_WAIT_TOTAL_US[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_WAIT_MAX_US[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_HOLD_TOTAL_US[site].load(Ordering::Relaxed), MEMORY_SET_LOCK_SITE_HOLD_MAX_US[site].load(Ordering::Relaxed), HOT_LOCK_SAMPLE_SHIFT);
         }
     }
+    for waiter in 0..MEMORY_SET_LOCK_SITE_SLOTS {
+        for owner in 0..MEMORY_SET_OWNER_SLOTS {
+            let samples = MEMORY_SET_OWNER_WAITER_SAMPLES[waiter][owner].load(Ordering::Relaxed);
+            if samples != 0 {
+                crate::println!(
+                    "BUILDSTORM_DIAG memory_set_pair waiter={} owner={} samples={} sample_shift={}",
+                    MEMORY_SET_LOCK_SITE_NAMES[waiter],
+                    if owner == MEMORY_SET_OWNER_UNKNOWN {
+                        "unknown"
+                    } else {
+                        MEMORY_SET_LOCK_SITE_NAMES[owner]
+                    },
+                    samples,
+                    HOT_LOCK_SAMPLE_SHIFT,
+                );
+            }
+        }
+    }
+    for bucket in 0..HEAP_SIZE_BUCKETS {
+        let alloc_samples: usize = HEAP_ALLOC_SAMPLES[bucket]
+            .iter()
+            .map(|v| v.load(Ordering::Relaxed))
+            .sum();
+        let free_samples: usize = HEAP_FREE_SAMPLES[bucket]
+            .iter()
+            .map(|v| v.load(Ordering::Relaxed))
+            .sum();
+        if alloc_samples != 0 || free_samples != 0 {
+            let alloc_bytes: usize = HEAP_ALLOC_SAMPLE_BYTES[bucket]
+                .iter()
+                .map(|v| v.load(Ordering::Relaxed))
+                .sum();
+            let free_bytes: usize = HEAP_FREE_SAMPLE_BYTES[bucket]
+                .iter()
+                .map(|v| v.load(Ordering::Relaxed))
+                .sum();
+            crate::println!("BUILDSTORM_DIAG heap_size bucket={} alloc_samples={} alloc_bytes={} free_samples={} free_bytes={} sample_shift={}", bucket, alloc_samples, alloc_bytes, free_samples, free_bytes, HOT_LOCK_SAMPLE_SHIFT);
+        }
+    }
+    crate::println!(
+        "BUILDSTORM_DIAG mmap_shape anonymous={} file={} fixed={} hinted={} lazy={} eager={} commit_reselect={} high_arena={} low_arena={}",
+        MMAP_ANONYMOUS.load(Ordering::Relaxed),
+        MMAP_FILE.load(Ordering::Relaxed),
+        MMAP_FIXED.load(Ordering::Relaxed),
+        MMAP_HINTED.load(Ordering::Relaxed),
+        MMAP_LAZY.load(Ordering::Relaxed),
+        MMAP_EAGER.load(Ordering::Relaxed),
+        MMAP_COMMIT_RESELECT.load(Ordering::Relaxed),
+        MMAP_HIGH_ARENA_PLACEMENTS.load(Ordering::Relaxed),
+        MMAP_LOW_ARENA_PLACEMENTS.load(Ordering::Relaxed),
+    );
+    crate::println!(
+        "BUILDSTORM_DIAG mmap_result select_ok={} select_enomem={} reselect_ok={} reselect_enomem={} len_le_64k={} len_le_1m={} len_le_16m={} len_le_256m={} len_gt_256m={} failed_len_max={} failed_gap_max={} failed_vmas_max={}",
+        MMAP_SELECT_OK.load(Ordering::Relaxed),
+        MMAP_SELECT_ENOMEM.load(Ordering::Relaxed),
+        MMAP_COMMIT_RESELECT_OK.load(Ordering::Relaxed),
+        MMAP_COMMIT_RESELECT_ENOMEM.load(Ordering::Relaxed),
+        MMAP_LENGTH_COUNTS[0].load(Ordering::Relaxed),
+        MMAP_LENGTH_COUNTS[1].load(Ordering::Relaxed),
+        MMAP_LENGTH_COUNTS[2].load(Ordering::Relaxed),
+        MMAP_LENGTH_COUNTS[3].load(Ordering::Relaxed),
+        MMAP_LENGTH_COUNTS[4].load(Ordering::Relaxed),
+        MMAP_FAILED_LENGTH_MAX.load(Ordering::Relaxed),
+        MMAP_FAILED_GAP_MAX.load(Ordering::Relaxed),
+        MMAP_FAILED_VMAS_MAX.load(Ordering::Relaxed),
+    );
+    crate::println!(
+        "BUILDSTORM_DIAG mmap_failure_shape len_le_64k={} len_le_1m={} len_le_16m={} len_le_256m={} len_gt_256m={} munmap_below_le_64k={} munmap_below_le_1m={} munmap_below_le_16m={} munmap_below_le_256m={} munmap_below_gt_256m={} munmap_overlaps_cursor={} munmap_at_or_above_cursor={}",
+        MMAP_FAILED_LENGTH_COUNTS[0].load(Ordering::Relaxed),
+        MMAP_FAILED_LENGTH_COUNTS[1].load(Ordering::Relaxed),
+        MMAP_FAILED_LENGTH_COUNTS[2].load(Ordering::Relaxed),
+        MMAP_FAILED_LENGTH_COUNTS[3].load(Ordering::Relaxed),
+        MMAP_FAILED_LENGTH_COUNTS[4].load(Ordering::Relaxed),
+        MUNMAP_BELOW_CURSOR_LENGTH_COUNTS[0].load(Ordering::Relaxed),
+        MUNMAP_BELOW_CURSOR_LENGTH_COUNTS[1].load(Ordering::Relaxed),
+        MUNMAP_BELOW_CURSOR_LENGTH_COUNTS[2].load(Ordering::Relaxed),
+        MUNMAP_BELOW_CURSOR_LENGTH_COUNTS[3].load(Ordering::Relaxed),
+        MUNMAP_BELOW_CURSOR_LENGTH_COUNTS[4].load(Ordering::Relaxed),
+        MUNMAP_OVERLAPS_CURSOR.load(Ordering::Relaxed),
+        MUNMAP_AT_OR_ABOVE_CURSOR.load(Ordering::Relaxed),
+    );
+    crate::println!(
+        "BUILDSTORM_DIAG process_progress exits={} child_wake_calls={} child_woken={}",
+        PROCESS_EXITS.load(Ordering::Relaxed),
+        CHILD_WAKE_CALLS.load(Ordering::Relaxed),
+        CHILD_WOKEN.load(Ordering::Relaxed)
+    );
     crate::task::manager::diagnostic_dump_user_comm();
+    report_exited_mmap_protocols();
     crate::println!("BUILDSTORM_DIAG snapshot_end={}", sequence);
 }

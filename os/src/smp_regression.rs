@@ -23,6 +23,11 @@ static LIFECYCLE_TERMINAL_KIND: AtomicUsize = AtomicUsize::new(0);
 static LIFECYCLE_TERMINAL_VADDR: AtomicUsize = AtomicUsize::new(0);
 static LIFECYCLE_TERMINAL_SEPC: AtomicUsize = AtomicUsize::new(0);
 static LIFECYCLE_TASK_DONE: AtomicBool = AtomicBool::new(false);
+static NAMESPACE_READY_MASK: AtomicUsize = AtomicUsize::new(0);
+static NAMESPACE_DONE_MASK: AtomicUsize = AtomicUsize::new(0);
+static NAMESPACE_ACK_MASK: AtomicUsize = AtomicUsize::new(0);
+static NAMESPACE_EPOCH: AtomicUsize = AtomicUsize::new(0);
+static NAMESPACE_STOP: AtomicBool = AtomicBool::new(false);
 
 const HEAP_STRESS_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const HEAP_STRESS_CHUNKS: usize = 10;
@@ -31,6 +36,12 @@ const ASID_ISOLATION_ITERATIONS: usize = 64;
 const RESIDENT_TEST_VADDR: usize = 0x4100_0000;
 const SHARED_LEFT_VADDR: usize = 0x4200_0000;
 const SHARED_RIGHT_VADDR: usize = 0x4300_0000;
+const HIGH_ARENA_TEST_VADDR: usize = crate::config::user_va::HIGH_MMAP_ARENA.start + 0x20_0000;
+const NAMESPACE_ROOT: &str = "/tmp/.wll_namespace_lifecycle";
+const NAMESPACE_LEFT: &str = "/tmp/.wll_namespace_lifecycle/left";
+const NAMESPACE_RIGHT: &str = "/tmp/.wll_namespace_lifecycle/right";
+const NAMESPACE_PULSE: &str = "/tmp/.wll_namespace_lifecycle/pulse";
+const NAMESPACE_ITERATIONS: usize = 64;
 
 /// Exercise sparse ResidentSet ownership and topology-transfer APIs
 /// independently of the contest workload.
@@ -308,6 +319,106 @@ fn verify_resident_memory_lifecycle() {
     crate::println!("[smp-regression] pass phase=resident-memory-lifecycle");
 }
 
+fn verify_high_arena_memory_lifecycle() {
+    let page = crate::config::PAGE_SIZE;
+    let flags = PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V;
+    let start = HIGH_ARENA_TEST_VADDR;
+    let mut parent = MemorySet::new_bare();
+
+    parent
+        .insert_lazy_area_with_backing(
+            VirtAddr::new(start),
+            VirtAddr::new(start + 4 * page),
+            flags,
+            MapAreaBacking::Anonymous,
+        )
+        .expect("high arena lazy area");
+    if parent.translate(VirtAddr::new(start + page)).is_some() {
+        panic!("[smp-regression] fail phase=high-arena eager-translation");
+    }
+    parent
+        .handle_page_fault(start + page, true, false)
+        .expect("high arena anonymous fault");
+    let parent_page = parent
+        .translate(VirtAddr::new(start + page))
+        .expect("high arena parent mapping");
+
+    // Software translation checks cannot detect an over-broad root ownership
+    // rule.  Activate this address space and touch the high VA through the
+    // hardware translation path before restoring the kernel root.
+    let interrupts_were_enabled = crate::trap::interrupts::is_interrupt_enabled();
+    crate::trap::interrupts::disable_interrupt();
+    parent.activate();
+    #[cfg(target_arch = "riscv64")]
+    {
+        let sum_was_enabled = riscv::register::sstatus::read().sum();
+        if !sum_was_enabled {
+            unsafe { riscv::register::sstatus::set_sum() };
+        }
+        let high_ptr = (start + page) as *mut usize;
+        unsafe {
+            core::ptr::write_volatile(high_ptr, 0xa5a5_5a5a_1122_3344usize);
+            if core::ptr::read_volatile(high_ptr) != 0xa5a5_5a5a_1122_3344usize {
+                panic!("[smp-regression] fail phase=high-arena-hardware-translation");
+            }
+        }
+        if !sum_was_enabled {
+            unsafe { riscv::register::sstatus::clear_sum() };
+        }
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        // LoongArch PLV0 cannot directly dereference a PLV3 leaf.  Validate
+        // the same resident frame through its cached DMW1 alias instead.
+        let high_ptr = crate::drivers::hal::phys_to_virt_ram(parent_page.raw()) as *mut usize;
+        unsafe {
+            core::ptr::write_volatile(high_ptr, 0xa5a5_5a5a_1122_3344usize);
+            if core::ptr::read_volatile(high_ptr) != 0xa5a5_5a5a_1122_3344usize {
+                panic!("[smp-regression] fail phase=high-arena-frame-alias");
+            }
+        }
+    }
+    crate::trap::restore_kernel_page_table();
+    if interrupts_were_enabled {
+        crate::trap::interrupts::enable_interrupt();
+    }
+
+    let mut child = parent.fork_cow().expect("high arena fork COW");
+    child
+        .handle_page_fault(start + page, true, false)
+        .expect("high arena child COW write");
+    if child
+        .translate(VirtAddr::new(start + page))
+        .expect("high arena child mapping")
+        == parent_page
+    {
+        panic!("[smp-regression] fail phase=high-arena cow-isolation");
+    }
+    child
+        .protect_range(
+            VirtAddr::new(start + page),
+            VirtAddr::new(start + 3 * page),
+            flags,
+        )
+        .expect("high arena partial mprotect");
+    child
+        .unmap_range(VirtAddr::new(start + page), VirtAddr::new(start + 2 * page))
+        .expect("high arena partial munmap");
+    if child.translate(VirtAddr::new(start + page)).is_some()
+        || child.translate(VirtAddr::new(start + 2 * page)).is_none()
+    {
+        panic!("[smp-regression] fail phase=high-arena partial-range");
+    }
+    drop(child);
+    drop(parent);
+
+    let recreated = MemorySet::new_bare();
+    if recreated.translate(VirtAddr::new(start + page)).is_some() {
+        panic!("[smp-regression] fail phase=high-arena stale-root");
+    }
+    crate::println!("[smp-regression] pass phase=high-arena-memory-lifecycle");
+}
+
 pub(crate) fn reset_user_memory_lifecycle_diagnostic() {
     LIFECYCLE_TERMINAL_KIND.store(0, Ordering::Relaxed);
     LIFECYCLE_TERMINAL_VADDR.store(0, Ordering::Relaxed);
@@ -514,6 +625,132 @@ fn worker() -> ! {
     }
 }
 
+fn namespace_reader_worker() -> ! {
+    let bit = 1usize << crate::platform::current_cpu_index();
+    NAMESPACE_READY_MASK.fetch_or(bit, Ordering::AcqRel);
+    let mut last_epoch = 0usize;
+
+    while !NAMESPACE_STOP.load(Ordering::Acquire) {
+        let before = NAMESPACE_EPOCH.load(Ordering::Acquire);
+        let exists = crate::fs::ext4_vol::lookup_kind(NAMESPACE_PULSE).is_some();
+        let after = NAMESPACE_EPOCH.load(Ordering::Acquire);
+        if before != 0 && before == after && before != last_epoch {
+            let expected_exists = before & 1 == 1;
+            if exists != expected_exists {
+                panic!(
+                    "[smp-regression] fail phase=namespace-cache epoch={} expected_exists={} observed_exists={}",
+                    before, expected_exists, exists
+                );
+            }
+            NAMESPACE_ACK_MASK.fetch_or(bit, Ordering::AcqRel);
+            last_epoch = before;
+        }
+    }
+
+    NAMESPACE_DONE_MASK.fetch_or(bit, Ordering::AcqRel);
+    crate::task::exit_current_and_run_next(0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn verify_namespace_lifecycle(expected: usize, coordinator_bit: usize) {
+    use crate::fs::ext4_vol;
+
+    if ext4_vol::lookup_kind(NAMESPACE_ROOT).is_some() {
+        panic!("[smp-regression] fail phase=namespace-private-root-exists");
+    }
+    ext4_vol::mkdir_ext4(NAMESPACE_ROOT).expect("namespace regression root");
+    ext4_vol::mkdir_ext4(NAMESPACE_LEFT).expect("namespace regression left directory");
+    ext4_vol::mkdir_ext4(NAMESPACE_RIGHT).expect("namespace regression right directory");
+
+    let reader_mask = expected & !coordinator_bit;
+    NAMESPACE_READY_MASK.store(0, Ordering::Release);
+    NAMESPACE_DONE_MASK.store(0, Ordering::Release);
+    NAMESPACE_ACK_MASK.store(0, Ordering::Release);
+    NAMESPACE_EPOCH.store(0, Ordering::Release);
+    NAMESPACE_STOP.store(false, Ordering::Release);
+    for cpu in 0..crate::config::MAX_CPUS {
+        let bit = 1usize << cpu;
+        if reader_mask & bit == 0 {
+            continue;
+        }
+        let task = TaskControlBlock::new_kernel_task(namespace_reader_worker);
+        task.set_affinity_mask(bit);
+        crate::task::manager::add_task(task);
+    }
+    wait_for(
+        &NAMESPACE_READY_MASK,
+        reader_mask,
+        "namespace-readers-ready",
+    );
+
+    for iteration in 0..NAMESPACE_ITERATIONS {
+        NAMESPACE_ACK_MASK.store(0, Ordering::Release);
+        ext4_vol::create_regular_ext4(NAMESPACE_PULSE).expect("namespace regression create pulse");
+        NAMESPACE_EPOCH.store(iteration * 2 + 1, Ordering::Release);
+        wait_for(
+            &NAMESPACE_ACK_MASK,
+            reader_mask,
+            "namespace-positive-visible",
+        );
+
+        NAMESPACE_ACK_MASK.store(0, Ordering::Release);
+        ext4_vol::unlink_regular_file(NAMESPACE_PULSE).expect("namespace regression unlink pulse");
+        NAMESPACE_EPOCH.store(iteration * 2 + 2, Ordering::Release);
+        wait_for(
+            &NAMESPACE_ACK_MASK,
+            reader_mask,
+            "namespace-negative-visible",
+        );
+    }
+
+    NAMESPACE_STOP.store(true, Ordering::Release);
+    wait_for(&NAMESPACE_DONE_MASK, reader_mask, "namespace-readers-done");
+
+    const LEFT_ITEM: &str = "/tmp/.wll_namespace_lifecycle/left/item";
+    const LEFT_RENAMED: &str = "/tmp/.wll_namespace_lifecycle/left/renamed";
+    const RIGHT_ITEM: &str = "/tmp/.wll_namespace_lifecycle/right/item";
+    let ino = ext4_vol::create_regular_ext4(LEFT_ITEM).expect("namespace regression item");
+    ext4_vol::rename_ext4(LEFT_ITEM, LEFT_RENAMED, false)
+        .expect("namespace regression same-parent rename");
+    if ext4_vol::lookup_kind(LEFT_ITEM).is_some() || ext4_vol::lookup_kind(LEFT_RENAMED).is_none() {
+        panic!("[smp-regression] fail phase=namespace-same-parent-rename");
+    }
+    ext4_vol::rename_ext4(LEFT_RENAMED, RIGHT_ITEM, false)
+        .expect("namespace regression cross-parent rename");
+    if ext4_vol::lookup_kind(LEFT_RENAMED).is_some() || ext4_vol::lookup_kind(RIGHT_ITEM).is_none()
+    {
+        panic!("[smp-regression] fail phase=namespace-cross-parent-rename");
+    }
+
+    let payload = b"open-unlink-lifetime";
+    ext4_vol::open_regular_ino(ino);
+    let written = ext4_vol::ext4_write_at(ino, 0, payload).expect("namespace regression write");
+    if written != payload.len() {
+        panic!("[smp-regression] fail phase=namespace-open-unlink-write");
+    }
+    ext4_vol::unlink_regular_file(RIGHT_ITEM).expect("namespace regression open unlink");
+    if ext4_vol::lookup_kind(RIGHT_ITEM).is_some() {
+        panic!("[smp-regression] fail phase=namespace-open-unlink-path");
+    }
+    let mut observed = [0u8; 20];
+    let read = ext4_vol::ext4_read_at(ino, 0, &mut observed).expect("namespace regression read");
+    if read != payload.len() || &observed[..read] != payload {
+        panic!("[smp-regression] fail phase=namespace-open-unlink-data");
+    }
+    ext4_vol::close_regular_ino(ino);
+
+    ext4_vol::remove_empty_dir_ext4(NAMESPACE_LEFT).expect("namespace regression remove left");
+    ext4_vol::remove_empty_dir_ext4(NAMESPACE_RIGHT).expect("namespace regression remove right");
+    ext4_vol::remove_empty_dir_ext4(NAMESPACE_ROOT).expect("namespace regression remove root");
+    crate::println!(
+        "[smp-regression] pass phase=namespace-lifecycle iterations={} readers={}",
+        NAMESPACE_ITERATIONS,
+        reader_mask.count_ones()
+    );
+}
+
 fn wait_for(mask: &AtomicUsize, expected: usize, phase: &str) {
     let deadline = crate::timer::get_time_us().saturating_add(5_000_000);
     while mask.load(Ordering::Acquire) != expected {
@@ -530,10 +767,14 @@ fn wait_for(mask: &AtomicUsize, expected: usize, phase: &str) {
 }
 
 pub fn run() {
+    crate::syscall::other::verify_interval_timer_state_machine();
     let heap_checksum = stress_kernel_heap();
     let (left_asid, right_asid, reused_asid) = verify_asid_isolation_and_reuse();
     verify_resident_set_api();
     verify_resident_memory_lifecycle();
+    if crate::config::user_va::HAS_HIGH_MMAP_ARENA {
+        verify_high_arena_memory_lifecycle();
+    }
     #[cfg(target_arch = "riscv64")]
     let asid_check = "translation";
     #[cfg(target_arch = "loongarch64")]
@@ -548,6 +789,7 @@ pub fn run() {
             expected
         );
     }
+    verify_namespace_lifecycle(expected, coordinator_bit);
 
     let root = crate::mm::page_table::kernel_page_table()
         .lock()

@@ -1,0 +1,4 @@
+1d1ee36b898e796ea77bde203b3f483d1ec5c307613ee3c1b846366efd0c967d  /srv/buildstorm/evidence/20260814-prepush-smp-gates/loongarch64.serial.log
+f01eb16f4220dbfe252f04d284e189e8448a8d7213005863ad1d15090483cabc  /srv/buildstorm/evidence/20260814-prepush-smp-gates/riscv64.serial.log
+08024d1c076df22092f3be2a19287be1888f4acb0463b575411db4c90ea0c747  /srv/buildstorm/evidence/20260814-prepush-smp-gates/loongarch64.runner.json
+28116507625c52ffaaa602d3eca9aa4e01c8eb7c004e3fcd3c6ff4ed65575124  /srv/buildstorm/evidence/20260814-prepush-smp-gates/riscv64.runner.json

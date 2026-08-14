@@ -1,9 +1,10 @@
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use buddy_system_allocator::FrameAllocator;
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "buildstorm-diagnostics")]
+use core::sync::atomic::AtomicU8;
 use lazy_static::lazy_static;
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 use crate::config::PAGE_SIZE;
 
@@ -43,34 +44,70 @@ impl TryFrom<polyhal::PhysAddr> for PhysPageNum {
 }
 
 /// 页帧追踪器 - RAII自动释放
-struct FrameTrackerInner {
+struct FrameRefRegion {
+    start_ppn: usize,
+    refs: Vec<AtomicUsize>,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    owners: Vec<AtomicU8>,
+}
+
+impl FrameRefRegion {
+    fn counter(&self, ppn: usize) -> Option<&AtomicUsize> {
+        ppn.checked_sub(self.start_ppn)
+            .and_then(|offset| self.refs.get(offset))
+    }
+}
+
+pub struct FrameTracker {
     ppn: PhysPageNum,
 }
 
-impl Drop for FrameTrackerInner {
-    fn drop(&mut self) {
-        dealloc_frame(self.ppn);
-    }
-}
-
-#[derive(Clone)]
-pub struct FrameTracker {
-    inner: Arc<FrameTrackerInner>,
-}
-
 impl FrameTracker {
-    pub fn new(ppn: PhysPageNum) -> Self {
-        Self {
-            inner: Arc::new(FrameTrackerInner { ppn }),
-        }
+    fn new(ppn: PhysPageNum) -> Self {
+        let old = frame_ref_counter(ppn.0).fetch_add(1, Ordering::Relaxed);
+        assert_eq!(old, 0, "allocated frame already has owners");
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_transition_owner(ppn.0, DIAG_OWNER_FREE, DIAG_OWNER_TRACKED);
+        Self { ppn }
     }
 
     pub fn ppn(&self) -> PhysPageNum {
-        self.inner.ppn
+        self.ppn
     }
 
     pub fn ref_count(&self) -> usize {
-        Arc::strong_count(&self.inner)
+        frame_ref_counter(self.ppn.0).load(Ordering::Acquire)
+    }
+
+    pub fn into_raw_ppn(self) -> PhysPageNum {
+        let ppn = self.ppn;
+        let old = frame_ref_counter(ppn.0).fetch_sub(1, Ordering::Release);
+        assert_eq!(old, 1, "shared frame cannot become a raw owner");
+        #[cfg(feature = "buildstorm-diagnostics")]
+        diagnostic_transition_owner(ppn.0, DIAG_OWNER_TRACKED, DIAG_OWNER_PAGE_TABLE);
+        core::mem::forget(self);
+        ppn
+    }
+}
+
+impl Clone for FrameTracker {
+    fn clone(&self) -> Self {
+        let old = frame_ref_counter(self.ppn.0).fetch_add(1, Ordering::Relaxed);
+        assert!(old != 0 && old != usize::MAX, "invalid frame owner count");
+        Self { ppn: self.ppn }
+    }
+}
+
+impl Drop for FrameTracker {
+    fn drop(&mut self) {
+        let old = frame_ref_counter(self.ppn.0).fetch_sub(1, Ordering::Release);
+        assert!(old != 0, "frame owner count underflow");
+        if old == 1 {
+            core::sync::atomic::fence(Ordering::Acquire);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            diagnostic_transition_owner(self.ppn.0, DIAG_OWNER_TRACKED, DIAG_OWNER_FREE);
+            dealloc_frame_inner(self.ppn);
+        }
     }
 }
 
@@ -78,6 +115,25 @@ lazy_static! {
     static ref FRAME_ALLOCATOR: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new());
     static ref MEM_REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 }
+static FRAME_REF_REGIONS: Once<Vec<FrameRefRegion>> = Once::new();
+
+#[cfg(feature = "buildstorm-diagnostics")]
+const DIAG_OWNER_FREE: u8 = 0;
+#[cfg(feature = "buildstorm-diagnostics")]
+const DIAG_OWNER_TRACKED: u8 = 1;
+#[cfg(feature = "buildstorm-diagnostics")]
+const DIAG_OWNER_PAGE_TABLE: u8 = 2;
+#[cfg(feature = "buildstorm-diagnostics")]
+const DIAG_OWNER_CONTIGUOUS: u8 = 3;
+
+#[cfg(feature = "buildstorm-diagnostics")]
+static DIAG_TRACKED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static DIAG_PAGE_TABLE_FRAMES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static DIAG_CONTIGUOUS_FRAMES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static DIAG_OWNER_TRANSITIONS: AtomicUsize = AtomicUsize::new(0);
 
 static TOTAL_MANAGED_FRAMES: AtomicUsize = AtomicUsize::new(0);
 static FREE_MANAGED_FRAMES: AtomicUsize = AtomicUsize::new(0);
@@ -105,6 +161,87 @@ pub fn add_frames_range(start: usize, end: usize) {
         TOTAL_MANAGED_FRAMES.fetch_add(pages, Ordering::Relaxed);
         FREE_MANAGED_FRAMES.fetch_add(pages, Ordering::Relaxed);
     }
+}
+
+pub fn finalize_frame_refcounts() {
+    FRAME_REF_REGIONS.call_once(|| {
+        MEM_REGIONS
+            .lock()
+            .iter()
+            .map(|&(start, end)| FrameRefRegion {
+                start_ppn: start,
+                refs: (start..end).map(|_| AtomicUsize::new(0)).collect(),
+                #[cfg(feature = "buildstorm-diagnostics")]
+                owners: (start..end).map(|_| AtomicU8::new(DIAG_OWNER_FREE)).collect(),
+            })
+            .collect()
+    });
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+fn frame_owner_counter(ppn: usize) -> &'static AtomicU8 {
+    FRAME_REF_REGIONS
+        .get()
+        .expect("frame ownership table not initialized")
+        .iter()
+        .find_map(|region| {
+            ppn.checked_sub(region.start_ppn)
+                .and_then(|offset| region.owners.get(offset))
+        })
+        .expect("frame outside ownership table")
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+fn diagnostic_owner_total(owner: u8) -> &'static AtomicUsize {
+    match owner {
+        DIAG_OWNER_TRACKED => &DIAG_TRACKED_FRAMES,
+        DIAG_OWNER_PAGE_TABLE => &DIAG_PAGE_TABLE_FRAMES,
+        DIAG_OWNER_CONTIGUOUS => &DIAG_CONTIGUOUS_FRAMES,
+        _ => unreachable!("free frames have no active-owner total"),
+    }
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+fn diagnostic_transition_owner(ppn: usize, expected: u8, next: u8) {
+    let state = frame_owner_counter(ppn);
+    if let Err(actual) = state.compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
+    {
+        panic!(
+            "frame ownership violation ppn={:#x} expected={} actual={} next={} refs={}",
+            ppn,
+            expected,
+            actual,
+            next,
+            frame_ref_counter(ppn).load(Ordering::Acquire)
+        );
+    }
+    if expected != DIAG_OWNER_FREE {
+        let old = diagnostic_owner_total(expected).fetch_sub(1, Ordering::Relaxed);
+        assert!(old != 0, "frame ownership total underflow");
+    }
+    if next != DIAG_OWNER_FREE {
+        diagnostic_owner_total(next).fetch_add(1, Ordering::Relaxed);
+    }
+    DIAG_OWNER_TRANSITIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+pub(crate) fn diagnostic_ownership_snapshot() -> (usize, usize, usize, usize) {
+    (
+        DIAG_TRACKED_FRAMES.load(Ordering::Relaxed),
+        DIAG_PAGE_TABLE_FRAMES.load(Ordering::Relaxed),
+        DIAG_CONTIGUOUS_FRAMES.load(Ordering::Relaxed),
+        DIAG_OWNER_TRANSITIONS.load(Ordering::Relaxed),
+    )
+}
+
+fn frame_ref_counter(ppn: usize) -> &'static AtomicUsize {
+    FRAME_REF_REGIONS
+        .get()
+        .expect("frame reference table not initialized")
+        .iter()
+        .find_map(|region| region.counter(ppn))
+        .expect("frame outside reference table")
 }
 
 fn is_managed_range(start_ppn: usize, pages: usize) -> bool {
@@ -166,6 +303,10 @@ pub fn alloc_contiguous_frames(pages: usize) -> Option<usize> {
         let ppn = FRAME_ALLOCATOR.lock().alloc(pages)?;
         if is_managed_range(ppn, pages) {
             FREE_MANAGED_FRAMES.fetch_sub(pages, Ordering::Relaxed);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            for page in ppn..ppn + pages {
+                diagnostic_transition_owner(page, DIAG_OWNER_FREE, DIAG_OWNER_CONTIGUOUS);
+            }
             return Some(ppn);
         }
         log::warn!(
@@ -188,6 +329,10 @@ pub fn dealloc_contiguous_frames(start_ppn: usize, pages: usize) {
             return;
         }
         #[cfg(feature = "buildstorm-diagnostics")]
+        for page in start_ppn..start_ppn + pages {
+            diagnostic_transition_owner(page, DIAG_OWNER_CONTIGUOUS, DIAG_OWNER_FREE);
+        }
+        #[cfg(feature = "buildstorm-diagnostics")]
         crate::buildstorm_diagnostics::lock(
             crate::buildstorm_diagnostics::LockClass::FrameAllocator,
             &FRAME_ALLOCATOR,
@@ -201,6 +346,17 @@ pub fn dealloc_contiguous_frames(start_ppn: usize, pages: usize) {
 
 /// 释放一个物理页帧
 pub fn dealloc_frame(ppn: PhysPageNum) {
+    assert_eq!(
+        frame_ref_counter(ppn.0).load(Ordering::Acquire),
+        0,
+        "deallocating an owned frame"
+    );
+    #[cfg(feature = "buildstorm-diagnostics")]
+    diagnostic_transition_owner(ppn.0, DIAG_OWNER_PAGE_TABLE, DIAG_OWNER_FREE);
+    dealloc_frame_inner(ppn);
+}
+
+fn dealloc_frame_inner(ppn: PhysPageNum) {
     if !is_managed_range(ppn.0, 1) {
         log::warn!(
             "[frame] ignore unmanaged free ppn={:#x} paddr={:#x}",
