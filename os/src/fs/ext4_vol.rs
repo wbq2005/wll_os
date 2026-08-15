@@ -17,10 +17,10 @@ const ROOT_INODE: u32 = 2;
 const EXT4_DIRENT_UNKNOWN: u8 = 0;
 const EXT4_DIRENT_DIR: u8 = 2;
 const MAX_FILE_OFFSET: usize = isize::MAX as usize;
-const REGULAR_CACHE_LIMIT: usize = 8 * 1024 * 1024;
+const DENSE_REGULAR_CACHE_LIMIT: usize = 8 * 1024 * 1024;
 const EXECUTABLE_IMAGE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
-const DIRTY_RANGE_FILE_LIMIT: usize = 256 * 1024;
 const ASYNC_WRITEBACK_MIN_FILE: usize = 256 * 1024;
+const WRITEBACK_CLUSTER_BYTES: usize = 256 * 1024;
 const CLEAN_PAGE_CACHE_MIN_PAGES: usize = 2048;
 const CLEAN_PAGE_CACHE_MAX_PAGES: usize = 65536;
 const CLEAN_PAGE_CACHE_MEMORY_DIVISOR: usize = 32;
@@ -282,12 +282,44 @@ impl PageCacheDirtyModel {
         Some(self.seq)
     }
 
-    fn finish_writeback(&mut self, seq: u64) -> bool {
+    fn finish_writeback(
+        &mut self,
+        seq: u64,
+        completed: Option<DirtyRange>,
+        committed_size: bool,
+    ) -> bool {
         if self.seq == seq {
-            self.ranges.clear();
+            if let Some(completed) = completed {
+                let mut remaining = Vec::new();
+                for range in self.ranges.iter().copied() {
+                    if range.end <= completed.start || range.start >= completed.end {
+                        remaining.push(range);
+                        continue;
+                    }
+                    if range.start < completed.start {
+                        remaining.push(DirtyRange {
+                            start: range.start,
+                            end: completed.start,
+                        });
+                    }
+                    if completed.end < range.end {
+                        remaining.push(DirtyRange {
+                            start: completed.end,
+                            end: range.end,
+                        });
+                    }
+                }
+                self.ranges = remaining;
+            }
             self.full_dirty = false;
-            self.size_dirty = false;
-            self.writeback = PageCacheWritebackState::Clean;
+            if committed_size {
+                self.size_dirty = false;
+            }
+            self.writeback = if self.data_dirty() {
+                PageCacheWritebackState::Dirty
+            } else {
+                PageCacheWritebackState::Clean
+            };
             self.last_error = None;
         } else {
             self.writeback = PageCacheWritebackState::Dirty;
@@ -305,9 +337,12 @@ impl PageCacheDirtyModel {
     }
 }
 
-#[derive(Clone, Debug)]
 struct CachedRegularFile {
-    data: Vec<u8>,
+    dense: Option<Vec<u8>>,
+    pages: BTreeMap<usize, FrameTracker>,
+    size: usize,
+    persisted_size: usize,
+    truncate_to: Option<usize>,
     dirty: PageCacheDirtyModel,
     mtime_sec: u32,
     mtime_extra: u32,
@@ -318,7 +353,9 @@ struct CachedRegularFile {
 
 impl CachedRegularFile {
     fn new(
-        data: Vec<u8>,
+        size: usize,
+        persisted_size: usize,
+        dense: Option<Vec<u8>>,
         dirty: PageCacheDirtyModel,
         mtime_sec: u32,
         mtime_extra: u32,
@@ -326,7 +363,11 @@ impl CachedRegularFile {
         ctime_extra: u32,
     ) -> Self {
         Self {
-            data,
+            dense,
+            pages: BTreeMap::new(),
+            size,
+            persisted_size,
+            truncate_to: None,
             dirty,
             mtime_sec,
             mtime_extra,
@@ -350,15 +391,13 @@ struct CachedRegularInfo {
     ctime_extra: u32,
 }
 
-enum WritebackData {
-    Whole(Vec<u8>),
-    Ranges(Vec<(usize, Vec<u8>)>),
-}
-
 struct WritebackSnapshot {
     ino: u32,
     target_len: usize,
-    data: WritebackData,
+    truncate_to: Option<usize>,
+    range: Option<DirtyRange>,
+    data: Vec<u8>,
+    commit_size: bool,
     dirty_seq: u64,
     mtime_sec: u32,
     mtime_extra: u32,
@@ -770,7 +809,7 @@ fn note_cached_data_write(cached: &mut CachedRegularFile) {
 }
 
 fn cached_file_async_writeback_ok(cached: &CachedRegularFile) -> bool {
-    cached.data.len() >= ASYNC_WRITEBACK_MIN_FILE && cached.data.len() <= REGULAR_CACHE_LIMIT
+    cached.size >= ASYNC_WRITEBACK_MIN_FILE
 }
 
 fn schedule_cached_writeback_if_ready(ino: u32) {
@@ -861,7 +900,7 @@ fn mark_dirty_range(cached: &mut CachedRegularFile, start: usize, end: usize) {
     }
     let mut new_range = DirtyRange {
         start,
-        end: end.min(cached.data.len()),
+        end: end.min(cached.size),
     };
     if new_range.start >= new_range.end {
         return;
@@ -912,22 +951,6 @@ fn clip_dirty_ranges(cached: &mut CachedRegularFile, len: usize) {
 
 fn regular_blocks(size: u64) -> u64 {
     size.div_ceil(512)
-}
-
-fn load_regular_data(fs: &Ext4, ino: u32) -> Result<Vec<u8>, SysErrNo> {
-    let size = fs.get_inode_ref(ino).inode.size() as usize;
-    let mut data = alloc::vec![0u8; size];
-    let mut off = 0usize;
-    while off < size {
-        let n = fs
-            .read_at(ino, off, &mut data[off..])
-            .map_err(map_ext4_err)?;
-        if n == 0 {
-            return Err(SysErrNo::EIO);
-        }
-        off += n;
-    }
-    Ok(data)
 }
 
 fn regular_cache_entry(ino: u32) -> Option<RegularCacheEntry> {
@@ -1319,12 +1342,25 @@ fn ensure_regular_cache(ino: u32) -> Result<bool, SysErrNo> {
     }
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let inode = fs.get_inode_ref(ino).inode;
-    if inode.size() > REGULAR_CACHE_LIMIT as u64 {
-        return Ok(false);
-    }
-    let data = load_regular_data(&fs, ino)?;
+    let size = inode.size() as usize;
+    let dense = if size <= DENSE_REGULAR_CACHE_LIMIT {
+        let mut data = alloc::vec![0u8; size];
+        let mut offset = 0usize;
+        while offset < size {
+            let read = extent_aware_read_at(ino, offset, &mut data[offset..])?;
+            if read == 0 {
+                return Err(SysErrNo::EIO);
+            }
+            offset += read;
+        }
+        Some(data)
+    } else {
+        None
+    };
     let cached = CachedRegularFile::new(
-        data,
+        size,
+        size,
+        dense,
         PageCacheDirtyModel::clean(),
         inode.mtime(),
         inode.i_mtime_extra(),
@@ -1338,24 +1374,112 @@ fn ensure_regular_cache(ino: u32) -> Result<bool, SysErrNo> {
     Ok(true)
 }
 
-fn cached_regular_read(ino: u32, offset: usize, buf: &mut [u8]) -> Option<usize> {
+fn copy_cached_range(
+    ino: u32,
+    cached: &CachedRegularFile,
+    start: usize,
+    out: &mut [u8],
+) -> Result<(), SysErrNo> {
+    if let Some(dense) = cached.dense.as_ref() {
+        let end = start.checked_add(out.len()).ok_or(SysErrNo::EFBIG)?;
+        let source = dense.get(start..end).ok_or(SysErrNo::EIO)?;
+        out.copy_from_slice(source);
+        return Ok(());
+    }
+    let mut copied = 0usize;
+    while copied < out.len() {
+        let current = start + copied;
+        let page_idx = current / PAGE_SIZE;
+        let page_off = current % PAGE_SIZE;
+        let count = (out.len() - copied).min(PAGE_SIZE - page_off);
+        if let Some(frame) = cached.pages.get(&page_idx) {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (frame.ppn().addr() + page_off) as *const u8,
+                    out[copied..].as_mut_ptr(),
+                    count,
+                );
+            }
+        } else if current < cached.persisted_size {
+            let disk_count = count.min(cached.persisted_size - current);
+            let n = extent_aware_read_at(ino, current, &mut out[copied..copied + disk_count])?;
+            if n != disk_count {
+                return Err(SysErrNo::EIO);
+            }
+            out[copied + disk_count..copied + count].fill(0);
+        } else {
+            out[copied..copied + count].fill(0);
+        }
+        copied += count;
+    }
+    Ok(())
+}
+
+fn promote_dense_regular_cache(cached: &mut CachedRegularFile) -> Result<(), SysErrNo> {
+    let Some(dense) = cached.dense.as_ref() else {
+        return Ok(());
+    };
+    let mut pages = BTreeMap::new();
+    for (page_idx, chunk) in dense.chunks(PAGE_SIZE).enumerate() {
+        let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                chunk.as_ptr(),
+                frame.ppn().addr() as *mut u8,
+                chunk.len(),
+            );
+        }
+        pages.insert(page_idx, frame);
+    }
+    cached.pages = pages;
+    cached.dense = None;
+    Ok(())
+}
+
+fn cached_page_for_write(
+    ino: u32,
+    cached: &mut CachedRegularFile,
+    page_idx: usize,
+    preserve_contents: bool,
+) -> Result<FrameTracker, SysErrNo> {
+    if let Some(frame) = cached.pages.get(&page_idx) {
+        return Ok(frame.clone());
+    }
+    let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
+    if preserve_contents {
+        let page_start = page_idx.checked_mul(PAGE_SIZE).ok_or(SysErrNo::EFBIG)?;
+        if page_start < cached.persisted_size {
+            let read_len = PAGE_SIZE.min(cached.persisted_size - page_start);
+            let page = unsafe {
+                core::slice::from_raw_parts_mut(frame.ppn().addr() as *mut u8, PAGE_SIZE)
+            };
+            let n = extent_aware_read_at(ino, page_start, &mut page[..read_len])?;
+            if n != read_len {
+                return Err(SysErrNo::EIO);
+            }
+        }
+    }
+    cached.pages.insert(page_idx, frame.clone());
+    Ok(frame)
+}
+
+fn cached_regular_read(ino: u32, offset: usize, buf: &mut [u8]) -> Option<Result<usize, SysErrNo>> {
     let entry = regular_cache_entry(ino)?;
     let cached = entry.lock();
     if cached.evicted {
         return None;
     }
-    if offset >= cached.data.len() {
-        return Some(0);
+    if offset >= cached.size {
+        return Some(Ok(0));
     }
-    let n = buf.len().min(cached.data.len() - offset);
-    buf[..n].copy_from_slice(&cached.data[offset..offset + n]);
-    Some(n)
+    let n = buf.len().min(cached.size - offset);
+    Some(copy_cached_range(ino, &cached, offset, &mut buf[..n]).map(|_| n))
 }
 
 fn cached_regular_size(ino: u32) -> Option<usize> {
     let entry = regular_cache_entry(ino)?;
     let cached = entry.lock();
-    (!cached.evicted).then_some(cached.data.len())
+    (!cached.evicted).then_some(cached.size)
 }
 
 fn cached_regular_snapshot(ino: u32) -> Option<Vec<u8>> {
@@ -1364,7 +1488,9 @@ fn cached_regular_snapshot(ino: u32) -> Option<Vec<u8>> {
     if cached.evicted {
         None
     } else {
-        Some(cached.data.clone())
+        let mut data = alloc::vec![0u8; cached.size];
+        copy_cached_range(ino, &cached, 0, &mut data).ok()?;
+        Some(data)
     }
 }
 
@@ -1375,7 +1501,7 @@ fn cached_regular_info(ino: u32) -> Option<CachedRegularInfo> {
         return None;
     }
     Some(CachedRegularInfo {
-        size: cached.data.len(),
+        size: cached.size,
         mtime_sec: cached.mtime_sec,
         mtime_extra: cached.mtime_extra,
         ctime_sec: cached.ctime_sec,
@@ -1393,12 +1519,46 @@ fn cached_regular_resize(ino: u32, new_len: usize) -> Result<(), SysErrNo> {
     if cached.evicted {
         return Err(SysErrNo::ENOENT);
     }
-    let old_len = cached.data.len();
-    cached.data.resize(new_len, 0);
-    if new_len > old_len {
-        cached.dirty.full_dirty = true;
-    } else if new_len < old_len {
+    let old_len = cached.size;
+    if new_len > DENSE_REGULAR_CACHE_LIMIT && cached.dense.is_some() {
+        promote_dense_regular_cache(&mut cached)?;
+    }
+    if new_len < old_len {
+        cached.persisted_size = cached.persisted_size.min(new_len);
+        cached.truncate_to = Some(
+            cached
+                .truncate_to
+                .map_or(new_len, |pending| pending.min(new_len)),
+        );
+        if let Some(dense) = cached.dense.as_mut() {
+            dense.truncate(new_len);
+        } else {
+            let first_removed_page = new_len.div_ceil(PAGE_SIZE);
+            drop(cached.pages.split_off(&first_removed_page));
+            if new_len % PAGE_SIZE != 0 {
+                if let Some(frame) = cached.pages.get(&(new_len / PAGE_SIZE)) {
+                    unsafe {
+                        core::ptr::write_bytes(
+                            (frame.ppn().addr() + new_len % PAGE_SIZE) as *mut u8,
+                            0,
+                            PAGE_SIZE - new_len % PAGE_SIZE,
+                        );
+                    }
+                }
+            }
+        }
         clip_dirty_ranges(&mut cached, new_len);
+    } else if new_len > old_len {
+        if let Some(dense) = cached.dense.as_mut() {
+            dense.resize(new_len, 0);
+        }
+    }
+    cached.size = new_len;
+    if new_len > old_len {
+        // ext4_rs treats logical blocks below i_size as already allocated.
+        // Materialize a grown range before committing the final size so a
+        // later write into that range cannot silently target an extent hole.
+        mark_dirty_range(&mut cached, old_len, new_len);
     }
     cached.dirty.size_dirty = true;
     note_cached_data_write(&mut cached);
@@ -1417,23 +1577,50 @@ fn cached_regular_write(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, Sy
     if cached.evicted {
         return Err(SysErrNo::ENOENT);
     }
-    let old_len = cached.data.len();
-    if end > cached.data.len() {
-        cached.data.resize(end, 0);
+    let old_len = cached.size;
+    if end > DENSE_REGULAR_CACHE_LIMIT && cached.dense.is_some() {
+        promote_dense_regular_cache(&mut cached)?;
     }
-    cached.data[offset..end].copy_from_slice(buf);
-    if cached.dirty.full_dirty || end > old_len || cached.data.len() > DIRTY_RANGE_FILE_LIMIT {
-        cached.dirty.full_dirty = true;
-        if end > old_len {
-            cached.dirty.size_dirty = true;
+    let copied = if let Some(dense) = cached.dense.as_mut() {
+        if end > dense.len() {
+            dense.resize(end, 0);
         }
+        dense[offset..end].copy_from_slice(buf);
+        buf.len()
     } else {
-        mark_dirty_range(&mut cached, offset, end);
+        let mut copied = 0usize;
+        while copied < buf.len() {
+            let current = offset + copied;
+            let page_idx = current / PAGE_SIZE;
+            let page_off = current % PAGE_SIZE;
+            let count = (buf.len() - copied).min(PAGE_SIZE - page_off);
+            let preserve_contents = page_off != 0 || count != PAGE_SIZE;
+            let frame = match cached_page_for_write(ino, &mut cached, page_idx, preserve_contents) {
+                Ok(frame) => frame,
+                Err(err) if copied == 0 => return Err(err),
+                Err(_) => break,
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf[copied..].as_ptr(),
+                    (frame.ppn().addr() + page_off) as *mut u8,
+                    count,
+                );
+            }
+            copied += count;
+        }
+        copied
+    };
+    let written_end = offset + copied;
+    cached.size = cached.size.max(written_end);
+    mark_dirty_range(&mut cached, offset, written_end);
+    if written_end > old_len {
+        cached.dirty.size_dirty = true;
     }
     note_cached_data_write(&mut cached);
     drop(cached);
     schedule_cached_writeback_if_ready(ino);
-    Ok(buf.len())
+    Ok(copied)
 }
 
 fn is_regular_cached(ino: u32) -> bool {
@@ -1484,7 +1671,12 @@ pub fn diagnostic_regular_cache_stats() -> (usize, usize, usize) {
         let cached = entry.lock();
         if !cached.evicted {
             dirty += usize::from(cached.is_dirty());
-            bytes = bytes.saturating_add(cached.data.len());
+            bytes = bytes.saturating_add(
+                cached
+                    .dense
+                    .as_ref()
+                    .map_or_else(|| cached.pages.len().saturating_mul(PAGE_SIZE), Vec::len),
+            );
         }
     }
     (entries.len(), dirty, bytes)
@@ -1645,7 +1837,9 @@ fn cache_empty_regular(ino: u32, dirty: bool) {
     insert_regular_cache_entry(
         ino,
         CachedRegularFile::new(
-            Vec::new(),
+            0,
+            0,
+            Some(Vec::new()),
             if dirty {
                 PageCacheDirtyModel::dirty_whole_file()
             } else {
@@ -1711,31 +1905,56 @@ fn take_writeback_snapshot(ino: u32) -> WritebackSnapshotResult {
     if let Some(err) = cached.dirty.last_error {
         return WritebackSnapshotResult::Failed(err);
     }
+    if cached.dirty.full_dirty {
+        cached.dirty.ranges.clear();
+        let size = cached.size;
+        if size != 0 {
+            cached.dirty.ranges.push(DirtyRange {
+                start: 0,
+                end: size,
+            });
+        }
+        cached.dirty.full_dirty = false;
+    }
     let Some(dirty_seq) = cached.dirty.begin_writeback() else {
         return WritebackSnapshotResult::Busy;
     };
 
-    let dirty_bytes = cached.dirty.ranges.iter().fold(0usize, |total, range| {
-        total.saturating_add(range.end.saturating_sub(range.start))
-    });
-    let write_whole = cached.dirty.full_dirty || dirty_bytes.saturating_mul(2) >= cached.data.len();
-    let data = if write_whole {
-        WritebackData::Whole(cached.data.clone())
-    } else {
-        let mut ranges = Vec::new();
-        for range in cached.dirty.ranges.iter().copied() {
-            let end = range.end.min(cached.data.len());
-            if range.start < end {
-                ranges.push((range.start, cached.data[range.start..end].to_vec()));
-            }
-        }
-        WritebackData::Ranges(ranges)
+    let range = cached
+        .dirty
+        .ranges
+        .first()
+        .copied()
+        .map(|range| DirtyRange {
+            start: range.start,
+            end: range
+                .end
+                .min(range.start.saturating_add(WRITEBACK_CLUSTER_BYTES)),
+        });
+    let commit_size = match (range, cached.dirty.ranges.as_slice()) {
+        (None, []) => true,
+        (Some(completed), [only]) => completed.start == only.start && completed.end == only.end,
+        _ => false,
     };
+    let mut data = if let Some(range) = range {
+        alloc::vec![0u8; range.end - range.start]
+    } else {
+        Vec::new()
+    };
+    if let Some(range) = range {
+        if let Err(err) = copy_cached_range(ino, &cached, range.start, &mut data) {
+            cached.dirty.fail_writeback(err);
+            return WritebackSnapshotResult::Failed(err);
+        }
+    }
 
     WritebackSnapshotResult::Snapshot(WritebackSnapshot {
         ino,
-        target_len: cached.data.len(),
+        target_len: cached.size,
+        truncate_to: cached.truncate_to,
+        range,
         data,
+        commit_size,
         dirty_seq,
         mtime_sec: cached.mtime_sec,
         mtime_extra: cached.mtime_extra,
@@ -1749,33 +1968,31 @@ fn apply_writeback_snapshot(snapshot: &WritebackSnapshot) -> Result<(), SysErrNo
     invalidate_pblock_runs_ino(snapshot.ino);
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let old_size = fs.get_inode_ref(snapshot.ino).inode.size();
-    if (snapshot.target_len as u64) < old_size {
+    let truncate_to = snapshot
+        .truncate_to
+        .unwrap_or(snapshot.target_len)
+        .min(snapshot.target_len);
+    if (truncate_to as u64) < old_size {
         let mut iref = fs.get_inode_ref(snapshot.ino);
-        fs.truncate_inode(&mut iref, snapshot.target_len as u64)
+        fs.truncate_inode(&mut iref, truncate_to as u64)
             .map_err(map_ext4_err)?;
     }
 
-    match &snapshot.data {
-        WritebackData::Whole(data) => {
-            if !data.is_empty() {
-                let written = fs.write_at(snapshot.ino, 0, data).map_err(map_ext4_err)?;
-                if written != data.len() {
-                    return Err(SysErrNo::EIO);
-                }
-            }
+    if let Some(range) = snapshot.range {
+        let written = fs
+            .write_at(snapshot.ino, range.start, &snapshot.data)
+            .map_err(map_ext4_err)?;
+        if written != snapshot.data.len() {
+            return Err(SysErrNo::EIO);
         }
-        WritebackData::Ranges(ranges) => {
-            for (start, data) in ranges {
-                if data.is_empty() {
-                    continue;
-                }
-                let written = fs
-                    .write_at(snapshot.ino, *start, data)
-                    .map_err(map_ext4_err)?;
-                if written != data.len() {
-                    return Err(SysErrNo::EIO);
-                }
-            }
+    }
+
+    if snapshot.commit_size {
+        let current_size = fs.get_inode_ref(snapshot.ino).inode.size();
+        if snapshot.target_len as u64 > current_size {
+            let mut iref = fs.get_inode_ref(snapshot.ino);
+            iref.inode.set_size(snapshot.target_len as u64);
+            fs.write_back_inode(&mut iref);
         }
     }
 
@@ -1810,7 +2027,21 @@ fn finish_writeback_snapshot(
                 return result;
             }
             if result.is_ok() {
-                requeue = cached.dirty.finish_writeback(snapshot.dirty_seq);
+                if cached.dirty.seq == snapshot.dirty_seq
+                    && cached.truncate_to == snapshot.truncate_to
+                {
+                    cached.truncate_to = None;
+                }
+                requeue = cached.dirty.finish_writeback(
+                    snapshot.dirty_seq,
+                    snapshot.range,
+                    snapshot.commit_size,
+                );
+                if !requeue {
+                    cached.persisted_size = snapshot.target_len;
+                } else {
+                    cached.persisted_size = cached.persisted_size.min(snapshot.target_len);
+                }
             } else {
                 cached
                     .dirty
@@ -2364,11 +2595,7 @@ pub fn truncate_regular_ino(ino: u32, size: u64) -> Result<(), SysErrNo> {
         invalidate_pblock_runs_ino(ino);
     }
     if kind == Ext4NodeKind::Regular && is_regular_cached(ino) {
-        if size as usize <= REGULAR_CACHE_LIMIT {
-            return cached_regular_resize(ino, size as usize);
-        }
-        flush_cached_ino(ino)?;
-        discard_regular_cache(ino);
+        return cached_regular_resize(ino, size as usize);
     }
     let _mutation = ext4_mutation_lock!();
     let mut iref = fs.get_inode_ref(ino);
@@ -2403,8 +2630,8 @@ pub fn truncate_regular_ext4(path: &str, size: u64) -> Result<(), SysErrNo> {
 }
 
 pub fn ext4_read_at(ino: u32, offset: usize, buf: &mut [u8]) -> Result<usize, SysErrNo> {
-    if let Some(n) = cached_regular_read(ino, offset, buf) {
-        return Ok(n);
+    if let Some(result) = cached_regular_read(ino, offset, buf) {
+        return result;
     }
     match clean_page_cached_read(ino, offset, buf) {
         Ok(n) => return Ok(n),
@@ -2420,14 +2647,6 @@ pub fn ext4_write_at(ino: u32, offset: usize, buf: &[u8]) -> Result<usize, SysEr
         return Ok(0);
     }
     invalidate_pblock_runs_ino(ino);
-    let end = offset + buf.len();
-    if end > REGULAR_CACHE_LIMIT {
-        if is_regular_cached(ino) {
-            flush_cached_ino(ino)?;
-            discard_regular_cache(ino);
-        }
-        return uncached_regular_write(ino, offset, buf);
-    }
     if ensure_regular_cache(ino)? {
         cached_regular_write(ino, offset, buf)
     } else {

@@ -358,3 +358,81 @@ python3 /srv/buildstorm/src/testsuits-for-oskernel/judge/judge_buildstorm-glibc.
 - VisionFive 2 与 Loongson 2K1000LA 的平台识别边界已建立，但本文结果是 QEMU `official-pass`，不等同于实板完成。
 
 当前内核分层、所有权和锁协议详见 `docs/kernel-architecture-overview-cn.md`。
+
+## 11. 2026-08-15 评测超时复核与 VFS 稳定性候选
+
+### 11.1 现象与证据等级
+
+评测机提交日志曾在 `ax-mm v0.5.28` 后超过 3000 秒，没有
+`BUILDSTORM_COMPILE mode=multi ok=true`，也没有 panic、OOM 或 VirtIO 错误。
+这只能证明该次运行 `unverified`，不能证明内核必然死锁。远端
+`47.110.253.40` 使用官方 `final-2026` 提交
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`、原始镜像和 QEMU 11.0.3 复核后，
+同一生产候选连续越过该边界并完成：
+
+本轮官方成功 dirty diff 的 SHA-256 为
+`6ab666171bfb50f3d2c704807a23d9567e442eda64da4c44edd74de384d48a73`，稳定
+patch-id 为 `8701497fa79e31b4266772f7695149dafcd52c93`。
+
+| 架构 | guest marker | judge | 镜像 SHA-256 | 内核 SHA-256 |
+| --- | --- | --- | --- | --- |
+| RISC-V64 | `ok=true elapsed_s=862.17`、`860.15`、`867.16` | 180/180 | `d74e4365...b334c` | `ff426fed...aad41` / `eb1518f5...43fb8` |
+| LoongArch64 | `ok=true elapsed_s=674.49`、`687.23` | 180/180 | `d1410544...fdc5` | `2c1c51be...31ee` / `a5c6dc1f...7ba8` |
+
+这些运行均为 `official-pass`；四种 release/diagnostics cfg 构建和双架构
+SMP 生命周期回归为 `capability-pass`。完整 provenance 保存在：
+
+- `docs/evidence/buildstorm-stage2/20260815-riscv64-vfs-clustered-sparsefix-official-complete/`
+- `docs/evidence/buildstorm-stage2/20260815-riscv64-vfs-hybrid-official-complete/`
+- `docs/evidence/buildstorm-stage2/20260815-loongarch64-vfs-hybrid-official-complete/`
+- `docs/evidence/buildstorm-stage2/20260815-vfs-hybrid-release-gates-retry1/`
+- `docs/evidence/buildstorm-stage2/20260815-vfs-hybrid-smp-gates/`
+
+### 11.2 根因模型与实现边界
+
+评测日志和源码交叉检查后，最强的通用模型是“大文件编译工作集触发的
+整文件缓存、逐块回写和 ext4 extent 查找放大”，它可以使 guest 在高 CPU
+下长时间没有新的 crate marker。候选把数据平面拆成四层：
+
+1. 小于 8 MiB 的 regular file 保留 dense cache，保持常规读取的低开销。
+2. 大文件改用按页的 sparse cache；缺页从 ext4 读取，写入只分配被修改页，
+   不再为整文件保留连续 `Vec<u8>`。
+3. dirty range 以 256 KiB cluster 分批回写，连续物理 extent 的完整块最多
+   以 64 块一次提交；尾部 partial block 仍执行 read-modify-write。
+4. truncate 清理新 EOF 后的 partial block，shared-file 写回按文件 identity
+   去重同步，保证 POSIX 读取零填充、fsync、rename 和 open-unlink 语义。
+
+该设计不改变 `VmaMap/MapArea`、`ResidentSet`、`PageTableOps` 或
+`TlbProtocol` 的所有权边界，也不按 crate、路径、命令、输出或评测 marker
+分支。`smp-regression` 的 regular-file lifecycle 在两架构均通过。
+
+### 11.3 性能解释与限制
+
+此前 Stage B per-CPU heap cache 的单次最快基线是 RISC-V64 `800.55s`、
+LoongArch64 `660.71s`；本候选分别为约 `860s`、`687s`，因此它不是吞吐加速，
+而是针对评测机长尾的稳定性候选。RISC-V64 多次 sparse/hybrid 运行都在
+约 900 秒内结束，不能把单次 800 秒基线外推为 3000 秒必现成功，也不能把
+本候选宣称为时间分提升。正式评测仍以同机 Linux 基线为准。
+
+当前工作树另有 `os/src/fs/vfs.rs` 的 parent/readlink cache 改动；它没有
+包含在上述官方成功 dirty diff（patch-id `8701497fa79e31b4266772f7695149dafcd52c93`）
+中，状态仍为 `unverified`，不得与本候选一起提交或归因。
+
+### 11.4 AI 使用与复现
+
+AI 用于交叉核对 dirty worktree、官方脚本、源码调用关系、日志和 hash，
+并辅助设计通用页缓存/回写结构及独立生命周期回归。人工可复核的证据包括
+dirty diff、kernel/image/suite hash、四 cfg 构建日志、双架构 SMP 串口、
+官方 serial 和 judge 输出。复现时先确认无 QEMU，再按顺序运行：
+
+```bash
+export BUILDSTORM_SUITE_DIR=/srv/buildstorm/src/testsuits-for-oskernel
+bash scripts/run_buildstorm_long_baseline.sh riscv64 \
+  /srv/buildstorm/images/sdcard-rv-pub.img /srv/buildstorm/evidence/<run>
+bash scripts/run_buildstorm_long_baseline.sh loongarch64 \
+  /srv/buildstorm/images/sdcard-la-pub.img /srv/buildstorm/evidence/<run>
+```
+
+脚本使用 `-snapshot -m 8G -smp 8`，不修改镜像、guest `/proc/uptime`、
+官方 suite、judge、marker 或 guest timeout。当前完整 BuildStorm 结论为
+`official-pass`；时间优化收益仍以正式评测机复测为准。

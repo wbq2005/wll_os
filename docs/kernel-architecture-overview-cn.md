@@ -327,3 +327,25 @@ BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=660.71 cores=8 bytes=1716224 arc
 - per-CPU heap cache 当前按固定上限和批量参数工作；后续若调整参数，必须保持 canonical layout、OOM drain、IRQ 状态和锁序不变量，并重新执行双架构压力与完整官方运行。
 - 实板支持必须分别验证 boot、interrupt、timer、SMP、DMA、storage、cache maintenance；QEMU 通过不能代替 VisionFive 2 或 Loongson 2K1000LA gate。
 - 初赛回归仍是提交要求，BuildStorm 完成不替代其他测例。
+
+## 14. 2026-08-15 regular-file data-plane update
+
+当前 VFS/ext4 数据平面采用“dense 小文件 + sparse 大文件页缓存 + clustered
+writeback”的分层结构。`CachedRegularFile` 只在文件不超过 8 MiB 时保留连续
+字节数组；更大的文件以 `BTreeMap<page_index, FrameTracker>` 保存实际修改页，
+读取缺页直接走 extent-aware ext4 路径。回写先按 dirty range 切成 256 KiB
+cluster，再对连续物理块做批量写入；partial block 仍由 ext4 完成
+read-modify-write。truncate 会清理 EOF 所在块的尾部字节，避免后续扩展暴露旧数据。
+
+这层只拥有文件数据缓存和持久化状态，不拥有 VMA、PTE 或用户页表 frame；
+`MemorySet -> MapArea -> ResidentSet -> FrameTracker` 的所有权链保持不变。
+namespace transaction lock 只保护名字解析和目录 mutation，regular-file
+writeback 不持有 namespace lock；RISC-V64 和 LoongArch64 的平台差异仍在
+VirtIO、页表和 TLB 边界内，数据面逻辑共用。
+
+当前最快吞吐基线仍是 Stage B 的 `800.55s/660.71s`；本层的已验证运行约为
+`860s/687s`，其工程目标是消除大文件回写的长尾和评测超时，而不是宣称加速。
+官方成功 marker、镜像/内核 hash 和 SMP 生命周期证据见
+`docs/buildstorm-2.3-design-optimization-cn.md` 第 11 节。工作树中额外的
+`os/src/fs/vfs.rs` parent/readlink cache 实验尚未纳入该架构结论，状态为
+`unverified`。

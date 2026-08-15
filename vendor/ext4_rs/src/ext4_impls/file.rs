@@ -403,13 +403,14 @@ impl Ext4 {
             iblk_idx += 1;
         }
 
-        // Aligned write
+        // Aligned write. Full blocks can be submitted as one request when
+        // their physical extent is contiguous. Partial tail blocks still
+        // need read-modify-write so bytes beyond the caller's range survive.
+        const MAX_CLUSTER_BLOCKS: usize = 64;
         let mut aligned_blocks = 0;
         log::info!("[Aligned Write] Starting aligned writes for {} blocks", (write_buf_len - written + BLOCK_SIZE - 1) / BLOCK_SIZE);
-        
+
         while written < write_buf_len {
-            aligned_blocks += 1;
-            
             // Get the physical block id
             let pblock_idx = match self.get_pblock_idx(&inode_ref, iblk_idx as u32) {
                 Ok(idx) => idx,
@@ -418,17 +419,43 @@ impl Ext4 {
                     return Err(e);
                 }
             };
-            total_blocks += 1;
-
-            let block_offset = pblock_idx as usize * BLOCK_SIZE;
-            let mut block = Block::load(&self.block_device, block_offset);
             let write_size = min(BLOCK_SIZE, write_buf_len - written);
-            block.write_offset(0, &write_buf[written..written + write_size], write_size);
-            block.sync_blk_to_disk(&self.block_device);
-            drop(block);
-            
-            written += write_size;
-            iblk_idx += 1;
+            if write_size < BLOCK_SIZE {
+                let block_offset = pblock_idx as usize * BLOCK_SIZE;
+                let mut block = Block::load(&self.block_device, block_offset);
+                block.write_offset(0, &write_buf[written..written + write_size], write_size);
+                block.sync_blk_to_disk(&self.block_device);
+                written += write_size;
+                iblk_idx += 1;
+                aligned_blocks += 1;
+                total_blocks += 1;
+                continue;
+            }
+
+            let mut cluster_blocks = 1usize;
+            while cluster_blocks < MAX_CLUSTER_BLOCKS
+                && written + (cluster_blocks + 1) * BLOCK_SIZE <= write_buf_len
+            {
+                let next_iblk = iblk_idx + cluster_blocks;
+                let next_pblock = match self.get_pblock_idx(&inode_ref, next_iblk as u32) {
+                    Ok(idx) => idx,
+                    Err(_) => break,
+                };
+                if next_pblock != pblock_idx + cluster_blocks as u64 {
+                    break;
+                }
+                cluster_blocks += 1;
+            }
+
+            let cluster_bytes = cluster_blocks * BLOCK_SIZE;
+            self.block_device.write_offset(
+                pblock_idx as usize * BLOCK_SIZE,
+                &write_buf[written..written + cluster_bytes],
+            );
+            written += cluster_bytes;
+            iblk_idx += cluster_blocks;
+            aligned_blocks += cluster_blocks;
+            total_blocks += cluster_blocks;
 
             if aligned_blocks % 1000 == 0 {
                 log::trace!("[Progress] Written {} blocks, {} bytes", aligned_blocks, written);
@@ -519,6 +546,29 @@ impl Ext4 {
         let new_blocks_cnt = ((new_size + block_size - 1) / block_size) as u32;
         let old_blocks_cnt = ((old_size + block_size - 1) / block_size) as u32;
         let diff_blocks_cnt = old_blocks_cnt - new_blocks_cnt;
+
+        // POSIX requires bytes exposed by a later extension to read as zero.
+        // Preserve the final partial block, but clear everything beyond the
+        // new EOF before removing subsequent extents.
+        let tail_offset = (new_size % block_size) as usize;
+        if tail_offset != 0 {
+            let lblock = (new_size / block_size) as u32;
+            if let Ok(path) = self.find_extent(inode_ref, lblock) {
+                if let Some(node) = path.path.last() {
+                    if let Some(extent) = node.extent {
+                        let first = extent.get_first_block();
+                        let len = extent.get_actual_len() as u32;
+                        if lblock >= first && lblock < first.saturating_add(len) {
+                            let pblock = extent.get_pblock() + (lblock - first) as u64;
+                            let mut block =
+                                Block::load(&self.block_device, pblock as usize * BLOCK_SIZE);
+                            block.data[tail_offset..].fill(0);
+                            block.sync_blk_to_disk(&self.block_device);
+                        }
+                    }
+                }
+            }
+        }
 
         if diff_blocks_cnt > 0{
             self.extent_remove_space(inode_ref, new_blocks_cnt, EXT_MAX_BLOCKS)?;

@@ -1,0 +1,2 @@
+official judge: scripted total 180.0 / 180.0
+compile: arch=riscv64 elapsed=873s baseline=1616s

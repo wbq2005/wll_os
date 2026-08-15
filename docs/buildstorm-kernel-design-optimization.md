@@ -1687,3 +1687,45 @@ Raw evidence is under
 implementation, regression design, controlled execution and evidence capture;
 the source diff, serial logs, kernel/image/suite hashes, runner arguments and
 official judge outputs are retained for developer verification.
+
+## 40. 2026-08-15 VFS sparse-cache and clustered writeback stability candidate
+
+The evaluator-side RISC-V run that remained at `ax-mm` beyond 3000 seconds was
+`unverified`: it had no panic/OOM/device error and no successful compile marker.
+On remote host `47.110.253.40`, the official `final-2026` suite at
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972` was rerun with the public images,
+QEMU 11.0.3, `-snapshot -m 8G -smp 8`, and production diagnostics disabled.
+The validated dirty patch has stable patch-id
+`8701497fa79e31b4266772f7695149dafcd52c93` and source commit
+`2acfed66b145ee0c48b55cc1046513ab20290a17`.
+
+The patch changes only the general ext4 regular-file data path, shared-file
+sync deduplication, and an independent lifecycle regression. Files larger than
+8 MiB use page-granular sparse cache entries instead of a whole-file `Vec`; dirty
+data is written in 256 KiB ranges, contiguous complete blocks are clustered,
+and truncate/partial-block handling preserves zero-fill semantics. No VMA,
+resident ownership, PTE, TLB, scheduler, or guest-time policy is changed.
+
+The official results are:
+
+| arch | exact marker | judge | image SHA-256 | kernel SHA-256 |
+| --- | --- | --- | --- | --- |
+| RISC-V64 | `ok=true elapsed_s=862.17`, `860.15`, and `867.16` | 180/180 | `d74e4365...b334c` | `ff426fed...aad41` / `eb1518f5...43fb8` |
+| LoongArch64 | `ok=true elapsed_s=674.49` and `687.23` | 180/180 | `d1410544...fdc5` | `2c1c51be...31ee` / `a5c6dc1f...7ba8` |
+
+The earlier Stage B heap-cache run was faster (`800.55s` / `660.71s`) but the
+submitted evaluator later exhibited a >3000-second long tail. The present
+candidate is therefore recorded as a reliability/stability candidate, not as a
+throughput improvement. Both architectures passed the regular-file sparse,
+truncate, fsync, rename and open-unlink lifecycle under `smp-regression`; all
+four release/diagnostics cfg builds passed. Evidence directories are the three
+20260815 `vfs-*` official runs plus `20260815-vfs-hybrid-release-gates-retry1`
+and `20260815-vfs-hybrid-smp-gates`.
+
+The local `os/src/fs/vfs.rs` cache-size/eviction experiment is intentionally not
+part of this patch or its attribution; it remains `unverified` and must be
+reviewed as a separate experiment. AI assisted source/evidence correlation,
+design, implementation and test orchestration; all hashes, raw logs, commands
+and judge output are retained for manual verification. The official score is
+locked only by the exact markers above; the manual document score is not
+claimed here.

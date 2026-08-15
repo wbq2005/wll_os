@@ -31,6 +31,7 @@ static NAMESPACE_STOP: AtomicBool = AtomicBool::new(false);
 
 const HEAP_STRESS_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const HEAP_STRESS_CHUNKS: usize = 10;
+const LARGE_HEAP_PROBE_BYTES: usize = 320 * 1024 * 1024;
 const ASID_TEST_VADDR: usize = 0x4000_0000;
 const ASID_ISOLATION_ITERATIONS: usize = 64;
 const RESIDENT_TEST_VADDR: usize = 0x4100_0000;
@@ -42,6 +43,240 @@ const NAMESPACE_LEFT: &str = "/tmp/.wll_namespace_lifecycle/left";
 const NAMESPACE_RIGHT: &str = "/tmp/.wll_namespace_lifecycle/right";
 const NAMESPACE_PULSE: &str = "/tmp/.wll_namespace_lifecycle/pulse";
 const NAMESPACE_ITERATIONS: usize = 64;
+const REGULAR_FILE_ROOT: &str = "/tmp/.wll_regular_file_lifecycle";
+const REGULAR_FILE_PATH: &str = "/tmp/.wll_regular_file_lifecycle/data";
+const REGULAR_FILE_RENAMED: &str = "/tmp/.wll_regular_file_lifecycle/renamed";
+const REGULAR_FILE_BYTES: usize = 8 * 1024 * 1024 + 3 * crate::config::PAGE_SIZE + 257;
+const REGULAR_FILE_IO_CHUNK: usize = 64 * 1024;
+
+fn regular_file_pattern(offset: usize) -> u8 {
+    (offset.wrapping_mul(131) ^ (offset >> 7) ^ 0x5a) as u8
+}
+
+fn regular_file_overwrite_pattern(offset: usize) -> u8 {
+    (offset.wrapping_mul(17) ^ 0xa5) as u8
+}
+
+fn verify_regular_file_window(
+    ino: u32,
+    start: usize,
+    len: usize,
+    overwrite_start: usize,
+    overwrite_len: usize,
+    phase: &str,
+) {
+    let mut observed = alloc::vec![0u8; len];
+    let read = crate::fs::ext4_vol::ext4_read_at(ino, start, &mut observed)
+        .expect("regular file lifecycle read");
+    if read != len {
+        panic!(
+            "[smp-regression] fail phase={} expected_read={} observed_read={}",
+            phase, len, read
+        );
+    }
+    for (index, byte) in observed.into_iter().enumerate() {
+        let offset = start + index;
+        let expected = if offset >= overwrite_start && offset < overwrite_start + overwrite_len {
+            regular_file_overwrite_pattern(offset - overwrite_start)
+        } else {
+            regular_file_pattern(offset)
+        };
+        if byte != expected {
+            panic!(
+                "[smp-regression] fail phase={} offset={} expected={} observed={}",
+                phase, offset, expected, byte
+            );
+        }
+    }
+}
+
+fn verify_regular_file_all(
+    ino: u32,
+    overwrite_start: usize,
+    overwrite_len: usize,
+    phase: &str,
+) {
+    let mut observed = alloc::vec![0u8; REGULAR_FILE_IO_CHUNK];
+    let mut start = 0usize;
+    while start < REGULAR_FILE_BYTES {
+        let count = observed.len().min(REGULAR_FILE_BYTES - start);
+        let read = crate::fs::ext4_vol::ext4_read_at(ino, start, &mut observed[..count])
+            .expect("regular file lifecycle full read");
+        if read != count {
+            panic!(
+                "[smp-regression] fail phase={} expected_read={} observed_read={} offset={}",
+                phase, count, read, start
+            );
+        }
+        for (index, byte) in observed[..count].iter().copied().enumerate() {
+            let offset = start + index;
+            let expected = if offset >= overwrite_start && offset < overwrite_start + overwrite_len
+            {
+                regular_file_overwrite_pattern(offset - overwrite_start)
+            } else {
+                regular_file_pattern(offset)
+            };
+            if byte != expected {
+                panic!(
+                    "[smp-regression] fail phase={} offset={} expected={} observed={}",
+                    phase, offset, expected, byte
+                );
+            }
+        }
+        start += count;
+    }
+}
+
+fn verify_regular_file_lifecycle() {
+    use crate::fs::ext4_vol;
+
+    if ext4_vol::lookup_kind(REGULAR_FILE_ROOT).is_some() {
+        panic!("[smp-regression] fail phase=regular-file-private-root-exists");
+    }
+    ext4_vol::mkdir_ext4(REGULAR_FILE_ROOT).expect("regular file lifecycle root");
+    let ino =
+        ext4_vol::create_regular_ext4(REGULAR_FILE_PATH).expect("regular file lifecycle create");
+    ext4_vol::open_regular_ino(ino);
+
+    let mut data = alloc::vec![0u8; REGULAR_FILE_IO_CHUNK];
+    let mut offset = 0usize;
+    while offset < REGULAR_FILE_BYTES {
+        let count = data.len().min(REGULAR_FILE_BYTES - offset);
+        for (index, byte) in data[..count].iter_mut().enumerate() {
+            *byte = regular_file_pattern(offset + index);
+        }
+        let written = ext4_vol::ext4_write_at(ino, offset, &data[..count])
+            .expect("regular file lifecycle sequential write");
+        if written != count {
+            panic!(
+                "[smp-regression] fail phase=regular-file-sequential-write offset={} expected={} observed={}",
+                offset, count, written
+            );
+        }
+        offset += count;
+    }
+
+    let overwrite_start = 8 * 1024 * 1024 - 31;
+    let overwrite_len = crate::config::PAGE_SIZE + 97;
+    let mut overwrite = alloc::vec![0u8; overwrite_len];
+    for (index, byte) in overwrite.iter_mut().enumerate() {
+        *byte = regular_file_overwrite_pattern(index);
+    }
+    let written = ext4_vol::ext4_write_at(ino, overwrite_start, &overwrite)
+        .expect("regular file lifecycle partial overwrite");
+    if written != overwrite.len() {
+        panic!("[smp-regression] fail phase=regular-file-partial-overwrite");
+    }
+    verify_regular_file_window(
+        ino,
+        overwrite_start - 19,
+        overwrite_len + 38,
+        overwrite_start,
+        overwrite_len,
+        "regular-file-cached-read",
+    );
+
+    ext4_vol::flush_cached_ino(ino).expect("regular file lifecycle fsync");
+    ext4_vol::close_regular_ino(ino);
+    verify_regular_file_window(
+        ino,
+        overwrite_start - 19,
+        overwrite_len + 38,
+        overwrite_start,
+        overwrite_len,
+        "regular-file-persisted-read",
+    );
+    verify_regular_file_all(
+        ino,
+        overwrite_start,
+        overwrite_len,
+        "regular-file-persisted-full-read",
+    );
+
+    ext4_vol::open_regular_ino(ino);
+    let first = [regular_file_pattern(0)];
+    if ext4_vol::ext4_write_at(ino, 0, &first).expect("regular file lifecycle recache") != 1 {
+        panic!("[smp-regression] fail phase=regular-file-recache");
+    }
+    let shrink_len = crate::config::PAGE_SIZE + 33;
+    let extend_len = 3 * crate::config::PAGE_SIZE + 111;
+    ext4_vol::truncate_regular_ino(ino, shrink_len as u64).expect("regular file lifecycle shrink");
+    ext4_vol::truncate_regular_ino(ino, extend_len as u64).expect("regular file lifecycle extend");
+    let mut hole = alloc::vec![0xffu8; extend_len - shrink_len];
+    let read = ext4_vol::ext4_read_at(ino, shrink_len, &mut hole)
+        .expect("regular file lifecycle sparse cached read");
+    if read != hole.len() || hole.iter().any(|byte| *byte != 0) {
+        panic!("[smp-regression] fail phase=regular-file-sparse-cached-read");
+    }
+    ext4_vol::flush_cached_ino(ino).expect("regular file lifecycle sparse fsync");
+    ext4_vol::close_regular_ino(ino);
+
+    hole.fill(0xff);
+    let read = ext4_vol::ext4_read_at(ino, shrink_len, &mut hole)
+        .expect("regular file lifecycle sparse persisted read");
+    if read != hole.len() || hole.iter().any(|byte| *byte != 0) {
+        panic!("[smp-regression] fail phase=regular-file-sparse-persisted-read");
+    }
+    let mut eof = [0u8; 1];
+    if ext4_vol::ext4_read_at(ino, extend_len, &mut eof).expect("regular file lifecycle eof") != 0 {
+        panic!("[smp-regression] fail phase=regular-file-eof");
+    }
+
+    let sparse_patch_offset = 2 * crate::config::PAGE_SIZE + 19;
+    let mut sparse_patch = [0u8; 97];
+    for (index, byte) in sparse_patch.iter_mut().enumerate() {
+        *byte = regular_file_overwrite_pattern(index + 31);
+    }
+    ext4_vol::open_regular_ino(ino);
+    let written = ext4_vol::ext4_write_at(ino, sparse_patch_offset, &sparse_patch)
+        .expect("regular file lifecycle sparse patch");
+    if written != sparse_patch.len() {
+        panic!("[smp-regression] fail phase=regular-file-sparse-patch-write");
+    }
+    ext4_vol::flush_cached_ino(ino).expect("regular file lifecycle sparse patch fsync");
+    ext4_vol::close_regular_ino(ino);
+    let mut sparse_window = [0xffu8; 135];
+    let sparse_window_start = sparse_patch_offset - 19;
+    let read = ext4_vol::ext4_read_at(ino, sparse_window_start, &mut sparse_window)
+        .expect("regular file lifecycle sparse patch persisted read");
+    if read != sparse_window.len()
+        || sparse_window[..19].iter().any(|byte| *byte != 0)
+        || sparse_window[19..19 + sparse_patch.len()] != sparse_patch
+        || sparse_window[19 + sparse_patch.len()..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        panic!("[smp-regression] fail phase=regular-file-sparse-patch-persisted");
+    }
+
+    ext4_vol::rename_ext4(REGULAR_FILE_PATH, REGULAR_FILE_RENAMED, false)
+        .expect("regular file lifecycle rename");
+    if ext4_vol::lookup_kind(REGULAR_FILE_PATH).is_some()
+        || ext4_vol::lookup_kind(REGULAR_FILE_RENAMED).is_none()
+    {
+        panic!("[smp-regression] fail phase=regular-file-rename");
+    }
+    ext4_vol::open_regular_ino(ino);
+    ext4_vol::unlink_regular_file(REGULAR_FILE_RENAMED)
+        .expect("regular file lifecycle open unlink");
+    if ext4_vol::lookup_kind(REGULAR_FILE_RENAMED).is_some() {
+        panic!("[smp-regression] fail phase=regular-file-open-unlink-path");
+    }
+    if ext4_vol::ext4_read_at(ino, shrink_len, &mut eof)
+        .expect("regular file lifecycle open unlink read")
+        != 1
+        || eof[0] != 0
+    {
+        panic!("[smp-regression] fail phase=regular-file-open-unlink-data");
+    }
+    ext4_vol::close_regular_ino(ino);
+    ext4_vol::remove_empty_dir_ext4(REGULAR_FILE_ROOT).expect("regular file lifecycle remove root");
+    crate::println!(
+        "[smp-regression] pass phase=regular-file-lifecycle bytes={} writeback_chunk={}",
+        REGULAR_FILE_BYTES,
+        256 * 1024
+    );
+}
 
 /// Exercise sparse ResidentSet ownership and topology-transfer APIs
 /// independently of the contest workload.
@@ -574,6 +809,26 @@ fn stress_kernel_heap() -> usize {
     checksum
 }
 
+fn verify_large_kernel_allocation() -> usize {
+    let mut probe = alloc::vec![0u8; LARGE_HEAP_PROBE_BYTES];
+    let mut checksum = 0usize;
+    for (page, chunk) in probe.chunks_mut(crate::config::PAGE_SIZE).enumerate() {
+        let value = (page as u8).wrapping_mul(37).wrapping_add(11);
+        chunk[0] = value;
+        checksum = checksum.wrapping_add(value as usize);
+    }
+    if checksum == 0 {
+        panic!("[smp-regression] fail phase=large-kernel-allocation checksum");
+    }
+    drop(probe);
+    crate::println!(
+        "[smp-regression] pass phase=large-kernel-allocation bytes={} checksum={}",
+        LARGE_HEAP_PROBE_BYTES,
+        checksum
+    );
+    checksum
+}
+
 /// Run the user-lifecycle probe from a real kernel task.  The production
 /// harness launches user programs from a kernel task too; running it directly
 /// on the boot stack leaves no current task or orphan reaper, making the
@@ -769,6 +1024,7 @@ fn wait_for(mask: &AtomicUsize, expected: usize, phase: &str) {
 pub fn run() {
     crate::syscall::other::verify_interval_timer_state_machine();
     let heap_checksum = stress_kernel_heap();
+    let large_heap_checksum = verify_large_kernel_allocation();
     let (left_asid, right_asid, reused_asid) = verify_asid_isolation_and_reuse();
     verify_resident_set_api();
     verify_resident_memory_lifecycle();
@@ -790,6 +1046,7 @@ pub fn run() {
         );
     }
     verify_namespace_lifecycle(expected, coordinator_bit);
+    verify_regular_file_lifecycle();
 
     let root = crate::mm::page_table::kernel_page_table()
         .lock()
@@ -835,7 +1092,7 @@ pub fn run() {
     run_user_memory_lifecycle_regression();
 
     crate::println!(
-        "[smp-regression] pass cpus={} mask={:#x} dispatch={:#x} tlb_targets={:#x} asid_pair={}/{} reused_asid={} asid_check={} isolation_iters={} heap_stress_mib={} checksum={}",
+        "[smp-regression] pass cpus={} mask={:#x} dispatch={:#x} tlb_targets={:#x} asid_pair={}/{} reused_asid={} asid_check={} isolation_iters={} heap_stress_mib={} large_heap_mib={} checksum={}",
         cpu_count,
         expected,
         SEEN_MASK.load(Ordering::Acquire),
@@ -846,6 +1103,7 @@ pub fn run() {
         asid_check,
         ASID_ISOLATION_ITERATIONS,
         HEAP_STRESS_CHUNKS * HEAP_STRESS_CHUNK_BYTES / 1024 / 1024,
-        heap_checksum,
+        LARGE_HEAP_PROBE_BYTES / 1024 / 1024,
+        heap_checksum.wrapping_add(large_heap_checksum),
     );
 }

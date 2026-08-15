@@ -271,6 +271,7 @@ fn collect_shared_file_writes(
 }
 
 fn write_back_shared_files(writes: Vec<(FileDescriptor, usize, Vec<u8>)>) -> Result<(), SysErrNo> {
+    let mut dirty_files: Vec<FileDescriptor> = Vec::new();
     for (mut file, offset, data) in writes {
         if data.is_empty() {
             continue;
@@ -279,6 +280,14 @@ fn write_back_shared_files(writes: Vec<(FileDescriptor, usize, Vec<u8>)>) -> Res
         if written != data.len() {
             return Err(SysErrNo::EIO);
         }
+        if !dirty_files
+            .iter()
+            .any(|dirty| dirty.same_file_identity(&file))
+        {
+            dirty_files.push(file);
+        }
+    }
+    for file in dirty_files {
         super::with_kernel_page_table(|| file.sync(false))?;
     }
     Ok(())
