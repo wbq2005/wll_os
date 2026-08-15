@@ -31,7 +31,8 @@ _boot_trampoline_stack_top:
     .globl _smp_boot_stacks
     .balign 16
 _smp_boot_stacks:
-    .space 1048576
+    # Keep this capacity in sync with MAX_CPUS * SMP_BOOT_STACK_SIZE.
+    .space 12 * 131072
     .globl _smp_boot_stacks_end
 _smp_boot_stacks_end:
 

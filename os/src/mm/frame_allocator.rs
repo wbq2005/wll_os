@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 use buddy_system_allocator::FrameAllocator;
-use core::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "buildstorm-diagnostics")]
 use core::sync::atomic::AtomicU8;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::{Mutex, Once};
 
@@ -44,17 +44,61 @@ impl TryFrom<polyhal::PhysAddr> for PhysPageNum {
 }
 
 /// 页帧追踪器 - RAII自动释放
-struct FrameRefRegion {
-    start_ppn: usize,
-    refs: Vec<AtomicUsize>,
+const FRAME_REF_CHUNK_FRAMES: usize = 1 << 18;
+
+struct FrameRefChunk {
+    refs: Vec<AtomicU32>,
     #[cfg(feature = "buildstorm-diagnostics")]
     owners: Vec<AtomicU8>,
 }
 
+struct FrameRefRegion {
+    start_ppn: usize,
+    end_ppn: usize,
+    chunks: Vec<FrameRefChunk>,
+}
+
 impl FrameRefRegion {
-    fn counter(&self, ppn: usize) -> Option<&AtomicUsize> {
-        ppn.checked_sub(self.start_ppn)
-            .and_then(|offset| self.refs.get(offset))
+    fn new(start_ppn: usize, end_ppn: usize) -> Self {
+        let pages = end_ppn - start_ppn;
+        let mut chunks = Vec::with_capacity(pages.div_ceil(FRAME_REF_CHUNK_FRAMES));
+        let mut remaining = pages;
+        while remaining != 0 {
+            let chunk_pages = remaining.min(FRAME_REF_CHUNK_FRAMES);
+            chunks.push(FrameRefChunk {
+                refs: (0..chunk_pages).map(|_| AtomicU32::new(0)).collect(),
+                #[cfg(feature = "buildstorm-diagnostics")]
+                owners: (0..chunk_pages)
+                    .map(|_| AtomicU8::new(DIAG_OWNER_FREE))
+                    .collect(),
+            });
+            remaining -= chunk_pages;
+        }
+        Self {
+            start_ppn,
+            end_ppn,
+            chunks,
+        }
+    }
+
+    fn slot(&self, ppn: usize) -> Option<(&FrameRefChunk, usize)> {
+        if ppn < self.start_ppn || ppn >= self.end_ppn {
+            return None;
+        }
+        let offset = ppn - self.start_ppn;
+        let chunk = self.chunks.get(offset / FRAME_REF_CHUNK_FRAMES)?;
+        Some((chunk, offset % FRAME_REF_CHUNK_FRAMES))
+    }
+
+    fn counter(&self, ppn: usize) -> Option<&AtomicU32> {
+        let (chunk, slot) = self.slot(ppn)?;
+        chunk.refs.get(slot)
+    }
+
+    #[cfg(feature = "buildstorm-diagnostics")]
+    fn owner(&self, ppn: usize) -> Option<&AtomicU8> {
+        let (chunk, slot) = self.slot(ppn)?;
+        chunk.owners.get(slot)
     }
 }
 
@@ -76,7 +120,7 @@ impl FrameTracker {
     }
 
     pub fn ref_count(&self) -> usize {
-        frame_ref_counter(self.ppn.0).load(Ordering::Acquire)
+        frame_ref_counter(self.ppn.0).load(Ordering::Acquire) as usize
     }
 
     pub fn into_raw_ppn(self) -> PhysPageNum {
@@ -93,7 +137,7 @@ impl FrameTracker {
 impl Clone for FrameTracker {
     fn clone(&self) -> Self {
         let old = frame_ref_counter(self.ppn.0).fetch_add(1, Ordering::Relaxed);
-        assert!(old != 0 && old != usize::MAX, "invalid frame owner count");
+        assert!(old != 0 && old != u32::MAX, "invalid frame owner count");
         Self { ppn: self.ppn }
     }
 }
@@ -168,12 +212,7 @@ pub fn finalize_frame_refcounts() {
         MEM_REGIONS
             .lock()
             .iter()
-            .map(|&(start, end)| FrameRefRegion {
-                start_ppn: start,
-                refs: (start..end).map(|_| AtomicUsize::new(0)).collect(),
-                #[cfg(feature = "buildstorm-diagnostics")]
-                owners: (start..end).map(|_| AtomicU8::new(DIAG_OWNER_FREE)).collect(),
-            })
+            .map(|&(start, end)| FrameRefRegion::new(start, end))
             .collect()
     });
 }
@@ -184,10 +223,7 @@ fn frame_owner_counter(ppn: usize) -> &'static AtomicU8 {
         .get()
         .expect("frame ownership table not initialized")
         .iter()
-        .find_map(|region| {
-            ppn.checked_sub(region.start_ppn)
-                .and_then(|offset| region.owners.get(offset))
-        })
+        .find_map(|region| region.owner(ppn))
         .expect("frame outside ownership table")
 }
 
@@ -235,7 +271,7 @@ pub(crate) fn diagnostic_ownership_snapshot() -> (usize, usize, usize, usize) {
     )
 }
 
-fn frame_ref_counter(ppn: usize) -> &'static AtomicUsize {
+fn frame_ref_counter(ppn: usize) -> &'static AtomicU32 {
     FRAME_REF_REGIONS
         .get()
         .expect("frame reference table not initialized")

@@ -1764,3 +1764,47 @@ hashes, raw serial logs, runner JSON, official judge output and lifecycle logs.
 No official image, suite, guest script, marker, judge, guest time, or
 workload-dependent production branch was changed. The compact evidence index
 is `docs/evidence/buildstorm-stage2/20260815-vfs-lookup-reuse-validation.md`.
+
+## 42. Large-memory boot and synchronous SIGILL compatibility (2026-08-15)
+
+The LoongArch64 evaluation log exposed two independent startup capacity bugs.
+At 36 GiB, a flat per-frame `AtomicUsize` table requested about 72 MiB as one
+allocation; the buddy allocator rounded that request to a 128 MiB order before
+dynamic heap expansion was available. The replacement stores `AtomicU32`
+counters in chunks of at most `2^18` frames, keeping each production allocation
+at about 1 MiB. `FrameTracker` clone/drop/raw-transfer semantics and allocator
+domains are unchanged. Separately, twelve 128 KiB secondary stacks require
+1.5 MiB, while both assembly entries reserved only 1 MiB. Both entries now
+reserve twelve slots, and Rust checks the linker-symbol span before starting
+secondary CPUs.
+
+The RISC-V64 evaluator then completed compilation but failed its nested-QEMU
+run gate with an empty run log. A derived, non-official capability image and
+diagnostic kernel localized the first fault to QEMU's `cpuinfo_init`: QEMU had
+installed a `SIGILL` handler and intentionally executed an extension probe.
+The kernel used to terminate the process instead of delivering the synchronous
+fault. The shared signal layer now constructs the existing Linux signal frame
+for an installed, unblocked handler, preserving the faulting context so
+`rt_sigreturn` can resume at the PC selected by userspace. Default, blocked,
+and ignored synchronous faults terminate instead of livelocking.
+
+The independent probe now dynamically launches QEMU, executes OpenSBI, and
+loads a real wll_OS kernel through `[kernel] Hello, OS!`. This is
+`capability-pass`, not an official score claim: the probe rootfs/image is
+derived and contains no official marker logic. Four production/diagnostics
+release configurations, dual-architecture SMP lifecycle tests, LoongArch64
+36G/12 startup and minibuild, and RISC-V64 public minibuild have passed. The
+RISC-V64 16G/8 and LoongArch64 36G/12 public clean builds completed with
+`BUILDSTORM_COMPILE mode=multi ok=true` at `786.62s` and `650.22s`; the current
+official judge parsed each raw serial log as 180/180. These unmodified public
+suite runs are `official-pass`. The public README still says 8G/8, while the
+executable judge expects 8 RISC-V CPUs and 12 LoongArch CPUs and the evaluator
+logs use 16G/8 and 36G/12. This upstream resource-description conflict is
+recorded rather than hidden. The unavailable evaluator-only nested-QEMU gate
+remains `unverified`; the independent nested-QEMU regression is only
+`capability-pass`.
+
+No official image, suite, guest script, judge, marker, or guest clock was
+modified. No production branch inspects a crate name, path, command, QEMU name,
+or expected output. The evidence index is
+`docs/evidence/buildstorm-stage2/20260815-large-memory-smp-sigill-validation-cn.md`.

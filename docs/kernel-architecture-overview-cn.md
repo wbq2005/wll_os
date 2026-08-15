@@ -169,7 +169,10 @@ insert、split、mprotect、munmap 和 coalesce 都先维护 VMA 元数据，再
 2. page-table frame：唯一 tracker 通过 `into_raw_ppn()` 转交 PolyHAL；
 3. contiguous frame：kernel heap 扩展、VirtIO DMA、kernel stack 等显式范围。
 
-每个受管 PPN 有一个 `AtomicUsize` 引用计数。clone 增加引用，drop 的最后一个 owner 释放 frame。共享 frame 禁止转交 raw ownership，从类型边界避免 COW/shared 页被页表析构误释放。
+每个受管 PPN 有一个 `AtomicU32` 引用计数。引用表按最多 `2^18` 个 frame
+分块，每个 production 块最多 1 MiB，避免大内存配置在 heap 尚未动态扩展前申请
+一个数十 MiB 的连续数组。clone 增加引用，drop 的最后一个 owner 释放 frame。
+共享 frame 禁止转交 raw ownership，从类型边界避免 COW/shared 页被页表析构误释放。
 
 diagnostics feature 额外维护 free/tracked/page-table/contiguous 原子状态机；production 只保留实际引用计数。
 
@@ -264,6 +267,9 @@ ext4 数据路径包含：
 - futex key 由地址空间/共享 backing 语义确定，阻塞通过 WaitQueue。
 - interval timer state 仍在 TCB inner 中，active-owner index 只加速扫描，不取得 timer state 所有权。
 - 信号投递修改 task pending state；实际用户 handler frame 在安全用户返回边界构建。
+- 同步用户异常保留故障 PC 和完整 `ucontext`。已安装且未屏蔽的 handler 通过
+  Linux signal frame 接收异常，`rt_sigreturn` 可恢复 handler 修改后的 PC；默认、
+  忽略或屏蔽同步异常时终止线程组，避免重复执行同一故障指令。
 - monotonic/uptime 来自真实 timer，不为 BuildStorm 改写或缩放。
 
 ## 10. 锁顺序与析构不变量
@@ -310,7 +316,7 @@ ext4 数据路径包含：
 
 该回归是 `capability-pass`，官方完整镜像运行才是 `official-pass`。
 
-## 12. BuildStorm 完成状态
+## 12. 最近已提交基线的 BuildStorm 完成状态
 
 RISC-V64：
 
@@ -325,6 +331,8 @@ BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=620.70 cores=8 bytes=1716224 arc
 ```
 
 两架构官方 judge 自动项均为 180/180。完整实验、AI 披露和复现步骤见 `docs/buildstorm-2.3-design-optimization-cn.md`。
+这些 marker 对应提交 `6045dd2534668ea4d1cff94725c41afb0a855af4`；第 15 节
+新增架构在本轮 candidate 中单独验证，不借用这里的 `official-pass`。
 
 ## 13. 当前限制与演进方向
 
@@ -356,3 +364,30 @@ VFS lookup 复用层的最新 production 结果为 `774.62s/620.70s`；相对前
 `docs/buildstorm-2.3-design-optimization-cn.md` 第 12 节。该层已纳入当前架构，
 但其确定性淘汰仍不是完整 LRU；未来统一 cache replacement 时必须保持
 namespace generation 与精确失效边界。
+
+## 15. 2026-08-15 大内存、多核启动与同步异常边界
+
+LoongArch64 评测配置暴露了两个启动期容量不变量。第一，36 GiB 内存约有
+943 万个 4 KiB frame；若引用表用单个 `Vec<AtomicUsize>`，有效数据约 72 MiB，
+buddy allocator 会为它寻找 128 MiB 阶，而初始化又早于动态 heap 扩展。当前
+`FrameRefRegion` 因此采用分块 `AtomicU32` 表。分块只改变索引和分配形状，不改变
+`FrameTracker`、page-table raw frame 或 contiguous frame 的所有权域。
+
+第二，secondary boot stack 的容量必须满足
+`MAX_CPUS * SMP_BOOT_STACK_SIZE`。两种架构的汇编均预留 12 个 128 KiB 槽，
+Rust 启动路径使用 `_smp_boot_stacks_end` 在启动 secondary CPU 前断言容量。汇编
+仍只负责架构入口和栈区，CPU 的 Present/Starting/Online 状态机、调度、IPI 和
+TLB 协议保持在共享平台层。
+
+RISC-V64 的嵌套 QEMU 能力还要求同步 `SIGILL` 遵循 Linux signal ABI。TCG 的
+host CPU 能力探测会先安装 handler，再故意执行候选指令，并由 handler 修改
+`ucontext.pc` 后继续。trap 层现在把可捕获的同步 `SIGILL` 交给 signal 层构造
+frame；默认处置和不可安全返回的 blocked/ignored 情况仍终止。该机制不识别
+QEMU、cargo、路径或输出，平台特定指令解码仍留在架构 trap 边界。
+
+当前证据、配置与分级见
+`docs/evidence/buildstorm-stage2/20260815-large-memory-smp-sigill-validation-cn.md`。
+当前 candidate 已在未修改的 public suite 上以评测日志对应的 16G/8 与 36G/12
+配置完成双架构 clean build，官方 judge 均解析为 180/180。评测机不可取得的
+hidden nested-QEMU 门仍需新提交复测；独立 probe 只能证明通用能力，不能代替
+隐藏评测结果。

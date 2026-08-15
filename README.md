@@ -33,7 +33,10 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 
 ## BuildStorm 决赛状态
 
-2026-08-15，当前 production 内核在远端 `47.110.253.40` 使用 QEMU 11.0.3、官方 `final-2026` glibc 镜像、`-snapshot -m 8G -smp 8` 配置下完成双架构 clean build，证据等级为 `official-pass`。VFS lookup 复用候选已在同配置完成双架构验证：
+2026-08-15，提交 `6045dd2534668ea4d1cff94725c41afb0a855af4` 在远端
+`47.110.249.0` 使用 QEMU 11.0.3、官方 `final-2026` glibc 镜像、
+`-snapshot -m 8G -smp 8` 配置下完成双架构 clean build，证据等级为
+`official-pass`。VFS lookup 复用候选已在同配置完成双架构验证：
 
 | 架构 | 官方成功标记 | guest 编译时间 | 官方 judge 自动项 |
 | --- | --- | ---: | ---: |
@@ -59,6 +62,21 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 `7.97%--9.68%`。四种 release/diagnostics cfg 与双架构 SMP8 namespace、
 regular-file、resident/high-arena、TLB/ASID、320 MiB 大分配和独立用户内存
 lifecycle 均通过。
+
+本轮 candidate 另外修复了评测机更大资源配置暴露的三项通用边界：
+页帧引用计数采用分块 `AtomicU32`，避免 36 GiB 内存启动时的高阶连续分配；
+两架构 secondary boot stack 按 12 核、每核 128 KiB 完整预留并在 Rust 启动
+路径断言容量；同步用户 `SIGILL` 通过 Linux signal frame 投递，使 QEMU 的
+CPU 扩展探测 handler 能修改 `ucontext.pc` 后恢复。四 cfg、双架构 SMP、
+LoongArch64 36G/12 minibuild、RISC-V64 16G/8 minibuild 和独立 nested-QEMU
+真实内核加载均为 `capability-pass`。当前 candidate 已在评测日志对应的
+RISC-V64 16G/8 与 LoongArch64 36G/12 配置完成 public clean build，分别得到
+`BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=786.62` 与 `650.22 s`，当前
+官方 judge 均为 180/180，因此 public suite 记为 `official-pass`。public README
+仍写 8G/8，而可执行 judge 期望 RV 8 核、LA 12 核；该上游冲突已在设计文档中
+保留。评测机额外的 hidden nested-QEMU 最终门仍为 `unverified`，不能由独立
+probe 的 `capability-pass` 代替。详见
+[本轮验证索引](docs/evidence/buildstorm-stage2/20260815-large-memory-smp-sigill-validation-cn.md)。
 
 `mode=multi` 表示多核编译，不表示双 libc。官方决赛证据是 glibc；RISC-V64
 另以 musl 脚本完成 `BUILDSTORM_RESULT ... status=OK rc=0 elapsed_s=783.15`，

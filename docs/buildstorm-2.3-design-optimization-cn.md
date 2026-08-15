@@ -11,13 +11,18 @@
 | 修改前后实验分析 | 4 | 第 7 节 |
 | AI 使用说明与可复现步骤 | 4 | 第 8、9 节 |
 
-当前结论为双架构 `official-pass`。RISC-V64 与 LoongArch64 均使用未修改的官方镜像、镜像内原始脚本、官方 judge、QEMU `-snapshot -m 8G -smp 8` 和 production 内核完成从零编译，并输出精确成功标记：
+提交 `6045dd2534668ea4d1cff94725c41afb0a855af4` 的结论为双架构
+`official-pass`。RISC-V64 与 LoongArch64 均使用未修改的官方镜像、镜像内原始
+脚本、官方 judge、QEMU `-snapshot -m 8G -smp 8` 和 production 内核完成从零
+编译，并输出精确成功标记：
 
 ```text
 BUILDSTORM_COMPILE mode=multi ok=true
 ```
 
-官方脚本自动项在本次环境中均为 180/180。设计文档 20 分由人工评审，本文不自行宣称该 20 分已经获得。
+官方脚本自动项在本次环境中均为 180/180。设计文档 20 分由人工评审，本文不
+自行宣称该 20 分已经获得。第 13 节所述本轮 candidate 必须使用自己的
+验证结果，不能直接继承这一历史 `official-pass`。
 
 ## 2. 权威输入与结果身份
 
@@ -133,7 +138,7 @@ Stage A 完成后，900 秒 diagnostics 已能走到 `flatten_objects`，但仍�
 
 - `UserVaLayout` 把低用户区、低 mmap arena、高 mmap arena 和用户上限集中定义。
 - `ResidentSet` 用 `BTreeMap<run_start, ResidentRun>` 表示稀疏驻留页，split/extract 不扫描整个虚拟区间。
-- 每个受管页帧有 `AtomicUsize` 引用计数；`FrameTracker::clone/drop` 负责共享和最终释放。
+- 每个受管页帧有分块 `AtomicU32` 引用计数；`FrameTracker::clone/drop` 负责共享和最终释放。
 - 页表页从唯一 `FrameTracker` 显式转交 raw page-table ownership；共享 frame 禁止转 raw。
 - diagnostics 版本额外记录 free/tracked/page-table/contiguous 所有权状态，production 不包含该影子表。
 
@@ -513,3 +518,81 @@ judge、marker 或 guest 时间，也未按 crate、测试路径、命令或输�
 `docs/evidence/buildstorm-stage2/20260815-vfs-lookup-reuse-validation.md`，原始目录
 包括两架构 production、RISC-V64 diagnostics、四 cfg gate、双架构 SMP gate 和
 RISC-V64 musl capability run。
+
+## 13. 2026-08-15 大内存、12 核启动与嵌套 QEMU 修复
+
+### 13.1 评测失败边界
+
+LoongArch64 在 `-m 36G -smp 12` 启动时出现约 71 MiB 的 heap allocation
+panic，并伴随高编号 CPU 非法取指。RISC-V64 则已经完成 timed build 和 ELF-to-BIN，
+但评测的 nested-QEMU 阶段返回 `run=FAIL`，运行输出为空。两者都不是编译 crate
+名称对应的特殊问题，而是更大资源拓扑和 Linux 同步异常 ABI 暴露的通用内核边界。
+
+### 13.2 LoongArch64 根因与架构修复
+
+36 GiB 对应约 943 万个 4 KiB frame。旧引用表把每个计数存为
+`AtomicUsize`，并用单个 `Vec` 一次分配约 72 MiB；buddy allocator 必须寻找
+128 MiB 阶，而该初始化发生在动态 heap 扩展前。当前实现采用：
+
+1. 每个计数收紧为 `AtomicU32`，其上限远高于可实现的单页 owner 数；
+2. 每块最多 `2^18` 个 frame，production 引用块约 1 MiB；
+3. diagnostics owner shadow 同步分块，每块约 256 KiB；
+4. `FrameTracker` clone/drop、最后引用释放、page-table raw ownership 和
+   contiguous allocation domain 不变。
+
+另一个独立根因是启动栈容量。`MAX_CPUS=12`、每槽 128 KiB，需要 1.5 MiB，
+旧汇编只保留 1 MiB。第 9 至 12 个槽会越过 `_smp_boot_stacks` 并破坏相邻 BSS。
+RISC-V64 与 LoongArch64 入口现在均预留 12 个槽；Rust 在启动 secondary CPU 前
+用 `_smp_boot_stacks_end` 断言链接区间不小于配置需求，避免配置再次漂移。
+
+### 13.3 RISC-V64 同步 SIGILL 根因与修复
+
+派生开发镜像中的独立 probe 在 QEMU `--version` 阶段复现了首个用户异常：
+QEMU `cpuinfo_init` 先调用 `sigaction` 安装 SIGILL handler，再执行候选扩展指令。
+Linux 会把故障 PC 和 `ucontext` 交给 handler，handler 跳过不支持的指令后经
+`rt_sigreturn` 继续；旧内核直接终止线程组，因此 nested-QEMU 的 run log 为空。
+
+trap 层现在把可捕获的同步 `SIGILL` 交给共享 signal 层。已安装且未屏蔽的
+handler 使用既有 Linux signal frame；默认 disposition 仍终止，blocked/ignored
+同步异常也终止，避免返回同一 PC 形成 livelock。该路径不识别 QEMU、cargo、
+crate、测试路径、命令、输出或 marker。独立 probe 已从动态装载继续到 OpenSBI，
+并加载真实 wll_OS 内核至 `[kernel] Hello, OS!`。
+
+### 13.4 验证矩阵与证据分级
+
+| 验证 | 配置 | 结果 | 等级 |
+| --- | --- | --- | --- |
+| release build | RV/LA production + diagnostics | 四项通过 | `capability-pass` |
+| SMP lifecycle | RV/LA 8G/8 | 两架构完整通过 | `capability-pass` |
+| LA 大内存启动/minibuild | production 36G/12 | toolchain、minibuild 通过 | `capability-pass` |
+| RV public minibuild | production 16G/8 | toolchain、minibuild 通过 | `capability-pass` |
+| RV nested QEMU | 派生镜像，production | QEMU/OpenSBI/真实内核加载通过 | `capability-pass` |
+| RV public full build | production 16G/8、3000 s harness | `ok=true elapsed_s=786.62`，judge 180/180 | `official-pass` |
+| LA public full build | production 36G/12、3000 s harness | `ok=true elapsed_s=650.22`，judge 180/180 | `official-pass` |
+
+旧提交 `6045dd2534668ea4d1cff94725c41afb0a855af4` 的 8G/8 双架构
+`official-pass` 仍是历史有效证据，但没有被当前 candidate 借用。本轮重新使用
+未修改的官方镜像、原始 public script、当前官方 judge 和评测日志中的实际资源
+配置完成双架构运行，因此 public suite 结果单独记为 `official-pass`。
+
+资源描述存在上游冲突：当前 public README 仍写 8G/8，当前可执行 judge 的
+`EXPECTED_CORES` 却是 RISC-V64 8、LoongArch64 12，而评测机原始命令明确为
+RISC-V64 16G/8 与 LoongArch64 36G/12。本文记录冲突并优先采用可执行 judge 与
+实际评测配置，不把它静默改写成一致。隐藏评测额外的 nested-QEMU 启动门不在
+public 镜像中；其独立回归是 `capability-pass`，最终隐藏评测状态仍是
+`unverified`，必须由新提交的评测机结果确认。
+
+RISC-V64 完整运行的 host wall time 为 `13:47.93`，最大 resident set 为
+`3,679,820 KiB`，runner exit status 为 0。production kernel SHA-256 为
+`8e2ffd8473b0359b178c3fc73dd0639b81bf924637ee26155f5ce939fae423e0`，
+完整 source dirty diff SHA-256 为
+`2830ac0c2953e90674ffabeb838f381c8f1346f5eb22afd1064b1b627c615bb8`。
+LoongArch64 完整运行的 host wall time 为 `11:25.51`，最大 resident set 为
+`4,292,876 KiB`，runner exit status 为 0。production kernel SHA-256 为
+`61e523cbb2049e3430faf0a35718b425b679001b6d409a580642b661d82c5000`；
+source dirty diff SHA-256 与 RISC-V64 相同。
+
+原始远端证据目录与复现命令见
+`docs/evidence/buildstorm-stage2/20260815-large-memory-smp-sigill-validation-cn.md`。
+AI 用于交叉检查评测日志、反汇编、dirty diff、源码所有权和单实例 QEMU 结果；
+人工可复核内容包括所有原始串口、kernel/image/source hash、完整命令和结果 marker。

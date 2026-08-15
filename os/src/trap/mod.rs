@@ -431,6 +431,9 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             exit_user_thread_group_for_signal(SIGSEGV);
         }
         TrapType::IllegalInstruction(vaddr) => {
+            if crate::syscall::signal::handle_synchronous_fault_for_user(ctx, SIGILL) {
+                return;
+            }
             #[cfg(feature = "smp-regression")]
             crate::smp_regression::note_user_memory_lifecycle_terminal_trap(
                 2,
@@ -443,7 +446,12 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 "[trap] User illegal instruction at {:#x}, killing process",
                 vaddr
             );
-            exit_user_thread_group_for_signal(SIGILL);
+            let needs_exit = crate::task::current_task()
+                .map(|task| task.status() != TaskStatus::Zombie)
+                .unwrap_or(true);
+            if needs_exit {
+                exit_user_thread_group_for_signal(SIGILL);
+            }
         }
         _ => {
             #[cfg(feature = "smp-regression")]

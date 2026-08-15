@@ -64,6 +64,7 @@ const KNOWN_SIGACTION_FLAGS: usize = SA_NOCLDSTOP
 
 const SIGNAL_FRAME_MAGIC: usize = 0x574c_4c5f_5349_4746; // "WLL_SIGF"
 const SI_USER: i32 = 0;
+const SI_KERNEL: i32 = 0x80;
 const SI_TKILL: i32 = -6;
 const CLD_EXITED: i32 = 1;
 
@@ -724,6 +725,38 @@ pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {
         }
         return true;
     }
+}
+
+/// Deliver a synchronous CPU exception through the Linux signal ABI.
+///
+/// A caught SIGILL/SIGSEGV must expose the faulting context to userspace so
+/// probes can update the saved PC and resume. Returning to the same faulting
+/// instruction when the signal is blocked or ignored would livelock, so those
+/// cases retain the default terminating behavior.
+pub(crate) fn handle_synchronous_fault_for_user(ctx: &mut TrapFrame, signum: i32) -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    if task.is_kernel || task.status() == TaskStatus::Zombie || !valid_signal(signum) {
+        return false;
+    }
+
+    let action = task.signal_actions.lock().get(signum);
+    if action.handler == SIG_IGN || !signal_is_unblocked(&task, signum) {
+        crate::task::terminate_task_group(&task, default_exit_code(signum));
+        return false;
+    }
+
+    queue_signal(
+        &task,
+        signum,
+        PendingSignalInfo {
+            code: SI_KERNEL,
+            sender_pid: 0,
+            sender_uid: 0,
+        },
+    );
+    handle_pending_for_user(ctx)
 }
 
 fn deliver_to_process(targets: &[Arc<TaskControlBlock>], signum: i32, info: PendingSignalInfo) {

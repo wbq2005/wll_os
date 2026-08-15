@@ -14,6 +14,7 @@ use polyhal::PhysAddr;
 extern "C" {
     fn _secondary_start();
     static _smp_boot_stacks: u8;
+    static _smp_boot_stacks_end: u8;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -378,6 +379,13 @@ pub extern "C" fn rust_main(hartid: usize, dtb_ptr: usize) -> ! {
     }
     fs::init();
     let secondary_stack_base = core::ptr::addr_of!(_smp_boot_stacks) as usize;
+    let secondary_stack_end = core::ptr::addr_of!(_smp_boot_stacks_end) as usize;
+    let required_secondary_stack_bytes =
+        crate::config::MAX_CPUS * crate::config::SMP_BOOT_STACK_SIZE;
+    assert!(
+        secondary_stack_end.saturating_sub(secondary_stack_base) >= required_secondary_stack_bytes,
+        "SMP boot stack reservation is smaller than MAX_CPUS * SMP_BOOT_STACK_SIZE"
+    );
     platform::start_secondary_cpus(
         hartid,
         _secondary_start as usize,
