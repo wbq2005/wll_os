@@ -1,0 +1,1 @@
+WLL_HARNESS_GROUPS=buildstorm WLL_HARNESS_LIBC=musl LOG= cargo +nightly-2025-01-18 build --locked --offline --release --target loongarch64-unknown-none --no-default-features --features loongarch

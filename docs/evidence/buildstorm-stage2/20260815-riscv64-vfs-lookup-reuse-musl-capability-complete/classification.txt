@@ -1,0 +1,1 @@
+capability-pass: BUILDSTORM_RESULT mode=multi status=OK rc=0, group end, ALL TESTS DONE, qemu exit 0, no panic/OOM

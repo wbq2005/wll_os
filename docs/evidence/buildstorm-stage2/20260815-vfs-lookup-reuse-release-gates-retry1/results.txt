@@ -1,0 +1,4 @@
+riscv64-production rc=0 elapsed_s=8
+riscv64-diagnostics rc=0 elapsed_s=8
+loongarch64-production rc=0 elapsed_s=10
+loongarch64-diagnostics rc=0 elapsed_s=8

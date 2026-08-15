@@ -57,8 +57,20 @@ macro_rules! vfs_lock {
     };
 }
 
-const RESOLVED_PARENT_CACHE_LIMIT: usize = 16 * 1024;
-const READLINK_RESULT_CACHE_LIMIT: usize = 16 * 1024;
+// Large compiler workloads walk a working set well above the old 16K bound.
+// Keep the namespace invalidation semantics, but retain enough entries to
+// avoid turning repeated paths into full component walks.
+const RESOLVED_PARENT_CACHE_LIMIT: usize = 64 * 1024;
+const READLINK_RESULT_CACHE_LIMIT: usize = 64 * 1024;
+
+fn make_string_cache_room<V>(cache: &mut BTreeMap<String, V>, limit: usize) {
+    if cache.len() < limit {
+        return;
+    }
+    if let Some(victim) = cache.keys().next().cloned() {
+        cache.remove(&victim);
+    }
+}
 
 fn invalidate_symlink_probe(path: &str, subtree: bool) {
     let path = normalize_path(path);
@@ -578,17 +590,13 @@ fn resolve_parent_symlinks_for_lookup(path: &str) -> Result<String, SysErrNo> {
     let parent = parent_path(&normalized);
     if parent == "/" || RESOLVED_DIRECTORY_CACHE.read().contains(&parent) {
         let mut cache = RESOLVED_PARENT_CACHE.write();
-        if cache.len() >= RESOLVED_PARENT_CACHE_LIMIT {
-            cache.clear();
-        }
+        make_string_cache_room(&mut cache, RESOLVED_PARENT_CACHE_LIMIT);
         cache.insert(normalized.clone(), normalized.clone());
         return Ok(normalized);
     }
     let resolved = resolve_path_symlinks(&normalized, FinalSymlink::Preserve)?;
     let mut cache = RESOLVED_PARENT_CACHE.write();
-    if cache.len() >= RESOLVED_PARENT_CACHE_LIMIT {
-        cache.clear();
-    }
+    make_string_cache_room(&mut cache, RESOLVED_PARENT_CACHE_LIMIT);
     cache.insert(normalized, resolved.clone());
     Ok(resolved)
 }
@@ -2817,9 +2825,7 @@ pub fn create_symlink(target: &str, link_path: &str) -> Result<(), SysErrNo> {
 
 fn cache_readlink_result(path: &str, result: &Result<String, SysErrNo>) {
     let mut cache = READLINK_RESULT_CACHE.write();
-    if cache.len() >= READLINK_RESULT_CACHE_LIMIT {
-        cache.clear();
-    }
+    make_string_cache_room(&mut cache, READLINK_RESULT_CACHE_LIMIT);
     cache.insert(path.into(), result.clone());
 }
 
@@ -3796,6 +3802,14 @@ pub fn open_path(
     let mem_has_file = !mounted_ext4 && MEM_FS.lock().get_file(&open_norm).is_some();
     let mem_has_special = !mounted_ext4 && MEM_FS.lock().get_special(&open_norm).is_some();
     let ext_path_norm = ext4_lookup_path(&open_norm);
+    // Resolve the final ext4 path once.  The old path opened the same inode
+    // through separate directory, regular-file, and symlink probes below;
+    // all three use the same generation-validated namespace cache.
+    let ext_kind = if !tmpfs_path {
+        ext4_vol::lookup_kind(&ext_path_norm)
+    } else {
+        None
+    };
     #[cfg(feature = "buildstorm-diagnostics")]
     crate::buildstorm_diagnostics::note_phase(
         34,
@@ -3807,7 +3821,7 @@ pub fn open_path(
             return Err(SysErrNo::EINVAL);
         }
         let mem_dir = !mounted_ext4 && MEM_FS.lock().is_dir(&open_norm);
-        let ext_dir = !tmpfs_path && ext4_vol::ext4_dir_path_exists(&ext_path_norm);
+        let ext_dir = matches!(ext_kind, Some((_, ext4_vol::Ext4NodeKind::Directory)));
         if mem_dir && (tmpfs_path || !ext_dir || super::is_memfs_overlay_create_dir(&open_norm)) {
             return open_mem_tmpfile_descriptor(&open_norm, mode, read_ok, write_ok, append);
         }
@@ -3815,7 +3829,7 @@ pub fn open_path(
             return Err(SysErrNo::EOPNOTSUPP);
         }
         if path_exists_non_dir(&open_norm)
-            || (!tmpfs_path && ext4_vol::ext4_regular_file_exists(&ext_path_norm))
+            || ext_kind.is_some_and(|(_, kind)| kind != ext4_vol::Ext4NodeKind::Directory)
         {
             return Err(SysErrNo::ENOTDIR);
         }
@@ -3890,7 +3904,7 @@ pub fn open_path(
     #[cfg(feature = "buildstorm-diagnostics")]
     let started_at = crate::timer::get_time_us();
     let mem_is_dir = !mounted_ext4 && MEM_FS.lock().is_dir(&open_norm);
-    let ext_is_dir = !tmpfs_path && ext4_vol::ext4_dir_path_exists(&ext_path_norm);
+    let ext_is_dir = matches!(ext_kind, Some((_, ext4_vol::Ext4NodeKind::Directory)));
     #[cfg(feature = "buildstorm-diagnostics")]
     crate::buildstorm_diagnostics::note_phase(
         35,
@@ -3910,7 +3924,7 @@ pub fn open_path(
     }
 
     if want_dir {
-        if (!tmpfs_path && ext4_vol::ext4_regular_file_exists(&ext_path_norm))
+        if ext_kind.is_some_and(|(_, kind)| kind != ext4_vol::Ext4NodeKind::Directory)
             || path_exists_non_dir(&open_norm)
         {
             return Err(SysErrNo::ENOTDIR);
@@ -3921,8 +3935,7 @@ pub fn open_path(
     if !tmpfs_path && !removed {
         #[cfg(feature = "buildstorm-diagnostics")]
         let started_at = crate::timer::get_time_us();
-        if let Some((ino, ext4_vol::Ext4NodeKind::Regular)) = ext4_vol::lookup_kind(&ext_path_norm)
-        {
+        if let Some((ino, ext4_vol::Ext4NodeKind::Regular)) = ext_kind {
             #[cfg(feature = "buildstorm-diagnostics")]
             crate::buildstorm_diagnostics::note_phase(
                 36,

@@ -33,14 +33,12 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 
 ## BuildStorm 决赛状态
 
-2026-08-15，当前 production 内核在远端 `47.110.253.40` 使用 QEMU 11.0.3、官方 `final-2026` glibc 镜像、`-snapshot -m 8G -smp 8` 配置下完成双架构 clean build，证据等级为 `official-pass`。最快 Stage B 基线与本轮稳定性候选分开记录：
+2026-08-15，当前 production 内核在远端 `47.110.253.40` 使用 QEMU 11.0.3、官方 `final-2026` glibc 镜像、`-snapshot -m 8G -smp 8` 配置下完成双架构 clean build，证据等级为 `official-pass`。VFS lookup 复用候选已在同配置完成双架构验证：
 
 | 架构 | 官方成功标记 | guest 编译时间 | 官方 judge 自动项 |
 | --- | --- | ---: | ---: |
-| RISC-V64 Stage B 基线 | `BUILDSTORM_COMPILE mode=multi ok=true` | 800.55 s | 180/180 |
-| LoongArch64 Stage B 基线 | `BUILDSTORM_COMPILE mode=multi ok=true` | 660.71 s | 180/180 |
-| RISC-V64 VFS 稳定性候选 | `BUILDSTORM_COMPILE mode=multi ok=true` | 860.15--867.16 s | 180/180 |
-| LoongArch64 VFS 稳定性候选 | `BUILDSTORM_COMPILE mode=multi ok=true` | 674.49--687.23 s | 180/180 |
+| RISC-V64 VFS lookup 复用 | `BUILDSTORM_COMPILE mode=multi ok=true` | 774.62 s | 180/180 |
+| LoongArch64 VFS lookup 复用 | `BUILDSTORM_COMPILE mode=multi ok=true` | 620.70 s | 180/180 |
 
 自动项包括 toolchain 8 分、minibuild 12 分、完整编译 40 分和本次 judge 基线下的时间分 120 分。内核设计优化文档 20 分由人工评审，不在上述自动结果中自行计分。正式评测机会重新测量同机 Linux 基线，因此最终时间分以评测机输出为准。
 
@@ -52,13 +50,21 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 - [双架构 official-pass 证据结论](docs/evidence/buildstorm-stage2/20260814-stage2-buildstorm-official-completion.md)
 - [Stage B per-CPU heap cache 结论与证据索引](docs/evidence/buildstorm-stage2/20260815-stageb-percpu-heap-cache-conclusion-cn.md)
 - [VFS 稀疏页缓存与 clustered writeback 结论](docs/buildstorm-2.3-design-optimization-cn.md#11-2026-08-15-评测超时复核与-vfs-稳定性候选)
+- [VFS lookup 复用与有界缓存验证记录](docs/evidence/buildstorm-stage2/20260815-vfs-lookup-reuse-validation.md)
 
-本轮候选的目标是消除评测机在 `ax-mm` 边界出现的超长尾，而不是把较快的
-Stage B 基线误写成已被本轮改动提升。大于 8 MiB 的 regular file 不再整文件
-驻留在连续 `Vec` 中，dirty data 按 256 KiB cluster 回写，连续 ext4 块批量提交；
-双架构 sparse/truncate/fsync/rename/open-unlink 回归均通过。工作树中额外的
-`os/src/fs/vfs.rs` parent/readlink cache 改动没有包含在上述官方成功 diff，
-仍为 `unverified`，不得与稳定性候选混合归因。
+本轮候选把 `open_path()` 对同一 ext4 路径的目录、regular-file 与 inode-kind
+重复查询合并为一次 generation-validated lookup，并把 parent/readlink cache 从
+16K 扩到 64K，满载时逐项淘汰而不是清空整个工作集。相对同配置 production
+对照，RISC-V64 提升 `9.94%--10.67%`，LoongArch64 提升
+`7.97%--9.68%`。四种 release/diagnostics cfg 与双架构 SMP8 namespace、
+regular-file、resident/high-arena、TLB/ASID、320 MiB 大分配和独立用户内存
+lifecycle 均通过。
+
+`mode=multi` 表示多核编译，不表示双 libc。官方决赛证据是 glibc；RISC-V64
+另以 musl 脚本完成 `BUILDSTORM_RESULT ... status=OK rc=0 elapsed_s=783.15`，
+记为 `capability-pass`。官方 LoongArch 镜像不含
+`/musl/buildstorm_testcode.sh`，因此 LoongArch musl 为 `unverified`，不伪造
+镜像内容，也不把缺少 workload 报告为内核通过或失败。
 
 完整运行命令如下，两个架构必须顺序执行，不能并发 QEMU：
 

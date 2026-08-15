@@ -436,3 +436,80 @@ bash scripts/run_buildstorm_long_baseline.sh loongarch64 \
 脚本使用 `-snapshot -m 8G -smp 8`，不修改镜像、guest `/proc/uptime`、
 官方 suite、judge、marker 或 guest timeout。当前完整 BuildStorm 结论为
 `official-pass`；时间优化收益仍以正式评测机复测为准。
+
+## 12. 2026-08-15 VFS lookup 复用与有界缓存
+
+### 12.1 热点证据与根因
+
+基于 `c80c638594216c6e3dda109d85bb492c0c7b8195` 的完整 diagnostics 对照为
+`867.01s`。末态计数显示 `open_path()` 在同一路径上分别执行 directory、
+regular-file 和最终 inode-kind 查询；parent-symlink 与 readlink cache 的 16K
+上限到达后还会清空整张表。前者重复经过相同 namespace generation 下的 ext4
+解析，后者把大于 16K 的编译工作集周期性退化为冷缓存。
+
+候选只修改 `os/src/fs/vfs.rs`，dirty diff SHA-256 为
+`94feb228a41f07ee09ac10e4688343333a5056f7113bd998be8a5648a2cc819d`：
+
+1. `open_path()` 对非 tmpfs 路径只调用一次 `lookup_kind()`，复用可复制的
+   `(ino, Ext4NodeKind)`。
+2. parent-symlink 与 readlink cache 上限从 16K 提升到 64K。
+3. 满载时只淘汰一个确定性条目，不再清空整个工作集。
+
+该设计不改变 tmpfs 路由、最终 symlink 语义、rename/unlink 失效、ext4 inode
+所有权、VMA/Resident/PTE/TLB 边界或 diagnostics 开关。namespace writer 仍负责
+失效，lookup 结果只在原有调用生命周期内复用。
+
+### 12.2 同配置性能结果
+
+官方 suite 为 `final-2026` 提交
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`，QEMU 11.0.3，官方原始镜像以
+snapshot 模式运行，production diagnostics 关闭，配置为 `-m 8G -smp 8`：
+
+| 配置 | 对照 | 候选 | 提升 | 证据等级 |
+| --- | ---: | ---: | ---: | --- |
+| RISC-V64 diagnostics | 867.01 s | 793.68 s | 8.46% | `unverified` 性能归因 |
+| RISC-V64 production | 860.15--867.16 s | 774.62 s | 9.94%--10.67% | `official-pass` |
+| LoongArch64 production | 674.49--687.23 s | 620.70 s | 7.97%--9.68% | `official-pass` |
+
+两次 production 都包含精确
+`BUILDSTORM_COMPILE mode=multi ok=true`，官方 judge 自动项为 180/180；人工
+设计文档 20 分不在自动结果中自行计分。RISC-V64/LoongArch64 production
+kernel SHA-256 分别为 `8821c921...f5c31` 与 `3241a943...c30d`。
+
+diagnostics 中首热点按因果预测下降：
+
+- `vfs_open_parent_symlink`：`49,802,733us -> 2,637,242us`；
+- `vfs_open_final_symlink`：`6,714,761us -> 3,809,435us`；
+- `vfs_open_ext4_regular_lookup`：`313,455us -> 7,945us`。
+
+### 12.3 回归、libc 边界与剩余风险
+
+四种 RISC-V64/LoongArch64 production/diagnostics release cfg 均通过。两架构
+SMP8 独立回归均通过 namespace、regular-file、resident/high-arena、
+user-memory、TLB/ASID、interval timer、160 MiB heap stress 与 320 MiB 大内核
+分配阶段，证据等级为 `capability-pass`。
+
+`mode=multi` 仅表示多核模式。官方决赛性能运行选择 glibc。RISC-V64 额外运行
+官方镜像中的 `/musl/buildstorm_testcode.sh`，得到
+`BUILDSTORM_RESULT mode=multi status=OK rc=0 elapsed_s=783.15`、group end、
+`ALL TESTS DONE`、QEMU exit 0 且无 panic/OOM，记为 `capability-pass`。
+LoongArch 官方镜像经只读 `debugfs` 核验不含该 musl 脚本，所以该组合保持
+`unverified`，没有修改镜像补齐 workload。
+
+当前淘汰策略是确定性有界策略而非 LRU。它消除了整表清空的性能悬崖，但后续
+若重构为统一 VFS cache，应保留 namespace generation、精确失效和锁顺序，不能
+让 cache 取得 inode、VMA 或页帧所有权。
+
+### 12.4 AI 使用、人工核验与复现
+
+OpenAI Codex / GPT-5 用于交叉检查 dirty worktree、源码、官方脚本和日志，建立
+可证伪因果模型，执行实现、单实例双架构 QEMU 与证据整理。人工可核验内容包括
+源码 diff、四 cfg 构建日志、SMP JSON/串口、kernel/image/suite hash、完整 QEMU
+参数、官方 serial 与 judge 输出。AI 未修改官方镜像、suite、guest script、
+judge、marker 或 guest 时间，也未按 crate、测试路径、命令或输出选择 production
+行为。
+
+复现命令沿用第 9.4 节；运行前必须确认没有其他 QEMU。证据索引见
+`docs/evidence/buildstorm-stage2/20260815-vfs-lookup-reuse-validation.md`，原始目录
+包括两架构 production、RISC-V64 diagnostics、四 cfg gate、双架构 SMP gate 和
+RISC-V64 musl capability run。

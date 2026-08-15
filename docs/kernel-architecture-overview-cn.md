@@ -237,6 +237,13 @@ lookup 持 shared namespace transaction；namespace writer 从第一次 parent/n
 
 缓存包括 positive path、negative path、directory snapshot 和 inode metadata。writer 精确失效受影响 parent/path，并增加 generation。reader 只在同一 shared transaction/generation 中发布结果。
 
+VFS 的 parent-symlink 与 readlink result cache 使用 64K 有界容量，满载时逐项
+淘汰，避免把大型编译工作集整表清空。`open_path()` 在完成 tmpfs/ext4 后端选择
+后，对同一 ext4 路径只取得一次 generation-validated `(ino, kind)`，并在该次
+open 生命周期内复用。缓存只保存解析结果，不拥有 inode、file description、VMA
+或 frame；rename/unlink/symlink mutation 仍通过既有 invalidation protocol
+撤销相关结果。
+
 ### 8.5 文件数据路径
 
 ext4 数据路径包含：
@@ -308,13 +315,13 @@ ext4 数据路径包含：
 RISC-V64：
 
 ```text
-BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=800.55 cores=8 bytes=1683456 arch=riscv64
+BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=774.62 cores=8 bytes=1683456 arch=riscv64
 ```
 
 LoongArch64：
 
 ```text
-BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=660.71 cores=8 bytes=1716224 arch=loongarch64
+BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=620.70 cores=8 bytes=1716224 arch=loongarch64
 ```
 
 两架构官方 judge 自动项均为 180/180。完整实验、AI 披露和复现步骤见 `docs/buildstorm-2.3-design-optimization-cn.md`。
@@ -343,9 +350,9 @@ namespace transaction lock 只保护名字解析和目录 mutation，regular-fil
 writeback 不持有 namespace lock；RISC-V64 和 LoongArch64 的平台差异仍在
 VirtIO、页表和 TLB 边界内，数据面逻辑共用。
 
-当前最快吞吐基线仍是 Stage B 的 `800.55s/660.71s`；本层的已验证运行约为
-`860s/687s`，其工程目标是消除大文件回写的长尾和评测超时，而不是宣称加速。
+VFS lookup 复用层的最新 production 结果为 `774.62s/620.70s`；相对前一版
+同配置 VFS production 对照分别提升 `9.94%--10.67%` 与 `7.97%--9.68%`。
 官方成功 marker、镜像/内核 hash 和 SMP 生命周期证据见
-`docs/buildstorm-2.3-design-optimization-cn.md` 第 11 节。工作树中额外的
-`os/src/fs/vfs.rs` parent/readlink cache 实验尚未纳入该架构结论，状态为
-`unverified`。
+`docs/buildstorm-2.3-design-optimization-cn.md` 第 12 节。该层已纳入当前架构，
+但其确定性淘汰仍不是完整 LRU；未来统一 cache replacement 时必须保持
+namespace generation 与精确失效边界。

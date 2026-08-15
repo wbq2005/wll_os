@@ -1,0 +1,1 @@
+python3 scripts/run_buildstorm.py --arch riscv64 --image /srv/buildstorm/images/sdcard-rv-pub.img --stage complete --timeout 15000 --memory 8G --smp 8 --skip-build

@@ -1,0 +1,7 @@
+792c30b69181ea3b86682e1eedf44e5af6715a3a95809d11524958f396f70bf7  /srv/buildstorm/evidence/20260815-vfs-lookup-reuse-smp-gates/loongarch64-build.log
+533183c1ccc2bcb23082fef6a898f8d8a76fbf2a3ddd47b53a838c1e599e9ef9  /srv/buildstorm/evidence/20260815-vfs-lookup-reuse-smp-gates/loongarch64-serial.log
+f646050a28ad9b2c0a92cc2d7f3f07a9694ce866ba620e1005dcd421bd22ae3b  /srv/buildstorm/evidence/20260815-vfs-lookup-reuse-smp-gates/riscv64-build.log
+af8bfa6087a6d461c41009af1e895b12bb0f0cddbce726aa0bc193b9d54a52f2  /srv/buildstorm/evidence/20260815-vfs-lookup-reuse-smp-gates/riscv64-serial.log
+253bc7d8d63798d11f054613747a6a06ee217fde6b98822312696aa780c9e314  /srv/buildstorm/evidence/20260815-vfs-lookup-reuse-smp-gates/loongarch64-runner.json
+7b3ce0e61819b1c75860c9257b8c4d8835e814eade491e5c4f3134521a882f33  /srv/buildstorm/evidence/20260815-vfs-lookup-reuse-smp-gates/riscv64-runner.json
+94feb228a41f07ee09ac10e4688343333a5056f7113bd998be8a5648a2cc819d  /srv/buildstorm/evidence/20260815-vfs-lookup-reuse-smp-gates/kernel-source-dirty.diff

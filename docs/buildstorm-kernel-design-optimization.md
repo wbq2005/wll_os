@@ -1729,3 +1729,38 @@ design, implementation and test orchestration; all hashes, raw logs, commands
 and judge output are retained for manual verification. The official score is
 locked only by the exact markers above; the manual document score is not
 claimed here.
+
+## 41. VFS lookup reuse and bounded working-set retention (2026-08-15)
+
+The previously isolated `os/src/fs/vfs.rs` experiment was validated separately
+on base `c80c638594216c6e3dda109d85bb492c0c7b8195`. Its diff SHA-256 is
+`94feb228a41f07ee09ac10e4688343333a5056f7113bd998be8a5648a2cc819d`.
+The causal model was repeated ext4 kind lookup inside `open_path()` plus complete
+parent/readlink cache clearing when a compiler working set crossed 16K entries.
+The retained design reuses one generation-validated `(inode, kind)` value,
+raises those two bounds to 64K, and evicts one entry at capacity. Namespace
+invalidation, tmpfs routing, symlink policy, inode lifetime and MM ownership are
+unchanged.
+
+Comparable production results improved from `860.15-867.16s` to `774.62s` on
+RISC-V64 (9.94-10.67%) and from `674.49-687.23s` to `620.70s` on LoongArch64
+(7.97-9.68%). Both runs used the unmodified public images, QEMU 11.0.3,
+`-snapshot -m 8G -smp 8`, production diagnostics disabled, official suite
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`, and contain the exact
+`BUILDSTORM_COMPILE mode=multi ok=true` marker. The public judge reports 180/180
+scriptable points; the manual document score is not asserted.
+
+All four production/diagnostics release cfg builds passed. Both architecture
+SMP8 regressions passed namespace, regular-file, resident/high-arena,
+user-memory, TLB/ASID, timer, heap-stress and 320 MiB large-allocation phases.
+RISC-V64 musl separately completed with `BUILDSTORM_RESULT status=OK rc=0` at
+`783.15s` and is `capability-pass`. The public LoongArch image has no
+`/musl/buildstorm_testcode.sh`, verified read-only with `debugfs`, so that
+combination remains `unverified` rather than being fabricated or misreported.
+
+AI assisted evidence correlation, implementation, controlled QEMU execution
+and documentation. Developer-verifiable artifacts include source and binary
+hashes, raw serial logs, runner JSON, official judge output and lifecycle logs.
+No official image, suite, guest script, marker, judge, guest time, or
+workload-dependent production branch was changed. The compact evidence index
+is `docs/evidence/buildstorm-stage2/20260815-vfs-lookup-reuse-validation.md`.
