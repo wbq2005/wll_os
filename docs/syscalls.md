@@ -146,6 +146,7 @@ run_user_task() 返回用户态
 | 283 | membarrier | 内存屏障 |
 | 326 | copy_file_range | 复制文件范围 |
 | 318 | getrandom | 获取随机数 |
+| 1030 | mkdir | legacy asm-generic 目录创建，复用 mkdirat 语义 |
 
 ## 已实现系统调用
 

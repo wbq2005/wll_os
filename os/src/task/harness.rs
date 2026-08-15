@@ -271,9 +271,10 @@ fn is_enabled_script(path: &str) -> bool {
         return false;
     };
     let libc_enabled = match option_env!("WLL_HARNESS_LIBC") {
-        Some("glibc") => path.starts_with("/glibc/"),
+        Some("glibc") | None => path.starts_with("/glibc/"),
         Some("musl") => path.starts_with("/musl/"),
-        Some(_) | None => true,
+        Some("both") => path.starts_with("/glibc/") || path.starts_with("/musl/"),
+        Some(_) => false,
     };
     if !libc_enabled {
         return false;
@@ -1036,11 +1037,48 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
     }
     console_write("[smp-regression] pass phase=user-memory-lifecycle\n");
 
+    run_directory_abi_regression();
+
     // The busybox probe is intentionally static/self-contained.  A separate
     // diagnostic-only dynamic ELF probe exercises the glibc interpreter and
     // fork/exec path without changing production harness behavior.
     #[cfg(all(feature = "buildstorm-diagnostics", feature = "smp-regression"))]
     run_dynamic_user_memory_lifecycle_probe();
+}
+
+#[cfg(feature = "smp-regression")]
+fn run_directory_abi_regression() {
+    let spec = UserProgramSpec {
+        path: String::from("/busybox"),
+        argv: alloc::vec![
+            String::from("/busybox"),
+            String::from("sh"),
+            String::from("-c"),
+            String::from(
+                "set -e; /busybox rm -rf /.wll_dir_abi; \
+                 /busybox mkdir -p /.wll_dir_abi/parent/child; \
+                 /busybox test -d /.wll_dir_abi/parent/child; \
+                 /busybox mkdir -p /.wll_dir_abi/parent/child; \
+                 /busybox rm -rf /.wll_dir_abi",
+            ),
+        ],
+        envp: alloc::vec![
+            String::from("PATH=/:/bin:/usr/bin"),
+            String::from("LD_LIBRARY_PATH=/lib"),
+        ],
+        cwd: String::from("/"),
+        root: String::from("/glibc"),
+        marker_name: None,
+    };
+    let exit_code =
+        run_user_program_spec_foreground_exit_code(&spec).expect("directory ABI regression launch");
+    if exit_code != 0 {
+        panic!(
+            "[smp-regression] fail phase=directory-abi exit={}",
+            exit_code
+        );
+    }
+    console_write("[smp-regression] pass phase=directory-abi\n");
 }
 
 #[cfg(all(feature = "buildstorm-diagnostics", feature = "smp-regression"))]

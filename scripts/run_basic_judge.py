@@ -48,7 +48,7 @@ ARCHES = {
 def run_docker(repo: Path, arch: str, timeout: int, image: str) -> tuple[int, str]:
     cfg = ARCHES[arch]
     script = (
-        f"make ARCH={cfg['make_arch']} build HARNESS_GROUPS=basic && "
+        f"make ARCH={cfg['make_arch']} build HARNESS_GROUPS=basic HARNESS_LIBC=both && "
         f"cp {cfg['kernel']} {cfg['copy']} && "
         f"{cfg['qemu'].format(timeout=timeout)}"
     )

@@ -203,6 +203,7 @@ pub const SYSCALL_GETRANDOM: usize = 278;
 pub const SYSCALL_OPEN: usize = 1024;
 pub const SYSCALL_LINK: usize = 1025;
 pub const SYSCALL_UNLINK: usize = 1026;
+pub const SYSCALL_MKDIR: usize = 1030;
 pub const SYSCALL_RMDIR: usize = 1031;
 pub const SYSCALL_ACCESS: usize = 1033;
 pub const SYSCALL_RENAME: usize = 1034;
@@ -401,6 +402,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[3],
         ),
         SYSCALL_MKDIRAT => fs::sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_MKDIR => fs::sys_mkdirat(AT_FDCWD, args[0] as *const u8, args[1] as u32),
         SYSCALL_UNLINK => fs::sys_unlink(args[0] as *const u8),
         SYSCALL_UNLINKAT => fs::sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
         SYSCALL_RMDIR => fs::sys_rmdir(args[0] as *const u8),

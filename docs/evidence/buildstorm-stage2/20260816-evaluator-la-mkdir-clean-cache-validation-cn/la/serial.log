@@ -1,0 +1,470 @@
+[DTB] ptr = 0x9000000000100000
+[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+[kernel] Hello, OS!
+[kernel] Memory init
+[VIRTIO] Probing...
+[VIRTIO] found
+[EXT4] mounted successfully
+[kernel] Starting sched.
+[harness] SCRIPT /glibc/buildstorm_testcode.sh
+#### OS COMP TEST GROUP START buildstorm-glibc ####
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+rustc 1.98.0-nightly (57d06900f 2026-05-27)
+cargo 1.98.0-nightly (fbb61be30 2026-05-26)
+BUILDSTORM_TOOLCHAIN ok
+BUILDSTORM_MINIBUILD ok
+----- pre-build tg-xtask (untimed) -----
+warning: failed to save last-use data
+This may prevent cargo from accurately tracking what is being used in its global cache. This information is used for automatically removing unused data in the cache.
+
+out of range integral type conversion attempted
+
+Caused by:
+  out of range integral type conversion attempted
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.73s
+----- build arceos-helloworld (timed, arch=loongarch64) -----
+BUILDSTORM_BEGIN mode=multi
+warning: failed to save last-use data
+This may prevent cargo from accurately tracking what is being used in its global cache. This information is used for automatically removing unused data in the cache.
+
+out of range integral type conversion attempted
+
+Caused by:
+  out of range integral type conversion attempted
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.76s
+     Running `target/debug/tg-xtask arceos build -p arceos-helloworld --arch loongarch64`
+[1970-01-01T00:00:46Z INFO  axbuild::context] Workspace root: /work/tgoskits
+Using build config: /work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml
+[1970-01-01T00:00:48Z INFO  axbuild::build::config_file] Found build config at /work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml
+Using build config: /work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml
+[1970-01-01T00:00:50Z INFO  axbuild::build::config_file] Found build config at /work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml
+[axbuild] cargo build package=arceos-helloworld target=scripts/targets/std/pie/loongarch64-unknown-linux-musl.json config=/work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml ...
+sh -c /work/tgoskits/tmp/axbuild/std/prebuild/prebuild-loongarch64-unknown-linux-musl-bd8e59296c60d6af.sh
+AR_loongarch64_unknown_linux_musl=loongarch64-linux-musl-ar
+AX_LOG=info
+AX_TARGET=loongarch64-unknown-none-softfloat
+CARGO_UNSTABLE_JSON_TARGET_SPEC=true
+CC_loongarch64_unknown_linux_musl=loongarch64-linux-musl-cc
+CFLAGS_loongarch64_unknown_linux_musl=-mabi=lp64s -msoft-float -fno-stack-protector
+CXXFLAGS_loongarch64_unknown_linux_musl=-mabi=lp64s -msoft-float -fno-stack-protector
+SMP=1
+cargo build --config /work/tgoskits/tmp/axbuild/std/config-loongarch64-unknown-linux-musl-dynamic.toml -p arceos-helloworld --target scripts/targets/std/pie/loongarch64-unknown-linux-musl.json -Z unstable-options --target-dir /work/tgoskits/target --features arceos,ax-std/irq,ax-std/paging,ax-std/smp,ax-std/std-compat -Z json-target-spec --release --message-format json-render-diagnostics
+warning: failed to save last-use data
+This may prevent cargo from accurately tracking what is being used in its global cache. This information is used for automatically removing unused data in the cache.
+
+out of range integral type conversion attempted
+
+Caused by:
+  out of range integral type conversion attempted
+   Compiling compiler_builtins v0.1.160 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling libc v0.2.185
+   Compiling std v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/std)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling thiserror v2.0.18
+   Compiling heapless v0.9.3
+   Compiling ax-percpu v0.4.14 (/work/tgoskits/components/percpu/percpu)
+   Compiling num-traits v0.2.19
+   Compiling radium v0.7.0
+   Compiling ax-errno v0.6.1 (/work/tgoskits/components/axerrno)
+   Compiling libc v0.2.186
+   Compiling rust_decimal v1.42.1
+   Compiling anyhow v1.0.103
+   Compiling ax-alloc v0.8.12 (/work/tgoskits/os/arceos/modules/axalloc)
+   Compiling someboot v0.3.5 (/work/tgoskits/platforms/someboot)
+   Compiling ax-driver v0.12.0 (/work/tgoskits/drivers/ax-driver)
+   Compiling somehal v0.8.0 (/work/tgoskits/platforms/somehal)
+   Compiling axplat-dyn v0.7.12 (/work/tgoskits/platforms/axplat-dyn)
+   Compiling ax-hal v0.5.28 (/work/tgoskits/os/arceos/modules/axhal)
+   Compiling ax-task v0.6.4 (/work/tgoskits/os/arceos/modules/axtask)
+   Compiling ax-runtime v0.10.4 (/work/tgoskits/os/arceos/modules/axruntime)
+   Compiling scope-local v0.4.2 (/work/tgoskits/components/scope-local)
+   Compiling ax-posix-api v0.5.29 (/work/tgoskits/os/arceos/api/arceos_posix_api)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rustc-std-workspace-core v1.99.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/rustc-std-workspace-core)
+   Compiling alloc v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rustc-demangle v0.1.27
+   Compiling panic_abort v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_abort)
+   Compiling cfg-if v1.0.4
+   Compiling rustc-literal-escaper v0.0.7
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling unwind v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/unwind)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rustc-std-workspace-alloc v1.99.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/rustc-std-workspace-alloc)
+   Compiling panic_unwind v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_unwind)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling hashbrown v0.17.1
+   Compiling std_detect v0.1.5 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/std_detect)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling proc_macro v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/proc_macro)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling log v0.4.33
+   Compiling bitflags v2.13.0
+   Compiling byteorder v1.5.0
+   Compiling as-any v0.3.2
+   Compiling scopeguard v1.2.0
+   Compiling stable_deref_trait v1.2.1
+   Compiling bit_field v0.10.3
+   Compiling derive_more v2.1.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-kernel-guard v0.3.11 (/work/tgoskits/components/kernel_guard)
+   Compiling irq-framework v0.3.0 (/work/tgoskits/components/irq-framework)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling lock_api v0.4.14
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rdif-def v0.3.0 (/work/tgoskits/drivers/interface/rdif-def)
+   Compiling tock-registers v0.10.1
+   Compiling strum v0.27.2
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-memory-addr v0.6.9 (/work/tgoskits/memory/memory_addr)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling hash32 v0.3.1
+   Compiling ax-kspin v0.3.15 (/work/tgoskits/components/kspin)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling pci_types v0.10.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling mmio-api v0.2.2 (/work/tgoskits/memory/mmio-api)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rdif-base v0.8.3 (/work/tgoskits/drivers/interface/rdif-base)
+   Compiling futures-sink v0.3.32
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling futures-core v0.3.32
+   Compiling pin-project-lite v0.2.17
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling spin v0.12.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling spinning_top v0.3.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling slab v0.4.12
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling arrayvec v0.7.7
+   Compiling futures-task v0.3.32
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rdif-msi v0.2.0 (/work/tgoskits/drivers/interface/rdif-msi)
+   Compiling rdif-clk v0.5.4 (/work/tgoskits/drivers/interface/rdif-clk)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rdif-pcie v0.2.5 (/work/tgoskits/drivers/interface/rdif-pcie)
+   Compiling rdif-reset v0.1.0 (/work/tgoskits/drivers/interface/rdif-reset)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling acpi v6.1.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rdif-power v0.8.0 (/work/tgoskits/drivers/interface/rdif-power)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rdif-intc v0.15.0 (/work/tgoskits/drivers/interface/rdif-intc)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling futures-channel v0.3.32
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling futures-util v0.3.32
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling tap v1.0.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling futures-io v0.3.32
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling const-default v1.0.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling pcie v0.6.7 (/work/tgoskits/drivers/pci/pcie)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+   Compiling funty v2.0.0
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling wyz v0.5.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling const-str v1.1.0
+   Compiling bytemuck v1.25.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling uguid v2.2.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling num-align v0.1.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling fdt-raw v0.3.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+   Compiling ranges-ext v0.6.4 (/work/tgoskits/memory/ranges-ext)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rgb v0.8.53
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling uefi-raw v0.14.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling buddy-slab-allocator v0.4.6 (/work/tgoskits/memory/buddy-slab-allocator)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling bitvec v1.1.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling fdt-edit v0.2.3
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling spinning_top v0.2.5
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling loongArch64 v0.2.6
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ucs2 v0.3.3
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling mbarrier v0.1.3
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling axpanic v0.1.1 (/work/tgoskits/components/axpanic)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ptr_meta v0.3.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling utf8-width v0.1.8
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rlsf v0.2.2
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling dma-api v0.9.3 (/work/tgoskits/memory/dma-api)
+   Compiling ansi_rgb v0.2.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rdif-pinctrl v0.1.2 (/work/tgoskits/drivers/interface/rdif-pinctrl)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling byte-unit v5.2.5
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling kernutil v0.2.2 (/work/tgoskits/components/kernutil)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling page-table-generic v0.7.4 (/work/tgoskits/memory/page-table-generic)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-page-table-entry v0.8.10 (/work/tgoskits/memory/page_table_entry)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rdrive v0.23.6 (/work/tgoskits/drivers/rdrive)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling numeric-enum-macro v0.2.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling axbacktrace v0.4.5 (/work/tgoskits/components/axbacktrace)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-page-table-multiarch v0.8.13 (/work/tgoskits/memory/page_table_multiarch)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling fdt-parser v0.4.19
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-memory-set v0.6.12 (/work/tgoskits/memory/memory_set)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-lazyinit v0.4.8 (/work/tgoskits/components/ax-lazyinit)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-log v0.5.18 (/work/tgoskits/os/arceos/modules/axlog)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-cpu v0.8.3 (/work/tgoskits/components/axcpu)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling chrono v0.4.45
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling futures v0.3.32
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling linux-raw-sys v0.12.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling rdif-serial v0.9.0 (/work/tgoskits/drivers/interface/rdif-serial)
+   Compiling ax-ctor-bare v0.4.8 (/work/tgoskits/components/ctor_bare/ctor_bare)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling memchr v2.8.2
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling bitmaps v3.2.1
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling axpoll v0.5.1 (/work/tgoskits/components/axpoll)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-plat v0.12.0 (/work/tgoskits/platforms/ax-plat)
+   Compiling some-serial v0.7.0 (/work/tgoskits/drivers/serial/some-serial)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-io v0.6.1 (/work/tgoskits/components/axio)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling flatten_objects v0.2.4
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling aml v0.16.4
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling uefi v0.37.0
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling axklib v0.7.5 (/work/tgoskits/components/axklib)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-mm v0.5.28 (/work/tgoskits/os/arceos/modules/axmm)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-sync v0.5.28 (/work/tgoskits/os/arceos/modules/axsync)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-api v0.7.4 (/work/tgoskits/os/arceos/api/arceos_api)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling ax-std v0.5.28 (/work/tgoskits/os/arceos/ulib/axstd)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+   Compiling arceos-helloworld v0.1.0 (/work/tgoskits/apps/arceos/helloworld)
+<jemalloc>: MADV_DONTNEED does not work (memset will be used instead)
+<jemalloc>: (This is the expected behaviour if you are running under QEMU)
+    Finished `release` profile [optimized] target(s) in 10m 11s
+Converting ELF to BIN format...
+  elf: /work/tgoskits/target/loongarch64-unknown-linux-musl/release/arceos-helloworld
+  bin: /work/tgoskits/target/loongarch64-unknown-linux-musl/release/arceos-helloworld.bin
+/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/loongarch64-unknown-linux-gnu/bin/llvm-objcopy --strip-all -O binary /work/tgoskits/target/loongarch64-unknown-linux-musl/release/arceos-helloworld /work/tgoskits/target/loongarch64-unknown-linux-musl/release/arceos-helloworld.bin
+[axbuild] cargo build package=arceos-helloworld target=scripts/targets/std/pie/loongarch64-unknown-linux-musl.json config=/work/tgoskits/tmp/axbuild/config/arceos-helloworld/build-loongarch64-unknown-none-softfloat.toml ... done (624.66s)
+[axbuild] cargo build elf=/work/tgoskits/target/loongarch64-unknown-linux-musl/release/arceos-helloworld
+[axbuild] cargo build artifact_dir=/work/tgoskits/target/loongarch64-unknown-linux-musl/release
+BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=642.70 cores=12 bytes=1716224 arch=loongarch64
+#### OS COMP TEST GROUP END buildstorm-glibc ####

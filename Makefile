@@ -13,6 +13,10 @@ LTP ?= 0
 # finals groups in the plain `make all` artifact; focused runners override this
 # value explicitly when they need one workload in isolation.
 HARNESS_GROUPS ?= cagent,buildstorm
+# The 2026 finals score only the glibc suites.  Keep musl available as an
+# explicit capability run without launching a second, unscored BuildStorm by
+# default after the scored glibc workload completes.
+HARNESS_LIBC ?= glibc
 FOCUSED_LTP_CASES_BASE := writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03,symlink01,readlink01,lstat01,lstat02,symlink02,symlink03,symlink04,symlinkat01,readlinkat01,setitimer02,setitimer01,getitimer01,getitimer02,mkdir02,mkdir03,mkdir04,mkdir05,rmdir01,rmdir02,rmdir03,fallocate02,fallocate03,mknod09,open10,open11,open12,unlink09,futex_wait05,prctl08,prctl09,epoll_wait02,epoll_pwait03,epoll_wait01,epoll_wait03,epoll_wait04,epoll_ctl01,epoll_ctl02,epoll_create1_01,epoll_create1_02,splice01,splice03,splice04,splice07,eventfd2_01,eventfd2_02,eventfd2_03,eventfd01,eventfd02,eventfd03,eventfd04,eventfd05,chown02,chown04,fchown04,lchown02,fchmod04,fchmod05,fchmod06,utimes01,truncate03,getsid02,waitid07,waitid08,waitid10
 FOCUSED_LTP_CASES_20260629 := copy_file_range01,creat01,creat03,creat04,creat05,faccessat02,faccessat201,faccessat202,fallocate04,fchmodat01,fchmodat02,fchownat01,fchownat02,fcntl14,fcntl17,fcntl36,ftruncate03,getxattr01,getxattr02,link02,link04,link05,linkat01,listxattr01,mkdirat01,mkdirat02,open14,openat01,openat02,openat03,openat04,openat201,openat202,openat203,readlinkat02,removexattr01,rename01,rename03,rename04,rename05,rename06,rename07,rename08,rename09,rename10,rename12,rename13,rename14,renameat201,renameat202,sendfile06,setxattr01,setxattr02,statx01,statx02,statx03,truncate02,unlinkat01
 FOCUSED_LTP_CASES_20260630 := fcntl23
@@ -160,13 +164,13 @@ build:
 	@echo "Building kernel for $(ARCH)..."
 	$(MAKE) prepare-cargo-config
 	@if [ "$(DEV_PRELOAD)" = "1" ]; then $(MAKE) check-sdcard ARCH=$(ARCH); fi
-	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
+	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) WLL_HARNESS_LIBC=$(HARNESS_LIBC) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
 
 # 快速检查（不做链接，更快，适合开发阶段验证代码）
 check:
 	@echo "Checking kernel for $(ARCH)..."
 	$(MAKE) prepare-cargo-config
-	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
+	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) WLL_HARNESS_LIBC=$(HARNESS_LIBC) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
 
 check-kernel-no-preload:
 	@if [ ! -f kernel-rv ]; then \

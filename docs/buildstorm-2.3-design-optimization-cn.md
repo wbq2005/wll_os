@@ -567,13 +567,14 @@ crate、测试路径、命令、输出或 marker。独立 probe 已从动态装�
 | LA 大内存启动/minibuild | production 36G/12 | toolchain、minibuild 通过 | `capability-pass` |
 | RV public minibuild | production 16G/8 | toolchain、minibuild 通过 | `capability-pass` |
 | RV nested QEMU | 派生镜像，production | QEMU/OpenSBI/真实内核加载通过 | `capability-pass` |
-| RV public full build | production 16G/8、3000 s harness | `ok=true elapsed_s=786.62`，judge 180/180 | `official-pass` |
-| LA public full build | production 36G/12、3000 s harness | `ok=true elapsed_s=650.22`，judge 180/180 | `official-pass` |
+| RV public full build | production 16G/8、3000 s harness | `ok=true elapsed_s=786.62`，judge 180/180 | `capability-pass` |
+| LA public full build | production 36G/12、3000 s harness | `ok=true elapsed_s=650.22`，judge 180/180 | `capability-pass` |
 
 旧提交 `6045dd2534668ea4d1cff94725c41afb0a855af4` 的 8G/8 双架构
 `official-pass` 仍是历史有效证据，但没有被当前 candidate 借用。本轮重新使用
 未修改的官方镜像、原始 public script、当前官方 judge 和评测日志中的实际资源
-配置完成双架构运行，因此 public suite 结果单独记为 `official-pass`。
+配置完成双架构运行；由于不是公开规则指定的 8G/8，这两次 public suite 运行
+单独记为 `capability-pass`。
 
 资源描述存在上游冲突：当前 public README 仍写 8G/8，当前可执行 judge 的
 `EXPECTED_CORES` 却是 RISC-V64 8、LoongArch64 12，而评测机原始命令明确为
@@ -596,3 +597,52 @@ source dirty diff SHA-256 与 RISC-V64 相同。
 `docs/evidence/buildstorm-stage2/20260815-large-memory-smp-sigill-validation-cn.md`。
 AI 用于交叉检查评测日志、反汇编、dirty diff、源码所有权和单实例 QEMU 结果；
 人工可复核内容包括所有原始串口、kernel/image/source hash、完整命令和结果 marker。
+
+## 14. 2026-08-16 评测路由、LA mkdir ABI 与 clean-page cache
+
+### 14.1 评测日志结论
+
+本轮得分 568.1，其中 RV BuildStorm 149.9，LA BuildStorm 20.0。评分表和可执行
+judge 只包含 glibc。RV 在 `BUILDSTORM_RESULT ... elapsed_s=2020.80` 后又启动
+`/musl/buildstorm_testcode.sh`，这是第二个不计分 workload；而 glibc 流程内部的
+`*-unknown-linux-musl.json` 是被测 ArceOS 的 Rust target，属于正式编译，不能关闭。
+默认 `HARNESS_LIBC=glibc` 只移除前者，显式 `musl/both` capability 入口仍保留。
+
+LA 的 release 编译已在 2020.04 秒结束，首错是 EFI 目录创建调用 legacy
+`mkdir(1030)` 返回 ENOSYS。修复复用 `sys_mkdirat(AT_FDCWD, ...)`，没有增加第二套
+VFS 语义。后续 `cp`/`vars.fd` 信息是父目录未创建后的派生错误；修复后未修改
+public LA 脚本完整输出 `ok=true`。
+
+### 14.2 热点因果模型与实现
+
+完整 diagnostics 显示 anonymous demand fault 累计 77.891 秒，clean-file cache
+fault 71.482 秒，COW 5.176 秒；MemorySet 等待、frame/heap 锁、extent、VirtIO、
+TLB 与 activation 均不是同量级首热点。clean-file fault 平均安装约 16 页，旧实现
+在一个 fault 内反复进入同一 clean-page cache 锁。
+
+最终实现只在 `CleanPageCache` 责任单元内增加两个批处理接口：一次持锁检查连续
+未缓存前缀，一次持锁提取连续 cache hit run。精确 LRU、容量、read-ahead 16、
+并发插入二次确认和 inode/range 失效不变；VmaMap、ResidentSet、PageTableOps 和
+TlbProtocol 没有被合并进 VFS。
+
+### 14.3 A/B、验证与诚实边界
+
+| 候选 | RV 时间 | 处理 |
+| --- | ---: | --- |
+| 基线 | 786.62 s | 对照 |
+| read-ahead 32 | 787.31 s | 未保留 |
+| cache batch | 766.54 / 789.87 s | 保留通用锁粒度优化 |
+| second-chance | 836.88 s | 未保留 |
+| clock + range invalidation | 768.04 s | 未优于 batch |
+| 精确 LRU + range invalidation | 767.32 s | 未证明独立收益 |
+
+两次 batch 平均 778.21 秒，相对基线约快 1.07%，未稳定越过宿主噪声，因此不把
+它宣称为确定性时间分提升。LA 同结构为 642.70 秒，相对 646.32 秒快 0.56%。
+
+最终 RV 16G/8 与 LA 36G/12 public serial 都包含精确
+`BUILDSTORM_COMPILE mode=multi ok=true`，judge 均解析为 180/180；由于不是
+公开规则指定的 8G/8，这两次运行属于 `capability-pass`。四种
+production/diagnostics cfg 和双架构 SMP8（含新增
+`directory-abi`）通过，属于 `capability-pass`。新提交在评测机隐藏门上的状态仍为
+`unverified`。完整哈希、原始日志路径、被证伪候选和 AI 披露见
+`docs/evidence/buildstorm-stage2/20260816-evaluator-la-mkdir-clean-cache-validation-cn/README.md`。

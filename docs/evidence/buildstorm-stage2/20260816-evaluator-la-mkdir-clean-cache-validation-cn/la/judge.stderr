@@ -1,0 +1,2 @@
+[judge] scripted total = 180.0 / 180.0 (+ doc 20 pts, judged manually) = 200 
+[judge] compile: arch=loongarch64 elapsed=643s baseline=1985s

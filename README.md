@@ -33,6 +33,34 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 
 ## BuildStorm 决赛状态
 
+### 2026-08-16 评测修复
+
+本轮评测总分为 568.1；RV BuildStorm 已通过但只得到 149.9，LA 只有 toolchain 与
+minibuild 的 20 分。日志复核得到两个确定性问题：
+
+- RV 在已完成计分 glibc BuildStorm 后，又启动了不计分的
+  `/musl/buildstorm_testcode.sh`。默认 harness 现在只运行 glibc；显式
+  `HARNESS_LIBC=musl` 或 `both` 仍保留为 capability 验证入口。glibc 流程内部的
+  `*-unknown-linux-musl.json` 是 ArceOS Rust target，属于正式编译，未被关闭。
+- LA clean build 已在 2020.04 秒完成，0 分首错是 EFI 准备阶段 legacy
+  `mkdir(1030)` 返回 ENOSYS。分发现在复用 `mkdirat(AT_FDCWD, ...)`；双架构独立
+  `directory-abi` 回归均通过。
+
+当前候选在未修改 public 镜像和 judge 上以远端复现资源配置完成；这些运行因资源
+不等于公开规则的 8G/8，证据等级为 `capability-pass`：
+
+| 架构 | 配置 | 成功标记 | public judge |
+| --- | --- | --- | ---: |
+| RISC-V64 | 16G/8 | `ok=true elapsed_s=789.87` | 180/180 |
+| LoongArch64 | 36G/12 | `ok=true elapsed_s=642.70` | 180/180 |
+
+diagnostics 将剩余首热点定位为 anonymous demand fault（77.891 秒）和 clean-file
+fault（71.482 秒）。保留的 clean-page cache batch 把 16 页预读检查和连续命中
+分别合并到一次锁临界区；两次 RV 同结构运行平均 778.21 秒，相对 786.62 秒基线
+约快 1.07%，未稳定越过宿主噪声，因此只声明通用锁粒度优化，不宣称确定性时间分
+提升。完整候选矩阵、被证伪的 second-chance/range 方案和证据分级见
+[2026-08-16 验证记录](docs/evidence/buildstorm-stage2/20260816-evaluator-la-mkdir-clean-cache-validation-cn/README.md)。
+
 2026-08-15，提交 `6045dd2534668ea4d1cff94725c41afb0a855af4` 在远端
 `47.110.249.0` 使用 QEMU 11.0.3、官方 `final-2026` glibc 镜像、
 `-snapshot -m 8G -smp 8` 配置下完成双架构 clean build，证据等级为
@@ -72,9 +100,10 @@ LoongArch64 36G/12 minibuild、RISC-V64 16G/8 minibuild 和独立 nested-QEMU
 真实内核加载均为 `capability-pass`。当前 candidate 已在评测日志对应的
 RISC-V64 16G/8 与 LoongArch64 36G/12 配置完成 public clean build，分别得到
 `BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=786.62` 与 `650.22 s`，当前
-官方 judge 均为 180/180，因此 public suite 记为 `official-pass`。public README
-仍写 8G/8，而可执行 judge 期望 RV 8 核、LA 12 核；该上游冲突已在设计文档中
-保留。评测机额外的 hidden nested-QEMU 最终门仍为 `unverified`，不能由独立
+官方 judge 均解析为 180/180。由于资源配置不等于公开规则的 8G/8，这两次运行
+只记为 `capability-pass`，不作为正式得分声明。public README 仍写 8G/8，而
+可执行 judge 期望 RV 8 核、LA 12 核；该上游冲突已在设计文档中保留。评测机
+额外的 hidden nested-QEMU 最终门仍为 `unverified`，不能由独立
 probe 的 `capability-pass` 代替。详见
 [本轮验证索引](docs/evidence/buildstorm-stage2/20260815-large-memory-smp-sigill-validation-cn.md)。
 
@@ -112,8 +141,11 @@ python3 scripts/run_buildstorm.py --arch loongarch64 \
 | `LTP` | `0` | 普通 `make build/check` 不默认打开 LTP |
 | `LIBCTEST` | `0` | 完整 libc-test 收集器为 opt-in |
 | `DEV_PRELOAD` | `0` | 默认不把测试脚本预载进 kernel |
+| `HARNESS_LIBC` | `glibc` | 默认只运行计分 libc；`musl`/`both` 需显式选择 |
 
 `scripts/perf_baseline_runner.py --suite all` 会打开 `LTP=1`，在 iozone/libcbench/lmbench 后追加当前 bounded LTP slice。`--suite ltp` 仍可作为只跑 LTP slice 的聚焦诊断入口。
+该开发 runner 与 `scripts/run_basic_judge.py` 显式使用 `HARNESS_LIBC=both`，因此默认
+提交行为的收紧不会降低本地双 libc 回归覆盖。
 
 ### Bounded LTP slice
 

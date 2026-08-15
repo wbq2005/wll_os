@@ -563,6 +563,39 @@ impl CleanPageCache {
         Some(page.frame.clone())
     }
 
+    fn uncached_prefix_len(&self, ino: u32, start_page_idx: usize, max_pages: usize) -> usize {
+        let mut pages = 0usize;
+        while pages < max_pages {
+            let Some(page_idx) = start_page_idx.checked_add(pages) else {
+                break;
+            };
+            if self.pages.contains_key(&CleanPageKey { ino, page_idx }) {
+                break;
+            }
+            pages += 1;
+        }
+        pages
+    }
+
+    fn get_run(&mut self, ino: u32, start_page_idx: usize, max_pages: usize) -> Vec<FrameTracker> {
+        let mut frames = Vec::new();
+        for page in 0..max_pages {
+            let Some(page_idx) = start_page_idx.checked_add(page) else {
+                break;
+            };
+            let key = CleanPageKey { ino, page_idx };
+            let age = self.bump_age();
+            let Some(cached) = self.pages.get_mut(&key) else {
+                break;
+            };
+            self.ages.remove(&(cached.last_used, key));
+            cached.last_used = age;
+            self.ages.insert((age, key));
+            frames.push(cached.frame.clone());
+        }
+        frames
+    }
+
     fn insert(&mut self, key: CleanPageKey, frame: FrameTracker) {
         let age = self.bump_age();
         if let Some(page) = self.pages.get_mut(&key) {
@@ -1143,6 +1176,13 @@ fn prefetch_clean_page_frames(
         return Ok(());
     }
 
+    let page_count = CLEAN_PAGE_CACHE
+        .lock()
+        .uncached_prefix_len(ino, start_page_idx, page_count);
+    if page_count < 2 {
+        return Ok(());
+    }
+
     let mut keys = Vec::new();
     let mut offsets = Vec::new();
     let mut read_lens = Vec::new();
@@ -1157,9 +1197,6 @@ fn prefetch_clean_page_frames(
             break;
         }
         let key = CleanPageKey { ino, page_idx };
-        if CLEAN_PAGE_CACHE.lock().get(key).is_some() {
-            break;
-        }
         let Some(pblock) = extent_pblock_for_read(fs, ino, page_idx as u32) else {
             break;
         };
@@ -1224,8 +1261,10 @@ pub fn clean_page_cache_frames(
     let start_page_idx = file_offset / PAGE_SIZE;
     let _ = prefetch_clean_page_frames(&fs, ino, start_page_idx, read_ahead_pages, metadata);
     let mut source = None;
-    let mut frames = Vec::new();
-    for page in 0..max_pages {
+    let mut frames = CLEAN_PAGE_CACHE
+        .lock()
+        .get_run(ino, start_page_idx, max_pages);
+    for page in frames.len()..max_pages {
         let Some(delta) = page.checked_mul(PAGE_SIZE) else {
             break;
         };
@@ -1233,10 +1272,6 @@ pub fn clean_page_cache_frames(
             break;
         };
         let key = clean_page_key(ino, offset);
-        if let Some(frame) = CLEAN_PAGE_CACHE.lock().get(key) {
-            frames.push(frame);
-            continue;
-        }
         if page >= read_ahead_pages {
             break;
         }

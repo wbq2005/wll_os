@@ -1,0 +1,2 @@
+a1171d2563ca61f7003906fcfcbfd926dcc84684f7093dc2d03257f034047650  ../target/riscv64gc-unknown-none-elf/release/wll_OS
+01e011d4d6eb273c53f353d44027d5505e23d9ce57be9388646c96f801f3332e  ../target/loongarch64-unknown-none/release/wll_OS

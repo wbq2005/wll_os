@@ -1797,7 +1797,8 @@ release configurations, dual-architecture SMP lifecycle tests, LoongArch64
 RISC-V64 16G/8 and LoongArch64 36G/12 public clean builds completed with
 `BUILDSTORM_COMPILE mode=multi ok=true` at `786.62s` and `650.22s`; the current
 official judge parsed each raw serial log as 180/180. These unmodified public
-suite runs are `official-pass`. The public README still says 8G/8, while the
+suite runs are `capability-pass`, because their resources differ from the
+published 8G/8 scoring configuration. The public README still says 8G/8, while the
 executable judge expects 8 RISC-V CPUs and 12 LoongArch CPUs and the evaluator
 logs use 16G/8 and 36G/12. This upstream resource-description conflict is
 recorded rather than hidden. The unavailable evaluator-only nested-QEMU gate
@@ -1808,3 +1809,43 @@ No official image, suite, guest script, judge, marker, or guest clock was
 modified. No production branch inspects a crate name, path, command, QEMU name,
 or expected output. The evidence index is
 `docs/evidence/buildstorm-stage2/20260815-large-memory-smp-sigill-validation-cn.md`.
+
+## 43. Evaluator routing, LoongArch mkdir ABI, and clean-page batching (2026-08-16)
+
+The scored tables contain only glibc, but the RISC-V evaluator log launched
+`/musl/buildstorm_testcode.sh` after the successful glibc group. This was an
+unscored second workload, not the `*-unknown-linux-musl.json` Rust target used
+inside the required ArceOS build. The default harness now selects glibc only;
+`musl` and `both` remain explicit capability modes.
+
+The LoongArch timed build itself completed in 2020.04 seconds. Its first real
+failure was legacy asm-generic `mkdir(1030)` returning ENOSYS while preparing
+the EFI directory. The new dispatch delegates to the existing
+`mkdirat(AT_FDCWD, ...)` implementation, preserving one permission, umask,
+pathname, ext4-transaction, and namespace-invalidation path. A feature-gated,
+independent directory ABI regression passes on both architectures.
+
+The latest complete diagnostics rank anonymous demand faults at 77.891 seconds
+and clean-file cache fault resolution at 71.482 seconds; COW is 5.176 seconds
+and aggregate MemorySet wait is about 80 milliseconds. The retained VFS change
+batches the sixteen-page clean-cache prefix check and contiguous hit collection
+under one lock acquisition each. Read-ahead size, exact LRU, cache capacity,
+invalidation, I/O, FrameTracker ownership, ResidentSet, PTE, and TLB protocols
+are unchanged.
+
+RISC-V batch runs completed at 766.54 and 789.87 seconds versus a 786.62-second
+same-host baseline; the mean improvement is 1.07% and is not stable beyond host
+noise. LoongArch completed at 642.70 seconds versus 646.32 seconds. A
+second-chance replacement regressed to 836.88 seconds and was removed; range
+invalidation variants at 768.04/767.32 seconds did not beat batch. The final
+public runs use 16G/8 and 36G/12 respectively and both parse as 180/180. Four
+production/diagnostics cfg checks and both SMP lifecycle regressions pass. The
+resource-mismatched public runs are `capability-pass`; the new evaluator-hidden
+result remains unverified until resubmission.
+
+AI assisted evidence correlation, causal-model design, implementation, and
+single-QEMU A/B orchestration. Developer-verifiable artifacts include raw
+serial, judge output, cfg logs, SMP logs, source/image/kernel hashes, and the
+production diff. No official image, suite, script, marker, judge, guest time,
+or workload-dependent production branch was changed. The evidence index is
+`docs/evidence/buildstorm-stage2/20260816-evaluator-la-mkdir-clean-cache-validation-cn/README.md`.

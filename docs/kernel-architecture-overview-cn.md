@@ -391,3 +391,34 @@ QEMU、cargo、路径或输出，平台特定指令解码仍留在架构 trap �
 配置完成双架构 clean build，官方 judge 均解析为 180/180。评测机不可取得的
 hidden nested-QEMU 门仍需新提交复测；独立 probe 只能证明通用能力，不能代替
 隐藏评测结果。
+
+## 16. 2026-08-16 harness、目录 ABI 与 clean-page cache 边界
+
+### 16.1 harness 只负责选择 workload
+
+默认 `HARNESS_LIBC=glibc`，因此正式 artifact 不再在计分 glibc 结束后自动运行
+第二轮 musl workload。`musl` 与 `both` 仍是显式构建选项。该选择只发生在 harness
+发现脚本阶段，不改变 syscall、VFS、MM、调度或时间语义。glibc BuildStorm 内部
+使用的 `*-unknown-linux-musl.json` 是 ArceOS build target，不是第二个 harness
+suite，仍完整执行。
+
+### 16.2 Linux 目录 ABI 统一入口
+
+asm-generic legacy `mkdir(1030)` 与 `mkdirat(34)` 统一进入
+`sys_mkdirat`。legacy wrapper 只补充 `AT_FDCWD`，不复制路径解析、权限、umask、
+ext4 mutation 或 namespace invalidation。独立 `directory-abi` 回归位于
+`smp-regression` feature 下，不进入 production harness。
+
+### 16.3 clean-page cache 批处理
+
+文件缺页的 read-ahead 上限仍为 16 页。`uncached_prefix_len()` 在一个 cache 锁
+临界区检查连续未缓存前缀，`get_run()` 在一个临界区取得连续命中并更新既有精确
+LRU。缓存仍只拥有 clean `FrameTracker` 引用；VMA 的 resident owner、页表 leaf
+与 TLB shootdown 完全留在 MM 层。insert 时的二次查询继续解决并发填充竞态，
+inode/range mutation 继续负责精确失效。
+
+second-chance 和 BTree range invalidation 均做过独立完整 A/B，但没有优于 batch，
+因此未进入最终架构。最终 public 结果为 RV 16G/8 `789.87s`、LA 36G/12
+`642.70s`，两者 judge 均解析为 180/180；由于资源不等于公开规则的 8G/8，证据
+等级为 `capability-pass`。性能收益未稳定越过噪声。详细证据见
+`docs/evidence/buildstorm-stage2/20260816-evaluator-la-mkdir-clean-cache-validation-cn/README.md`。

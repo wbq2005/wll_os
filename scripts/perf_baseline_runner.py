@@ -304,7 +304,8 @@ def build_kernel(
             trace_prefix += f"WLL_TRACE_TEST_GROUPS={shlex.quote(trace_test_groups)} "
     script = (
         f"{harness_prefix}{ltp_cases_prefix}{trace_prefix}make ARCH={cfg['make_arch']} build "
-        f"IOZONE={profile['iozone']} LMBENCH={profile['lmbench']} LTP={profile['ltp']} && "
+        f"HARNESS_LIBC=both IOZONE={profile['iozone']} LMBENCH={profile['lmbench']} "
+        f"LTP={profile['ltp']} && "
         f"cp {cfg['target']} {container_path(repo, kernel, results_root)}"
     )
     write_text(summary_dir / "build-command.txt", script + "\n")
@@ -542,6 +543,7 @@ def run_one(
             "LMBENCH": profile["lmbench"],
             "LTP": profile["ltp"],
             "WLL_HARNESS_GROUPS": harness_groups,
+            "WLL_HARNESS_LIBC": "both",
             "LTP_CASES": ltp_cases,
         },
         "paths": {

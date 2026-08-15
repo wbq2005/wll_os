@@ -1,0 +1,211 @@
+diff --git a/Makefile b/Makefile
+index 591059e..8f3ed9e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -13,6 +13,10 @@ LTP ?= 0
+ # finals groups in the plain `make all` artifact; focused runners override this
+ # value explicitly when they need one workload in isolation.
+ HARNESS_GROUPS ?= cagent,buildstorm
++# The 2026 finals score only the glibc suites.  Keep musl available as an
++# explicit capability run without launching a second, unscored BuildStorm by
++# default after the scored glibc workload completes.
++HARNESS_LIBC ?= glibc
+ FOCUSED_LTP_CASES_BASE := writev01,setegid02,getgroups01,setgroups01,setgroups02,setgroups03,setgroups04,access01,open02,setfsuid01,setfsgid01,faccessat01,access02,open03,symlink01,readlink01,lstat01,lstat02,symlink02,symlink03,symlink04,symlinkat01,readlinkat01,setitimer02,setitimer01,getitimer01,getitimer02,mkdir02,mkdir03,mkdir04,mkdir05,rmdir01,rmdir02,rmdir03,fallocate02,fallocate03,mknod09,open10,open11,open12,unlink09,futex_wait05,prctl08,prctl09,epoll_wait02,epoll_pwait03,epoll_wait01,epoll_wait03,epoll_wait04,epoll_ctl01,epoll_ctl02,epoll_create1_01,epoll_create1_02,splice01,splice03,splice04,splice07,eventfd2_01,eventfd2_02,eventfd2_03,eventfd01,eventfd02,eventfd03,eventfd04,eventfd05,chown02,chown04,fchown04,lchown02,fchmod04,fchmod05,fchmod06,utimes01,truncate03,getsid02,waitid07,waitid08,waitid10
+ FOCUSED_LTP_CASES_20260629 := copy_file_range01,creat01,creat03,creat04,creat05,faccessat02,faccessat201,faccessat202,fallocate04,fchmodat01,fchmodat02,fchownat01,fchownat02,fcntl14,fcntl17,fcntl36,ftruncate03,getxattr01,getxattr02,link02,link04,link05,linkat01,listxattr01,mkdirat01,mkdirat02,open14,openat01,openat02,openat03,openat04,openat201,openat202,openat203,readlinkat02,removexattr01,rename01,rename03,rename04,rename05,rename06,rename07,rename08,rename09,rename10,rename12,rename13,rename14,renameat201,renameat202,sendfile06,setxattr01,setxattr02,statx01,statx02,statx03,truncate02,unlinkat01
+ FOCUSED_LTP_CASES_20260630 := fcntl23
+@@ -160,13 +164,13 @@ build:
+ 	@echo "Building kernel for $(ARCH)..."
+ 	$(MAKE) prepare-cargo-config
+ 	@if [ "$(DEV_PRELOAD)" = "1" ]; then $(MAKE) check-sdcard ARCH=$(ARCH); fi
+-	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
++	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) WLL_HARNESS_LIBC=$(HARNESS_LIBC) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
+ 
+ # 快速检查（不做链接，更快，适合开发阶段验证代码）
+ check:
+ 	@echo "Checking kernel for $(ARCH)..."
+ 	$(MAKE) prepare-cargo-config
+-	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
++	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) WLL_HARNESS_LIBC=$(HARNESS_LIBC) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
+ 
+ check-kernel-no-preload:
+ 	@if [ ! -f kernel-rv ]; then \
+diff --git a/os/src/fs/ext4_vol.rs b/os/src/fs/ext4_vol.rs
+index bfe06b7..e8847cb 100644
+--- a/os/src/fs/ext4_vol.rs
++++ b/os/src/fs/ext4_vol.rs
+@@ -563,6 +563,39 @@ impl CleanPageCache {
+         Some(page.frame.clone())
+     }
+ 
++    fn uncached_prefix_len(&self, ino: u32, start_page_idx: usize, max_pages: usize) -> usize {
++        let mut pages = 0usize;
++        while pages < max_pages {
++            let Some(page_idx) = start_page_idx.checked_add(pages) else {
++                break;
++            };
++            if self.pages.contains_key(&CleanPageKey { ino, page_idx }) {
++                break;
++            }
++            pages += 1;
++        }
++        pages
++    }
++
++    fn get_run(&mut self, ino: u32, start_page_idx: usize, max_pages: usize) -> Vec<FrameTracker> {
++        let mut frames = Vec::new();
++        for page in 0..max_pages {
++            let Some(page_idx) = start_page_idx.checked_add(page) else {
++                break;
++            };
++            let key = CleanPageKey { ino, page_idx };
++            let age = self.bump_age();
++            let Some(cached) = self.pages.get_mut(&key) else {
++                break;
++            };
++            self.ages.remove(&(cached.last_used, key));
++            cached.last_used = age;
++            self.ages.insert((age, key));
++            frames.push(cached.frame.clone());
++        }
++        frames
++    }
++
+     fn insert(&mut self, key: CleanPageKey, frame: FrameTracker) {
+         let age = self.bump_age();
+         if let Some(page) = self.pages.get_mut(&key) {
+@@ -1143,6 +1176,13 @@ fn prefetch_clean_page_frames(
+         return Ok(());
+     }
+ 
++    let page_count = CLEAN_PAGE_CACHE
++        .lock()
++        .uncached_prefix_len(ino, start_page_idx, page_count);
++    if page_count < 2 {
++        return Ok(());
++    }
++
+     let mut keys = Vec::new();
+     let mut offsets = Vec::new();
+     let mut read_lens = Vec::new();
+@@ -1157,9 +1197,6 @@ fn prefetch_clean_page_frames(
+             break;
+         }
+         let key = CleanPageKey { ino, page_idx };
+-        if CLEAN_PAGE_CACHE.lock().get(key).is_some() {
+-            break;
+-        }
+         let Some(pblock) = extent_pblock_for_read(fs, ino, page_idx as u32) else {
+             break;
+         };
+@@ -1224,8 +1261,10 @@ pub fn clean_page_cache_frames(
+     let start_page_idx = file_offset / PAGE_SIZE;
+     let _ = prefetch_clean_page_frames(&fs, ino, start_page_idx, read_ahead_pages, metadata);
+     let mut source = None;
+-    let mut frames = Vec::new();
+-    for page in 0..max_pages {
++    let mut frames = CLEAN_PAGE_CACHE
++        .lock()
++        .get_run(ino, start_page_idx, max_pages);
++    for page in frames.len()..max_pages {
+         let Some(delta) = page.checked_mul(PAGE_SIZE) else {
+             break;
+         };
+@@ -1233,10 +1272,6 @@ pub fn clean_page_cache_frames(
+             break;
+         };
+         let key = clean_page_key(ino, offset);
+-        if let Some(frame) = CLEAN_PAGE_CACHE.lock().get(key) {
+-            frames.push(frame);
+-            continue;
+-        }
+         if page >= read_ahead_pages {
+             break;
+         }
+diff --git a/os/src/syscall/mod.rs b/os/src/syscall/mod.rs
+index 608e8af..ba142db 100644
+--- a/os/src/syscall/mod.rs
++++ b/os/src/syscall/mod.rs
+@@ -203,6 +203,7 @@ pub const SYSCALL_GETRANDOM: usize = 278;
+ pub const SYSCALL_OPEN: usize = 1024;
+ pub const SYSCALL_LINK: usize = 1025;
+ pub const SYSCALL_UNLINK: usize = 1026;
++pub const SYSCALL_MKDIR: usize = 1030;
+ pub const SYSCALL_RMDIR: usize = 1031;
+ pub const SYSCALL_ACCESS: usize = 1033;
+ pub const SYSCALL_RENAME: usize = 1034;
+@@ -401,6 +402,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
+             args[3],
+         ),
+         SYSCALL_MKDIRAT => fs::sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
++        SYSCALL_MKDIR => fs::sys_mkdirat(AT_FDCWD, args[0] as *const u8, args[1] as u32),
+         SYSCALL_UNLINK => fs::sys_unlink(args[0] as *const u8),
+         SYSCALL_UNLINKAT => fs::sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
+         SYSCALL_RMDIR => fs::sys_rmdir(args[0] as *const u8),
+diff --git a/os/src/task/harness.rs b/os/src/task/harness.rs
+index 672a856..b145ec2 100644
+--- a/os/src/task/harness.rs
++++ b/os/src/task/harness.rs
+@@ -271,9 +271,10 @@ fn is_enabled_script(path: &str) -> bool {
+         return false;
+     };
+     let libc_enabled = match option_env!("WLL_HARNESS_LIBC") {
+-        Some("glibc") => path.starts_with("/glibc/"),
++        Some("glibc") | None => path.starts_with("/glibc/"),
+         Some("musl") => path.starts_with("/musl/"),
+-        Some(_) | None => true,
++        Some("both") => path.starts_with("/glibc/") || path.starts_with("/musl/"),
++        Some(_) => false,
+     };
+     if !libc_enabled {
+         return false;
+@@ -1036,6 +1037,8 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
+     }
+     console_write("[smp-regression] pass phase=user-memory-lifecycle\n");
+ 
++    run_directory_abi_regression();
++
+     // The busybox probe is intentionally static/self-contained.  A separate
+     // diagnostic-only dynamic ELF probe exercises the glibc interpreter and
+     // fork/exec path without changing production harness behavior.
+@@ -1043,6 +1046,41 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
+     run_dynamic_user_memory_lifecycle_probe();
+ }
+ 
++#[cfg(feature = "smp-regression")]
++fn run_directory_abi_regression() {
++    let spec = UserProgramSpec {
++        path: String::from("/busybox"),
++        argv: alloc::vec![
++            String::from("/busybox"),
++            String::from("sh"),
++            String::from("-c"),
++            String::from(
++                "set -e; /busybox rm -rf /.wll_dir_abi; \
++                 /busybox mkdir -p /.wll_dir_abi/parent/child; \
++                 /busybox test -d /.wll_dir_abi/parent/child; \
++                 /busybox mkdir -p /.wll_dir_abi/parent/child; \
++                 /busybox rm -rf /.wll_dir_abi",
++            ),
++        ],
++        envp: alloc::vec![
++            String::from("PATH=/:/bin:/usr/bin"),
++            String::from("LD_LIBRARY_PATH=/lib"),
++        ],
++        cwd: String::from("/"),
++        root: String::from("/glibc"),
++        marker_name: None,
++    };
++    let exit_code =
++        run_user_program_spec_foreground_exit_code(&spec).expect("directory ABI regression launch");
++    if exit_code != 0 {
++        panic!(
++            "[smp-regression] fail phase=directory-abi exit={}",
++            exit_code
++        );
++    }
++    console_write("[smp-regression] pass phase=directory-abi\n");
++}
++
+ #[cfg(all(feature = "buildstorm-diagnostics", feature = "smp-regression"))]
+ fn run_dynamic_user_memory_lifecycle_probe() {
+     crate::smp_regression::reset_user_memory_lifecycle_diagnostic();
