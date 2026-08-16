@@ -1849,3 +1849,35 @@ serial, judge output, cfg logs, SMP logs, source/image/kernel hashes, and the
 production diff. No official image, suite, script, marker, judge, guest time,
 or workload-dependent production branch was changed. The evidence index is
 `docs/evidence/buildstorm-stage2/20260816-evaluator-la-mkdir-clean-cache-validation-cn/README.md`.
+
+## 44. LoongArch64 directory-fd ABI after the evaluator build (2026-08-16)
+
+Evaluator commit `2953af6a725c015f89e64db9eab8f60ee27f6fe1` finished the
+LoongArch64 Rust build in 2439.63 seconds. The earliest later failure was GNU
+coreutils `mkdir -p` returning `ENOSYS` while creating `/work/buildstorm.esp`;
+the missing directory caused the following `cp` errors and prevented the final
+BuildStorm result marker. Source and ABI correlation identified asm-generic
+`fchdir(50)` as the missing general capability, rather than a compiler, MM, or
+LoongArch platform failure.
+
+The shared syscall layer now implements `fchdir(50)` using the existing
+directory-descriptor resolver and process root/cwd state. It also implements
+`fchmodat2(452)` through the existing FD/path metadata operations, including
+bounded `AT_EMPTY_PATH` and `AT_SYMLINK_NOFOLLOW` handling. The change does not
+own directory objects, bypass namespace invalidation, alter architecture MM,
+or inspect workload names, paths, commands, or output.
+
+All four RISC-V64/LoongArch64 production/diagnostics release checks passed.
+Both SMP8 regressions passed a feature-gated glibc/coreutils directory metadata
+probe and their final CPU/lifecycle marker. An unmodified public LoongArch64
+8G/8 run completed with
+`BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=553.62`; the official judge
+parsed 180/180 automated points. This is `official-pass` for the public flow.
+The evaluator-only UEFI preparation remains `unverified` until resubmission,
+and the cross-host elapsed times are not used to claim a timing improvement.
+
+AI assisted log/source correlation, causal modeling, implementation, and
+serial-QEMU evidence collection. Raw serial, runner metadata, hashes, judge
+output, build logs, and the independent regression are indexed under
+`docs/evidence/buildstorm-stage2/20260816-la-fchdir-capability-gates/` and
+`docs/evidence/buildstorm-stage2/20260816-la-fchdir-official-public-complete/`.

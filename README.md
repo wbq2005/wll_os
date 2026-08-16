@@ -35,8 +35,21 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 
 ### 2026-08-16 评测修复
 
-本轮评测总分为 568.1；RV BuildStorm 已通过但只得到 149.9，LA 只有 toolchain 与
-minibuild 的 20 分。日志复核得到两个确定性问题：
+最新评测提交 `2953af6a725c015f89e64db9eab8f60ee27f6fe1` 总分为 542.1；RV
+BuildStorm 已通过并得到 123.9，LA 仍只有 toolchain 与 minibuild 的 20 分。日志
+复核表明 LA 的 Rust clean build 已在 2439.63 秒完成，0 分发生在随后启动产物的
+隐藏 UEFI 准备阶段：GNU coreutils `mkdir -p` 调用 `fchdir(50)`，旧内核返回
+`ENOSYS`，导致 `/work/buildstorm.esp` 未创建并且最终成功 marker 缺失。
+
+修复在共享 Linux ABI 层实现 `fchdir(50)` 和 coreutils 同路径需要的
+`fchmodat2(452)`，复用现有目录 FD、cwd、root 和 VFS 元数据语义，不包含 LA、
+BuildStorm、路径或命令特判。双架构 production/diagnostics release 与 SMP8
+`directory-metadata-abi` 回归均通过；未修改 public LA 8G/8 完整流程得到
+`BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=553.62`，官方 judge 自动项
+180/180。该 public 流程为 `official-pass`；评测机独有的 UEFI 后处理门仍为
+`unverified`，需下一轮评测确认。
+
+上一轮日志复核还得到两个确定性问题：
 
 - RV 在已完成计分 glibc BuildStorm 后，又启动了不计分的
   `/musl/buildstorm_testcode.sh`。默认 harness 现在只运行 glibc；显式

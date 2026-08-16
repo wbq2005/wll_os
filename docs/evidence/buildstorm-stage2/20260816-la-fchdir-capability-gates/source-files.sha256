@@ -1,0 +1,3 @@
+84c7bb9aa1f16e8fe9f692c2b708be4f427b696965c03c5a05e09d42b11eebaf  os/src/syscall/mod.rs
+e49a2c60e43ee60b4ad69136820e6c030790725d3811ca3ac42da0cf4e600233  os/src/syscall/fs.rs
+69c8e5ad2491b2ff23b29c9c0ae7be8509bce7800375a119e285a4633c18fbde  os/src/task/harness.rs

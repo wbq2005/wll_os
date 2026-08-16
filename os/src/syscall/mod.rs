@@ -57,6 +57,7 @@ pub const SYSCALL_STATFS: usize = 43;
 pub const SYSCALL_FSTATFS: usize = 44;
 pub const SYSCALL_FACCESSAT: usize = 48;
 pub const SYSCALL_CHDIR: usize = 49;
+pub const SYSCALL_FCHDIR: usize = 50;
 pub const SYSCALL_FCHMOD: usize = 52;
 pub const SYSCALL_FCHMODAT: usize = 53;
 pub const SYSCALL_FCHOWNAT: usize = 54;
@@ -194,6 +195,7 @@ pub const SYSCALL_STATX: usize = 291;
 pub const SYSCALL_OPENAT2: usize = 437;
 pub const SYSCALL_FACCESSAT2: usize = 439;
 pub const SYSCALL_EPOLL_PWAIT2: usize = 441;
+pub const SYSCALL_FCHMODAT2: usize = 452;
 pub const SYSCALL_COPY_FILE_RANGE: usize = 285;
 pub const SYSCALL_GETRANDOM: usize = 278;
 
@@ -343,6 +345,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_FCHMODAT => {
             fs::sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32)
         }
+        SYSCALL_FCHMODAT2 => fs::sys_fchmodat2(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3],
+        ),
         SYSCALL_FCHOWN => fs::sys_fchown(args[0], args[1], args[2]),
         SYSCALL_FCHOWNAT => fs::sys_fchownat(
             args[0] as isize,
@@ -395,6 +403,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
             args[4] as *mut u8,
         ),
         SYSCALL_CHDIR => fs::sys_chdir(args[0] as *const u8),
+        SYSCALL_FCHDIR => fs::sys_fchdir(args[0]),
         SYSCALL_MKNODAT => fs::sys_mknodat(
             args[0] as isize,
             args[1] as *const u8,

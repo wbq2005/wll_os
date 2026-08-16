@@ -1,0 +1,4 @@
+07307571458a5e24e05b01a7dac768507d1d390ae1618a89c128e5113fb54cf5  target/loongarch64-unknown-none/release/wll_OS
+f10fd92e2a14b2c3926c18ffec55ee53b0dbd6e2598a471d99f8c51ecc91b1cd  /srv/buildstorm/evidence/20260816-la-fchdir-official-public-complete/serial.log
+9de25c2d631f1039b9356ab299ef8f209014e21374e13ab718ac2a27c4f91545  /srv/buildstorm/evidence/20260816-la-fchdir-official-public-complete/runner.json
+76e181ed00cc70e220c4c06eae24e73c97418a37117a356a45091073f329b558  /srv/buildstorm/evidence/20260816-la-fchdir-official-public-complete/kernel-source-dirty.diff

@@ -2334,6 +2334,20 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallRet {
     }
 }
 
+pub fn sys_fchdir(fd: usize) -> SyscallRet {
+    let dirfd = isize::try_from(fd).map_err(|_| SysErrNo::EBADF)?;
+    let logical_path = resolve_base_dir(dirfd)?;
+    let root = current_root()?;
+    let host_path = crate::fs::apply_root(&root, &logical_path);
+    if !super::with_kernel_page_table(|| crate::fs::dir_exists(&host_path)) {
+        return Err(SysErrNo::ENOENT);
+    }
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    task.fs.lock().cwd = logical_path.clone();
+    task.inner.lock().cwd = logical_path;
+    Ok(0)
+}
+
 pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
@@ -2391,19 +2405,39 @@ pub fn sys_mknodat(dirfd: isize, pathname: *const u8, mode: u32, dev: usize) -> 
 }
 
 pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
+    sys_fchmodat2(dirfd, pathname, mode, 0)
+}
+
+pub fn sys_fchmodat2(dirfd: isize, pathname: *const u8, mode: u32, flags: usize) -> SyscallRet {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
     let path = read_user_path(pathname)?;
     if path.is_empty() {
-        return Err(SysErrNo::ENOENT);
+        if flags & AT_EMPTY_PATH == 0 || dirfd == AT_FDCWD {
+            return Err(SysErrNo::ENOENT);
+        }
+        let fd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
+        let task = current_task().ok_or(SysErrNo::ESRCH)?;
+        let inner = task.inner.lock();
+        let mut fds = inner.fd_table.lock();
+        let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+        super::with_kernel_page_table(|| crate::fs::set_mode_fd(file_desc, mode))?;
+        return Ok(0);
     }
     let (logical_path, host_path) = resolve_host_path_str(dirfd, &path)?;
     if let Some(fd) = proc_self_fd_number(&logical_path)? {
+        if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            return Err(SysErrNo::EOPNOTSUPP);
+        }
         let task = current_task().ok_or(SysErrNo::ESRCH)?;
         let inner = task.inner.lock();
         let mut fds = inner.fd_table.lock();
         let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
         super::with_kernel_page_table(|| crate::fs::set_mode_fd(file_desc, mode))?;
     } else {
-        super::with_kernel_page_table(|| crate::fs::set_mode_path(&host_path, true, mode))?;
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        super::with_kernel_page_table(|| crate::fs::set_mode_path(&host_path, follow, mode))?;
     }
     Ok(0)
 }

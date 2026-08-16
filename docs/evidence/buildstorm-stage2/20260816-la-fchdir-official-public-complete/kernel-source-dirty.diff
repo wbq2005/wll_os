@@ -1,0 +1,2756 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1bf6b0d..e895ff9 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -581,6 +581,7 @@ dependencies = [
+  "ext4-view",
+  "ext4_rs",
+  "flat_device_tree",
++ "hashbrown",
+  "lazy_static",
+  "lazyinit",
+  "log",
+diff --git a/os/Cargo.toml b/os/Cargo.toml
+index b8cbf8a..6971586 100644
+--- a/os/Cargo.toml
++++ b/os/Cargo.toml
+@@ -20,8 +20,9 @@ lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+ # 实用工具
+ bitflags = "2.4.0"
+ cfg-if = "1"
+-log = "0.4"
+-ext4_rs = "1.3.3"
++log = "0.4"
++hashbrown = { version = "0.17.1", default-features = false }
++ext4_rs = "1.3.3"
+ flat_device_tree = "3.1.1"
+ virtio-drivers = { version = "0.7.4", default-features = false, features = ["alloc"] }
+ 
+diff --git a/os/src/buildstorm_diagnostics.rs b/os/src/buildstorm_diagnostics.rs
+index dbbfb2a..5f56019 100644
+--- a/os/src/buildstorm_diagnostics.rs
++++ b/os/src/buildstorm_diagnostics.rs
+@@ -13,6 +13,21 @@ use crate::task::wait_queue::{BlockReason, WaitOutcome};
+ 
+ const REPORT_INTERVAL_US: usize = 10 * 1_000_000;
+ const CPU_SLOTS: usize = crate::config::MAX_CPUS;
++const SYSCALL_SLOTS: usize = 512;
++const SYSCALL_SAMPLE_SHIFT: usize = 6;
++const SYSCALL_SAMPLE_MASK: usize = (1 << SYSCALL_SAMPLE_SHIFT) - 1;
++const USER_TRAP_SLOTS: usize = 9;
++const USER_TRAP_NAMES: [&str; USER_TRAP_SLOTS] = [
++    "unused",
++    "syscall",
++    "timer",
++    "ipi",
++    "store_page_fault",
++    "load_page_fault",
++    "instruction_page_fault",
++    "privilege_page_fault",
++    "other",
++];
+ const MMAP_PROTOCOL_SLOTS: usize = 16;
+ const EXITED_MMAP_PROTOCOL_SLOTS: usize = 128;
+ 
+@@ -219,9 +234,12 @@ pub(crate) enum WorkClass {
+     ExtentLookup,
+     AddressSpaceActivation,
+     TlbShootdown,
++    CleanCacheMetadata,
++    CleanCachePrefetch,
++    CleanCacheGetRun,
+ }
+ 
+-const WORK_NAMES: [&str; 21] = [
++const WORK_NAMES: [&str; 24] = [
+     "openat",
+     "statx",
+     "readlink",
+@@ -243,6 +261,9 @@ const WORK_NAMES: [&str; 21] = [
+     "extent_lookup",
+     "address_space_activation",
+     "tlb_shootdown",
++    "clean_cache_metadata",
++    "clean_cache_prefetch",
++    "clean_cache_get_run",
+ ];
+ const WORK_SLOTS: usize = WORK_NAMES.len();
+ 
+@@ -493,6 +514,16 @@ static MUNMAP_AT_OR_ABOVE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+ static PROCESS_EXITS: AtomicUsize = AtomicUsize::new(0);
+ static CHILD_WAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
+ static CHILD_WOKEN: AtomicUsize = AtomicUsize::new(0);
++static CLONE_CALLS: AtomicUsize = AtomicUsize::new(0);
++static CLONE_VFORK_CALLS: AtomicUsize = AtomicUsize::new(0);
++static CLONE_SHARE_VM_CALLS: AtomicUsize = AtomicUsize::new(0);
++static CLONE_FORK_COW_CALLS: AtomicUsize = AtomicUsize::new(0);
++static CLONE_FORK_COW_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
++static CLONE_FORK_COW_MAX_US: AtomicUsize = AtomicUsize::new(0);
++static CLONE_VFORK_FORK_COW_CALLS: AtomicUsize = AtomicUsize::new(0);
++static CLONE_VFORK_FORK_COW_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
++static CLONE_FORK_COW_AREAS: AtomicUsize = AtomicUsize::new(0);
++static CLONE_FORK_COW_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
+ 
+ const BLOCK_NAMES: [&str; 7] = [
+     "block_io",
+@@ -856,6 +887,22 @@ static USER_RUN_SYSCALL: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0)
+ static USER_RUN_TIMER: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+ static USER_RUN_IRQ: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+ static USER_RUN_OTHER: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
++static SYSCALL_COUNTS_PER_CPU: [[AtomicUsize; SYSCALL_SLOTS]; CPU_SLOTS] =
++    [const { [const { AtomicUsize::new(0) }; SYSCALL_SLOTS] }; CPU_SLOTS];
++static SYSCALL_SAMPLES: [AtomicUsize; SYSCALL_SLOTS] =
++    [const { AtomicUsize::new(0) }; SYSCALL_SLOTS];
++static SYSCALL_TOTAL_US: [AtomicUsize; SYSCALL_SLOTS] =
++    [const { AtomicUsize::new(0) }; SYSCALL_SLOTS];
++static SYSCALL_MAX_US: [AtomicUsize; SYSCALL_SLOTS] =
++    [const { AtomicUsize::new(0) }; SYSCALL_SLOTS];
++static USER_TRAP_COUNTS_PER_CPU: [[AtomicUsize; USER_TRAP_SLOTS]; CPU_SLOTS] =
++    [const { [const { AtomicUsize::new(0) }; USER_TRAP_SLOTS] }; CPU_SLOTS];
++static USER_TRAP_SAMPLES: [AtomicUsize; USER_TRAP_SLOTS] =
++    [const { AtomicUsize::new(0) }; USER_TRAP_SLOTS];
++static USER_TRAP_TOTAL_US: [AtomicUsize; USER_TRAP_SLOTS] =
++    [const { AtomicUsize::new(0) }; USER_TRAP_SLOTS];
++static USER_TRAP_MAX_US: [AtomicUsize; USER_TRAP_SLOTS] =
++    [const { AtomicUsize::new(0) }; USER_TRAP_SLOTS];
+ static CONTEXT_SWITCHES: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+ static TASK_MIGRATIONS: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+ static RUNQUEUE_MAX: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+@@ -914,6 +961,16 @@ static ANONYMOUS_VMA_CURRENT: AtomicUsize = AtomicUsize::new(0);
+ static ANONYMOUS_VMA_MAX: AtomicUsize = AtomicUsize::new(0);
+ static ANONYMOUS_VMA_PAGES: AtomicUsize = AtomicUsize::new(0);
+ static ANONYMOUS_VMA_PAGES_MAX: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_SHAPE_CALLS: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_SHAPE_SAMPLES: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_LEFT_RESIDENT: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_RIGHT_RESIDENT: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_BOTH_RESIDENT: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_ISOLATED: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_FORWARD_PAGES: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_BACKWARD_PAGES: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_FORWARD_MAX: AtomicUsize = AtomicUsize::new(0);
++static ANONYMOUS_FAULT_BACKWARD_MAX: AtomicUsize = AtomicUsize::new(0);
+ static ANONYMOUS_MOVE_LEFT_SELECTED: AtomicUsize = AtomicUsize::new(0);
+ static ANONYMOUS_MOVE_LEFT_NO_REALLOC: AtomicUsize = AtomicUsize::new(0);
+ static ANONYMOUS_MOVE_LEFT_SHRINK: AtomicUsize = AtomicUsize::new(0);
+@@ -1010,6 +1067,10 @@ static PAGE_TABLE_WRITES: AtomicUsize = AtomicUsize::new(0);
+ static LOCAL_TLB_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+ static REMOTE_SHOOTDOWNS: AtomicUsize = AtomicUsize::new(0);
+ static REMOTE_SHOOTDOWN_TARGETS: AtomicUsize = AtomicUsize::new(0);
++static PAGE_TABLE_BATCHES: AtomicUsize = AtomicUsize::new(0);
++static PAGE_TABLE_BATCH_WRITES: AtomicUsize = AtomicUsize::new(0);
++static PAGE_TABLE_BATCH_MAX: AtomicUsize = AtomicUsize::new(0);
++static PAGE_TABLE_BATCH_LOCAL_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+ 
+ static PATH_COMPONENT_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+ static PATH_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+@@ -1177,10 +1238,18 @@ pub(crate) fn note_user_run_exit() {
+ 
+ pub(crate) struct UserTrapScope {
+     cpu: usize,
++    kind: usize,
++    started_at: Option<usize>,
+ }
+ 
+ impl Drop for UserTrapScope {
+     fn drop(&mut self) {
++        if let Some(started_at) = self.started_at {
++            let elapsed = now_us().saturating_sub(started_at);
++            USER_TRAP_SAMPLES[self.kind].fetch_add(1, Ordering::Relaxed);
++            USER_TRAP_TOTAL_US[self.kind].fetch_add(elapsed, Ordering::Relaxed);
++            USER_TRAP_MAX_US[self.kind].fetch_max(elapsed, Ordering::Relaxed);
++        }
+         ACTIVE_USER_TRAP_KIND[self.cpu].store(0, Ordering::Release);
+     }
+ }
+@@ -1188,10 +1257,16 @@ impl Drop for UserTrapScope {
+ #[inline]
+ pub(crate) fn note_user_trap_enter(kind: usize) -> UserTrapScope {
+     let cpu = cpu_slot();
++    let kind = kind.min(USER_TRAP_SLOTS - 1);
++    let sequence = USER_TRAP_COUNTS_PER_CPU[cpu][kind].fetch_add(1, Ordering::Relaxed);
+     ACTIVE_USER_TRAP_SINCE_US[cpu].store(now_us(), Ordering::Relaxed);
+     ACTIVE_USER_TRAP_ENTRIES[cpu].fetch_add(1, Ordering::Relaxed);
+     ACTIVE_USER_TRAP_KIND[cpu].store(kind, Ordering::Release);
+-    UserTrapScope { cpu }
++    UserTrapScope {
++        cpu,
++        kind,
++        started_at: ((sequence & SYSCALL_SAMPLE_MASK) == 0).then(now_us),
++    }
+ }
+ 
+ #[inline]
+@@ -1350,6 +1425,16 @@ pub(crate) fn note_remote_shootdown(targets: usize) {
+     REMOTE_SHOOTDOWN_TARGETS.fetch_add(targets, Ordering::Relaxed);
+ }
+ 
++#[inline]
++pub(crate) fn note_page_table_batch(writes: usize, local_flush: bool) {
++    PAGE_TABLE_BATCHES.fetch_add(1, Ordering::Relaxed);
++    PAGE_TABLE_BATCH_WRITES.fetch_add(writes, Ordering::Relaxed);
++    PAGE_TABLE_BATCH_MAX.fetch_max(writes, Ordering::Relaxed);
++    if local_flush {
++        PAGE_TABLE_BATCH_LOCAL_FLUSHES.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
+ #[inline]
+ pub(crate) fn note_anonymous_vma_install(
+     left_mergeable: bool,
+@@ -1375,6 +1460,36 @@ pub(crate) fn note_anonymous_vma_install(
+     ANONYMOUS_VMA_PAGES_MAX.fetch_max(pages, Ordering::Relaxed);
+ }
+ 
++#[inline]
++pub(crate) fn sample_anonymous_fault_shape() -> bool {
++    ANONYMOUS_FAULT_SHAPE_CALLS.fetch_add(1, Ordering::Relaxed) & WORK_SAMPLE_MASK == 0
++}
++
++#[inline]
++pub(crate) fn note_anonymous_fault_shape(
++    left_resident: bool,
++    right_resident: bool,
++    forward_pages: usize,
++    backward_pages: usize,
++) {
++    ANONYMOUS_FAULT_SHAPE_SAMPLES.fetch_add(1, Ordering::Relaxed);
++    if left_resident {
++        ANONYMOUS_FAULT_LEFT_RESIDENT.fetch_add(1, Ordering::Relaxed);
++    }
++    if right_resident {
++        ANONYMOUS_FAULT_RIGHT_RESIDENT.fetch_add(1, Ordering::Relaxed);
++    }
++    if left_resident && right_resident {
++        ANONYMOUS_FAULT_BOTH_RESIDENT.fetch_add(1, Ordering::Relaxed);
++    } else if !left_resident && !right_resident {
++        ANONYMOUS_FAULT_ISOLATED.fetch_add(1, Ordering::Relaxed);
++    }
++    ANONYMOUS_FAULT_FORWARD_PAGES.fetch_add(forward_pages, Ordering::Relaxed);
++    ANONYMOUS_FAULT_BACKWARD_PAGES.fetch_add(backward_pages, Ordering::Relaxed);
++    ANONYMOUS_FAULT_FORWARD_MAX.fetch_max(forward_pages, Ordering::Relaxed);
++    ANONYMOUS_FAULT_BACKWARD_MAX.fetch_max(backward_pages, Ordering::Relaxed);
++}
++
+ #[inline]
+ pub(crate) fn note_anonymous_move_shape(
+     left_selected: bool,
+@@ -1999,6 +2114,33 @@ pub(crate) fn note_process_exit() {
+     PROCESS_EXITS.fetch_add(1, Ordering::Relaxed);
+ }
+ 
++#[inline]
++pub(crate) fn note_clone(
++    is_vfork: bool,
++    share_vm: bool,
++    elapsed_us: usize,
++    areas: usize,
++    resident_pages: usize,
++) {
++    CLONE_CALLS.fetch_add(1, Ordering::Relaxed);
++    if is_vfork {
++        CLONE_VFORK_CALLS.fetch_add(1, Ordering::Relaxed);
++    }
++    if share_vm {
++        CLONE_SHARE_VM_CALLS.fetch_add(1, Ordering::Relaxed);
++        return;
++    }
++    CLONE_FORK_COW_CALLS.fetch_add(1, Ordering::Relaxed);
++    CLONE_FORK_COW_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
++    CLONE_FORK_COW_MAX_US.fetch_max(elapsed_us, Ordering::Relaxed);
++    CLONE_FORK_COW_AREAS.fetch_add(areas, Ordering::Relaxed);
++    CLONE_FORK_COW_RESIDENT_PAGES.fetch_add(resident_pages, Ordering::Relaxed);
++    if is_vfork {
++        CLONE_VFORK_FORK_COW_CALLS.fetch_add(1, Ordering::Relaxed);
++        CLONE_VFORK_FORK_COW_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
++    }
++}
++
+ #[inline]
+ pub(crate) fn note_child_wake(woken: usize) {
+     CHILD_WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+@@ -2331,8 +2473,34 @@ pub(crate) fn note_sched_getaffinity(mask: usize) {
+     SCHED_GETAFFINITY_MAX_BITS.fetch_max(bits, Ordering::Relaxed);
+ }
+ 
++pub(crate) struct SyscallScope {
++    syscall_id: usize,
++    started_at: Option<usize>,
++}
++
++impl Drop for SyscallScope {
++    fn drop(&mut self) {
++        if let Some(started_at) = self.started_at {
++            let elapsed = now_us().saturating_sub(started_at);
++            SYSCALL_SAMPLES[self.syscall_id].fetch_add(1, Ordering::Relaxed);
++            SYSCALL_TOTAL_US[self.syscall_id].fetch_add(elapsed, Ordering::Relaxed);
++            SYSCALL_MAX_US[self.syscall_id].fetch_max(elapsed, Ordering::Relaxed);
++        }
++    }
++}
++
+ #[inline]
+-pub(crate) fn note_syscall_enter(_syscall_id: usize) {}
++pub(crate) fn note_syscall_enter(syscall_id: usize) -> Option<SyscallScope> {
++    if syscall_id >= SYSCALL_SLOTS {
++        return None;
++    }
++    let cpu = cpu_slot();
++    let sequence = SYSCALL_COUNTS_PER_CPU[cpu][syscall_id].fetch_add(1, Ordering::Relaxed);
++    Some(SyscallScope {
++        syscall_id,
++        started_at: ((sequence & SYSCALL_SAMPLE_MASK) == 0).then(now_us),
++    })
++}
+ #[inline]
+ pub(crate) fn note_syscall_exit(_syscall_id: usize) {}
+ 
+@@ -2371,6 +2539,40 @@ pub(crate) fn maybe_report() {
+     for cpu in 0..CPU_SLOTS {
+         crate::println!("BUILDSTORM_DIAG user_run cpu={} count={} total_us={} max_us={} syscall={} timer={} irq={} other={}", cpu, USER_RUN_COUNT[cpu].load(Ordering::Relaxed), USER_RUN_TOTAL_US[cpu].load(Ordering::Relaxed), USER_RUN_MAX_US[cpu].load(Ordering::Relaxed), USER_RUN_SYSCALL[cpu].load(Ordering::Relaxed), USER_RUN_TIMER[cpu].load(Ordering::Relaxed), USER_RUN_IRQ[cpu].load(Ordering::Relaxed), USER_RUN_OTHER[cpu].load(Ordering::Relaxed));
+     }
++    for syscall_id in 0..SYSCALL_SLOTS {
++        let count: usize = SYSCALL_COUNTS_PER_CPU
++            .iter()
++            .map(|cpu| cpu[syscall_id].load(Ordering::Relaxed))
++            .sum();
++        if count != 0 {
++            crate::println!(
++                "BUILDSTORM_DIAG syscall={} count={} total_us={} max_us={} sample_count={} sample_shift={}",
++                syscall_id,
++                count,
++                SYSCALL_TOTAL_US[syscall_id].load(Ordering::Relaxed),
++                SYSCALL_MAX_US[syscall_id].load(Ordering::Relaxed),
++                SYSCALL_SAMPLES[syscall_id].load(Ordering::Relaxed),
++                SYSCALL_SAMPLE_SHIFT,
++            );
++        }
++    }
++    for kind in 1..USER_TRAP_SLOTS {
++        let count: usize = USER_TRAP_COUNTS_PER_CPU
++            .iter()
++            .map(|cpu| cpu[kind].load(Ordering::Relaxed))
++            .sum();
++        if count != 0 {
++            crate::println!(
++                "BUILDSTORM_DIAG user_trap={} count={} total_us={} max_us={} sample_count={} sample_shift={}",
++                USER_TRAP_NAMES[kind],
++                count,
++                USER_TRAP_TOTAL_US[kind].load(Ordering::Relaxed),
++                USER_TRAP_MAX_US[kind].load(Ordering::Relaxed),
++                USER_TRAP_SAMPLES[kind].load(Ordering::Relaxed),
++                SYSCALL_SAMPLE_SHIFT,
++            );
++        }
++    }
+     for cpu in 0..CPU_SLOTS {
+         let pid = ACTIVE_USER_PID[cpu].load(Ordering::Acquire);
+         let since_us = ACTIVE_USER_SINCE_US[cpu].load(Ordering::Relaxed);
+@@ -2382,6 +2584,13 @@ pub(crate) fn maybe_report() {
+         crate::println!("BUILDSTORM_DIAG blocked_owner cpu={} current={} max={} enters={} exits={} loop_dispatches={} timed_loops={} timed_total_us={} timed_max_us={} empty_iterations={} wake_to_owner={} wake_to_global={}", cpu, BLOCKED_OWNER_CURRENT[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_MAX[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_ENTERS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_EXITS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_LOOP_DISPATCHES[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_LOOPS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_TOTAL_US[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_MAX_US[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_EMPTY_ITERATIONS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_WAKES[cpu].load(Ordering::Relaxed), BLOCKED_GLOBAL_WAKES.load(Ordering::Relaxed));
+     }
+     crate::println!("BUILDSTORM_DIAG mm user_root={} kernel_root={} redundant_root={} page_table_writes={} local_flush={} remote_shootdown={} remote_targets={}", USER_ROOT_ACTIVATIONS.load(Ordering::Relaxed), KERNEL_ROOT_ACTIVATIONS.load(Ordering::Relaxed), REDUNDANT_ROOT_ACTIVATIONS.load(Ordering::Relaxed), PAGE_TABLE_WRITES.load(Ordering::Relaxed), LOCAL_TLB_FLUSHES.load(Ordering::Relaxed), REMOTE_SHOOTDOWNS.load(Ordering::Relaxed), REMOTE_SHOOTDOWN_TARGETS.load(Ordering::Relaxed));
++    crate::println!(
++        "BUILDSTORM_DIAG page_table_batch commits={} writes={} max={} local_flushes={}",
++        PAGE_TABLE_BATCHES.load(Ordering::Relaxed),
++        PAGE_TABLE_BATCH_WRITES.load(Ordering::Relaxed),
++        PAGE_TABLE_BATCH_MAX.load(Ordering::Relaxed),
++        PAGE_TABLE_BATCH_LOCAL_FLUSHES.load(Ordering::Relaxed)
++    );
+     let (tracked_frames, page_table_frames, contiguous_frames, owner_transitions) =
+         crate::mm::frame_allocator::diagnostic_ownership_snapshot();
+     crate::println!(
+@@ -2391,7 +2600,11 @@ pub(crate) fn maybe_report() {
+         contiguous_frames,
+         owner_transitions
+     );
++    crate::mm::frame_allocator::report_cache_diagnostics();
+     crate::println!("BUILDSTORM_DIAG anonymous_vma installs={} left={} right={} both={} neither={} current={} max={} pages={} pages_max={}", ANONYMOUS_VMA_INSTALLS.load(Ordering::Relaxed), ANONYMOUS_VMA_LEFT_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_RIGHT_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_BOTH_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_NEITHER_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_CURRENT.load(Ordering::Relaxed), ANONYMOUS_VMA_MAX.load(Ordering::Relaxed), ANONYMOUS_VMA_PAGES.load(Ordering::Relaxed), ANONYMOUS_VMA_PAGES_MAX.load(Ordering::Relaxed));
++    crate::println!("BUILDSTORM_DIAG anonymous_fault_shape calls={} samples={} left_resident={} right_resident={} both_resident={} isolated={} forward_pages={} backward_pages={} forward_max={} backward_max={} sample_shift={}", ANONYMOUS_FAULT_SHAPE_CALLS.load(Ordering::Relaxed), ANONYMOUS_FAULT_SHAPE_SAMPLES.load(Ordering::Relaxed), ANONYMOUS_FAULT_LEFT_RESIDENT.load(Ordering::Relaxed), ANONYMOUS_FAULT_RIGHT_RESIDENT.load(Ordering::Relaxed), ANONYMOUS_FAULT_BOTH_RESIDENT.load(Ordering::Relaxed), ANONYMOUS_FAULT_ISOLATED.load(Ordering::Relaxed), ANONYMOUS_FAULT_FORWARD_PAGES.load(Ordering::Relaxed), ANONYMOUS_FAULT_BACKWARD_PAGES.load(Ordering::Relaxed), ANONYMOUS_FAULT_FORWARD_MAX.load(Ordering::Relaxed), ANONYMOUS_FAULT_BACKWARD_MAX.load(Ordering::Relaxed), WORK_SAMPLE_SHIFT);
++    let clean_cache = crate::fs::ext4_vol::diagnostic_clean_page_cache_stats();
++    crate::println!("BUILDSTORM_DIAG clean_page_cache current={} max={} folios={} folio_touches={} run_calls={} run_pages={} run_max={} prefetch_calls={} prefetch_pages={} inserts={} evictions={} invalidations={}", clean_cache.0, clean_cache.1, clean_cache.2, clean_cache.3, clean_cache.4, clean_cache.5, clean_cache.6, clean_cache.7, clean_cache.8, clean_cache.9, clean_cache.10, clean_cache.11);
+     crate::println!("BUILDSTORM_DIAG anonymous_move left_selected={} left_no_realloc={} left_shrink={} left_remove={} left_frame_relocate={} left_remove_suffix={} left_remove_suffix_max={} right_selected={} right_no_realloc={} right_shrink={} right_remove={} right_frame_move={} right_remove_suffix={} right_remove_suffix_max={} zero_metadata={}", ANONYMOUS_MOVE_LEFT_SELECTED.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_NO_REALLOC.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_SHRINK.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_FRAME_RELOCATE.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE_SUFFIX.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE_SUFFIX_MAX.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_SELECTED.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_NO_REALLOC.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_SHRINK.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_FRAME_MOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE_SUFFIX.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE_SUFFIX_MAX.load(Ordering::Relaxed), ANONYMOUS_MOVE_ZERO_METADATA.load(Ordering::Relaxed));
+     crate::println!("BUILDSTORM_DIAG anonymous_coalesce calls={} areas={} areas_max={} sort_us={} scan_us={} total_us={} merges={} merged_frames={} frame_reallocs={} frame_relocate={}", ANONYMOUS_COALESCE_CALLS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_AREAS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_AREAS_MAX.load(Ordering::Relaxed), ANONYMOUS_COALESCE_SORT_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_SCAN_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_TOTAL_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_MERGES.load(Ordering::Relaxed), ANONYMOUS_COALESCE_MERGED_FRAMES.load(Ordering::Relaxed), ANONYMOUS_COALESCE_FRAME_REALLOCS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_FRAME_RELOCATE.load(Ordering::Relaxed));
+     crate::println!(
+@@ -2603,6 +2816,19 @@ pub(crate) fn maybe_report() {
+         CHILD_WAKE_CALLS.load(Ordering::Relaxed),
+         CHILD_WOKEN.load(Ordering::Relaxed)
+     );
++    crate::println!(
++        "BUILDSTORM_DIAG process_clone calls={} vfork={} share_vm={} fork_cow={} fork_cow_total_us={} fork_cow_max_us={} vfork_fork_cow={} vfork_fork_cow_total_us={} fork_cow_areas={} fork_cow_resident_pages={}",
++        CLONE_CALLS.load(Ordering::Relaxed),
++        CLONE_VFORK_CALLS.load(Ordering::Relaxed),
++        CLONE_SHARE_VM_CALLS.load(Ordering::Relaxed),
++        CLONE_FORK_COW_CALLS.load(Ordering::Relaxed),
++        CLONE_FORK_COW_TOTAL_US.load(Ordering::Relaxed),
++        CLONE_FORK_COW_MAX_US.load(Ordering::Relaxed),
++        CLONE_VFORK_FORK_COW_CALLS.load(Ordering::Relaxed),
++        CLONE_VFORK_FORK_COW_TOTAL_US.load(Ordering::Relaxed),
++        CLONE_FORK_COW_AREAS.load(Ordering::Relaxed),
++        CLONE_FORK_COW_RESIDENT_PAGES.load(Ordering::Relaxed)
++    );
+     crate::task::manager::diagnostic_dump_user_comm();
+     report_exited_mmap_protocols();
+     crate::println!("BUILDSTORM_DIAG snapshot_end={}", sequence);
+diff --git a/os/src/fs/ext4_vol.rs b/os/src/fs/ext4_vol.rs
+index e8847cb..4a4b7f3 100644
+--- a/os/src/fs/ext4_vol.rs
++++ b/os/src/fs/ext4_vol.rs
+@@ -24,6 +24,7 @@ const WRITEBACK_CLUSTER_BYTES: usize = 256 * 1024;
+ const CLEAN_PAGE_CACHE_MIN_PAGES: usize = 2048;
+ const CLEAN_PAGE_CACHE_MAX_PAGES: usize = 65536;
+ const CLEAN_PAGE_CACHE_MEMORY_DIVISOR: usize = 32;
++const CLEAN_PAGE_FOLIO_PAGES: usize = 16;
+ const PBLOCK_RUN_CACHE_LIMIT: usize = 2048;
+ const PBLOCK_RUN_LOOKAHEAD: u32 = 16;
+ // The official compiler workload touches more than 50K distinct inodes in a
+@@ -38,6 +39,26 @@ static WRITEBACK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+ static EXECUTABLE_IMAGE_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+ #[cfg(feature = "buildstorm-diagnostics")]
+ static EXECUTABLE_IMAGE_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_MAX: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_RUN_CALLS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_RUN_PAGES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_RUN_MAX: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_PREFETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_PREFETCH_PAGES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_INSERTS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static CLEAN_PAGE_CACHE_FOLIO_TOUCHES: AtomicUsize = AtomicUsize::new(0);
+ static NAMESPACE_GENERATION: AtomicUsize = AtomicUsize::new(0);
+ fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
+     let end = offset.checked_add(len).ok_or(SysErrNo::EFBIG)?;
+@@ -70,19 +91,21 @@ use spin::{Mutex, RwLock};
+ 
+ use crate::config::PAGE_SIZE;
+ use crate::fs::normalize_path;
++use crate::fs::{FsHashMap, FsHashSet};
+ use crate::mm::frame_allocator::{self, FrameTracker};
+ use crate::utils::error::SysErrNo;
+ 
+ lazy_static! {
+     /// 挂载后的 Ext4（无盘或未探测到 virtio 时为 `None`）
+     pub static ref ROOT_EXT4: Mutex<Option<Arc<Ext4>>> = Mutex::new(None);
+-    static ref PATH_CACHE: RwLock<BTreeMap<String, (u32, Ext4NodeKind)>> =
+-        RwLock::new(BTreeMap::new());
+-    static ref NEGATIVE_PATH_CACHE: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
++    static ref PATH_CACHE: RwLock<FsHashMap<String, (u32, Ext4NodeKind)>> =
++        RwLock::new(FsHashMap::default());
++    static ref NEGATIVE_PATH_CACHE: RwLock<FsHashSet<String>> =
++        RwLock::new(FsHashSet::default());
+     static ref DIR_CACHE: RwLock<BTreeMap<u32, Arc<BTreeMap<String, (u32, bool)>>>> =
+         RwLock::new(BTreeMap::new());
+-    static ref INODE_METADATA_CACHE: RwLock<BTreeMap<u32, (Ext4Metadata, Ext4NodeKind)>> =
+-        RwLock::new(BTreeMap::new());
++    static ref INODE_METADATA_CACHE: RwLock<FsHashMap<u32, (Ext4Metadata, Ext4NodeKind)>> =
++        RwLock::new(FsHashMap::default());
+     static ref DATA_TIME_OVERRIDES: Mutex<BTreeMap<u32, (u32, u32, u32, u32)>> =
+         Mutex::new(BTreeMap::new());
+     static ref REGULAR_FILE_CACHE: Mutex<BTreeMap<u32, RegularCacheEntry>> =
+@@ -419,11 +442,47 @@ struct CleanPageKey {
+     page_idx: usize,
+ }
+ 
+-struct CachedCleanPage {
+-    frame: FrameTracker,
++impl CleanPageKey {
++    fn folio_key(self) -> CleanPageFolioKey {
++        CleanPageFolioKey {
++            ino: self.ino,
++            start_page_idx: self.page_idx - self.page_idx % CLEAN_PAGE_FOLIO_PAGES,
++        }
++    }
++
++    fn folio_slot(self) -> usize {
++        self.page_idx % CLEAN_PAGE_FOLIO_PAGES
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++struct CleanPageFolioKey {
++    ino: u32,
++    start_page_idx: usize,
++}
++
++struct CachedCleanFolio {
++    frames: [Option<FrameTracker>; CLEAN_PAGE_FOLIO_PAGES],
+     last_used: u64,
+ }
+ 
++impl CachedCleanFolio {
++    fn new(last_used: u64) -> Self {
++        Self {
++            frames: core::array::from_fn(|_| None),
++            last_used,
++        }
++    }
++
++    fn page_count(&self) -> usize {
++        self.frames.iter().filter(|frame| frame.is_some()).count()
++    }
++
++    fn is_empty(&self) -> bool {
++        self.frames.iter().all(|frame| frame.is_none())
++    }
++}
++
+ #[derive(Clone, Copy)]
+ struct CleanPageReadMetadata {
+     file_size: usize,
+@@ -534,17 +593,19 @@ impl PblockRunCache {
+ }
+ 
+ struct CleanPageCache {
+-    pages: BTreeMap<CleanPageKey, CachedCleanPage>,
+-    ages: BTreeSet<(u64, CleanPageKey)>,
++    folios: BTreeMap<CleanPageFolioKey, CachedCleanFolio>,
++    ages: BTreeSet<(u64, CleanPageFolioKey)>,
+     next_age: u64,
++    page_count: usize,
+ }
+ 
+ impl CleanPageCache {
+     fn new() -> Self {
+         Self {
+-            pages: BTreeMap::new(),
++            folios: BTreeMap::new(),
+             ages: BTreeSet::new(),
+             next_age: 1,
++            page_count: 0,
+         }
+     }
+ 
+@@ -555,12 +616,22 @@ impl CleanPageCache {
+     }
+ 
+     fn get(&mut self, key: CleanPageKey) -> Option<FrameTracker> {
++        let folio_key = key.folio_key();
++        let slot = key.folio_slot();
++        let (old_age, frame) = {
++            let folio = self.folios.get(&folio_key)?;
++            (folio.last_used, folio.frames[slot].as_ref()?.clone())
++        };
+         let age = self.bump_age();
+-        let page = self.pages.get_mut(&key)?;
+-        self.ages.remove(&(page.last_used, key));
+-        page.last_used = age;
+-        self.ages.insert((age, key));
+-        Some(page.frame.clone())
++        self.ages.remove(&(old_age, folio_key));
++        self.folios
++            .get_mut(&folio_key)
++            .expect("clean folio disappeared while locked")
++            .last_used = age;
++        self.ages.insert((age, folio_key));
++        #[cfg(feature = "buildstorm-diagnostics")]
++        CLEAN_PAGE_CACHE_FOLIO_TOUCHES.fetch_add(1, Ordering::Relaxed);
++        Some(frame)
+     }
+ 
+     fn uncached_prefix_len(&self, ino: u32, start_page_idx: usize, max_pages: usize) -> usize {
+@@ -569,7 +640,13 @@ impl CleanPageCache {
+             let Some(page_idx) = start_page_idx.checked_add(pages) else {
+                 break;
+             };
+-            if self.pages.contains_key(&CleanPageKey { ino, page_idx }) {
++            let key = CleanPageKey { ino, page_idx };
++            if self
++                .folios
++                .get(&key.folio_key())
++                .and_then(|folio| folio.frames[key.folio_slot()].as_ref())
++                .is_some()
++            {
+                 break;
+             }
+             pages += 1;
+@@ -579,62 +656,111 @@ impl CleanPageCache {
+ 
+     fn get_run(&mut self, ino: u32, start_page_idx: usize, max_pages: usize) -> Vec<FrameTracker> {
+         let mut frames = Vec::new();
+-        for page in 0..max_pages {
+-            let Some(page_idx) = start_page_idx.checked_add(page) else {
++        while frames.len() < max_pages {
++            let Some(page_idx) = start_page_idx.checked_add(frames.len()) else {
+                 break;
+             };
+             let key = CleanPageKey { ino, page_idx };
+-            let age = self.bump_age();
+-            let Some(cached) = self.pages.get_mut(&key) else {
++            let folio_key = key.folio_key();
++            let slot = key.folio_slot();
++            let Some(old_age) = self
++                .folios
++                .get(&folio_key)
++                .and_then(|folio| folio.frames[slot].as_ref().map(|_| folio.last_used))
++            else {
+                 break;
+             };
+-            self.ages.remove(&(cached.last_used, key));
+-            cached.last_used = age;
+-            self.ages.insert((age, key));
+-            frames.push(cached.frame.clone());
++            let age = self.bump_age();
++            self.ages.remove(&(old_age, folio_key));
++            self.folios
++                .get_mut(&folio_key)
++                .expect("clean folio disappeared while locked")
++                .last_used = age;
++            self.ages.insert((age, folio_key));
++            #[cfg(feature = "buildstorm-diagnostics")]
++            CLEAN_PAGE_CACHE_FOLIO_TOUCHES.fetch_add(1, Ordering::Relaxed);
++
++            let folio = self
++                .folios
++                .get(&folio_key)
++                .expect("clean folio disappeared while locked");
++            let remaining = max_pages - frames.len();
++            for frame in folio.frames[slot..].iter().take(remaining) {
++                let Some(frame) = frame.as_ref() else {
++                    break;
++                };
++                frames.push(frame.clone());
++            }
++        }
++        #[cfg(feature = "buildstorm-diagnostics")]
++        {
++            CLEAN_PAGE_CACHE_RUN_CALLS.fetch_add(1, Ordering::Relaxed);
++            CLEAN_PAGE_CACHE_RUN_PAGES.fetch_add(frames.len(), Ordering::Relaxed);
++            CLEAN_PAGE_CACHE_RUN_MAX.fetch_max(frames.len(), Ordering::Relaxed);
+         }
+         frames
+     }
+ 
+     fn insert(&mut self, key: CleanPageKey, frame: FrameTracker) {
++        let folio_key = key.folio_key();
++        let slot = key.folio_slot();
++        let replacing = self
++            .folios
++            .get(&folio_key)
++            .and_then(|folio| folio.frames[slot].as_ref())
++            .is_some();
++        if !replacing && self.page_count >= clean_page_cache_limit() {
++            self.evict_one();
++        }
++
++        if let Some(old_age) = self.folios.get(&folio_key).map(|folio| folio.last_used) {
++            self.ages.remove(&(old_age, folio_key));
++        }
+         let age = self.bump_age();
+-        if let Some(page) = self.pages.get_mut(&key) {
+-            self.ages.remove(&(page.last_used, key));
+-            page.frame = frame;
+-            page.last_used = age;
+-            self.ages.insert((age, key));
+-            return;
++        let folio = self
++            .folios
++            .entry(folio_key)
++            .or_insert_with(|| CachedCleanFolio::new(age));
++        let inserted = folio.frames[slot].is_none();
++        folio.frames[slot] = Some(frame);
++        folio.last_used = age;
++        self.ages.insert((age, folio_key));
++        if inserted {
++            self.page_count += 1;
+         }
+-        if self.pages.len() >= clean_page_cache_limit() {
+-            self.evict_one();
++        #[cfg(feature = "buildstorm-diagnostics")]
++        if inserted {
++            CLEAN_PAGE_CACHE_INSERTS.fetch_add(1, Ordering::Relaxed);
++            CLEAN_PAGE_CACHE_MAX.fetch_max(self.page_count, Ordering::Relaxed);
+         }
+-        self.pages.insert(
+-            key,
+-            CachedCleanPage {
+-                frame,
+-                last_used: age,
+-            },
+-        );
+-        self.ages.insert((age, key));
+     }
+ 
+     fn evict_one(&mut self) {
+-        if let Some((age, key)) = self.ages.iter().next().copied() {
+-            self.ages.remove(&(age, key));
+-            self.pages.remove(&key);
++        if let Some((age, folio_key)) = self.ages.iter().next().copied() {
++            self.ages.remove(&(age, folio_key));
++            if let Some(folio) = self.folios.remove(&folio_key) {
++                let evicted = folio.page_count();
++                self.page_count = self.page_count.saturating_sub(evicted);
++                #[cfg(feature = "buildstorm-diagnostics")]
++                CLEAN_PAGE_CACHE_EVICTIONS.fetch_add(evicted, Ordering::Relaxed);
++            }
+         }
+     }
+ 
+     fn invalidate_ino(&mut self, ino: u32) {
+-        let victims: Vec<CleanPageKey> = self
+-            .pages
++        let victims: Vec<CleanPageFolioKey> = self
++            .folios
+             .keys()
+             .copied()
+             .filter(|key| key.ino == ino)
+             .collect();
+-        for key in victims {
+-            if let Some(page) = self.pages.remove(&key) {
+-                self.ages.remove(&(page.last_used, key));
++        for folio_key in victims {
++            if let Some(folio) = self.folios.remove(&folio_key) {
++                self.ages.remove(&(folio.last_used, folio_key));
++                let invalidated = folio.page_count();
++                self.page_count = self.page_count.saturating_sub(invalidated);
++                #[cfg(feature = "buildstorm-diagnostics")]
++                CLEAN_PAGE_CACHE_INVALIDATIONS.fetch_add(invalidated, Ordering::Relaxed);
+             }
+         }
+     }
+@@ -645,22 +771,57 @@ impl CleanPageCache {
+         }
+         let first = start / PAGE_SIZE;
+         let last = (end - 1) / PAGE_SIZE;
+-        let victims: Vec<CleanPageKey> = self
+-            .pages
++        let victims: Vec<CleanPageFolioKey> = self
++            .folios
+             .keys()
+             .copied()
+-            .filter(|key| key.ino == ino && key.page_idx >= first && key.page_idx <= last)
++            .filter(|key| {
++                key.ino == ino
++                    && key.start_page_idx <= last
++                    && key.start_page_idx.saturating_add(CLEAN_PAGE_FOLIO_PAGES) > first
++            })
+             .collect();
+-        for key in victims {
+-            if let Some(page) = self.pages.remove(&key) {
+-                self.ages.remove(&(page.last_used, key));
++        for folio_key in victims {
++            let mut invalidated = 0usize;
++            let mut remove_folio = false;
++            let mut old_age = 0u64;
++            if let Some(folio) = self.folios.get_mut(&folio_key) {
++                old_age = folio.last_used;
++                let first_slot = first.saturating_sub(folio_key.start_page_idx);
++                let last_slot = last
++                    .saturating_sub(folio_key.start_page_idx)
++                    .min(CLEAN_PAGE_FOLIO_PAGES - 1);
++                for slot in first_slot..=last_slot {
++                    invalidated += usize::from(folio.frames[slot].take().is_some());
++                }
++                remove_folio = folio.is_empty();
++            }
++            if remove_folio {
++                self.folios.remove(&folio_key);
++                self.ages.remove(&(old_age, folio_key));
+             }
++            self.page_count = self.page_count.saturating_sub(invalidated);
++            #[cfg(feature = "buildstorm-diagnostics")]
++            CLEAN_PAGE_CACHE_INVALIDATIONS.fetch_add(invalidated, Ordering::Relaxed);
+         }
+     }
+ 
++    #[cfg(feature = "buildstorm-diagnostics")]
++    fn page_count(&self) -> usize {
++        self.page_count
++    }
++
++    #[cfg(feature = "buildstorm-diagnostics")]
++    fn folio_count(&self) -> usize {
++        self.folios.len()
++    }
++
+     fn clear(&mut self) {
+-        self.pages.clear();
++        #[cfg(feature = "buildstorm-diagnostics")]
++        CLEAN_PAGE_CACHE_INVALIDATIONS.fetch_add(self.page_count, Ordering::Relaxed);
++        self.folios.clear();
+         self.ages.clear();
++        self.page_count = 0;
+     }
+ }
+ 
+@@ -672,6 +833,38 @@ fn clean_page_cache_limit() -> usize {
+         .min(CLEAN_PAGE_CACHE_MAX_PAGES)
+ }
+ 
++#[cfg(feature = "buildstorm-diagnostics")]
++pub fn diagnostic_clean_page_cache_stats() -> (
++    usize,
++    usize,
++    usize,
++    usize,
++    usize,
++    usize,
++    usize,
++    usize,
++    usize,
++    usize,
++    usize,
++    usize,
++) {
++    let cache = CLEAN_PAGE_CACHE.lock();
++    (
++        cache.page_count(),
++        CLEAN_PAGE_CACHE_MAX.load(Ordering::Relaxed),
++        cache.folio_count(),
++        CLEAN_PAGE_CACHE_FOLIO_TOUCHES.load(Ordering::Relaxed),
++        CLEAN_PAGE_CACHE_RUN_CALLS.load(Ordering::Relaxed),
++        CLEAN_PAGE_CACHE_RUN_PAGES.load(Ordering::Relaxed),
++        CLEAN_PAGE_CACHE_RUN_MAX.load(Ordering::Relaxed),
++        CLEAN_PAGE_CACHE_PREFETCH_CALLS.load(Ordering::Relaxed),
++        CLEAN_PAGE_CACHE_PREFETCH_PAGES.load(Ordering::Relaxed),
++        CLEAN_PAGE_CACHE_INSERTS.load(Ordering::Relaxed),
++        CLEAN_PAGE_CACHE_EVICTIONS.load(Ordering::Relaxed),
++        CLEAN_PAGE_CACHE_INVALIDATIONS.load(Ordering::Relaxed),
++    )
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Ext4NodeKind {
+     Regular,
+@@ -1108,6 +1301,10 @@ fn fill_clean_page_frame(
+     metadata: Option<CleanPageReadMetadata>,
+ ) -> Result<FrameTracker, SysErrNo> {
+     let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    frame_allocator::diagnostic_note_allocation(
++        frame_allocator::FrameAllocationClass::CleanFile,
++    );
+     let page_start = page_idx.checked_mul(PAGE_SIZE).ok_or(SysErrNo::EFBIG)?;
+     let metadata = match metadata {
+         Some(metadata) => metadata,
+@@ -1210,6 +1407,11 @@ fn prefetch_clean_page_frames(
+     if keys.len() < 2 {
+         return Ok(());
+     }
++    #[cfg(feature = "buildstorm-diagnostics")]
++    {
++        CLEAN_PAGE_CACHE_PREFETCH_CALLS.fetch_add(1, Ordering::Relaxed);
++        CLEAN_PAGE_CACHE_PREFETCH_PAGES.fetch_add(keys.len(), Ordering::Relaxed);
++    }
+ 
+     let blocks = crate::fs::block_dev::read_root_blocks(&offsets)?;
+     if blocks.len() != keys.len() {
+@@ -1221,6 +1423,10 @@ fn prefetch_clean_page_frames(
+             return Err(SysErrNo::EIO);
+         }
+         let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
++        #[cfg(feature = "buildstorm-diagnostics")]
++        frame_allocator::diagnostic_note_allocation(
++            frame_allocator::FrameAllocationClass::CleanFile,
++        );
+         unsafe {
+             core::ptr::copy_nonoverlapping(block.as_ptr(), frame.ppn().addr() as *mut u8, read_len);
+         }
+@@ -1256,14 +1462,32 @@ pub fn clean_page_cache_frames(
+     }
+ 
+     let read_ahead_pages = read_ahead_pages.max(1).min(max_pages);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let metadata_scope = crate::buildstorm_diagnostics::WorkScope::new(
++        crate::buildstorm_diagnostics::WorkClass::CleanCacheMetadata,
++    );
+     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
+     let metadata = clean_page_read_metadata(&fs, ino)?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    drop(metadata_scope);
+     let start_page_idx = file_offset / PAGE_SIZE;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let prefetch_scope = crate::buildstorm_diagnostics::WorkScope::new(
++        crate::buildstorm_diagnostics::WorkClass::CleanCachePrefetch,
++    );
+     let _ = prefetch_clean_page_frames(&fs, ino, start_page_idx, read_ahead_pages, metadata);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    drop(prefetch_scope);
+     let mut source = None;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let get_run_scope = crate::buildstorm_diagnostics::WorkScope::new(
++        crate::buildstorm_diagnostics::WorkClass::CleanCacheGetRun,
++    );
+     let mut frames = CLEAN_PAGE_CACHE
+         .lock()
+         .get_run(ino, start_page_idx, max_pages);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    drop(get_run_scope);
+     for page in frames.len()..max_pages {
+         let Some(delta) = page.checked_mul(PAGE_SIZE) else {
+             break;
+@@ -1457,6 +1681,10 @@ fn promote_dense_regular_cache(cached: &mut CachedRegularFile) -> Result<(), Sys
+     let mut pages = BTreeMap::new();
+     for (page_idx, chunk) in dense.chunks(PAGE_SIZE).enumerate() {
+         let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
++        #[cfg(feature = "buildstorm-diagnostics")]
++        frame_allocator::diagnostic_note_allocation(
++            frame_allocator::FrameAllocationClass::FileWrite,
++        );
+         unsafe {
+             core::ptr::copy_nonoverlapping(
+                 chunk.as_ptr(),
+@@ -1481,6 +1709,10 @@ fn cached_page_for_write(
+         return Ok(frame.clone());
+     }
+     let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    frame_allocator::diagnostic_note_allocation(
++        frame_allocator::FrameAllocationClass::FileWrite,
++    );
+     if preserve_contents {
+         let page_start = page_idx.checked_mul(PAGE_SIZE).ok_or(SysErrNo::EFBIG)?;
+         if page_start < cached.persisted_size {
+diff --git a/os/src/fs/mod.rs b/os/src/fs/mod.rs
+index dfd5eaa..0c17891 100644
+--- a/os/src/fs/mod.rs
++++ b/os/src/fs/mod.rs
+@@ -28,11 +28,38 @@ use alloc::format;
+ use alloc::string::{String, ToString};
+ use alloc::sync::Arc;
+ use alloc::vec::Vec;
++use core::hash::{BuildHasherDefault, Hasher};
+ use lazy_static::lazy_static;
+ use spin::Mutex;
+ 
+ use crate::utils::error::SysErrNo;
+ 
++pub(crate) type FsHashMap<K, V> =
++    hashbrown::HashMap<K, V, BuildHasherDefault<FsHasher>>;
++pub(crate) type FsHashSet<K> = hashbrown::HashSet<K, BuildHasherDefault<FsHasher>>;
++
++/// Deterministic no_std hasher for in-kernel filesystem caches.
++pub(crate) struct FsHasher(u64);
++
++impl Default for FsHasher {
++    fn default() -> Self {
++        Self(0xcbf2_9ce4_8422_2325)
++    }
++}
++
++impl Hasher for FsHasher {
++    fn finish(&self) -> u64 {
++        self.0
++    }
++
++    fn write(&mut self, bytes: &[u8]) {
++        for byte in bytes {
++            self.0 ^= u64::from(*byte);
++            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
++        }
++    }
++}
++
+ /// 文件内容
+ pub type FileContent = fd::MemFileContent;
+ 
+diff --git a/os/src/fs/vfs.rs b/os/src/fs/vfs.rs
+index 8249345..a0b3ac7 100644
+--- a/os/src/fs/vfs.rs
++++ b/os/src/fs/vfs.rs
+@@ -11,7 +11,9 @@ use crate::utils::error::SysErrNo;
+ 
+ use super::fd;
+ use super::{block_dev, ext4_vol, vfat};
+-use super::{normalize_path, MemNodeMetadata, MemNodeSnapshot, MemSpecialKind, MEM_FS};
++use super::{
++    normalize_path, FsHashMap, FsHashSet, MemNodeMetadata, MemNodeSnapshot, MemSpecialKind, MEM_FS,
++};
+ 
+ const S_IFDIR: u32 = 0o040000;
+ const S_IFMT: u32 = 0o170000;
+@@ -34,13 +36,14 @@ const MS_REMOUNT: usize = 32;
+ lazy_static! {
+     static ref WHITEOUTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+     static ref MOUNT_TABLE: Mutex<Vec<MountEntry>> = Mutex::new(Vec::new());
+-    static ref SYMLINK_PROBE_CACHE: RwLock<BTreeMap<String, Option<String>>> =
+-        RwLock::new(BTreeMap::new());
+-    static ref READLINK_RESULT_CACHE: RwLock<BTreeMap<String, Result<String, SysErrNo>>> =
+-        RwLock::new(BTreeMap::new());
+-    static ref RESOLVED_DIRECTORY_CACHE: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
+-    static ref RESOLVED_PARENT_CACHE: RwLock<BTreeMap<String, String>> =
+-        RwLock::new(BTreeMap::new());
++    static ref SYMLINK_PROBE_CACHE: RwLock<FsHashMap<String, Option<String>>> =
++        RwLock::new(FsHashMap::default());
++    static ref READLINK_RESULT_CACHE: RwLock<FsHashMap<String, Result<String, SysErrNo>>> =
++        RwLock::new(FsHashMap::default());
++    static ref RESOLVED_DIRECTORY_CACHE: RwLock<FsHashSet<String>> =
++        RwLock::new(FsHashSet::default());
++    static ref RESOLVED_PARENT_CACHE: RwLock<FsHashMap<String, String>> =
++        RwLock::new(FsHashMap::default());
+ }
+ 
+ #[cfg(feature = "buildstorm-diagnostics")]
+@@ -63,7 +66,7 @@ macro_rules! vfs_lock {
+ const RESOLVED_PARENT_CACHE_LIMIT: usize = 64 * 1024;
+ const READLINK_RESULT_CACHE_LIMIT: usize = 64 * 1024;
+ 
+-fn make_string_cache_room<V>(cache: &mut BTreeMap<String, V>, limit: usize) {
++fn make_string_cache_room<V>(cache: &mut FsHashMap<String, V>, limit: usize) {
+     if cache.len() < limit {
+         return;
+     }
+diff --git a/os/src/main.rs b/os/src/main.rs
+index a8c54f4..555ddf4 100644
+--- a/os/src/main.rs
++++ b/os/src/main.rs
+@@ -51,6 +51,10 @@ impl PageAlloc for KernelPageAlloc {
+     fn alloc(&self) -> PhysAddr {
+         mm::frame_allocator::alloc_frame()
+             .map(|frame| {
++                #[cfg(feature = "buildstorm-diagnostics")]
++                mm::frame_allocator::diagnostic_note_allocation(
++                    mm::frame_allocator::FrameAllocationClass::PageTable,
++                );
+                 let paddr = PhysAddr::new(frame.into_raw_ppn().addr());
+                 paddr.clear_len(crate::config::PAGE_SIZE);
+                 paddr
+diff --git a/os/src/mm/elf_loader.rs b/os/src/mm/elf_loader.rs
+index 0f6d89f..00a0038 100644
+--- a/os/src/mm/elf_loader.rs
++++ b/os/src/mm/elf_loader.rs
+@@ -4,6 +4,7 @@
+ use alloc::vec::Vec;
+ use polyhal::VirtAddr;
+ 
++use crate::mm::map_area::MapAreaBacking;
+ use crate::mm::memory_set::MemorySet;
+ use crate::mm::page_table::PTEFlags;
+ use crate::utils::error::SysErrNo;
+@@ -357,10 +358,11 @@ impl<'a> ElfFile<'a> {
+ 
+         let user_stack_top = crate::config::USER_STACK_TOP;
+         let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
+-        memory_set.insert_framed_area(
++        memory_set.insert_lazy_area_with_backing(
+             VirtAddr::new(user_stack_bottom),
+             VirtAddr::new(user_stack_top),
+             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
++            MapAreaBacking::Anonymous,
+         )?;
+ 
+         Ok((memory_set, user_stack_top, entry))
+@@ -554,10 +556,11 @@ impl<'a> ElfFile<'a> {
+             user_stack_top
+         );
+ 
+-        memory_set.insert_framed_area(
++        memory_set.insert_lazy_area_with_backing(
+             VirtAddr::new(user_stack_bottom),
+             VirtAddr::new(user_stack_top),
+             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
++            MapAreaBacking::Anonymous,
+         )?;
+ 
+         Ok((memory_set, user_stack_top, entry))
+diff --git a/os/src/mm/frame_allocator.rs b/os/src/mm/frame_allocator.rs
+index abf0f74..cba2223 100644
+--- a/os/src/mm/frame_allocator.rs
++++ b/os/src/mm/frame_allocator.rs
+@@ -8,6 +8,82 @@ use spin::{Mutex, Once};
+ 
+ use crate::config::PAGE_SIZE;
+ 
++const FRAME_CACHE_CAPACITY: usize = 256;
++const FRAME_CACHE_REFILL: usize = 64;
++const FRAME_CACHE_FLUSH: usize = 64;
++
++struct LocalFrameCache {
++    frames: [usize; FRAME_CACHE_CAPACITY],
++    len: usize,
++}
++
++impl LocalFrameCache {
++    const fn empty() -> Self {
++        Self {
++            frames: [0; FRAME_CACHE_CAPACITY],
++            len: 0,
++        }
++    }
++
++    #[inline]
++    fn pop(&mut self) -> Option<usize> {
++        if self.len == 0 {
++            return None;
++        }
++        self.len -= 1;
++        Some(self.frames[self.len])
++    }
++
++    #[inline]
++    fn push(&mut self, ppn: usize) -> bool {
++        if self.len == FRAME_CACHE_CAPACITY {
++            return false;
++        }
++        self.frames[self.len] = ppn;
++        self.len += 1;
++        true
++    }
++
++    fn drain(&mut self, output: &mut [usize]) -> usize {
++        let mut count = 0;
++        while count < output.len() {
++            let Some(ppn) = self.pop() else {
++                break;
++            };
++            output[count] = ppn;
++            count += 1;
++        }
++        count
++    }
++}
++
++static FRAME_CACHES: [Mutex<LocalFrameCache>; crate::config::MAX_CPUS] =
++    [const { Mutex::new(LocalFrameCache::empty()) }; crate::config::MAX_CPUS];
++
++struct FrameCacheInterruptGuard {
++    restore_enabled: bool,
++}
++
++impl FrameCacheInterruptGuard {
++    #[inline]
++    fn new() -> Self {
++        let restore_enabled = crate::trap::interrupts::is_interrupt_enabled();
++        if restore_enabled {
++            crate::trap::interrupts::disable_interrupt();
++        }
++        Self { restore_enabled }
++    }
++}
++
++impl Drop for FrameCacheInterruptGuard {
++    #[inline]
++    fn drop(&mut self) {
++        if self.restore_enabled {
++            crate::trap::interrupts::enable_interrupt();
++        }
++    }
++}
++
+ /// 物理页号
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+ pub struct PhysPageNum(pub usize);
+@@ -182,6 +258,72 @@ static DIAG_OWNER_TRANSITIONS: AtomicUsize = AtomicUsize::new(0);
+ static TOTAL_MANAGED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+ static FREE_MANAGED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+ 
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_CACHE_REFILL_PAGES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_CACHE_FREES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_CACHE_DRAINED_PAGES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_CENTRAL_ALLOC_RUNS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_CENTRAL_ALLOC_PAGES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_CENTRAL_FREE_BATCHES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_CENTRAL_FREE_PAGES: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_ZERO_CALLS: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_ZERO_SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_ZERO_SAMPLE_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_ZERO_SAMPLE_MAX_US: AtomicUsize = AtomicUsize::new(0);
++
++#[cfg(feature = "buildstorm-diagnostics")]
++const FRAME_ZERO_SAMPLE_SHIFT: usize = 10;
++
++#[cfg(feature = "buildstorm-diagnostics")]
++#[derive(Clone, Copy)]
++#[repr(usize)]
++pub(crate) enum FrameAllocationClass {
++    PageTable,
++    Anonymous,
++    SharedMemory,
++    PrivateCopy,
++    CleanFile,
++    FileWrite,
++    EagerMapping,
++    BackingFallback,
++}
++
++#[cfg(feature = "buildstorm-diagnostics")]
++const FRAME_ALLOCATION_CLASS_NAMES: [&str; 8] = [
++    "page_table",
++    "anonymous",
++    "shared_memory",
++    "private_copy",
++    "clean_file",
++    "file_write",
++    "eager_mapping",
++    "backing_fallback",
++];
++
++#[cfg(feature = "buildstorm-diagnostics")]
++static FRAME_ALLOCATION_CLASSES: [AtomicUsize; FRAME_ALLOCATION_CLASS_NAMES.len()] =
++    [const { AtomicUsize::new(0) }; FRAME_ALLOCATION_CLASS_NAMES.len()];
++
++#[cfg(feature = "buildstorm-diagnostics")]
++#[inline]
++pub(crate) fn diagnostic_note_allocation(class: FrameAllocationClass) {
++    FRAME_ALLOCATION_CLASSES[class as usize].fetch_add(1, Ordering::Relaxed);
++}
++
+ /// 初始化帧分配器
+ pub fn init_frame_allocator() {
+     // 将在启动时由main.rs添加内存区域
+@@ -287,39 +429,177 @@ fn is_managed_range(start_ppn: usize, pages: usize) -> bool {
+     let Some(end_ppn) = start_ppn.checked_add(pages) else {
+         return false;
+     };
++    if let Some(regions) = FRAME_REF_REGIONS.get() {
++        return regions
++            .iter()
++            .any(|region| start_ppn >= region.start_ppn && end_ppn <= region.end_ppn);
++    }
+     MEM_REGIONS
+         .lock()
+         .iter()
+         .any(|(start, end)| start_ppn >= *start && end_ppn <= *end)
+ }
+ 
+-/// 分配一个物理页帧
+-pub fn alloc_frame() -> Option<FrameTracker> {
+-    loop {
+-        #[cfg(feature = "buildstorm-diagnostics")]
+-        let ppn = crate::buildstorm_diagnostics::lock(
+-            crate::buildstorm_diagnostics::LockClass::FrameAllocator,
+-            &FRAME_ALLOCATOR,
+-        )
+-        .alloc(1)?;
+-        #[cfg(not(feature = "buildstorm-diagnostics"))]
+-        let ppn = FRAME_ALLOCATOR.lock().alloc(1)?;
+-        if !is_managed_range(ppn, 1) {
++#[inline]
++fn frame_cache_cpu() -> usize {
++    crate::platform::current_cpu_index().min(crate::config::MAX_CPUS - 1)
++}
++
++fn central_alloc_run(max_pages: usize) -> Option<(usize, usize)> {
++    if max_pages == 0 {
++        return None;
++    }
++    let mut pages = 1usize << (usize::BITS as usize - 1 - max_pages.leading_zeros() as usize);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let mut allocator = crate::buildstorm_diagnostics::lock(
++        crate::buildstorm_diagnostics::LockClass::FrameAllocator,
++        &FRAME_ALLOCATOR,
++    );
++    #[cfg(not(feature = "buildstorm-diagnostics"))]
++    let mut allocator = FRAME_ALLOCATOR.lock();
++
++    while pages != 0 {
++        if let Some(ppn) = allocator.alloc(pages) {
++            if is_managed_range(ppn, pages) {
++                #[cfg(feature = "buildstorm-diagnostics")]
++                {
++                    FRAME_CENTRAL_ALLOC_RUNS.fetch_add(1, Ordering::Relaxed);
++                    FRAME_CENTRAL_ALLOC_PAGES.fetch_add(pages, Ordering::Relaxed);
++                }
++                return Some((ppn, pages));
++            }
+             log::warn!(
+-                "[frame] discard unmanaged allocation ppn={:#x} paddr={:#x}",
++                "[frame] discard unmanaged allocation ppn={:#x}, pages={}",
+                 ppn,
+-                ppn * PAGE_SIZE
++                pages
+             );
+             continue;
+         }
+-        FREE_MANAGED_FRAMES.fetch_sub(1, Ordering::Relaxed);
+-        let tracker = FrameTracker::new(PhysPageNum(ppn));
+-        unsafe {
+-            let ptr = PhysPageNum(ppn).addr() as *mut u8;
+-            core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
++        pages >>= 1;
++    }
++    None
++}
++
++fn central_dealloc_pages(pages: &[usize]) {
++    if pages.is_empty() {
++        return;
++    }
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let mut allocator = crate::buildstorm_diagnostics::lock(
++        crate::buildstorm_diagnostics::LockClass::FrameAllocator,
++        &FRAME_ALLOCATOR,
++    );
++    #[cfg(not(feature = "buildstorm-diagnostics"))]
++    let mut allocator = FRAME_ALLOCATOR.lock();
++    for &ppn in pages {
++        allocator.dealloc(ppn, 1);
++    }
++    #[cfg(feature = "buildstorm-diagnostics")]
++    {
++        FRAME_CENTRAL_FREE_BATCHES.fetch_add(1, Ordering::Relaxed);
++        FRAME_CENTRAL_FREE_PAGES.fetch_add(pages.len(), Ordering::Relaxed);
++    }
++}
++
++fn drain_all_frame_caches() {
++    let _interrupt_guard = FrameCacheInterruptGuard::new();
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let mut drained = 0usize;
++    for cache in &FRAME_CACHES {
++        let mut pages = [0usize; FRAME_CACHE_CAPACITY];
++        let count = cache.lock().drain(&mut pages);
++        if count != 0 {
++            central_dealloc_pages(&pages[..count]);
++            #[cfg(feature = "buildstorm-diagnostics")]
++            {
++                drained += count;
++            }
+         }
+-        return Some(tracker);
+     }
++    #[cfg(feature = "buildstorm-diagnostics")]
++    FRAME_CACHE_DRAINED_PAGES.fetch_add(drained, Ordering::Relaxed);
++}
++
++fn alloc_cached_frame() -> Option<usize> {
++    let _interrupt_guard = FrameCacheInterruptGuard::new();
++    let cpu = frame_cache_cpu();
++    if let Some(ppn) = FRAME_CACHES[cpu].lock().pop() {
++        #[cfg(feature = "buildstorm-diagnostics")]
++        FRAME_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
++        return Some(ppn);
++    }
++    #[cfg(feature = "buildstorm-diagnostics")]
++    FRAME_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
++
++    let mut run = central_alloc_run(FRAME_CACHE_REFILL);
++    if run.is_none() {
++        drain_all_frame_caches();
++        run = central_alloc_run(FRAME_CACHE_REFILL);
++    }
++    let (start_ppn, pages) = run?;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    FRAME_CACHE_REFILL_PAGES.fetch_add(pages, Ordering::Relaxed);
++
++    let mut overflow = [0usize; FRAME_CACHE_REFILL];
++    let mut overflow_count = 0;
++    {
++        let mut cache = FRAME_CACHES[cpu].lock();
++        for ppn in start_ppn + 1..start_ppn + pages {
++            if !cache.push(ppn) {
++                overflow[overflow_count] = ppn;
++                overflow_count += 1;
++            }
++        }
++    }
++    central_dealloc_pages(&overflow[..overflow_count]);
++    Some(start_ppn)
++}
++
++fn cache_deallocated_frame(ppn: usize) {
++    let _interrupt_guard = FrameCacheInterruptGuard::new();
++    let cpu = frame_cache_cpu();
++    let mut flushed = [0usize; FRAME_CACHE_FLUSH];
++    let flushed_count = {
++        let mut cache = FRAME_CACHES[cpu].lock();
++        if cache.push(ppn) {
++            0
++        } else {
++            let count = cache.drain(&mut flushed);
++            let inserted = cache.push(ppn);
++            debug_assert!(inserted);
++            count
++        }
++    };
++    #[cfg(feature = "buildstorm-diagnostics")]
++    FRAME_CACHE_FREES.fetch_add(1, Ordering::Relaxed);
++    central_dealloc_pages(&flushed[..flushed_count]);
++}
++
++/// 分配一个物理页帧
++pub fn alloc_frame() -> Option<FrameTracker> {
++    let ppn = alloc_cached_frame()?;
++    FREE_MANAGED_FRAMES.fetch_sub(1, Ordering::Relaxed);
++    let tracker = FrameTracker::new(PhysPageNum(ppn));
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let zero_sequence = FRAME_ZERO_CALLS.fetch_add(1, Ordering::Relaxed);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let zero_started = if zero_sequence & ((1 << FRAME_ZERO_SAMPLE_SHIFT) - 1) == 0 {
++        Some(crate::timer::get_time_us())
++    } else {
++        None
++    };
++    unsafe {
++        let ptr = PhysPageNum(ppn).addr() as *mut u8;
++        crate::platform::zero_phys_range(ptr, PAGE_SIZE);
++    }
++    #[cfg(feature = "buildstorm-diagnostics")]
++    if let Some(started) = zero_started {
++        let elapsed = crate::timer::get_time_us().saturating_sub(started);
++        FRAME_ZERO_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
++        FRAME_ZERO_SAMPLE_TOTAL_US.fetch_add(elapsed, Ordering::Relaxed);
++        FRAME_ZERO_SAMPLE_MAX_US.fetch_max(elapsed, Ordering::Relaxed);
++    }
++    Some(tracker)
+ }
+ 
+ /// 分配连续的 `pages` 个物理页（用于 virtio DMA）。
+@@ -328,15 +608,24 @@ pub fn alloc_contiguous_frames(pages: usize) -> Option<usize> {
+     if pages == 0 {
+         return Some(0);
+     }
++    let mut drained_caches = false;
+     loop {
+         #[cfg(feature = "buildstorm-diagnostics")]
+-        let ppn = crate::buildstorm_diagnostics::lock(
++        let allocation = crate::buildstorm_diagnostics::lock(
+             crate::buildstorm_diagnostics::LockClass::FrameAllocator,
+             &FRAME_ALLOCATOR,
+         )
+-        .alloc(pages)?;
++        .alloc(pages);
+         #[cfg(not(feature = "buildstorm-diagnostics"))]
+-        let ppn = FRAME_ALLOCATOR.lock().alloc(pages)?;
++        let allocation = FRAME_ALLOCATOR.lock().alloc(pages);
++        let Some(ppn) = allocation else {
++            if drained_caches {
++                return None;
++            }
++            drain_all_frame_caches();
++            drained_caches = true;
++            continue;
++        };
+         if is_managed_range(ppn, pages) {
+             FREE_MANAGED_FRAMES.fetch_sub(pages, Ordering::Relaxed);
+             #[cfg(feature = "buildstorm-diagnostics")]
+@@ -401,15 +690,46 @@ fn dealloc_frame_inner(ppn: PhysPageNum) {
+         );
+         return;
+     }
+-    #[cfg(feature = "buildstorm-diagnostics")]
+-    crate::buildstorm_diagnostics::lock(
+-        crate::buildstorm_diagnostics::LockClass::FrameAllocator,
+-        &FRAME_ALLOCATOR,
+-    )
+-    .dealloc(ppn.0, 1);
+-    #[cfg(not(feature = "buildstorm-diagnostics"))]
+-    FRAME_ALLOCATOR.lock().dealloc(ppn.0, 1);
+     FREE_MANAGED_FRAMES.fetch_add(1, Ordering::Relaxed);
++    cache_deallocated_frame(ppn.0);
++}
++
++#[cfg(feature = "buildstorm-diagnostics")]
++pub(crate) fn report_cache_diagnostics() {
++    let _interrupt_guard = FrameCacheInterruptGuard::new();
++    let cached: usize = FRAME_CACHES.iter().map(|cache| cache.lock().len).sum();
++    crate::println!(
++        "BUILDSTORM_DIAG frame_cache cached={} hits={} misses={} refill_pages={} cached_frees={} drained_pages={} central_alloc_runs={} central_alloc_pages={} central_free_batches={} central_free_pages={} zero_block_bytes={}",
++        cached,
++        FRAME_CACHE_HITS.load(Ordering::Relaxed),
++        FRAME_CACHE_MISSES.load(Ordering::Relaxed),
++        FRAME_CACHE_REFILL_PAGES.load(Ordering::Relaxed),
++        FRAME_CACHE_FREES.load(Ordering::Relaxed),
++        FRAME_CACHE_DRAINED_PAGES.load(Ordering::Relaxed),
++        FRAME_CENTRAL_ALLOC_RUNS.load(Ordering::Relaxed),
++        FRAME_CENTRAL_ALLOC_PAGES.load(Ordering::Relaxed),
++        FRAME_CENTRAL_FREE_BATCHES.load(Ordering::Relaxed),
++        FRAME_CENTRAL_FREE_PAGES.load(Ordering::Relaxed),
++        crate::platform::zero_block_bytes(),
++    );
++    crate::println!(
++        "BUILDSTORM_DIAG frame_zero calls={} sample_count={} sample_total_us={} sample_max_us={} sample_shift={}",
++        FRAME_ZERO_CALLS.load(Ordering::Relaxed),
++        FRAME_ZERO_SAMPLE_COUNT.load(Ordering::Relaxed),
++        FRAME_ZERO_SAMPLE_TOTAL_US.load(Ordering::Relaxed),
++        FRAME_ZERO_SAMPLE_MAX_US.load(Ordering::Relaxed),
++        FRAME_ZERO_SAMPLE_SHIFT,
++    );
++    for (name, count) in FRAME_ALLOCATION_CLASS_NAMES
++        .iter()
++        .zip(FRAME_ALLOCATION_CLASSES.iter())
++    {
++        crate::println!(
++            "BUILDSTORM_DIAG frame_allocation class={} count={}",
++            name,
++            count.load(Ordering::Relaxed),
++        );
++    }
+ }
+ 
+ /// 获取剩余可用页帧数
+diff --git a/os/src/mm/heap_allocator.rs b/os/src/mm/heap_allocator.rs
+index 45d9334..ae6ea8a 100644
+--- a/os/src/mm/heap_allocator.rs
++++ b/os/src/mm/heap_allocator.rs
+@@ -337,8 +337,7 @@ pub fn grow_from_frame_allocator(total_memory_bytes: usize) -> usize {
+     // Large user-space builds can require a single high-order allocation.
+     // Reserving 1/4 of RAM keeps multi-hundred-MiB buddy blocks available on
+     // the official 8 GiB runs while remaining capped at 2 GiB.
+-    let requested = (total_memory_bytes / DYNAMIC_HEAP_MEMORY_FRACTION)
+-        .min(MAX_DYNAMIC_HEAP_SIZE);
++    let requested = (total_memory_bytes / DYNAMIC_HEAP_MEMORY_FRACTION).min(MAX_DYNAMIC_HEAP_SIZE);
+     let requested = if requested.is_power_of_two() {
+         requested
+     } else {
+diff --git a/os/src/mm/memory_set.rs b/os/src/mm/memory_set.rs
+index 2aeba04..eb0b2a7 100644
+--- a/os/src/mm/memory_set.rs
++++ b/os/src/mm/memory_set.rs
+@@ -1,5 +1,6 @@
+ use alloc::vec::Vec;
+ use core::mem;
++use core::sync::atomic::{fence, Ordering};
+ use polyhal::pagetable::{MappingFlags, MappingSize, PageTable, PageTableWrapper, TLB};
+ use polyhal::{PhysAddr, VirtAddr};
+ 
+@@ -68,17 +69,37 @@ fn is_shared_mapping(area: &MapArea) -> bool {
+     )
+ }
+ 
++fn commit_page_table_batch(page_table: &PageTableWrapper, writes: usize) {
++    if writes == 0 {
++        return;
++    }
++    fence(Ordering::SeqCst);
++    let local_flush = PageTable::current().root() == page_table.root();
++    if local_flush {
++        #[cfg(feature = "buildstorm-diagnostics")]
++        crate::buildstorm_diagnostics::note_local_tlb_flush();
++        TLB::flush_all();
++    }
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_page_table_batch(writes, local_flush);
++}
++
+ fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
+     if !has_leaf_permission(area.flags) {
+         return;
+     }
+ 
+-    for (idx, page) in area.resident().iter_range(0, area.page_count()) {
+-        let mf = effective_mapping_flags_for_page(area.flags, page);
+-        let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
+-        let paddr = PhysAddr::new(page.ppn().addr());
+-        page_table.map_page(vaddr, paddr, mf, MappingSize::Page4KB);
+-    }
++    let writes =
++        page_table.map_pages_without_flush(area.resident().iter_range(0, area.page_count()).map(
++            |(idx, page)| {
++                (
++                    VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE),
++                    PhysAddr::new(page.ppn().addr()),
++                    effective_mapping_flags_for_page(area.flags, page),
++                )
++            },
++        ));
++    commit_page_table_batch(page_table, writes);
+ }
+ 
+ fn map_area_page(page_table: &PageTableWrapper, area: &MapArea, vpn: usize) {
+@@ -105,12 +126,17 @@ fn map_area_page_window(
+     }
+ 
+     let end_idx = start_idx.saturating_add(page_count).min(area.page_count());
+-    for (idx, page) in area.resident().iter_range(start_idx, end_idx) {
+-        let mf = effective_mapping_flags_for_page(area.flags, page);
+-        let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
+-        let paddr = PhysAddr::new(page.ppn().addr());
+-        page_table.map_page(vaddr, paddr, mf, MappingSize::Page4KB);
+-    }
++    let writes =
++        page_table.map_pages_without_flush(area.resident().iter_range(start_idx, end_idx).map(
++            |(idx, page)| {
++                (
++                    VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE),
++                    PhysAddr::new(page.ppn().addr()),
++                    effective_mapping_flags_for_page(area.flags, page),
++                )
++            },
++        ));
++    commit_page_table_batch(page_table, writes);
+ }
+ 
+ fn unmap_area_pages_without_shootdown(
+@@ -151,6 +177,10 @@ fn copy_area_frames(area: &mut MapArea) -> Result<Vec<FrameTracker>, SysErrNo> {
+         let Some(frame) = frame_allocator::alloc_frame() else {
+             return Err(SysErrNo::ENOMEM);
+         };
++        #[cfg(feature = "buildstorm-diagnostics")]
++        frame_allocator::diagnostic_note_allocation(
++            frame_allocator::FrameAllocationClass::PrivateCopy,
++        );
+         unsafe {
+             core::ptr::copy_nonoverlapping(
+                 src_page.ppn().addr() as *const u8,
+@@ -275,6 +305,10 @@ impl MemorySet {
+                 }
+                 return Err(SysErrNo::ENOMEM);
+             };
++            #[cfg(feature = "buildstorm-diagnostics")]
++            frame_allocator::diagnostic_note_allocation(
++                frame_allocator::FrameAllocationClass::EagerMapping,
++            );
+             let ppn = frame.ppn();
+             let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
+             let paddr = PhysAddr::new(ppn.addr());
+@@ -339,6 +373,10 @@ impl MemorySet {
+         let mut frames: Vec<FrameTracker> = Vec::new();
+         for vpn in start_vpn..end_vpn {
+             if let Some(frame) = frame_allocator::alloc_frame() {
++                #[cfg(feature = "buildstorm-diagnostics")]
++                frame_allocator::diagnostic_note_allocation(
++                    frame_allocator::FrameAllocationClass::EagerMapping,
++                );
+                 let ppn = frame.ppn();
+                 let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
+                 let paddr = PhysAddr::new(ppn.addr());
+@@ -697,6 +735,10 @@ impl MemorySet {
+                 let Some(frame) = frame_allocator::alloc_frame() else {
+                     return Err(SysErrNo::ENOMEM);
+                 };
++                #[cfg(feature = "buildstorm-diagnostics")]
++                frame_allocator::diagnostic_note_allocation(
++                    frame_allocator::FrameAllocationClass::PrivateCopy,
++                );
+                 unsafe {
+                     core::ptr::copy_nonoverlapping(
+                         source_page.ppn().addr() as *const u8,
+@@ -710,6 +752,10 @@ impl MemorySet {
+             let Some(frame) = frame_allocator::alloc_frame() else {
+                 return Err(SysErrNo::ENOMEM);
+             };
++            #[cfg(feature = "buildstorm-diagnostics")]
++            frame_allocator::diagnostic_note_allocation(
++                frame_allocator::FrameAllocationClass::BackingFallback,
++            );
+             let backing_offset = page_start.saturating_sub(self.areas[source_index].start_va.raw());
+             let data = read_backing_page(&backing, backing_offset)?;
+             unsafe {
+@@ -1009,17 +1055,51 @@ impl MemorySet {
+                 crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousAllocate,
+             );
+             let pages_to_end = (area.end_va.raw() - page_start) / PAGE_SIZE;
+-            let max_window_pages = pages_to_end.min(ANONYMOUS_FAULT_WINDOW_PAGES);
+-            let mut window_pages = 0usize;
+-            while window_pages < max_window_pages
+-                && area.resident().lookup(page_idx + window_pages).is_none()
++            let max_forward_pages = pages_to_end.min(ANONYMOUS_FAULT_WINDOW_PAGES);
++            let mut forward_pages = 0usize;
++            while forward_pages < max_forward_pages
++                && area.resident().lookup(page_idx + forward_pages).is_none()
+             {
+-                window_pages += 1;
++                forward_pages += 1;
++            }
++            let inspect_backward = forward_pages < ANONYMOUS_FAULT_WINDOW_PAGES
++                || cfg!(feature = "buildstorm-diagnostics");
++            let mut backward_pages = 1usize;
++            if inspect_backward {
++                let max_backward_pages = (page_idx + 1).min(ANONYMOUS_FAULT_WINDOW_PAGES);
++                while backward_pages < max_backward_pages
++                    && area.resident().lookup(page_idx - backward_pages).is_none()
++                {
++                    backward_pages += 1;
++                }
++            }
++            let (window_start_idx, window_pages) = if backward_pages > forward_pages {
++                (page_idx + 1 - backward_pages, backward_pages)
++            } else {
++                (page_idx, forward_pages)
++            };
++            #[cfg(feature = "buildstorm-diagnostics")]
++            if crate::buildstorm_diagnostics::sample_anonymous_fault_shape() {
++                let left_resident = page_idx != 0 && area.resident().lookup(page_idx - 1).is_some();
++                let right_resident = page_idx + 1 < area.page_count()
++                    && area.resident().lookup(page_idx + 1).is_some();
++                crate::buildstorm_diagnostics::note_anonymous_fault_shape(
++                    left_resident,
++                    right_resident,
++                    forward_pages,
++                    backward_pages,
++                );
+             }
+             let mut frames = Vec::new();
+             for page in 0..window_pages {
+                 match frame_allocator::alloc_frame() {
+-                    Some(frame) => frames.push(frame),
++                    Some(frame) => {
++                        #[cfg(feature = "buildstorm-diagnostics")]
++                        frame_allocator::diagnostic_note_allocation(
++                            frame_allocator::FrameAllocationClass::Anonymous,
++                        );
++                        frames.push(frame);
++                    }
+                     None if page == 0 => return Err(SysErrNo::ENOMEM),
+                     None => break,
+                 }
+@@ -1048,13 +1128,18 @@ impl MemorySet {
+                 .area_index_containing(page_start)
+                 .ok_or(SysErrNo::EFAULT)?;
+             self.areas[idx]
+-                .insert_resident_run(page_idx, frames, PageState::Private)
++                .insert_resident_run(window_start_idx, frames, PageState::Private)
+                 .map_err(|_| SysErrNo::EFAULT)?;
+             #[cfg(feature = "buildstorm-diagnostics")]
+             let anonymous_map = crate::buildstorm_diagnostics::WorkScope::new(
+                 crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousMap,
+             );
+-            map_area_page_window(&self.page_table, &self.areas[idx], page_idx, _mapped_pages);
++            map_area_page_window(
++                &self.page_table,
++                &self.areas[idx],
++                window_start_idx,
++                _mapped_pages,
++            );
+             #[cfg(feature = "buildstorm-diagnostics")]
+             drop(anonymous_map);
+             #[cfg(feature = "buildstorm-diagnostics")]
+@@ -1154,6 +1239,10 @@ impl MemorySet {
+             );
+             return Err(SysErrNo::ENOMEM);
+         };
++        #[cfg(feature = "buildstorm-diagnostics")]
++        frame_allocator::diagnostic_note_allocation(
++            frame_allocator::FrameAllocationClass::BackingFallback,
++        );
+         let backing_offset = page_start.saturating_sub(self.areas[idx].start_va.raw());
+         let data = match read_backing_page(&self.areas[idx].backing, backing_offset) {
+             Ok(data) => data,
+@@ -1386,6 +1475,10 @@ impl MemorySet {
+                 let Some(frame) = frame_allocator::alloc_frame() else {
+                     return Err(SysErrNo::ENOMEM);
+                 };
++                #[cfg(feature = "buildstorm-diagnostics")]
++                frame_allocator::diagnostic_note_allocation(
++                    frame_allocator::FrameAllocationClass::PrivateCopy,
++                );
+                 let new_paddr = PhysAddr::new(frame.ppn().addr());
+                 let src_paddr = PhysAddr::new(src_frame.ppn().addr());
+                 unsafe {
+@@ -1441,6 +1534,10 @@ impl Clone for MemorySet {
+ 
+             for (idx, src_frame) in area.resident().iter_range(0, area.page_count()) {
+                 if let Some(frame) = frame_allocator::alloc_frame() {
++                    #[cfg(feature = "buildstorm-diagnostics")]
++                    frame_allocator::diagnostic_note_allocation(
++                        frame_allocator::FrameAllocationClass::PrivateCopy,
++                    );
+                     let new_paddr = PhysAddr::new(frame.ppn().addr());
+                     let src_paddr = PhysAddr::new(src_frame.ppn().addr());
+                     unsafe {
+diff --git a/os/src/mm/mod.rs b/os/src/mm/mod.rs
+index 0fc9544..fb2a317 100644
+--- a/os/src/mm/mod.rs
++++ b/os/src/mm/mod.rs
+@@ -15,6 +15,10 @@ impl PageAlloc for KernelPageAlloc {
+     fn alloc(&self) -> PhysAddr {
+         frame_allocator::alloc_frame()
+             .map(|frame| {
++                #[cfg(feature = "buildstorm-diagnostics")]
++                frame_allocator::diagnostic_note_allocation(
++                    frame_allocator::FrameAllocationClass::PageTable,
++                );
+                 let paddr: PhysAddr = frame.into_raw_ppn().into();
+                 paddr.clear_len(crate::config::PAGE_SIZE);
+                 paddr
+diff --git a/os/src/platform.rs b/os/src/platform.rs
+index a4e7b4f..72ea00e 100644
+--- a/os/src/platform.rs
++++ b/os/src/platform.rs
+@@ -9,6 +9,8 @@ use core::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
+ use spin::Mutex;
+ 
+ use crate::config::MAX_CPUS;
++#[cfg(target_arch = "riscv64")]
++use crate::config::PAGE_SIZE;
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ #[repr(usize)]
+@@ -23,6 +25,7 @@ static PLATFORM_KIND: AtomicUsize = AtomicUsize::new(PlatformKind::Unknown as us
+ static PHYSICAL_CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
+ static TOTAL_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
+ static GOLDFISH_RTC_BASE: AtomicUsize = AtomicUsize::new(0);
++static ZERO_BLOCK_BYTES: AtomicUsize = AtomicUsize::new(0);
+ static CPU_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
+ static CPU_STATES: [AtomicUsize; MAX_CPUS] =
+     [const { AtomicUsize::new(CpuState::Absent as usize) }; MAX_CPUS];
+@@ -86,6 +89,10 @@ pub fn init(boot_hardware_id: usize) {
+     };
+ 
+     let mut cpu_count = 0usize;
++    #[cfg(target_arch = "riscv64")]
++    let mut cboz_consensus = None;
++    #[cfg(target_arch = "riscv64")]
++    let mut cboz_usable = true;
+     for node in fdt.find_nodes("/cpus/cpu") {
+         if cpu_count >= MAX_CPUS {
+             log::warn!("[platform] ignoring CPU beyond MAX_CPUS={}", MAX_CPUS);
+@@ -96,6 +103,39 @@ pub fn init(boot_hardware_id: usize) {
+             .and_then(|mut regions| regions.next())
+             .map(|region| region.address as usize)
+             .unwrap_or(cpu_count);
++        #[cfg(target_arch = "riscv64")]
++        {
++            let listed_extension = node
++                .find_property("riscv,isa-extensions")
++                .map(|property| property.str_list().any(|extension| extension == "zicboz"))
++                .unwrap_or(false);
++            let legacy_extension =
++                node.find_property("riscv,isa")
++                    .map(|property| {
++                        property.str().split('_').any(|extension| {
++                            extension == "zicboz" || extension.starts_with("zicboz1")
++                        })
++                    })
++                    .unwrap_or(false);
++            let block_bytes = node
++                .find_property("riscv,cboz-block-size")
++                .and_then(|property| {
++                    (property.raw_value().len() >= core::mem::size_of::<u32>())
++                        .then(|| property.u32() as usize)
++                })
++                .filter(|bytes| *bytes != 0 && bytes.is_power_of_two() && *bytes <= PAGE_SIZE);
++            let cpu_block = (listed_extension || legacy_extension)
++                .then_some(block_bytes)
++                .flatten();
++            if cpu_count == 0 {
++                cboz_consensus = cpu_block;
++            } else if cboz_consensus != cpu_block {
++                cboz_usable = false;
++            }
++            if cpu_block.is_none() {
++                cboz_usable = false;
++            }
++        }
+         CPU_IDS[cpu_count].store(hardware_id, Ordering::Relaxed);
+         CPU_STATES[cpu_count].store(CpuState::Present as usize, Ordering::Relaxed);
+         cpu_count += 1;
+@@ -107,6 +147,13 @@ pub fn init(boot_hardware_id: usize) {
+     }
+     PHYSICAL_CPU_COUNT.store(cpu_count, Ordering::Release);
+ 
++    #[cfg(target_arch = "riscv64")]
++    if cboz_usable {
++        if let Some(block_bytes) = cboz_consensus {
++            ZERO_BLOCK_BYTES.store(block_bytes, Ordering::Release);
++        }
++    }
++
+     let total_memory = fdt
+         .memory()
+         .flat_map(|memory| memory.regions())
+@@ -139,6 +186,42 @@ pub fn init(boot_hardware_id: usize) {
+         total_memory / 1024 / 1024,
+         model
+     );
++    #[cfg(target_arch = "riscv64")]
++    log::info!(
++        "[platform] cbo.zero block={} bytes",
++        ZERO_BLOCK_BYTES.load(Ordering::Acquire)
++    );
++}
++
++pub fn zero_block_bytes() -> usize {
++    ZERO_BLOCK_BYTES.load(Ordering::Acquire)
++}
++
++/// Zero a physical-memory range using the best runtime-safe platform backend.
++///
++/// The caller must provide a valid writable range. Zicboz is used only when
++/// every discovered RISC-V CPU reports the same usable block size.
++pub unsafe fn zero_phys_range(ptr: *mut u8, len: usize) {
++    #[cfg(target_arch = "riscv64")]
++    {
++        let block_bytes = zero_block_bytes();
++        let start = ptr as usize;
++        if block_bytes != 0 && start % block_bytes == 0 && len % block_bytes == 0 {
++            if let Some(end) = start.checked_add(len) {
++                let mut addr = start;
++                while addr < end {
++                    core::arch::asm!(
++                        ".insn i 0x0f, 0x2, x0, {base}, 0x4",
++                        base = in(reg) addr,
++                        options(nostack)
++                    );
++                    addr += block_bytes;
++                }
++                return;
++            }
++        }
++    }
++    core::ptr::write_bytes(ptr, 0, len);
+ }
+ 
+ pub fn kind() -> PlatformKind {
+diff --git a/os/src/smp_regression.rs b/os/src/smp_regression.rs
+index aee8bee..6bebbfb 100644
+--- a/os/src/smp_regression.rs
++++ b/os/src/smp_regression.rs
+@@ -90,12 +90,7 @@ fn verify_regular_file_window(
+     }
+ }
+ 
+-fn verify_regular_file_all(
+-    ino: u32,
+-    overwrite_start: usize,
+-    overwrite_len: usize,
+-    phase: &str,
+-) {
++fn verify_regular_file_all(ino: u32, overwrite_start: usize, overwrite_len: usize, phase: &str) {
+     let mut observed = alloc::vec![0u8; REGULAR_FILE_IO_CHUNK];
+     let mut start = 0usize;
+     while start < REGULAR_FILE_BYTES {
+diff --git a/os/src/syscall/fs.rs b/os/src/syscall/fs.rs
+index 1eeca55..bbc9cf0 100644
+--- a/os/src/syscall/fs.rs
++++ b/os/src/syscall/fs.rs
+@@ -2334,6 +2334,20 @@ pub fn sys_chdir(pathname: *const u8) -> SyscallRet {
+     }
+ }
+ 
++pub fn sys_fchdir(fd: usize) -> SyscallRet {
++    let dirfd = isize::try_from(fd).map_err(|_| SysErrNo::EBADF)?;
++    let logical_path = resolve_base_dir(dirfd)?;
++    let root = current_root()?;
++    let host_path = crate::fs::apply_root(&root, &logical_path);
++    if !super::with_kernel_page_table(|| crate::fs::dir_exists(&host_path)) {
++        return Err(SysErrNo::ENOENT);
++    }
++    let task = current_task().ok_or(SysErrNo::ESRCH)?;
++    task.fs.lock().cwd = logical_path.clone();
++    task.inner.lock().cwd = logical_path;
++    Ok(0)
++}
++
+ pub fn sys_mkdirat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
+     let (_logical_path, host_path) = resolve_host_path(dirfd, pathname)?;
+     let task = current_task().ok_or(SysErrNo::ESRCH)?;
+@@ -2391,19 +2405,39 @@ pub fn sys_mknodat(dirfd: isize, pathname: *const u8, mode: u32, dev: usize) ->
+ }
+ 
+ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SyscallRet {
++    sys_fchmodat2(dirfd, pathname, mode, 0)
++}
++
++pub fn sys_fchmodat2(dirfd: isize, pathname: *const u8, mode: u32, flags: usize) -> SyscallRet {
++    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
++        return Err(SysErrNo::EINVAL);
++    }
+     let path = read_user_path(pathname)?;
+     if path.is_empty() {
+-        return Err(SysErrNo::ENOENT);
++        if flags & AT_EMPTY_PATH == 0 || dirfd == AT_FDCWD {
++            return Err(SysErrNo::ENOENT);
++        }
++        let fd = usize::try_from(dirfd).map_err(|_| SysErrNo::EBADF)?;
++        let task = current_task().ok_or(SysErrNo::ESRCH)?;
++        let inner = task.inner.lock();
++        let mut fds = inner.fd_table.lock();
++        let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
++        super::with_kernel_page_table(|| crate::fs::set_mode_fd(file_desc, mode))?;
++        return Ok(0);
+     }
+     let (logical_path, host_path) = resolve_host_path_str(dirfd, &path)?;
+     if let Some(fd) = proc_self_fd_number(&logical_path)? {
++        if flags & AT_SYMLINK_NOFOLLOW != 0 {
++            return Err(SysErrNo::EOPNOTSUPP);
++        }
+         let task = current_task().ok_or(SysErrNo::ESRCH)?;
+         let inner = task.inner.lock();
+         let mut fds = inner.fd_table.lock();
+         let file_desc = fds.get_mut(fd).ok_or(SysErrNo::EBADF)?;
+         super::with_kernel_page_table(|| crate::fs::set_mode_fd(file_desc, mode))?;
+     } else {
+-        super::with_kernel_page_table(|| crate::fs::set_mode_path(&host_path, true, mode))?;
++        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
++        super::with_kernel_page_table(|| crate::fs::set_mode_path(&host_path, follow, mode))?;
+     }
+     Ok(0)
+ }
+diff --git a/os/src/syscall/mm.rs b/os/src/syscall/mm.rs
+index 518db28..848f8b8 100644
+--- a/os/src/syscall/mm.rs
++++ b/os/src/syscall/mm.rs
+@@ -321,7 +321,12 @@ fn shm_alloc_frames(size: usize) -> Result<Vec<FrameTracker>, SysErrNo> {
+     let pages = len / PAGE_SIZE;
+     let mut frames = Vec::new();
+     for _ in 0..pages {
+-        frames.push(frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?);
++        let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
++        #[cfg(feature = "buildstorm-diagnostics")]
++        frame_allocator::diagnostic_note_allocation(
++            frame_allocator::FrameAllocationClass::SharedMemory,
++        );
++        frames.push(frame);
+     }
+     Ok(frames)
+ }
+diff --git a/os/src/syscall/mod.rs b/os/src/syscall/mod.rs
+index ba142db..965fd55 100644
+--- a/os/src/syscall/mod.rs
++++ b/os/src/syscall/mod.rs
+@@ -57,6 +57,7 @@ pub const SYSCALL_STATFS: usize = 43;
+ pub const SYSCALL_FSTATFS: usize = 44;
+ pub const SYSCALL_FACCESSAT: usize = 48;
+ pub const SYSCALL_CHDIR: usize = 49;
++pub const SYSCALL_FCHDIR: usize = 50;
+ pub const SYSCALL_FCHMOD: usize = 52;
+ pub const SYSCALL_FCHMODAT: usize = 53;
+ pub const SYSCALL_FCHOWNAT: usize = 54;
+@@ -194,6 +195,7 @@ pub const SYSCALL_STATX: usize = 291;
+ pub const SYSCALL_OPENAT2: usize = 437;
+ pub const SYSCALL_FACCESSAT2: usize = 439;
+ pub const SYSCALL_EPOLL_PWAIT2: usize = 441;
++pub const SYSCALL_FCHMODAT2: usize = 452;
+ pub const SYSCALL_COPY_FILE_RANGE: usize = 285;
+ pub const SYSCALL_GETRANDOM: usize = 278;
+ 
+@@ -343,6 +345,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
+         SYSCALL_FCHMODAT => {
+             fs::sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32)
+         }
++        SYSCALL_FCHMODAT2 => fs::sys_fchmodat2(
++            args[0] as isize,
++            args[1] as *const u8,
++            args[2] as u32,
++            args[3],
++        ),
+         SYSCALL_FCHOWN => fs::sys_fchown(args[0], args[1], args[2]),
+         SYSCALL_FCHOWNAT => fs::sys_fchownat(
+             args[0] as isize,
+@@ -395,6 +403,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
+             args[4] as *mut u8,
+         ),
+         SYSCALL_CHDIR => fs::sys_chdir(args[0] as *const u8),
++        SYSCALL_FCHDIR => fs::sys_fchdir(args[0]),
+         SYSCALL_MKNODAT => fs::sys_mknodat(
+             args[0] as isize,
+             args[1] as *const u8,
+diff --git a/os/src/syscall/process.rs b/os/src/syscall/process.rs
+index f9de453..0a6bf6b 100644
+--- a/os/src/syscall/process.rs
++++ b/os/src/syscall/process.rs
+@@ -167,11 +167,9 @@ fn reap_zombie_child(waiter: &Arc<TaskControlBlock>, target: WaitTarget) -> Opti
+ fn peek_zombie_child(waiter: &Arc<TaskControlBlock>, target: WaitTarget) -> Option<(usize, i32)> {
+     for owner in waiter.thread_group.user_members() {
+         let inner = owner.inner.lock();
+-        if let Some(child) = inner
+-            .children
+-            .iter()
+-            .find(|child| child_matches_wait_target(child, target) && child.thread_group.is_process_zombie())
+-        {
++        if let Some(child) = inner.children.iter().find(|child| {
++            child_matches_wait_target(child, target) && child.thread_group.is_process_zombie()
++        }) {
+             return Some((child.thread_group.tgid(), child.thread_group.exit_code()));
+         }
+     }
+@@ -233,7 +231,11 @@ fn note_exec_failure_boundary(
+     let (parent_pid, clone_flags) = {
+         let inner = task.inner.lock();
+         (
+-            inner.parent.as_ref().map(|parent| parent.pid.0).unwrap_or(0),
++            inner
++                .parent
++                .as_ref()
++                .map(|parent| parent.pid.0)
++                .unwrap_or(0),
+             inner.clone_flags,
+         )
+     };
+@@ -438,20 +440,19 @@ fn read_user_path(ptr: *const u8) -> Result<String, SysErrNo> {
+ }
+ 
+ fn write_stack_bytes(
+-    memory_set: &crate::mm::memory_set::MemorySet,
++    memory_set: &mut crate::mm::memory_set::MemorySet,
+     dst: usize,
+     data: &[u8],
+-) {
++) -> Result<(), SysErrNo> {
++    memory_set.prepare_write(dst, data.len())?;
+     let mut copied = 0usize;
+     while copied < data.len() {
+-        let Some(va) = dst.checked_add(copied) else {
+-            break;
+-        };
++        let va = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
+         let page_left = crate::config::PAGE_SIZE - va % crate::config::PAGE_SIZE;
+         let count = page_left.min(data.len() - copied);
+-        let Some(pa) = memory_set.translate(VirtAddr::new(va)) else {
+-            break;
+-        };
++        let pa = memory_set
++            .translate(VirtAddr::new(va))
++            .ok_or(SysErrNo::EFAULT)?;
+         unsafe {
+             core::ptr::copy_nonoverlapping(
+                 data[copied..copied + count].as_ptr(),
+@@ -461,6 +462,20 @@ fn write_stack_bytes(
+         }
+         copied += count;
+     }
++    Ok(())
++}
++
++fn push_stack_bytes(
++    memory_set: &mut crate::mm::memory_set::MemorySet,
++    stack_bottom: usize,
++    sp: &mut usize,
++    data: &[u8],
++) -> Result<(), SysErrNo> {
++    *sp = sp.checked_sub(data.len()).ok_or(SysErrNo::E2BIG)?;
++    if *sp < stack_bottom {
++        return Err(SysErrNo::E2BIG);
++    }
++    write_stack_bytes(memory_set, *sp, data)
+ }
+ 
+ pub(crate) fn proc_self_exe_target(path: &str) -> Result<Option<String>, SysErrNo> {
+@@ -487,7 +502,7 @@ pub(crate) fn proc_self_exe_target(path: &str) -> Result<Option<String>, SysErrN
+ ///   - argc    (usize)
+ ///   ← SP 指向这里
+ pub(crate) fn setup_user_stack(
+-    memory_set: &crate::mm::memory_set::MemorySet,
++    memory_set: &mut crate::mm::memory_set::MemorySet,
+     stack_top: usize,
+     argv: &[String],
+     envp: &[String],
+@@ -495,7 +510,7 @@ pub(crate) fn setup_user_stack(
+     phdr_vaddr: usize,
+     phnum: usize,
+     interp_base: usize,
+-) -> usize {
++) -> Result<usize, SysErrNo> {
+     let credentials = current_task()
+         .map(|task| task.credentials.lock().clone())
+         .unwrap_or_else(Credentials::root);
+@@ -513,7 +528,7 @@ pub(crate) fn setup_user_stack(
+ }
+ 
+ fn setup_user_stack_with_credentials(
+-    memory_set: &crate::mm::memory_set::MemorySet,
++    memory_set: &mut crate::mm::memory_set::MemorySet,
+     stack_top: usize,
+     argv: &[String],
+     envp: &[String],
+@@ -522,29 +537,25 @@ fn setup_user_stack_with_credentials(
+     phnum: usize,
+     interp_base: usize,
+     credentials: Credentials,
+-) -> usize {
++) -> Result<usize, SysErrNo> {
+     let mut sp = stack_top;
+-
+-    // 辅助函数：往栈上写 bytes
+-    // Copy strings a page at a time; rustc can pass hundreds of arguments.
+-    let write_bytes = |ms: &crate::mm::memory_set::MemorySet, sp: &mut usize, data: &[u8]| {
+-        *sp -= data.len();
+-        write_stack_bytes(ms, *sp, data);
+-    };
++    let stack_bottom = stack_top
++        .checked_sub(crate::config::USER_STACK_SIZE)
++        .ok_or(SysErrNo::E2BIG)?;
+ 
+     // 1) 将所有 argv/envp 字符串写到栈顶区域，记录各自地址
+     let mut argv_ptrs: Vec<usize> = Vec::new();
+     for arg in argv.iter().rev() {
+-        write_bytes(memory_set, &mut sp, &[0u8]); // null terminator
+-        write_bytes(memory_set, &mut sp, arg.as_bytes());
++        push_stack_bytes(memory_set, stack_bottom, &mut sp, &[0u8])?;
++        push_stack_bytes(memory_set, stack_bottom, &mut sp, arg.as_bytes())?;
+         argv_ptrs.push(sp);
+     }
+     argv_ptrs.reverse();
+ 
+     let mut envp_ptrs: Vec<usize> = Vec::new();
+     for env in envp.iter().rev() {
+-        write_bytes(memory_set, &mut sp, &[0u8]);
+-        write_bytes(memory_set, &mut sp, env.as_bytes());
++        push_stack_bytes(memory_set, stack_bottom, &mut sp, &[0u8])?;
++        push_stack_bytes(memory_set, stack_bottom, &mut sp, env.as_bytes())?;
+         envp_ptrs.push(sp);
+     }
+     envp_ptrs.reverse();
+@@ -556,25 +567,24 @@ fn setup_user_stack_with_credentials(
+     } else {
+         "unknown"
+     };
+-    write_bytes(memory_set, &mut sp, &[0u8]);
+-    write_bytes(memory_set, &mut sp, platform.as_bytes());
++    push_stack_bytes(memory_set, stack_bottom, &mut sp, &[0u8])?;
++    push_stack_bytes(memory_set, stack_bottom, &mut sp, platform.as_bytes())?;
+     let platform_addr = sp;
+ 
+     // Reserve stable bytes for AT_RANDOM; glibc uses them for stack/pointer
+     // guards during startup and later exit-handler validation.
+-    sp -= 16;
+-    let random_addr = sp;
+-    for i in 0..16u8 {
+-        let va = VirtAddr::new(sp + i as usize);
+-        if let Some(pa) = memory_set.translate(va) {
+-            unsafe {
+-                *(pa.raw() as *mut u8) = i.wrapping_mul(37).wrapping_add(7);
+-            }
+-        }
++    let mut random = [0u8; 16];
++    for (index, byte) in random.iter_mut().enumerate() {
++        *byte = (index as u8).wrapping_mul(37).wrapping_add(7);
+     }
++    push_stack_bytes(memory_set, stack_bottom, &mut sp, &random)?;
++    let random_addr = sp;
+ 
+     // 2) 对齐到 16 字节
+     sp &= !0xF;
++    if sp < stack_bottom {
++        return Err(SysErrNo::E2BIG);
++    }
+ 
+     // 3) 计算总共需要多少 usize 条目来放 auxv/envp/argv/argc
+     //    auxv: 若干 (key,val) 对 + (AT_NULL, 0)
+@@ -634,49 +644,58 @@ fn setup_user_stack_with_credentials(
+     let auxv_entries = auxv_pairs.len();
+     let total_slots = 1 + (argv_ptrs.len() + 1) + (envp_ptrs.len() + 1) + auxv_entries * 2;
+     // 确保 sp 在写完后 16 字节对齐
+-    sp -= total_slots * core::mem::size_of::<usize>();
++    let table_bytes = total_slots
++        .checked_mul(core::mem::size_of::<usize>())
++        .ok_or(SysErrNo::E2BIG)?;
++    sp = sp.checked_sub(table_bytes).ok_or(SysErrNo::E2BIG)?;
+     sp &= !0xF;
++    if sp < stack_bottom {
++        return Err(SysErrNo::E2BIG);
++    }
+ 
+     let final_sp = sp;
+ 
+     // Write argc/argv/envp/auxv from low to high addresses. The strings and
+     // random bytes were already placed above this table on the same stack.
+     let mut pos = final_sp;
+-    let write_at = |ms: &crate::mm::memory_set::MemorySet, pos: usize, val: usize| {
++    let write_at = |ms: &mut crate::mm::memory_set::MemorySet,
++                    pos: usize,
++                    val: usize|
++     -> Result<(), SysErrNo> {
+         let bytes = val.to_le_bytes();
+-        write_stack_bytes(ms, pos, &bytes);
++        write_stack_bytes(ms, pos, &bytes)
+     };
+ 
+     let sz = core::mem::size_of::<usize>();
+ 
+     // argc
+-    write_at(memory_set, pos, argv_ptrs.len());
++    write_at(memory_set, pos, argv_ptrs.len())?;
+     pos += sz;
+ 
+     // argv pointers
+     for &ptr in &argv_ptrs {
+-        write_at(memory_set, pos, ptr);
++        write_at(memory_set, pos, ptr)?;
+         pos += sz;
+     }
+-    write_at(memory_set, pos, 0); // argv NULL terminator
++    write_at(memory_set, pos, 0)?; // argv NULL terminator
+     pos += sz;
+ 
+     // envp pointers
+     for &ptr in &envp_ptrs {
+-        write_at(memory_set, pos, ptr);
++        write_at(memory_set, pos, ptr)?;
+         pos += sz;
+     }
+-    write_at(memory_set, pos, 0); // envp NULL terminator
++    write_at(memory_set, pos, 0)?; // envp NULL terminator
+     pos += sz;
+ 
+     for (key, val) in auxv_pairs {
+-        write_at(memory_set, pos, key);
++        write_at(memory_set, pos, key)?;
+         pos += sz;
+-        write_at(memory_set, pos, val);
++        write_at(memory_set, pos, val)?;
+         pos += sz;
+     }
+ 
+-    final_sp
++    Ok(final_sp)
+ }
+ 
+ /// execve 系统调用
+@@ -828,13 +847,14 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
+ 
+             let user_stack_top = crate::config::USER_STACK_TOP;
+             let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
+-            memory_set.insert_framed_area(
++            memory_set.insert_lazy_area_with_backing(
+                 VirtAddr::new(user_stack_bottom),
+                 VirtAddr::new(user_stack_top),
+                 crate::mm::page_table::PTEFlags::U
+                     | crate::mm::page_table::PTEFlags::R
+                     | crate::mm::page_table::PTEFlags::W
+                     | crate::mm::page_table::PTEFlags::V,
++                crate::mm::map_area::MapAreaBacking::Anonymous,
+             )?;
+ 
+             (
+@@ -920,7 +940,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
+     };
+ 
+     let sp = setup_user_stack(
+-        &new_memory_set,
++        &mut new_memory_set,
+         user_stack_top,
+         &argv_with_path,
+         &envp,
+@@ -928,7 +948,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
+         phdr_vaddr,
+         phnum,
+         interp_base,
+-    );
++    )?;
+     crate::syscall::signal::install_signal_trampoline(&mut new_memory_set)?;
+     if let Some(task) = current_task() {
+         crate::task::terminate_thread_group_peers_for_exec(&task);
+@@ -948,8 +968,15 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
+             let closed = fds.close_on_exec();
+             #[cfg(feature = "buildstorm-diagnostics")]
+             {
+-                let pipe_closed = closed.iter().filter(|entry| entry.is_pipe_read() || entry.is_pipe_write()).count();
+-                crate::buildstorm_diagnostics::note_exec_pipes(pipe_endpoints, pipe_cloexec, pipe_closed);
++                let pipe_closed = closed
++                    .iter()
++                    .filter(|entry| entry.is_pipe_read() || entry.is_pipe_write())
++                    .count();
++                crate::buildstorm_diagnostics::note_exec_pipes(
++                    pipe_endpoints,
++                    pipe_cloexec,
++                    pipe_closed,
++                );
+             }
+             closed
+         };
+@@ -1107,8 +1134,7 @@ fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> Sysca
+         // exit between the checks above and a bare sleep, which would otherwise
+         // lose its SIGCHLD wakeup and leave the parent blocked forever.
+         match crate::task::wait_queue::sleep_on_child_exit_if(|| {
+-            Ok(peek_zombie_child(&task, target).is_none()
+-                && has_matching_child(&task, target))
++            Ok(peek_zombie_child(&task, target).is_none() && has_matching_child(&task, target))
+         }) {
+             Ok(_) => {}
+             Err(SysErrNo::EINTR) => {
+@@ -1222,14 +1248,18 @@ fn write_waitid_child_event(
+     super::user::copy_object_to_user(infop, &info)
+ }
+ 
+-pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusage: usize) -> SyscallRet {
++pub fn sys_waitid(
++    idtype: usize,
++    id: usize,
++    infop: usize,
++    options: usize,
++    _rusage: usize,
++) -> SyscallRet {
+     const SUPPORTED_OPTIONS: usize = WEXITED | WSTOPPED | WCONTINUED | WNOHANG | WNOWAIT;
+     if infop == 0 {
+         return Err(SysErrNo::EFAULT);
+     }
+-    if (options & !SUPPORTED_OPTIONS) != 0
+-        || (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0
+-    {
++    if (options & !SUPPORTED_OPTIONS) != 0 || (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0 {
+         return Err(SysErrNo::EINVAL);
+     }
+ 
+@@ -1293,14 +1323,8 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusag
+         // event consumption and writes the user-visible siginfo.
+         match crate::task::wait_queue::sleep_on_child_exit_if(|| {
+             let event_ready = (want_stopped || want_continued)
+-                && take_child_wait_event(
+-                    &task,
+-                    target,
+-                    want_stopped,
+-                    want_continued,
+-                    false,
+-                )
+-                .is_some();
++                && take_child_wait_event(&task, target, want_stopped, want_continued, false)
++                    .is_some();
+             let exit_ready = want_exited && peek_zombie_child(&task, target).is_some();
+             Ok(!event_ready && !exit_ready && has_matching_child(&task, target))
+         }) {
+@@ -1377,19 +1401,42 @@ pub fn sys_clone(
+     // address space so execve cannot replace the parent's shared MemorySet.
+     let share_vm = (clone_bits & CLONE_VM) != 0 && !is_vfork;
+     let is_thread = (clone_bits & CLONE_THREAD) != 0;
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let clone_started_us = crate::timer::get_time_us();
++    #[cfg(feature = "buildstorm-diagnostics")]
++    let mut fork_cow_shape = (0usize, 0usize);
+     let memory_set = if share_vm {
+         parent.memory_set.clone()
+     } else {
+         // fork_cow copies backing frames through physical mappings while the
+         // syscall remains on the kernel page table.  The parent address space
+         // is reactivated by the scheduler before its next user-mode entry.
+-        let child_memory = crate::buildstorm_memory_set_lock!(
++        let mut parent_memory = crate::buildstorm_memory_set_lock!(
+             crate::buildstorm_diagnostics::MemorySetLockSite::ForkCow,
+             &parent.memory_set,
+-        )
+-        .fork_cow()?;
++        );
++        #[cfg(feature = "buildstorm-diagnostics")]
++        {
++            fork_cow_shape = (
++                parent_memory.areas.len(),
++                parent_memory
++                    .areas
++                    .iter()
++                    .map(|area| area.resident().len())
++                    .sum(),
++            );
++        }
++        let child_memory = parent_memory.fork_cow()?;
+         new_shared_memory_set(child_memory)
+     };
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_clone(
++        is_vfork,
++        share_vm,
++        crate::timer::get_time_us().saturating_sub(clone_started_us),
++        fork_cow_shape.0,
++        fork_cow_shape.1,
++    );
+     let mm = if share_vm {
+         parent.mm.clone()
+     } else {
+@@ -1579,9 +1626,7 @@ pub fn sys_clone(
+         crate::task::manager::add_task(child);
+     }
+     if is_vfork {
+-        crate::task::commit_current_deferred_block(
+-            crate::task::wait_queue::BlockReason::ChildExit,
+-        );
++        crate::task::commit_current_deferred_block(crate::task::wait_queue::BlockReason::ChildExit);
+     }
+     if crate::trap::foreground_driver_active() && !is_vfork {
+         crate::task::request_foreground_requeue_front(parent.pid.0);
+@@ -1601,12 +1646,12 @@ pub fn sys_clone(
+ /// 为 init/test 进程构造最小的用户栈（argv=["init"], envp=[], auxv）。
+ /// 由 `TaskControlBlock::new_user` 调用。
+ pub fn setup_user_stack_for_init(
+-    memory_set: &crate::mm::memory_set::MemorySet,
++    memory_set: &mut crate::mm::memory_set::MemorySet,
+     stack_top: usize,
+     elf_entry: usize,
+     phdr_vaddr: usize,
+     phnum: usize,
+-) -> usize {
++) -> Result<usize, SysErrNo> {
+     let argv = alloc::vec![String::from("/init")];
+     let envp: Vec<String> = alloc::vec![
+         String::from("PATH=/:/bin:/usr/bin"),
+diff --git a/os/src/task/harness.rs b/os/src/task/harness.rs
+index b145ec2..ca6eb0b 100644
+--- a/os/src/task/harness.rs
++++ b/os/src/task/harness.rs
+@@ -1038,6 +1038,7 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
+     console_write("[smp-regression] pass phase=user-memory-lifecycle\n");
+ 
+     run_directory_abi_regression();
++    run_directory_metadata_abi_regression();
+ 
+     // The busybox probe is intentionally static/self-contained.  A separate
+     // diagnostic-only dynamic ELF probe exercises the glibc interpreter and
+@@ -1081,6 +1082,43 @@ fn run_directory_abi_regression() {
+     console_write("[smp-regression] pass phase=directory-abi\n");
+ }
+ 
++#[cfg(feature = "smp-regression")]
++fn run_directory_metadata_abi_regression() {
++    let spec = UserProgramSpec {
++        path: String::from("/bin/sh"),
++        argv: alloc::vec![
++            String::from("/bin/sh"),
++            String::from("-c"),
++            String::from(
++                "set -e; rm -rf /.wll_dir_metadata_abi; \
++                 mkdir -p -m 0710 /.wll_dir_metadata_abi/parent/child; \
++                 chmod 0750 /.wll_dir_metadata_abi/parent/child; \
++                 chown 0:0 /.wll_dir_metadata_abi/parent/child; \
++                 test \"$(stat -c '%a' /.wll_dir_metadata_abi/parent/child)\" = 750; \
++                 ln -s parent/child /.wll_dir_metadata_abi/link; \
++                 test \"$(readlink /.wll_dir_metadata_abi/link)\" = parent/child; \
++                 rm -rf /.wll_dir_metadata_abi",
++            ),
++        ],
++        envp: alloc::vec![
++            String::from("PATH=/usr/bin:/bin"),
++            String::from("LD_LIBRARY_PATH=/lib:/usr/lib"),
++        ],
++        cwd: String::from("/"),
++        root: String::from("/"),
++        marker_name: None,
++    };
++    let exit_code = run_user_program_spec_foreground_exit_code(&spec)
++        .expect("directory metadata ABI regression launch");
++    if exit_code != 0 {
++        panic!(
++            "[smp-regression] fail phase=directory-metadata-abi exit={}",
++            exit_code
++        );
++    }
++    console_write("[smp-regression] pass phase=directory-metadata-abi\n");
++}
++
+ #[cfg(all(feature = "buildstorm-diagnostics", feature = "smp-regression"))]
+ fn run_dynamic_user_memory_lifecycle_probe() {
+     crate::smp_regression::reset_user_memory_lifecycle_diagnostic();
+diff --git a/os/src/task/task.rs b/os/src/task/task.rs
+index 4cf2a4a..e5252f9 100644
+--- a/os/src/task/task.rs
++++ b/os/src/task/task.rs
+@@ -60,12 +60,12 @@ impl TaskControlBlock {
+ 
+         // 在用户栈上构造最小的 argc/argv/auxv
+         let sp = crate::syscall::process::setup_user_stack_for_init(
+-            &memory_set,
++            &mut memory_set,
+             user_stack_top,
+             entry,
+             phdr_vaddr,
+             phnum,
+-        );
++        )?;
+ 
+         let mut trap_frame = TrapFrame::new();
+         init_user_trapframe(&mut trap_frame);
+@@ -238,13 +238,14 @@ impl TaskControlBlock {
+ 
+                 let user_stack_top = crate::config::USER_STACK_TOP;
+                 let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
+-                memory_set.insert_framed_area(
++                memory_set.insert_lazy_area_with_backing(
+                     polyhal::VirtAddr::new(user_stack_bottom),
+                     polyhal::VirtAddr::new(user_stack_top),
+                     crate::mm::page_table::PTEFlags::U
+                         | crate::mm::page_table::PTEFlags::R
+                         | crate::mm::page_table::PTEFlags::W
+                         | crate::mm::page_table::PTEFlags::V,
++                    crate::mm::map_area::MapAreaBacking::Anonymous,
+                 )?;
+ 
+                 (
+@@ -289,7 +290,7 @@ impl TaskControlBlock {
+ 
+         // 2. Setup user stack with spec's argv/envp
+         let sp = crate::syscall::process::setup_user_stack(
+-            &memory_set,
++            &mut memory_set,
+             user_stack_top,
+             &launch_argv,
+             &spec.envp,
+@@ -297,7 +298,7 @@ impl TaskControlBlock {
+             phdr_vaddr,
+             phnum,
+             interp_base,
+-        );
++        )?;
+         crate::syscall::signal::install_signal_trampoline(&mut memory_set)?;
+ 
+         let mut trap_frame = TrapFrame::new();
+diff --git a/os/src/trap/mod.rs b/os/src/trap/mod.rs
+index 1e0540d..4ff8367 100644
+--- a/os/src/trap/mod.rs
++++ b/os/src/trap/mod.rs
+@@ -108,21 +108,8 @@ fn note_terminal_user_trap(
+         })
+         .unwrap_or((0, 0, 0, 0, 0, 0));
+     crate::buildstorm_diagnostics::note_first_terminal_user_trap(
+-        kind,
+-        task.pid.0,
+-        vaddr,
+-        sepc,
+-        sp,
+-        ra,
+-        tp,
+-        fault_pa,
+-        sepc_pa,
+-        vma_start,
+-        vma_end,
+-        vma_flags,
+-        backing,
+-        resident,
+-        page_state,
++        kind, task.pid.0, vaddr, sepc, sp, ra, tp, fault_pa, sepc_pa, vma_start, vma_end,
++        vma_flags, backing, resident, page_state,
+     );
+ }
+ 
+@@ -382,11 +369,7 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
+                     _ => unreachable!(),
+                 };
+                 #[cfg(feature = "smp-regression")]
+-                crate::smp_regression::note_user_memory_lifecycle_terminal_trap(
+-                    1,
+-                    vaddr,
+-                    sepc,
+-                );
++                crate::smp_regression::note_user_memory_lifecycle_terminal_trap(1, vaddr, sepc);
+                 #[cfg(feature = "buildstorm-diagnostics")]
+                 note_terminal_user_trap(terminal_kind, Some(&task), vaddr, ctx);
+                 let sp = ctx[TrapFrameArgs::SP];
+@@ -488,9 +471,11 @@ fn handle_syscall(ctx: &mut TrapFrame) {
+     // 调用系统调用分发函数
+     let syscall_task = crate::task::current_task();
+     #[cfg(feature = "buildstorm-diagnostics")]
+-    crate::buildstorm_diagnostics::note_syscall_enter(syscall_id);
++    let syscall_scope = crate::buildstorm_diagnostics::note_syscall_enter(syscall_id);
+     let result = syscall(syscall_id, args);
+     #[cfg(feature = "buildstorm-diagnostics")]
++    drop(syscall_scope);
++    #[cfg(feature = "buildstorm-diagnostics")]
+     crate::buildstorm_diagnostics::note_syscall_exit(syscall_id);
+ 
+     *CURRENT_SYSCALL_CTX_PTR.lock() = 0;
+diff --git a/patch/polyhal/src/pagetable/mod.rs b/patch/polyhal/src/pagetable/mod.rs
+index c2c98bc..c99887f 100644
+--- a/patch/polyhal/src/pagetable/mod.rs
++++ b/patch/polyhal/src/pagetable/mod.rs
+@@ -58,9 +58,53 @@ impl PageTable {
+     }
+     /// Get the page table list through the physical address
+     #[inline]
+-    pub(crate) fn get_pte_list(paddr: PhysAddr) -> &'static mut [PTE] {
+-        paddr.slice_mut_with_len::<PTE>(Self::PTE_NUM_IN_PAGE)
+-    }
++    pub(crate) fn get_pte_list(paddr: PhysAddr) -> &'static mut [PTE] {
++        paddr.slice_mut_with_len::<PTE>(Self::PTE_NUM_IN_PAGE)
++    }
++
++    fn leaf_table_for_mapping(&self, vaddr: VirtAddr) -> PhysAddr {
++        let mut table = self.0;
++        if Self::PAGE_LEVEL == 4 {
++            let pte = &mut Self::get_pte_list(table)[vaddr.pn_index(3)];
++            if !pte.is_valid() {
++                *pte = PTE::new_table(frame_alloc());
++            }
++            table = pte.address();
++        }
++        for level in (1..=2).rev() {
++            let pte = &mut Self::get_pte_list(table)[vaddr.pn_index(level)];
++            if !pte.is_valid() {
++                *pte = PTE::new_table(frame_alloc());
++            }
++            table = pte.address();
++        }
++        table
++    }
++
++    /// Publish 4 KiB leaves without issuing a TLB invalidation.
++    ///
++    /// Adjacent virtual pages reuse their leaf-table walk. The caller must
++    /// publish the writes with the architecture's ordering and TLB protocol
++    /// before an active address space can observe them.
++    pub fn map_pages_without_flush<I>(&self, pages: I) -> usize
++    where
++        I: IntoIterator<Item = (VirtAddr, PhysAddr, MappingFlags)>,
++    {
++        let mut leaf_tag = usize::MAX;
++        let mut leaf_table = PhysAddr::new(0);
++        let mut mapped = 0usize;
++        for (vaddr, paddr, flags) in pages {
++            let current_tag = vaddr.raw() >> 21;
++            if current_tag != leaf_tag {
++                leaf_table = self.leaf_table_for_mapping(vaddr);
++                leaf_tag = current_tag;
++            }
++            Self::get_pte_list(leaf_table)[vaddr.pn_index(0)] =
++                PTE::new_page(paddr, flags.into());
++            mapped += 1;
++        }
++        mapped
++    }
+ 
+     /// Mapping a page to specific virtual page (user space address).
+     ///
+@@ -76,32 +120,7 @@ impl PageTable {
+         flags: MappingFlags,
+         _size: MappingSize,
+     ) {
+-        let mut pte_list = Self::get_pte_list(self.0);
+-        if Self::PAGE_LEVEL == 4 {
+-            let pte = &mut pte_list[vaddr.pn_index(3)];
+-            if !pte.is_valid() {
+-                *pte = PTE::new_table(frame_alloc());
+-            }
+-            pte_list = Self::get_pte_list(pte.address());
+-        }
+-        // level 3
+-        {
+-            let pte = &mut pte_list[vaddr.pn_index(2)];
+-            if !pte.is_valid() {
+-                *pte = PTE::new_table(frame_alloc());
+-            }
+-            pte_list = Self::get_pte_list(pte.address());
+-        }
+-        // level 2
+-        {
+-            let pte = &mut pte_list[vaddr.pn_index(1)];
+-            if !pte.is_valid() {
+-                *pte = PTE::new_table(frame_alloc());
+-            }
+-            pte_list = Self::get_pte_list(pte.address());
+-        }
+-        // level 1, map page
+-        pte_list[vaddr.pn_index(0)] = PTE::new_page(paddr, flags.into());
++        self.map_pages_without_flush(core::iter::once((vaddr, paddr, flags)));
+         TLB::flush_vaddr(vaddr);
+     }
+ 
+diff --git a/scripts/run_buildstorm_window.py b/scripts/run_buildstorm_window.py
+index b11e0ee..787a4ec 100644
+--- a/scripts/run_buildstorm_window.py
++++ b/scripts/run_buildstorm_window.py
+@@ -216,6 +216,8 @@ def parse_guest_aggregate_block(
+         "cpus": {},
+         "user_runs": {},
+         "user_active": {},
++        "syscalls": {},
++        "user_traps": {},
+         "work": {},
+         "phases": {},
+         "fault_sources": {},
+@@ -261,6 +263,14 @@ def parse_guest_aggregate_block(
+             cpu = fields.get("cpu")
+             if isinstance(cpu, int):
+                 result["user_active"][str(cpu)] = fields
++        elif body.startswith("syscall="):
++            syscall_id = fields.get("syscall")
++            if isinstance(syscall_id, int):
++                result["syscalls"][str(syscall_id)] = fields
++        elif body.startswith("user_trap="):
++            name = fields.get("user_trap")
++            if isinstance(name, str):
++                result["user_traps"][name] = fields
+         elif body.startswith("mm "):
+             result["mm"] = fields
+         elif body.startswith("frame_ownership "):

@@ -1,0 +1,11 @@
+[smp-regression] pass phase=interval-timer-state-machine
+[smp-regression] pass phase=large-kernel-allocation bytes=335544320 checksum=10444800
+[smp-regression] pass phase=resident-memory-lifecycle
+[smp-regression] pass phase=high-arena-memory-lifecycle
+[smp-regression] pass phase=namespace-lifecycle iterations=64 readers=7
+[smp-regression] pass phase=regular-file-lifecycle bytes=8401153 writeback_chunk=262144
+[smp-regression] pass phase=user-memory-lifecycle
+[smp-regression] pass phase=directory-abi
+[smp-regression] pass phase=directory-metadata-abi
+[smp-regression] pass cpus=8 mask=0xff dispatch=0xff tlb_targets=0xfe asid_pair=1/2 reused_asid=1 asid_check=translation isolation_iters=64 heap_stress_mib=160 large_heap_mib=320 checksum=10444890
+[riscv64] passed=True log=/srv/buildstorm/worktrees/stage16-syscall-trap-attribution-20260816/_tmp/smp-regression-riscv64.log

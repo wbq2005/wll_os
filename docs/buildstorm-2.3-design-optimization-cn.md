@@ -646,3 +646,62 @@ production/diagnostics cfg 和双架构 SMP8（含新增
 `directory-abi`）通过，属于 `capability-pass`。新提交在评测机隐藏门上的状态仍为
 `unverified`。完整哈希、原始日志路径、被证伪候选和 AI 披露见
 `docs/evidence/buildstorm-stage2/20260816-evaluator-la-mkdir-clean-cache-validation-cn/README.md`。
+
+## 15. 2026-08-16 LA 隐藏 UEFI 阶段的目录 FD ABI 修复
+
+### 15.1 首个失败边界与根因
+
+评测提交 `2953af6a725c015f89e64db9eab8f60ee27f6fe1` 的 LoongArch64 日志并未
+卡在编译器。Cargo 在 2439.63 秒完成 release artifact，随后评测脚本进入不计时的
+UEFI 启动准备，最早错误为：
+
+```text
+mkdir: cannot create directory '/work/buildstorm.esp': Function not implemented
+```
+
+后续 `cp` 的 `No such file or directory` 和 `Not a directory` 都是父目录未创建的
+派生错误。GNU coreutils 的递归目录创建会保存目录 FD、切换工作目录，再以
+asm-generic syscall 50 `fchdir` 恢复；旧分发表没有 syscall 50，因而返回
+`ENOSYS`。这解释了为什么 toolchain、minibuild 和完整 Rust 编译都成功，LA 却没有
+最终 `BUILDSTORM_RESULT`，只能得到环境 20 分。
+
+### 15.2 通用设计与不变量
+
+共享 syscall 层新增 `fchdir(50)` 与 `fchmodat2(452)`。`fchdir` 只接受现有
+`MemDir`、`Ext4Dir` 或目录型 `O_PATH` descriptor，通过同一 `resolve_base_dir`
+取得 logical path，叠加进程 root 后验证目录仍存在，再同步 task 的共享 fs cwd 与
+兼容 cwd 字段。无效 FD 返回 `EBADF`，非目录 FD 返回 `ENOTDIR`，不存在的目标不
+制造目录或伪造成功。
+
+`fchmodat2` 复用已有 `set_mode_fd`/`set_mode_path`，支持 Linux
+`AT_EMPTY_PATH` 与 `AT_SYMLINK_NOFOLLOW` 边界，并拒绝未知 flags。实现不拥有 inode、
+open-file description 或目录生命周期，不改变 ext4 transaction、namespace cache
+失效、VmaMap、ResidentSet、PageTableOps 或 TlbProtocol。两种架构共用同一 ABI；
+LoongArch 平台层没有评测专用分支。
+
+### 15.3 验证矩阵与证据等级
+
+| 验证 | 配置 | 结果 | 等级 |
+| --- | --- | --- | --- |
+| release cfg | RV/LA production + diagnostics | 四项通过 | `capability-pass` |
+| 独立目录元数据 ABI | RV SMP8 | `directory-metadata-abi` 与最终 `pass cpus=8` | `capability-pass` |
+| 独立目录元数据 ABI | LA SMP8 | `directory-metadata-abi` 与最终 `pass cpus=8` | `capability-pass` |
+| public BuildStorm | LA production 8G/8 | `ok=true elapsed_s=553.62`，judge 180/180 | `official-pass` |
+| 评测机隐藏 UEFI 门 | 提交修复后 | 等待新评测 | `unverified` |
+
+public 运行使用未修改的官方镜像、原始脚本、`-snapshot -m 8G -smp 8` 和
+production kernel。它证明完整公共编译没有回归，但 553.62 秒与评测机 2439.63 秒
+宿主条件不同，不能直接换算新时间分；本轮修复的性能收益记为 `not measured`。
+评测机隐藏 UEFI 步骤不在 public script 内，因此不能把 public 结果提升为隐藏门
+已经通过的声明。
+
+原始日志、source/image/kernel hash、runner 参数、judge 输出和复现命令保存在：
+
+- `docs/evidence/buildstorm-stage2/20260816-la-fchdir-capability-gates/`
+- `docs/evidence/buildstorm-stage2/20260816-la-fchdir-official-public-complete/`
+
+AI 用于评测日志与源码/dirty diff 的交叉核对、ABI 因果模型、实现和串行 QEMU
+验证编排；开发者可复核 syscall 分发、目录 FD 类型约束、独立 coreutils 回归、四种
+cfg 日志、双架构 SMP 串口和完整 public serial。未修改官方镜像、suite、guest
+script、judge、marker、guest 时间或 `/proc/uptime`，production 行为不检查 crate、
+测试名、路径、命令或输出。

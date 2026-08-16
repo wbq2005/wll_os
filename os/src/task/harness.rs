@@ -1038,6 +1038,7 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
     console_write("[smp-regression] pass phase=user-memory-lifecycle\n");
 
     run_directory_abi_regression();
+    run_directory_metadata_abi_regression();
 
     // The busybox probe is intentionally static/self-contained.  A separate
     // diagnostic-only dynamic ELF probe exercises the glibc interpreter and
@@ -1079,6 +1080,43 @@ fn run_directory_abi_regression() {
         );
     }
     console_write("[smp-regression] pass phase=directory-abi\n");
+}
+
+#[cfg(feature = "smp-regression")]
+fn run_directory_metadata_abi_regression() {
+    let spec = UserProgramSpec {
+        path: String::from("/bin/sh"),
+        argv: alloc::vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            String::from(
+                "set -e; rm -rf /.wll_dir_metadata_abi; \
+                 mkdir -p -m 0710 /.wll_dir_metadata_abi/parent/child; \
+                 chmod 0750 /.wll_dir_metadata_abi/parent/child; \
+                 chown 0:0 /.wll_dir_metadata_abi/parent/child; \
+                 test \"$(stat -c '%a' /.wll_dir_metadata_abi/parent/child)\" = 750; \
+                 ln -s parent/child /.wll_dir_metadata_abi/link; \
+                 test \"$(readlink /.wll_dir_metadata_abi/link)\" = parent/child; \
+                 rm -rf /.wll_dir_metadata_abi",
+            ),
+        ],
+        envp: alloc::vec![
+            String::from("PATH=/usr/bin:/bin"),
+            String::from("LD_LIBRARY_PATH=/lib:/usr/lib"),
+        ],
+        cwd: String::from("/"),
+        root: String::from("/"),
+        marker_name: None,
+    };
+    let exit_code = run_user_program_spec_foreground_exit_code(&spec)
+        .expect("directory metadata ABI regression launch");
+    if exit_code != 0 {
+        panic!(
+            "[smp-regression] fail phase=directory-metadata-abi exit={}",
+            exit_code
+        );
+    }
+    console_write("[smp-regression] pass phase=directory-metadata-abi\n");
 }
 
 #[cfg(all(feature = "buildstorm-diagnostics", feature = "smp-regression"))]

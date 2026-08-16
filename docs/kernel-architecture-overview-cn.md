@@ -422,3 +422,17 @@ second-chance 和 BTree range invalidation 均做过独立完整 A/B，但没有
 `642.70s`，两者 judge 均解析为 180/180；由于资源不等于公开规则的 8G/8，证据
 等级为 `capability-pass`。性能收益未稳定越过噪声。详细证据见
 `docs/evidence/buildstorm-stage2/20260816-evaluator-la-mkdir-clean-cache-validation-cn/README.md`。
+
+### 16.4 目录 FD 与 cwd 的共享 ABI 边界
+
+`fchdir(50)` 复用 syscall 层的目录 descriptor 解析，只接受 `MemDir`、`Ext4Dir`
+与目录型 `Path`，取得 logical path 后再按进程 root 验证节点并更新共享 cwd。
+`fchmodat2(452)` 复用 VFS 的 FD/path metadata 修改入口。两者不把 inode、目录项或
+open-file description 所有权搬进 syscall 层，也不绕过 namespace transaction 与
+cache invalidation。
+
+该能力由 RISC-V64 与 LoongArch64 共用，不属于 LA UEFI 平台代码。评测日志中的
+LA clean build 已完成，失败来自随后 coreutils 目录恢复操作缺少 syscall 50；通用
+修复后的 LA public 8G/8 完整流程为 `official-pass`，而评测机独有 UEFI 后处理仍为
+`unverified`。证据见
+`docs/evidence/buildstorm-stage2/20260816-la-fchdir-official-public-complete/`。
