@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use core::mem;
+use core::sync::atomic::{fence, Ordering};
 use polyhal::pagetable::{MappingFlags, MappingSize, PageTable, PageTableWrapper, TLB};
 use polyhal::{PhysAddr, VirtAddr};
 
@@ -64,8 +65,25 @@ fn is_readonly_share_candidate(area: &MapArea) -> bool {
 fn is_shared_mapping(area: &MapArea) -> bool {
     matches!(
         area.backing,
-        MapAreaBacking::SharedMemory { .. } | MapAreaBacking::File { shared: true, .. }
+        MapAreaBacking::AnonymousShared
+            | MapAreaBacking::SharedMemory { .. }
+            | MapAreaBacking::File { shared: true, .. }
     )
+}
+
+fn commit_page_table_batch(page_table: &PageTableWrapper, writes: usize) {
+    if writes == 0 {
+        return;
+    }
+    fence(Ordering::SeqCst);
+    let local_flush = PageTable::current().root() == page_table.root();
+    if local_flush {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_local_tlb_flush();
+        TLB::flush_all();
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_page_table_batch(writes, local_flush);
 }
 
 fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
@@ -73,12 +91,17 @@ fn map_area_pages(page_table: &PageTableWrapper, area: &MapArea) {
         return;
     }
 
-    for (idx, page) in area.resident().iter_range(0, area.page_count()) {
-        let mf = effective_mapping_flags_for_page(area.flags, page);
-        let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
-        let paddr = PhysAddr::new(page.ppn().addr());
-        page_table.map_page(vaddr, paddr, mf, MappingSize::Page4KB);
-    }
+    let writes =
+        page_table.map_pages_without_flush(area.resident().iter_range(0, area.page_count()).map(
+            |(idx, page)| {
+                (
+                    VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE),
+                    PhysAddr::new(page.ppn().addr()),
+                    effective_mapping_flags_for_page(area.flags, page),
+                )
+            },
+        ));
+    commit_page_table_batch(page_table, writes);
 }
 
 fn map_area_page(page_table: &PageTableWrapper, area: &MapArea, vpn: usize) {
@@ -105,12 +128,17 @@ fn map_area_page_window(
     }
 
     let end_idx = start_idx.saturating_add(page_count).min(area.page_count());
-    for (idx, page) in area.resident().iter_range(start_idx, end_idx) {
-        let mf = effective_mapping_flags_for_page(area.flags, page);
-        let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
-        let paddr = PhysAddr::new(page.ppn().addr());
-        page_table.map_page(vaddr, paddr, mf, MappingSize::Page4KB);
-    }
+    let writes =
+        page_table.map_pages_without_flush(area.resident().iter_range(start_idx, end_idx).map(
+            |(idx, page)| {
+                (
+                    VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE),
+                    PhysAddr::new(page.ppn().addr()),
+                    effective_mapping_flags_for_page(area.flags, page),
+                )
+            },
+        ));
+    commit_page_table_batch(page_table, writes);
 }
 
 fn unmap_area_pages_without_shootdown(
@@ -126,6 +154,36 @@ fn unmap_area_pages_without_shootdown(
         let vaddr = VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE);
         page_table.unmap_page(vaddr);
     }
+}
+
+fn unmap_area_resident_range_without_flush(
+    page_table: &PageTableWrapper,
+    area: &MapArea,
+    start_idx: usize,
+    end_idx: usize,
+) -> usize {
+    if !has_leaf_permission(area.flags) || start_idx >= end_idx {
+        return 0;
+    }
+    page_table.unmap_pages_without_flush(
+        area.resident()
+            .iter_range(start_idx, end_idx)
+            .map(|(idx, _)| VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE)),
+    )
+}
+
+fn commit_page_table_retirement(page_table: &PageTableWrapper, writes: usize) {
+    if writes == 0 {
+        return;
+    }
+    fence(Ordering::SeqCst);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        crate::buildstorm_diagnostics::note_local_tlb_flush();
+        crate::buildstorm_diagnostics::note_page_table_batch(writes, true);
+    }
+    TLB::flush_all();
+    crate::platform::tlb_shootdown(page_table.root().raw());
 }
 
 fn unmap_area_pages(page_table: &PageTableWrapper, area: &MapArea, flags: PTEFlags) {
@@ -151,6 +209,10 @@ fn copy_area_frames(area: &mut MapArea) -> Result<Vec<FrameTracker>, SysErrNo> {
         let Some(frame) = frame_allocator::alloc_frame() else {
             return Err(SysErrNo::ENOMEM);
         };
+        #[cfg(feature = "buildstorm-diagnostics")]
+        frame_allocator::diagnostic_note_allocation(
+            frame_allocator::FrameAllocationClass::PrivateCopy,
+        );
         unsafe {
             core::ptr::copy_nonoverlapping(
                 src_page.ppn().addr() as *const u8,
@@ -170,7 +232,9 @@ fn read_backing_page(backing: &MapAreaBacking, page_offset: usize) -> Result<Vec
             let mut file = file.clone();
             let _ = file.read_at(page_offset.saturating_add(*offset), &mut data)?;
         }
-        MapAreaBacking::Anonymous | MapAreaBacking::SharedMemory { .. } => {}
+        MapAreaBacking::Anonymous
+        | MapAreaBacking::AnonymousShared
+        | MapAreaBacking::SharedMemory { .. } => {}
     }
     Ok(data)
 }
@@ -275,6 +339,10 @@ impl MemorySet {
                 }
                 return Err(SysErrNo::ENOMEM);
             };
+            #[cfg(feature = "buildstorm-diagnostics")]
+            frame_allocator::diagnostic_note_allocation(
+                frame_allocator::FrameAllocationClass::EagerMapping,
+            );
             let ppn = frame.ppn();
             let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
             let paddr = PhysAddr::new(ppn.addr());
@@ -284,6 +352,9 @@ impl MemorySet {
                     .map_page(vaddr, paddr, mf, MappingSize::Page4KB);
             }
             area.append_resident(frame).map_err(|_| SysErrNo::EFAULT)?;
+        }
+        if is_shared_mapping(&area) {
+            area.set_all_resident_state(PageState::Shared);
         }
 
         self.areas.push(area);
@@ -339,6 +410,10 @@ impl MemorySet {
         let mut frames: Vec<FrameTracker> = Vec::new();
         for vpn in start_vpn..end_vpn {
             if let Some(frame) = frame_allocator::alloc_frame() {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                frame_allocator::diagnostic_note_allocation(
+                    frame_allocator::FrameAllocationClass::EagerMapping,
+                );
                 let ppn = frame.ppn();
                 let vaddr = VirtAddr::new(vpn * PAGE_SIZE);
                 let paddr = PhysAddr::new(ppn.addr());
@@ -561,6 +636,52 @@ impl MemorySet {
         }
     }
 
+    /// Discard resident pages from private anonymous VMAs without changing
+    /// their topology. Revoked frames stay owned until the local and remote
+    /// TLB retirement barrier has completed.
+    pub fn discard_anonymous_range(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+    ) -> Result<usize, SysErrNo> {
+        let start = start_va.raw();
+        let end = end_va.raw();
+        if start >= end || start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
+            return Err(SysErrNo::EINVAL);
+        }
+        if !self.range_covered(start, end) {
+            return Err(SysErrNo::ENOMEM);
+        }
+
+        let mut retired = Vec::new();
+        let mut revoked = 0usize;
+        let mut discarded = 0usize;
+        for area in &mut self.areas {
+            if !area.overlaps(start, end) || !matches!(area.backing, MapAreaBacking::Anonymous) {
+                continue;
+            }
+            let overlap_start = start.max(area.start_va.raw());
+            let overlap_end = end.min(area.end_va.raw());
+            let start_idx = (overlap_start - area.start_va.raw()) / PAGE_SIZE;
+            let end_idx = (overlap_end - area.start_va.raw()) / PAGE_SIZE;
+            revoked = revoked.saturating_add(unmap_area_resident_range_without_flush(
+                &self.page_table,
+                area,
+                start_idx,
+                end_idx,
+            ));
+            let owner = area.extract_resident_range(start_idx, end_idx);
+            discarded = discarded.saturating_add(owner.len());
+            if !owner.is_empty() {
+                retired.push(owner);
+            }
+        }
+
+        commit_page_table_retirement(&self.page_table, revoked);
+        drop(retired);
+        Ok(discarded)
+    }
+
     pub fn unmap_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> Result<(), SysErrNo> {
         let start = start_va.raw();
         let end = end_va.raw();
@@ -697,6 +818,10 @@ impl MemorySet {
                 let Some(frame) = frame_allocator::alloc_frame() else {
                     return Err(SysErrNo::ENOMEM);
                 };
+                #[cfg(feature = "buildstorm-diagnostics")]
+                frame_allocator::diagnostic_note_allocation(
+                    frame_allocator::FrameAllocationClass::PrivateCopy,
+                );
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         source_page.ppn().addr() as *const u8,
@@ -710,6 +835,10 @@ impl MemorySet {
             let Some(frame) = frame_allocator::alloc_frame() else {
                 return Err(SysErrNo::ENOMEM);
             };
+            #[cfg(feature = "buildstorm-diagnostics")]
+            frame_allocator::diagnostic_note_allocation(
+                frame_allocator::FrameAllocationClass::BackingFallback,
+            );
             let backing_offset = page_start.saturating_sub(self.areas[source_index].start_va.raw());
             let data = read_backing_page(&backing, backing_offset)?;
             unsafe {
@@ -1009,17 +1138,51 @@ impl MemorySet {
                 crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousAllocate,
             );
             let pages_to_end = (area.end_va.raw() - page_start) / PAGE_SIZE;
-            let max_window_pages = pages_to_end.min(ANONYMOUS_FAULT_WINDOW_PAGES);
-            let mut window_pages = 0usize;
-            while window_pages < max_window_pages
-                && area.resident().lookup(page_idx + window_pages).is_none()
+            let max_forward_pages = pages_to_end.min(ANONYMOUS_FAULT_WINDOW_PAGES);
+            let mut forward_pages = 0usize;
+            while forward_pages < max_forward_pages
+                && area.resident().lookup(page_idx + forward_pages).is_none()
             {
-                window_pages += 1;
+                forward_pages += 1;
+            }
+            let inspect_backward = forward_pages < ANONYMOUS_FAULT_WINDOW_PAGES
+                || cfg!(feature = "buildstorm-diagnostics");
+            let mut backward_pages = 1usize;
+            if inspect_backward {
+                let max_backward_pages = (page_idx + 1).min(ANONYMOUS_FAULT_WINDOW_PAGES);
+                while backward_pages < max_backward_pages
+                    && area.resident().lookup(page_idx - backward_pages).is_none()
+                {
+                    backward_pages += 1;
+                }
+            }
+            let (window_start_idx, window_pages) = if backward_pages > forward_pages {
+                (page_idx + 1 - backward_pages, backward_pages)
+            } else {
+                (page_idx, forward_pages)
+            };
+            #[cfg(feature = "buildstorm-diagnostics")]
+            if crate::buildstorm_diagnostics::sample_anonymous_fault_shape() {
+                let left_resident = page_idx != 0 && area.resident().lookup(page_idx - 1).is_some();
+                let right_resident = page_idx + 1 < area.page_count()
+                    && area.resident().lookup(page_idx + 1).is_some();
+                crate::buildstorm_diagnostics::note_anonymous_fault_shape(
+                    left_resident,
+                    right_resident,
+                    forward_pages,
+                    backward_pages,
+                );
             }
             let mut frames = Vec::new();
             for page in 0..window_pages {
                 match frame_allocator::alloc_frame() {
-                    Some(frame) => frames.push(frame),
+                    Some(frame) => {
+                        #[cfg(feature = "buildstorm-diagnostics")]
+                        frame_allocator::diagnostic_note_allocation(
+                            frame_allocator::FrameAllocationClass::Anonymous,
+                        );
+                        frames.push(frame);
+                    }
                     None if page == 0 => return Err(SysErrNo::ENOMEM),
                     None => break,
                 }
@@ -1048,13 +1211,18 @@ impl MemorySet {
                 .area_index_containing(page_start)
                 .ok_or(SysErrNo::EFAULT)?;
             self.areas[idx]
-                .insert_resident_run(page_idx, frames, PageState::Private)
+                .insert_resident_run(window_start_idx, frames, PageState::Private)
                 .map_err(|_| SysErrNo::EFAULT)?;
             #[cfg(feature = "buildstorm-diagnostics")]
             let anonymous_map = crate::buildstorm_diagnostics::WorkScope::new(
                 crate::buildstorm_diagnostics::WorkClass::PageFaultAnonymousMap,
             );
-            map_area_page_window(&self.page_table, &self.areas[idx], page_idx, _mapped_pages);
+            map_area_page_window(
+                &self.page_table,
+                &self.areas[idx],
+                window_start_idx,
+                _mapped_pages,
+            );
             #[cfg(feature = "buildstorm-diagnostics")]
             drop(anonymous_map);
             #[cfg(feature = "buildstorm-diagnostics")]
@@ -1154,6 +1322,10 @@ impl MemorySet {
             );
             return Err(SysErrNo::ENOMEM);
         };
+        #[cfg(feature = "buildstorm-diagnostics")]
+        frame_allocator::diagnostic_note_allocation(
+            frame_allocator::FrameAllocationClass::BackingFallback,
+        );
         let backing_offset = page_start.saturating_sub(self.areas[idx].start_va.raw());
         let data = match read_backing_page(&self.areas[idx].backing, backing_offset) {
             Ok(data) => data,
@@ -1171,9 +1343,9 @@ impl MemorySet {
             core::ptr::copy_nonoverlapping(data.as_ptr(), frame.ppn().addr() as *mut u8, PAGE_SIZE);
         }
         let state = match self.areas[idx].backing {
-            MapAreaBacking::File { shared: true, .. } | MapAreaBacking::SharedMemory { .. } => {
-                PageState::Shared
-            }
+            MapAreaBacking::AnonymousShared
+            | MapAreaBacking::File { shared: true, .. }
+            | MapAreaBacking::SharedMemory { .. } => PageState::Shared,
             MapAreaBacking::File { shared: false, .. } => PageState::FileClean,
             MapAreaBacking::Anonymous => PageState::Private,
         };
@@ -1386,6 +1558,10 @@ impl MemorySet {
                 let Some(frame) = frame_allocator::alloc_frame() else {
                     return Err(SysErrNo::ENOMEM);
                 };
+                #[cfg(feature = "buildstorm-diagnostics")]
+                frame_allocator::diagnostic_note_allocation(
+                    frame_allocator::FrameAllocationClass::PrivateCopy,
+                );
                 let new_paddr = PhysAddr::new(frame.ppn().addr());
                 let src_paddr = PhysAddr::new(src_frame.ppn().addr());
                 unsafe {
@@ -1431,7 +1607,10 @@ impl Clone for MemorySet {
             let mut new_area =
                 MapArea::with_backing(area.start_va, area.end_va, new_flags, area.backing.clone());
 
-            if matches!(area.backing, MapAreaBacking::SharedMemory { .. }) {
+            if matches!(
+                area.backing,
+                MapAreaBacking::AnonymousShared | MapAreaBacking::SharedMemory { .. }
+            ) {
                 new_area.set_all_resident_state(PageState::Shared);
                 new_area.clone_resident_from(area);
                 map_area_pages(&new_ms.page_table, &new_area);
@@ -1441,6 +1620,10 @@ impl Clone for MemorySet {
 
             for (idx, src_frame) in area.resident().iter_range(0, area.page_count()) {
                 if let Some(frame) = frame_allocator::alloc_frame() {
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    frame_allocator::diagnostic_note_allocation(
+                        frame_allocator::FrameAllocationClass::PrivateCopy,
+                    );
                     let new_paddr = PhysAddr::new(frame.ppn().addr());
                     let src_paddr = PhysAddr::new(src_frame.ppn().addr());
                     unsafe {

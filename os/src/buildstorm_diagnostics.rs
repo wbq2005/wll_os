@@ -13,6 +13,21 @@ use crate::task::wait_queue::{BlockReason, WaitOutcome};
 
 const REPORT_INTERVAL_US: usize = 10 * 1_000_000;
 const CPU_SLOTS: usize = crate::config::MAX_CPUS;
+const SYSCALL_SLOTS: usize = 512;
+const SYSCALL_SAMPLE_SHIFT: usize = 6;
+const SYSCALL_SAMPLE_MASK: usize = (1 << SYSCALL_SAMPLE_SHIFT) - 1;
+const USER_TRAP_SLOTS: usize = 9;
+const USER_TRAP_NAMES: [&str; USER_TRAP_SLOTS] = [
+    "unused",
+    "syscall",
+    "timer",
+    "ipi",
+    "store_page_fault",
+    "load_page_fault",
+    "instruction_page_fault",
+    "privilege_page_fault",
+    "other",
+];
 const MMAP_PROTOCOL_SLOTS: usize = 16;
 const EXITED_MMAP_PROTOCOL_SLOTS: usize = 128;
 
@@ -219,9 +234,12 @@ pub(crate) enum WorkClass {
     ExtentLookup,
     AddressSpaceActivation,
     TlbShootdown,
+    CleanCacheMetadata,
+    CleanCachePrefetch,
+    CleanCacheGetRun,
 }
 
-const WORK_NAMES: [&str; 21] = [
+const WORK_NAMES: [&str; 24] = [
     "openat",
     "statx",
     "readlink",
@@ -243,6 +261,9 @@ const WORK_NAMES: [&str; 21] = [
     "extent_lookup",
     "address_space_activation",
     "tlb_shootdown",
+    "clean_cache_metadata",
+    "clean_cache_prefetch",
+    "clean_cache_get_run",
 ];
 const WORK_SLOTS: usize = WORK_NAMES.len();
 
@@ -436,6 +457,7 @@ pub(crate) enum MemorySetLockSite {
     MmapSelect,
     MmapCommit,
     Mprotect,
+    Madvise,
     Munmap,
     FileInvalidate,
     FileWriteback,
@@ -445,7 +467,7 @@ pub(crate) enum MemorySetLockSite {
     Futex,
 }
 
-const MEMORY_SET_LOCK_SITE_NAMES: [&str; 16] = [
+const MEMORY_SET_LOCK_SITE_NAMES: [&str; 17] = [
     "other",
     "user_entry_activation",
     "hardware_page_fault",
@@ -455,6 +477,7 @@ const MEMORY_SET_LOCK_SITE_NAMES: [&str; 16] = [
     "mmap_select",
     "mmap_commit",
     "mprotect",
+    "madvise",
     "munmap",
     "file_invalidate",
     "file_writeback",
@@ -486,6 +509,9 @@ static MMAP_FAILED_GAP_MAX: AtomicUsize = AtomicUsize::new(0);
 static MMAP_FAILED_VMAS_MAX: AtomicUsize = AtomicUsize::new(0);
 static MMAP_HIGH_ARENA_PLACEMENTS: AtomicUsize = AtomicUsize::new(0);
 static MMAP_LOW_ARENA_PLACEMENTS: AtomicUsize = AtomicUsize::new(0);
+static MADVISE_DONTNEED_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MADVISE_DONTNEED_REQUESTED_PAGES: AtomicUsize = AtomicUsize::new(0);
+static MADVISE_DONTNEED_DISCARDED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static MUNMAP_BELOW_CURSOR_LENGTH_COUNTS: [AtomicUsize; MMAP_LENGTH_BUCKETS] =
     [const { AtomicUsize::new(0) }; MMAP_LENGTH_BUCKETS];
 static MUNMAP_OVERLAPS_CURSOR: AtomicUsize = AtomicUsize::new(0);
@@ -493,6 +519,16 @@ static MUNMAP_AT_OR_ABOVE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static PROCESS_EXITS: AtomicUsize = AtomicUsize::new(0);
 static CHILD_WAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CHILD_WOKEN: AtomicUsize = AtomicUsize::new(0);
+static CLONE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CLONE_VFORK_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CLONE_SHARE_VM_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CLONE_FORK_COW_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CLONE_FORK_COW_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+static CLONE_FORK_COW_MAX_US: AtomicUsize = AtomicUsize::new(0);
+static CLONE_VFORK_FORK_COW_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CLONE_VFORK_FORK_COW_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+static CLONE_FORK_COW_AREAS: AtomicUsize = AtomicUsize::new(0);
+static CLONE_FORK_COW_RESIDENT_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 const BLOCK_NAMES: [&str; 7] = [
     "block_io",
@@ -856,6 +892,22 @@ static USER_RUN_SYSCALL: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0)
 static USER_RUN_TIMER: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
 static USER_RUN_IRQ: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
 static USER_RUN_OTHER: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static SYSCALL_COUNTS_PER_CPU: [[AtomicUsize; SYSCALL_SLOTS]; CPU_SLOTS] =
+    [const { [const { AtomicUsize::new(0) }; SYSCALL_SLOTS] }; CPU_SLOTS];
+static SYSCALL_SAMPLES: [AtomicUsize; SYSCALL_SLOTS] =
+    [const { AtomicUsize::new(0) }; SYSCALL_SLOTS];
+static SYSCALL_TOTAL_US: [AtomicUsize; SYSCALL_SLOTS] =
+    [const { AtomicUsize::new(0) }; SYSCALL_SLOTS];
+static SYSCALL_MAX_US: [AtomicUsize; SYSCALL_SLOTS] =
+    [const { AtomicUsize::new(0) }; SYSCALL_SLOTS];
+static USER_TRAP_COUNTS_PER_CPU: [[AtomicUsize; USER_TRAP_SLOTS]; CPU_SLOTS] =
+    [const { [const { AtomicUsize::new(0) }; USER_TRAP_SLOTS] }; CPU_SLOTS];
+static USER_TRAP_SAMPLES: [AtomicUsize; USER_TRAP_SLOTS] =
+    [const { AtomicUsize::new(0) }; USER_TRAP_SLOTS];
+static USER_TRAP_TOTAL_US: [AtomicUsize; USER_TRAP_SLOTS] =
+    [const { AtomicUsize::new(0) }; USER_TRAP_SLOTS];
+static USER_TRAP_MAX_US: [AtomicUsize; USER_TRAP_SLOTS] =
+    [const { AtomicUsize::new(0) }; USER_TRAP_SLOTS];
 static CONTEXT_SWITCHES: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
 static TASK_MIGRATIONS: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
 static RUNQUEUE_MAX: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
@@ -914,6 +966,16 @@ static ANONYMOUS_VMA_CURRENT: AtomicUsize = AtomicUsize::new(0);
 static ANONYMOUS_VMA_MAX: AtomicUsize = AtomicUsize::new(0);
 static ANONYMOUS_VMA_PAGES: AtomicUsize = AtomicUsize::new(0);
 static ANONYMOUS_VMA_PAGES_MAX: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_SHAPE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_SHAPE_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_LEFT_RESIDENT: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_RIGHT_RESIDENT: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_BOTH_RESIDENT: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_ISOLATED: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_FORWARD_PAGES: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_BACKWARD_PAGES: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_FORWARD_MAX: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_BACKWARD_MAX: AtomicUsize = AtomicUsize::new(0);
 static ANONYMOUS_MOVE_LEFT_SELECTED: AtomicUsize = AtomicUsize::new(0);
 static ANONYMOUS_MOVE_LEFT_NO_REALLOC: AtomicUsize = AtomicUsize::new(0);
 static ANONYMOUS_MOVE_LEFT_SHRINK: AtomicUsize = AtomicUsize::new(0);
@@ -1010,6 +1072,10 @@ static PAGE_TABLE_WRITES: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_TLB_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 static REMOTE_SHOOTDOWNS: AtomicUsize = AtomicUsize::new(0);
 static REMOTE_SHOOTDOWN_TARGETS: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_BATCHES: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_BATCH_WRITES: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_BATCH_MAX: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_BATCH_LOCAL_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 
 static PATH_COMPONENT_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
 static PATH_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -1177,10 +1243,18 @@ pub(crate) fn note_user_run_exit() {
 
 pub(crate) struct UserTrapScope {
     cpu: usize,
+    kind: usize,
+    started_at: Option<usize>,
 }
 
 impl Drop for UserTrapScope {
     fn drop(&mut self) {
+        if let Some(started_at) = self.started_at {
+            let elapsed = now_us().saturating_sub(started_at);
+            USER_TRAP_SAMPLES[self.kind].fetch_add(1, Ordering::Relaxed);
+            USER_TRAP_TOTAL_US[self.kind].fetch_add(elapsed, Ordering::Relaxed);
+            USER_TRAP_MAX_US[self.kind].fetch_max(elapsed, Ordering::Relaxed);
+        }
         ACTIVE_USER_TRAP_KIND[self.cpu].store(0, Ordering::Release);
     }
 }
@@ -1188,10 +1262,16 @@ impl Drop for UserTrapScope {
 #[inline]
 pub(crate) fn note_user_trap_enter(kind: usize) -> UserTrapScope {
     let cpu = cpu_slot();
+    let kind = kind.min(USER_TRAP_SLOTS - 1);
+    let sequence = USER_TRAP_COUNTS_PER_CPU[cpu][kind].fetch_add(1, Ordering::Relaxed);
     ACTIVE_USER_TRAP_SINCE_US[cpu].store(now_us(), Ordering::Relaxed);
     ACTIVE_USER_TRAP_ENTRIES[cpu].fetch_add(1, Ordering::Relaxed);
     ACTIVE_USER_TRAP_KIND[cpu].store(kind, Ordering::Release);
-    UserTrapScope { cpu }
+    UserTrapScope {
+        cpu,
+        kind,
+        started_at: ((sequence & SYSCALL_SAMPLE_MASK) == 0).then(now_us),
+    }
 }
 
 #[inline]
@@ -1351,6 +1431,16 @@ pub(crate) fn note_remote_shootdown(targets: usize) {
 }
 
 #[inline]
+pub(crate) fn note_page_table_batch(writes: usize, local_flush: bool) {
+    PAGE_TABLE_BATCHES.fetch_add(1, Ordering::Relaxed);
+    PAGE_TABLE_BATCH_WRITES.fetch_add(writes, Ordering::Relaxed);
+    PAGE_TABLE_BATCH_MAX.fetch_max(writes, Ordering::Relaxed);
+    if local_flush {
+        PAGE_TABLE_BATCH_LOCAL_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
 pub(crate) fn note_anonymous_vma_install(
     left_mergeable: bool,
     right_mergeable: bool,
@@ -1373,6 +1463,36 @@ pub(crate) fn note_anonymous_vma_install(
     ANONYMOUS_VMA_MAX.fetch_max(vma_count, Ordering::Relaxed);
     ANONYMOUS_VMA_PAGES.fetch_add(pages, Ordering::Relaxed);
     ANONYMOUS_VMA_PAGES_MAX.fetch_max(pages, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn sample_anonymous_fault_shape() -> bool {
+    ANONYMOUS_FAULT_SHAPE_CALLS.fetch_add(1, Ordering::Relaxed) & WORK_SAMPLE_MASK == 0
+}
+
+#[inline]
+pub(crate) fn note_anonymous_fault_shape(
+    left_resident: bool,
+    right_resident: bool,
+    forward_pages: usize,
+    backward_pages: usize,
+) {
+    ANONYMOUS_FAULT_SHAPE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    if left_resident {
+        ANONYMOUS_FAULT_LEFT_RESIDENT.fetch_add(1, Ordering::Relaxed);
+    }
+    if right_resident {
+        ANONYMOUS_FAULT_RIGHT_RESIDENT.fetch_add(1, Ordering::Relaxed);
+    }
+    if left_resident && right_resident {
+        ANONYMOUS_FAULT_BOTH_RESIDENT.fetch_add(1, Ordering::Relaxed);
+    } else if !left_resident && !right_resident {
+        ANONYMOUS_FAULT_ISOLATED.fetch_add(1, Ordering::Relaxed);
+    }
+    ANONYMOUS_FAULT_FORWARD_PAGES.fetch_add(forward_pages, Ordering::Relaxed);
+    ANONYMOUS_FAULT_BACKWARD_PAGES.fetch_add(backward_pages, Ordering::Relaxed);
+    ANONYMOUS_FAULT_FORWARD_MAX.fetch_max(forward_pages, Ordering::Relaxed);
+    ANONYMOUS_FAULT_BACKWARD_MAX.fetch_max(backward_pages, Ordering::Relaxed);
 }
 
 #[inline]
@@ -1688,6 +1808,13 @@ pub(crate) fn note_mmap_shape(anonymous: bool, fixed: bool, hinted: bool, lazy: 
 }
 
 #[inline]
+pub(crate) fn note_madvise_dontneed(requested_pages: usize, discarded_pages: usize) {
+    MADVISE_DONTNEED_CALLS.fetch_add(1, Ordering::Relaxed);
+    MADVISE_DONTNEED_REQUESTED_PAGES.fetch_add(requested_pages, Ordering::Relaxed);
+    MADVISE_DONTNEED_DISCARDED_PAGES.fetch_add(discarded_pages, Ordering::Relaxed);
+}
+
+#[inline]
 fn mmap_length_bucket(length: usize) -> usize {
     if length <= 64 * 1024 {
         0
@@ -1997,6 +2124,33 @@ fn report_exited_mmap_protocols() {
 #[inline]
 pub(crate) fn note_process_exit() {
     PROCESS_EXITS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn note_clone(
+    is_vfork: bool,
+    share_vm: bool,
+    elapsed_us: usize,
+    areas: usize,
+    resident_pages: usize,
+) {
+    CLONE_CALLS.fetch_add(1, Ordering::Relaxed);
+    if is_vfork {
+        CLONE_VFORK_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    if share_vm {
+        CLONE_SHARE_VM_CALLS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    CLONE_FORK_COW_CALLS.fetch_add(1, Ordering::Relaxed);
+    CLONE_FORK_COW_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+    CLONE_FORK_COW_MAX_US.fetch_max(elapsed_us, Ordering::Relaxed);
+    CLONE_FORK_COW_AREAS.fetch_add(areas, Ordering::Relaxed);
+    CLONE_FORK_COW_RESIDENT_PAGES.fetch_add(resident_pages, Ordering::Relaxed);
+    if is_vfork {
+        CLONE_VFORK_FORK_COW_CALLS.fetch_add(1, Ordering::Relaxed);
+        CLONE_VFORK_FORK_COW_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -2331,8 +2485,34 @@ pub(crate) fn note_sched_getaffinity(mask: usize) {
     SCHED_GETAFFINITY_MAX_BITS.fetch_max(bits, Ordering::Relaxed);
 }
 
+pub(crate) struct SyscallScope {
+    syscall_id: usize,
+    started_at: Option<usize>,
+}
+
+impl Drop for SyscallScope {
+    fn drop(&mut self) {
+        if let Some(started_at) = self.started_at {
+            let elapsed = now_us().saturating_sub(started_at);
+            SYSCALL_SAMPLES[self.syscall_id].fetch_add(1, Ordering::Relaxed);
+            SYSCALL_TOTAL_US[self.syscall_id].fetch_add(elapsed, Ordering::Relaxed);
+            SYSCALL_MAX_US[self.syscall_id].fetch_max(elapsed, Ordering::Relaxed);
+        }
+    }
+}
+
 #[inline]
-pub(crate) fn note_syscall_enter(_syscall_id: usize) {}
+pub(crate) fn note_syscall_enter(syscall_id: usize) -> Option<SyscallScope> {
+    if syscall_id >= SYSCALL_SLOTS {
+        return None;
+    }
+    let cpu = cpu_slot();
+    let sequence = SYSCALL_COUNTS_PER_CPU[cpu][syscall_id].fetch_add(1, Ordering::Relaxed);
+    Some(SyscallScope {
+        syscall_id,
+        started_at: ((sequence & SYSCALL_SAMPLE_MASK) == 0).then(now_us),
+    })
+}
 #[inline]
 pub(crate) fn note_syscall_exit(_syscall_id: usize) {}
 
@@ -2371,6 +2551,40 @@ pub(crate) fn maybe_report() {
     for cpu in 0..CPU_SLOTS {
         crate::println!("BUILDSTORM_DIAG user_run cpu={} count={} total_us={} max_us={} syscall={} timer={} irq={} other={}", cpu, USER_RUN_COUNT[cpu].load(Ordering::Relaxed), USER_RUN_TOTAL_US[cpu].load(Ordering::Relaxed), USER_RUN_MAX_US[cpu].load(Ordering::Relaxed), USER_RUN_SYSCALL[cpu].load(Ordering::Relaxed), USER_RUN_TIMER[cpu].load(Ordering::Relaxed), USER_RUN_IRQ[cpu].load(Ordering::Relaxed), USER_RUN_OTHER[cpu].load(Ordering::Relaxed));
     }
+    for syscall_id in 0..SYSCALL_SLOTS {
+        let count: usize = SYSCALL_COUNTS_PER_CPU
+            .iter()
+            .map(|cpu| cpu[syscall_id].load(Ordering::Relaxed))
+            .sum();
+        if count != 0 {
+            crate::println!(
+                "BUILDSTORM_DIAG syscall={} count={} total_us={} max_us={} sample_count={} sample_shift={}",
+                syscall_id,
+                count,
+                SYSCALL_TOTAL_US[syscall_id].load(Ordering::Relaxed),
+                SYSCALL_MAX_US[syscall_id].load(Ordering::Relaxed),
+                SYSCALL_SAMPLES[syscall_id].load(Ordering::Relaxed),
+                SYSCALL_SAMPLE_SHIFT,
+            );
+        }
+    }
+    for kind in 1..USER_TRAP_SLOTS {
+        let count: usize = USER_TRAP_COUNTS_PER_CPU
+            .iter()
+            .map(|cpu| cpu[kind].load(Ordering::Relaxed))
+            .sum();
+        if count != 0 {
+            crate::println!(
+                "BUILDSTORM_DIAG user_trap={} count={} total_us={} max_us={} sample_count={} sample_shift={}",
+                USER_TRAP_NAMES[kind],
+                count,
+                USER_TRAP_TOTAL_US[kind].load(Ordering::Relaxed),
+                USER_TRAP_MAX_US[kind].load(Ordering::Relaxed),
+                USER_TRAP_SAMPLES[kind].load(Ordering::Relaxed),
+                SYSCALL_SAMPLE_SHIFT,
+            );
+        }
+    }
     for cpu in 0..CPU_SLOTS {
         let pid = ACTIVE_USER_PID[cpu].load(Ordering::Acquire);
         let since_us = ACTIVE_USER_SINCE_US[cpu].load(Ordering::Relaxed);
@@ -2382,6 +2596,13 @@ pub(crate) fn maybe_report() {
         crate::println!("BUILDSTORM_DIAG blocked_owner cpu={} current={} max={} enters={} exits={} loop_dispatches={} timed_loops={} timed_total_us={} timed_max_us={} empty_iterations={} wake_to_owner={} wake_to_global={}", cpu, BLOCKED_OWNER_CURRENT[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_MAX[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_ENTERS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_EXITS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_LOOP_DISPATCHES[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_LOOPS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_TOTAL_US[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_MAX_US[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_EMPTY_ITERATIONS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_WAKES[cpu].load(Ordering::Relaxed), BLOCKED_GLOBAL_WAKES.load(Ordering::Relaxed));
     }
     crate::println!("BUILDSTORM_DIAG mm user_root={} kernel_root={} redundant_root={} page_table_writes={} local_flush={} remote_shootdown={} remote_targets={}", USER_ROOT_ACTIVATIONS.load(Ordering::Relaxed), KERNEL_ROOT_ACTIVATIONS.load(Ordering::Relaxed), REDUNDANT_ROOT_ACTIVATIONS.load(Ordering::Relaxed), PAGE_TABLE_WRITES.load(Ordering::Relaxed), LOCAL_TLB_FLUSHES.load(Ordering::Relaxed), REMOTE_SHOOTDOWNS.load(Ordering::Relaxed), REMOTE_SHOOTDOWN_TARGETS.load(Ordering::Relaxed));
+    crate::println!(
+        "BUILDSTORM_DIAG page_table_batch commits={} writes={} max={} local_flushes={}",
+        PAGE_TABLE_BATCHES.load(Ordering::Relaxed),
+        PAGE_TABLE_BATCH_WRITES.load(Ordering::Relaxed),
+        PAGE_TABLE_BATCH_MAX.load(Ordering::Relaxed),
+        PAGE_TABLE_BATCH_LOCAL_FLUSHES.load(Ordering::Relaxed)
+    );
     let (tracked_frames, page_table_frames, contiguous_frames, owner_transitions) =
         crate::mm::frame_allocator::diagnostic_ownership_snapshot();
     crate::println!(
@@ -2391,7 +2612,11 @@ pub(crate) fn maybe_report() {
         contiguous_frames,
         owner_transitions
     );
+    crate::mm::frame_allocator::report_cache_diagnostics();
     crate::println!("BUILDSTORM_DIAG anonymous_vma installs={} left={} right={} both={} neither={} current={} max={} pages={} pages_max={}", ANONYMOUS_VMA_INSTALLS.load(Ordering::Relaxed), ANONYMOUS_VMA_LEFT_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_RIGHT_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_BOTH_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_NEITHER_MERGEABLE.load(Ordering::Relaxed), ANONYMOUS_VMA_CURRENT.load(Ordering::Relaxed), ANONYMOUS_VMA_MAX.load(Ordering::Relaxed), ANONYMOUS_VMA_PAGES.load(Ordering::Relaxed), ANONYMOUS_VMA_PAGES_MAX.load(Ordering::Relaxed));
+    crate::println!("BUILDSTORM_DIAG anonymous_fault_shape calls={} samples={} left_resident={} right_resident={} both_resident={} isolated={} forward_pages={} backward_pages={} forward_max={} backward_max={} sample_shift={}", ANONYMOUS_FAULT_SHAPE_CALLS.load(Ordering::Relaxed), ANONYMOUS_FAULT_SHAPE_SAMPLES.load(Ordering::Relaxed), ANONYMOUS_FAULT_LEFT_RESIDENT.load(Ordering::Relaxed), ANONYMOUS_FAULT_RIGHT_RESIDENT.load(Ordering::Relaxed), ANONYMOUS_FAULT_BOTH_RESIDENT.load(Ordering::Relaxed), ANONYMOUS_FAULT_ISOLATED.load(Ordering::Relaxed), ANONYMOUS_FAULT_FORWARD_PAGES.load(Ordering::Relaxed), ANONYMOUS_FAULT_BACKWARD_PAGES.load(Ordering::Relaxed), ANONYMOUS_FAULT_FORWARD_MAX.load(Ordering::Relaxed), ANONYMOUS_FAULT_BACKWARD_MAX.load(Ordering::Relaxed), WORK_SAMPLE_SHIFT);
+    let clean_cache = crate::fs::ext4_vol::diagnostic_clean_page_cache_stats();
+    crate::println!("BUILDSTORM_DIAG clean_page_cache current={} max={} folios={} folio_touches={} run_calls={} run_pages={} run_max={} prefetch_calls={} prefetch_pages={} inserts={} evictions={} invalidations={}", clean_cache.0, clean_cache.1, clean_cache.2, clean_cache.3, clean_cache.4, clean_cache.5, clean_cache.6, clean_cache.7, clean_cache.8, clean_cache.9, clean_cache.10, clean_cache.11);
     crate::println!("BUILDSTORM_DIAG anonymous_move left_selected={} left_no_realloc={} left_shrink={} left_remove={} left_frame_relocate={} left_remove_suffix={} left_remove_suffix_max={} right_selected={} right_no_realloc={} right_shrink={} right_remove={} right_frame_move={} right_remove_suffix={} right_remove_suffix_max={} zero_metadata={}", ANONYMOUS_MOVE_LEFT_SELECTED.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_NO_REALLOC.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_SHRINK.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_FRAME_RELOCATE.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE_SUFFIX.load(Ordering::Relaxed), ANONYMOUS_MOVE_LEFT_REMOVE_SUFFIX_MAX.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_SELECTED.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_NO_REALLOC.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_SHRINK.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_FRAME_MOVE.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE_SUFFIX.load(Ordering::Relaxed), ANONYMOUS_MOVE_RIGHT_REMOVE_SUFFIX_MAX.load(Ordering::Relaxed), ANONYMOUS_MOVE_ZERO_METADATA.load(Ordering::Relaxed));
     crate::println!("BUILDSTORM_DIAG anonymous_coalesce calls={} areas={} areas_max={} sort_us={} scan_us={} total_us={} merges={} merged_frames={} frame_reallocs={} frame_relocate={}", ANONYMOUS_COALESCE_CALLS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_AREAS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_AREAS_MAX.load(Ordering::Relaxed), ANONYMOUS_COALESCE_SORT_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_SCAN_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_TOTAL_US.load(Ordering::Relaxed), ANONYMOUS_COALESCE_MERGES.load(Ordering::Relaxed), ANONYMOUS_COALESCE_MERGED_FRAMES.load(Ordering::Relaxed), ANONYMOUS_COALESCE_FRAME_REALLOCS.load(Ordering::Relaxed), ANONYMOUS_COALESCE_FRAME_RELOCATE.load(Ordering::Relaxed));
     crate::println!(
@@ -2568,6 +2793,12 @@ pub(crate) fn maybe_report() {
         MMAP_LOW_ARENA_PLACEMENTS.load(Ordering::Relaxed),
     );
     crate::println!(
+        "BUILDSTORM_DIAG madvise_dontneed calls={} requested_pages={} discarded_pages={}",
+        MADVISE_DONTNEED_CALLS.load(Ordering::Relaxed),
+        MADVISE_DONTNEED_REQUESTED_PAGES.load(Ordering::Relaxed),
+        MADVISE_DONTNEED_DISCARDED_PAGES.load(Ordering::Relaxed),
+    );
+    crate::println!(
         "BUILDSTORM_DIAG mmap_result select_ok={} select_enomem={} reselect_ok={} reselect_enomem={} len_le_64k={} len_le_1m={} len_le_16m={} len_le_256m={} len_gt_256m={} failed_len_max={} failed_gap_max={} failed_vmas_max={}",
         MMAP_SELECT_OK.load(Ordering::Relaxed),
         MMAP_SELECT_ENOMEM.load(Ordering::Relaxed),
@@ -2602,6 +2833,19 @@ pub(crate) fn maybe_report() {
         PROCESS_EXITS.load(Ordering::Relaxed),
         CHILD_WAKE_CALLS.load(Ordering::Relaxed),
         CHILD_WOKEN.load(Ordering::Relaxed)
+    );
+    crate::println!(
+        "BUILDSTORM_DIAG process_clone calls={} vfork={} share_vm={} fork_cow={} fork_cow_total_us={} fork_cow_max_us={} vfork_fork_cow={} vfork_fork_cow_total_us={} fork_cow_areas={} fork_cow_resident_pages={}",
+        CLONE_CALLS.load(Ordering::Relaxed),
+        CLONE_VFORK_CALLS.load(Ordering::Relaxed),
+        CLONE_SHARE_VM_CALLS.load(Ordering::Relaxed),
+        CLONE_FORK_COW_CALLS.load(Ordering::Relaxed),
+        CLONE_FORK_COW_TOTAL_US.load(Ordering::Relaxed),
+        CLONE_FORK_COW_MAX_US.load(Ordering::Relaxed),
+        CLONE_VFORK_FORK_COW_CALLS.load(Ordering::Relaxed),
+        CLONE_VFORK_FORK_COW_TOTAL_US.load(Ordering::Relaxed),
+        CLONE_FORK_COW_AREAS.load(Ordering::Relaxed),
+        CLONE_FORK_COW_RESIDENT_PAGES.load(Ordering::Relaxed)
     );
     crate::task::manager::diagnostic_dump_user_comm();
     report_exited_mmap_protocols();

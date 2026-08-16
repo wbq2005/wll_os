@@ -705,3 +705,46 @@ AI 用于评测日志与源码/dirty diff 的交叉核对、ABI 因果模型、�
 cfg 日志、双架构 SMP 串口和完整 public serial。未修改官方镜像、suite、guest
 script、judge、marker、guest 时间或 `/proc/uptime`，production 行为不检查 crate、
 测试名、路径、命令或输出。
+
+## 16. 2026-08-16 MADV_DONTNEED resident retirement
+
+### 16.1 证据与根因
+
+评测 LA 日志在编译阶段出现 135 次 jemalloc
+`MADV_DONTNEED does not work (memset will be used instead)`。源码交叉核对发现
+asm-generic syscall 233 仅返回 `Ok(0)`，没有改变 resident、PTE 或 frame owner。
+jemalloc 的自检因此读回旧字节并改用同步 memset。该现象同时解释了为什么早期 crate
+仍有进展，但大量编译进程在内存回收边界重复消耗 CPU。
+
+### 16.2 架构设计与不变量
+
+`MapAreaBacking` 区分 `Anonymous` 与 `AnonymousShared`。`MADV_DONTNEED` 只从完整
+覆盖范围内的 private anonymous VMA 提取 resident owner，不拆分或合并 VMA；shared
+anonymous、SysV shm、shared/private file mapping 均不误丢弃。`ResidentSet` 只负责
+转移指定 VMA-relative VPN 范围的 owner，不直接操作页表。
+
+`PageTableOps::unmap_pages_without_flush` 按 2 MiB leaf-table 边界复用 walk，同时适配
+三层与四层页表。`MemorySet` 负责协议顺序：先撤销 leaf，执行发布 fence、本地 full
+flush 和以 address-space root 为键的远端 shootdown，最后 drop 暂存的 owner。
+若 resident 存在但 leaf 已因先前 `mprotect(PROT_NONE)` 撤销，则旧保护操作已经完成
+retirement，当前无需重复 flush。refault 重新分配 zeroed frame，VMA policy 保持不变。
+
+### 16.3 验证与性能
+
+四种 release cfg 和双架构 SMP8 均通过。独立 resident 回归写入非零页、discard、
+确认 translation 消失、refault 后逐字节为零，并检查 VMA 数不变；同一 parent/child
+COW 地址空间还验证 anonymous shared 页面不被 discard 且 fork 后保持同一物理页。
+
+LA diagnostics 300 秒最终快照为 `calls=1481 requested_pages=190954
+discarded_pages=32904`，syscall 233 count 为 1523，jemalloc fallback 警告为 0。
+同机隔离 A/B 为 556.35 秒到 547.73 秒，提升 1.55%。随后从最终树排除了仅有
+0.41% 收益的 Stage16 syscall-return/CPU-index 快路径，但保留 lazy user stack 和
+Zicboz 清零后端；该精确最终树的 LA 与 RV 分别在 558.27 秒、686.50 秒产生
+`ok=true` marker，官方 judge 均解析为 180/180，属于 `official-pass`。LA 相对纯净
+`12f110ae` 的 623.15 秒累计提升 10.41%。Stage17 隔离收益低于旧 5% 门，但按后续
+“正向优化无需回滚”规则保留；最终评测机分数仍为 `unverified`，不能跨宿主换算。
+
+证据索引：
+`docs/evidence/buildstorm-stage2/stage17-madvise-dontneed-official-20260816/README.md`。
+AI 辅助日志/源码审计、协议设计、实现和串行 A/B；开发者可从最终增量补丁、原始
+serial、runner JSON、SMP/cfg 日志、judge 与 hash 独立复核。

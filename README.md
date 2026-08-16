@@ -49,6 +49,23 @@ BuildStorm、路径或命令特判。双架构 production/diagnostics release �
 180/180。该 public 流程为 `official-pass`；评测机独有的 UEFI 后处理门仍为
 `unverified`，需下一轮评测确认。
 
+### 2026-08-16 MADV_DONTNEED 通用优化
+
+同一轮 LA 日志还出现 135 次 jemalloc
+`MADV_DONTNEED does not work (memset will be used instead)`。旧内核对 syscall 233
+只返回成功，没有撤销 private anonymous resident page，jemalloc 因而退化为主动
+memset。当前实现保持 VMA 拓扑不变，批量撤销 PTE，完成本地/远端 TLB retirement
+后再释放 ResidentSet frame owner；anonymous shared、SysV shm 和 file mapping 保持
+原所有权语义。
+
+LA diagnostics 300 秒记录 1481 次调用、190954 个请求页和 32904 个实际丢弃页，
+fallback 警告降为 0。隔离 A/B 中 LA production 从 556.35 秒降至 547.73 秒，
+提升 1.55%。排除未采纳的 Stage16 syscall-return 快路径后，最终提交树的 LA/RV
+完整时间分别为 558.27 秒和 686.50 秒；其中 LA 相对纯净 `12f110ae` 的 623.15 秒
+累计提升 10.41%。两架构均包含精确 `BUILDSTORM_COMPILE mode=multi ok=true`，
+官方 judge 自动项均为 180/180。完整证据见
+[Stage17 MADV_DONTNEED 验证](docs/evidence/buildstorm-stage2/stage17-madvise-dontneed-official-20260816/README.md)。
+
 上一轮日志复核还得到两个确定性问题：
 
 - RV 在已完成计分 glibc BuildStorm 后，又启动了不计分的
@@ -93,6 +110,7 @@ fault（71.482 秒）。保留的 clean-page cache batch 把 16 页预读检查�
 - [历史累计设计记录](docs/buildstorm-kernel-design-optimization.md)
 - [双架构 official-pass 证据结论](docs/evidence/buildstorm-stage2/20260814-stage2-buildstorm-official-completion.md)
 - [Stage B per-CPU heap cache 结论与证据索引](docs/evidence/buildstorm-stage2/20260815-stageb-percpu-heap-cache-conclusion-cn.md)
+- [Stage17 MADV_DONTNEED 双架构 official-pass](docs/evidence/buildstorm-stage2/stage17-madvise-dontneed-official-20260816/README.md)
 - [VFS 稀疏页缓存与 clustered writeback 结论](docs/buildstorm-2.3-design-optimization-cn.md#11-2026-08-15-评测超时复核与-vfs-稳定性候选)
 - [VFS lookup 复用与有界缓存验证记录](docs/evidence/buildstorm-stage2/20260815-vfs-lookup-reuse-validation.md)
 

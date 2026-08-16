@@ -540,7 +540,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> SyscallRet {
         SYSCALL_GETSID => other::sys_getsid(args[0]),
         SYSCALL_MEMBARRIER => other::sys_membarrier(args[0], args[1]),
         SYSCALL_MPROTECT => mm::sys_mprotect(args[0], args[1], args[2] as i32),
-        SYSCALL_MADVISE => Ok(0), // madvise advisory, ignore
+        SYSCALL_MADVISE => mm::sys_madvise(args[0], args[1], args[2] as i32),
 
         // sched stubs / single-CPU policy
         SYSCALL_SCHED_GETAFFINITY => other::sys_sched_getaffinity(args[0], args[1], args[2]),

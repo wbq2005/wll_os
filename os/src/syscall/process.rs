@@ -167,11 +167,9 @@ fn reap_zombie_child(waiter: &Arc<TaskControlBlock>, target: WaitTarget) -> Opti
 fn peek_zombie_child(waiter: &Arc<TaskControlBlock>, target: WaitTarget) -> Option<(usize, i32)> {
     for owner in waiter.thread_group.user_members() {
         let inner = owner.inner.lock();
-        if let Some(child) = inner
-            .children
-            .iter()
-            .find(|child| child_matches_wait_target(child, target) && child.thread_group.is_process_zombie())
-        {
+        if let Some(child) = inner.children.iter().find(|child| {
+            child_matches_wait_target(child, target) && child.thread_group.is_process_zombie()
+        }) {
             return Some((child.thread_group.tgid(), child.thread_group.exit_code()));
         }
     }
@@ -233,7 +231,11 @@ fn note_exec_failure_boundary(
     let (parent_pid, clone_flags) = {
         let inner = task.inner.lock();
         (
-            inner.parent.as_ref().map(|parent| parent.pid.0).unwrap_or(0),
+            inner
+                .parent
+                .as_ref()
+                .map(|parent| parent.pid.0)
+                .unwrap_or(0),
             inner.clone_flags,
         )
     };
@@ -438,20 +440,19 @@ fn read_user_path(ptr: *const u8) -> Result<String, SysErrNo> {
 }
 
 fn write_stack_bytes(
-    memory_set: &crate::mm::memory_set::MemorySet,
+    memory_set: &mut crate::mm::memory_set::MemorySet,
     dst: usize,
     data: &[u8],
-) {
+) -> Result<(), SysErrNo> {
+    memory_set.prepare_write(dst, data.len())?;
     let mut copied = 0usize;
     while copied < data.len() {
-        let Some(va) = dst.checked_add(copied) else {
-            break;
-        };
+        let va = dst.checked_add(copied).ok_or(SysErrNo::EFAULT)?;
         let page_left = crate::config::PAGE_SIZE - va % crate::config::PAGE_SIZE;
         let count = page_left.min(data.len() - copied);
-        let Some(pa) = memory_set.translate(VirtAddr::new(va)) else {
-            break;
-        };
+        let pa = memory_set
+            .translate(VirtAddr::new(va))
+            .ok_or(SysErrNo::EFAULT)?;
         unsafe {
             core::ptr::copy_nonoverlapping(
                 data[copied..copied + count].as_ptr(),
@@ -461,6 +462,20 @@ fn write_stack_bytes(
         }
         copied += count;
     }
+    Ok(())
+}
+
+fn push_stack_bytes(
+    memory_set: &mut crate::mm::memory_set::MemorySet,
+    stack_bottom: usize,
+    sp: &mut usize,
+    data: &[u8],
+) -> Result<(), SysErrNo> {
+    *sp = sp.checked_sub(data.len()).ok_or(SysErrNo::E2BIG)?;
+    if *sp < stack_bottom {
+        return Err(SysErrNo::E2BIG);
+    }
+    write_stack_bytes(memory_set, *sp, data)
 }
 
 pub(crate) fn proc_self_exe_target(path: &str) -> Result<Option<String>, SysErrNo> {
@@ -487,7 +502,7 @@ pub(crate) fn proc_self_exe_target(path: &str) -> Result<Option<String>, SysErrN
 ///   - argc    (usize)
 ///   ← SP 指向这里
 pub(crate) fn setup_user_stack(
-    memory_set: &crate::mm::memory_set::MemorySet,
+    memory_set: &mut crate::mm::memory_set::MemorySet,
     stack_top: usize,
     argv: &[String],
     envp: &[String],
@@ -495,7 +510,7 @@ pub(crate) fn setup_user_stack(
     phdr_vaddr: usize,
     phnum: usize,
     interp_base: usize,
-) -> usize {
+) -> Result<usize, SysErrNo> {
     let credentials = current_task()
         .map(|task| task.credentials.lock().clone())
         .unwrap_or_else(Credentials::root);
@@ -513,7 +528,7 @@ pub(crate) fn setup_user_stack(
 }
 
 fn setup_user_stack_with_credentials(
-    memory_set: &crate::mm::memory_set::MemorySet,
+    memory_set: &mut crate::mm::memory_set::MemorySet,
     stack_top: usize,
     argv: &[String],
     envp: &[String],
@@ -522,29 +537,25 @@ fn setup_user_stack_with_credentials(
     phnum: usize,
     interp_base: usize,
     credentials: Credentials,
-) -> usize {
+) -> Result<usize, SysErrNo> {
     let mut sp = stack_top;
-
-    // 辅助函数：往栈上写 bytes
-    // Copy strings a page at a time; rustc can pass hundreds of arguments.
-    let write_bytes = |ms: &crate::mm::memory_set::MemorySet, sp: &mut usize, data: &[u8]| {
-        *sp -= data.len();
-        write_stack_bytes(ms, *sp, data);
-    };
+    let stack_bottom = stack_top
+        .checked_sub(crate::config::USER_STACK_SIZE)
+        .ok_or(SysErrNo::E2BIG)?;
 
     // 1) 将所有 argv/envp 字符串写到栈顶区域，记录各自地址
     let mut argv_ptrs: Vec<usize> = Vec::new();
     for arg in argv.iter().rev() {
-        write_bytes(memory_set, &mut sp, &[0u8]); // null terminator
-        write_bytes(memory_set, &mut sp, arg.as_bytes());
+        push_stack_bytes(memory_set, stack_bottom, &mut sp, &[0u8])?;
+        push_stack_bytes(memory_set, stack_bottom, &mut sp, arg.as_bytes())?;
         argv_ptrs.push(sp);
     }
     argv_ptrs.reverse();
 
     let mut envp_ptrs: Vec<usize> = Vec::new();
     for env in envp.iter().rev() {
-        write_bytes(memory_set, &mut sp, &[0u8]);
-        write_bytes(memory_set, &mut sp, env.as_bytes());
+        push_stack_bytes(memory_set, stack_bottom, &mut sp, &[0u8])?;
+        push_stack_bytes(memory_set, stack_bottom, &mut sp, env.as_bytes())?;
         envp_ptrs.push(sp);
     }
     envp_ptrs.reverse();
@@ -556,25 +567,24 @@ fn setup_user_stack_with_credentials(
     } else {
         "unknown"
     };
-    write_bytes(memory_set, &mut sp, &[0u8]);
-    write_bytes(memory_set, &mut sp, platform.as_bytes());
+    push_stack_bytes(memory_set, stack_bottom, &mut sp, &[0u8])?;
+    push_stack_bytes(memory_set, stack_bottom, &mut sp, platform.as_bytes())?;
     let platform_addr = sp;
 
     // Reserve stable bytes for AT_RANDOM; glibc uses them for stack/pointer
     // guards during startup and later exit-handler validation.
-    sp -= 16;
-    let random_addr = sp;
-    for i in 0..16u8 {
-        let va = VirtAddr::new(sp + i as usize);
-        if let Some(pa) = memory_set.translate(va) {
-            unsafe {
-                *(pa.raw() as *mut u8) = i.wrapping_mul(37).wrapping_add(7);
-            }
-        }
+    let mut random = [0u8; 16];
+    for (index, byte) in random.iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(37).wrapping_add(7);
     }
+    push_stack_bytes(memory_set, stack_bottom, &mut sp, &random)?;
+    let random_addr = sp;
 
     // 2) 对齐到 16 字节
     sp &= !0xF;
+    if sp < stack_bottom {
+        return Err(SysErrNo::E2BIG);
+    }
 
     // 3) 计算总共需要多少 usize 条目来放 auxv/envp/argv/argc
     //    auxv: 若干 (key,val) 对 + (AT_NULL, 0)
@@ -634,49 +644,58 @@ fn setup_user_stack_with_credentials(
     let auxv_entries = auxv_pairs.len();
     let total_slots = 1 + (argv_ptrs.len() + 1) + (envp_ptrs.len() + 1) + auxv_entries * 2;
     // 确保 sp 在写完后 16 字节对齐
-    sp -= total_slots * core::mem::size_of::<usize>();
+    let table_bytes = total_slots
+        .checked_mul(core::mem::size_of::<usize>())
+        .ok_or(SysErrNo::E2BIG)?;
+    sp = sp.checked_sub(table_bytes).ok_or(SysErrNo::E2BIG)?;
     sp &= !0xF;
+    if sp < stack_bottom {
+        return Err(SysErrNo::E2BIG);
+    }
 
     let final_sp = sp;
 
     // Write argc/argv/envp/auxv from low to high addresses. The strings and
     // random bytes were already placed above this table on the same stack.
     let mut pos = final_sp;
-    let write_at = |ms: &crate::mm::memory_set::MemorySet, pos: usize, val: usize| {
+    let write_at = |ms: &mut crate::mm::memory_set::MemorySet,
+                    pos: usize,
+                    val: usize|
+     -> Result<(), SysErrNo> {
         let bytes = val.to_le_bytes();
-        write_stack_bytes(ms, pos, &bytes);
+        write_stack_bytes(ms, pos, &bytes)
     };
 
     let sz = core::mem::size_of::<usize>();
 
     // argc
-    write_at(memory_set, pos, argv_ptrs.len());
+    write_at(memory_set, pos, argv_ptrs.len())?;
     pos += sz;
 
     // argv pointers
     for &ptr in &argv_ptrs {
-        write_at(memory_set, pos, ptr);
+        write_at(memory_set, pos, ptr)?;
         pos += sz;
     }
-    write_at(memory_set, pos, 0); // argv NULL terminator
+    write_at(memory_set, pos, 0)?; // argv NULL terminator
     pos += sz;
 
     // envp pointers
     for &ptr in &envp_ptrs {
-        write_at(memory_set, pos, ptr);
+        write_at(memory_set, pos, ptr)?;
         pos += sz;
     }
-    write_at(memory_set, pos, 0); // envp NULL terminator
+    write_at(memory_set, pos, 0)?; // envp NULL terminator
     pos += sz;
 
     for (key, val) in auxv_pairs {
-        write_at(memory_set, pos, key);
+        write_at(memory_set, pos, key)?;
         pos += sz;
-        write_at(memory_set, pos, val);
+        write_at(memory_set, pos, val)?;
         pos += sz;
     }
 
-    final_sp
+    Ok(final_sp)
 }
 
 /// execve 系统调用
@@ -828,13 +847,14 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
 
             let user_stack_top = crate::config::USER_STACK_TOP;
             let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
-            memory_set.insert_framed_area(
+            memory_set.insert_lazy_area_with_backing(
                 VirtAddr::new(user_stack_bottom),
                 VirtAddr::new(user_stack_top),
                 crate::mm::page_table::PTEFlags::U
                     | crate::mm::page_table::PTEFlags::R
                     | crate::mm::page_table::PTEFlags::W
                     | crate::mm::page_table::PTEFlags::V,
+                crate::mm::map_area::MapAreaBacking::Anonymous,
             )?;
 
             (
@@ -920,7 +940,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     };
 
     let sp = setup_user_stack(
-        &new_memory_set,
+        &mut new_memory_set,
         user_stack_top,
         &argv_with_path,
         &envp,
@@ -928,7 +948,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         phdr_vaddr,
         phnum,
         interp_base,
-    );
+    )?;
     crate::syscall::signal::install_signal_trampoline(&mut new_memory_set)?;
     if let Some(task) = current_task() {
         crate::task::terminate_thread_group_peers_for_exec(&task);
@@ -948,8 +968,15 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             let closed = fds.close_on_exec();
             #[cfg(feature = "buildstorm-diagnostics")]
             {
-                let pipe_closed = closed.iter().filter(|entry| entry.is_pipe_read() || entry.is_pipe_write()).count();
-                crate::buildstorm_diagnostics::note_exec_pipes(pipe_endpoints, pipe_cloexec, pipe_closed);
+                let pipe_closed = closed
+                    .iter()
+                    .filter(|entry| entry.is_pipe_read() || entry.is_pipe_write())
+                    .count();
+                crate::buildstorm_diagnostics::note_exec_pipes(
+                    pipe_endpoints,
+                    pipe_cloexec,
+                    pipe_closed,
+                );
             }
             closed
         };
@@ -1107,8 +1134,7 @@ fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> Sysca
         // exit between the checks above and a bare sleep, which would otherwise
         // lose its SIGCHLD wakeup and leave the parent blocked forever.
         match crate::task::wait_queue::sleep_on_child_exit_if(|| {
-            Ok(peek_zombie_child(&task, target).is_none()
-                && has_matching_child(&task, target))
+            Ok(peek_zombie_child(&task, target).is_none() && has_matching_child(&task, target))
         }) {
             Ok(_) => {}
             Err(SysErrNo::EINTR) => {
@@ -1222,14 +1248,18 @@ fn write_waitid_child_event(
     super::user::copy_object_to_user(infop, &info)
 }
 
-pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusage: usize) -> SyscallRet {
+pub fn sys_waitid(
+    idtype: usize,
+    id: usize,
+    infop: usize,
+    options: usize,
+    _rusage: usize,
+) -> SyscallRet {
     const SUPPORTED_OPTIONS: usize = WEXITED | WSTOPPED | WCONTINUED | WNOHANG | WNOWAIT;
     if infop == 0 {
         return Err(SysErrNo::EFAULT);
     }
-    if (options & !SUPPORTED_OPTIONS) != 0
-        || (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0
-    {
+    if (options & !SUPPORTED_OPTIONS) != 0 || (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0 {
         return Err(SysErrNo::EINVAL);
     }
 
@@ -1293,14 +1323,8 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize, _rusag
         // event consumption and writes the user-visible siginfo.
         match crate::task::wait_queue::sleep_on_child_exit_if(|| {
             let event_ready = (want_stopped || want_continued)
-                && take_child_wait_event(
-                    &task,
-                    target,
-                    want_stopped,
-                    want_continued,
-                    false,
-                )
-                .is_some();
+                && take_child_wait_event(&task, target, want_stopped, want_continued, false)
+                    .is_some();
             let exit_ready = want_exited && peek_zombie_child(&task, target).is_some();
             Ok(!event_ready && !exit_ready && has_matching_child(&task, target))
         }) {
@@ -1377,19 +1401,42 @@ pub fn sys_clone(
     // address space so execve cannot replace the parent's shared MemorySet.
     let share_vm = (clone_bits & CLONE_VM) != 0 && !is_vfork;
     let is_thread = (clone_bits & CLONE_THREAD) != 0;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let clone_started_us = crate::timer::get_time_us();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let mut fork_cow_shape = (0usize, 0usize);
     let memory_set = if share_vm {
         parent.memory_set.clone()
     } else {
         // fork_cow copies backing frames through physical mappings while the
         // syscall remains on the kernel page table.  The parent address space
         // is reactivated by the scheduler before its next user-mode entry.
-        let child_memory = crate::buildstorm_memory_set_lock!(
+        let mut parent_memory = crate::buildstorm_memory_set_lock!(
             crate::buildstorm_diagnostics::MemorySetLockSite::ForkCow,
             &parent.memory_set,
-        )
-        .fork_cow()?;
+        );
+        #[cfg(feature = "buildstorm-diagnostics")]
+        {
+            fork_cow_shape = (
+                parent_memory.areas.len(),
+                parent_memory
+                    .areas
+                    .iter()
+                    .map(|area| area.resident().len())
+                    .sum(),
+            );
+        }
+        let child_memory = parent_memory.fork_cow()?;
         new_shared_memory_set(child_memory)
     };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_clone(
+        is_vfork,
+        share_vm,
+        crate::timer::get_time_us().saturating_sub(clone_started_us),
+        fork_cow_shape.0,
+        fork_cow_shape.1,
+    );
     let mm = if share_vm {
         parent.mm.clone()
     } else {
@@ -1579,9 +1626,7 @@ pub fn sys_clone(
         crate::task::manager::add_task(child);
     }
     if is_vfork {
-        crate::task::commit_current_deferred_block(
-            crate::task::wait_queue::BlockReason::ChildExit,
-        );
+        crate::task::commit_current_deferred_block(crate::task::wait_queue::BlockReason::ChildExit);
     }
     if crate::trap::foreground_driver_active() && !is_vfork {
         crate::task::request_foreground_requeue_front(parent.pid.0);
@@ -1601,12 +1646,12 @@ pub fn sys_clone(
 /// 为 init/test 进程构造最小的用户栈（argv=["init"], envp=[], auxv）。
 /// 由 `TaskControlBlock::new_user` 调用。
 pub fn setup_user_stack_for_init(
-    memory_set: &crate::mm::memory_set::MemorySet,
+    memory_set: &mut crate::mm::memory_set::MemorySet,
     stack_top: usize,
     elf_entry: usize,
     phdr_vaddr: usize,
     phnum: usize,
-) -> usize {
+) -> Result<usize, SysErrNo> {
     let argv = alloc::vec![String::from("/init")];
     let envp: Vec<String> = alloc::vec![
         String::from("PATH=/:/bin:/usr/bin"),

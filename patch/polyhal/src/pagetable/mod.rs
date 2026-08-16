@@ -62,6 +62,98 @@ impl PageTable {
         paddr.slice_mut_with_len::<PTE>(Self::PTE_NUM_IN_PAGE)
     }
 
+    fn leaf_table_for_mapping(&self, vaddr: VirtAddr) -> PhysAddr {
+        let mut table = self.0;
+        if Self::PAGE_LEVEL == 4 {
+            let pte = &mut Self::get_pte_list(table)[vaddr.pn_index(3)];
+            if !pte.is_valid() {
+                *pte = PTE::new_table(frame_alloc());
+            }
+            table = pte.address();
+        }
+        for level in (1..=2).rev() {
+            let pte = &mut Self::get_pte_list(table)[vaddr.pn_index(level)];
+            if !pte.is_valid() {
+                *pte = PTE::new_table(frame_alloc());
+            }
+            table = pte.address();
+        }
+        table
+    }
+
+    fn leaf_table_for_unmapping(&self, vaddr: VirtAddr) -> Option<PhysAddr> {
+        let mut table = self.0;
+        if Self::PAGE_LEVEL == 4 {
+            let pte = Self::get_pte_list(table)[vaddr.pn_index(3)];
+            if !pte.is_table() {
+                return None;
+            }
+            table = pte.address();
+        }
+        for level in (1..=2).rev() {
+            let pte = Self::get_pte_list(table)[vaddr.pn_index(level)];
+            if !pte.is_table() {
+                return None;
+            }
+            table = pte.address();
+        }
+        Some(table)
+    }
+
+    /// Publish 4 KiB leaves without issuing a TLB invalidation.
+    ///
+    /// Adjacent virtual pages reuse their leaf-table walk. The caller must
+    /// publish the writes with the architecture's ordering and TLB protocol
+    /// before an active address space can observe them.
+    pub fn map_pages_without_flush<I>(&self, pages: I) -> usize
+    where
+        I: IntoIterator<Item = (VirtAddr, PhysAddr, MappingFlags)>,
+    {
+        let mut leaf_tag = usize::MAX;
+        let mut leaf_table = PhysAddr::new(0);
+        let mut mapped = 0usize;
+        for (vaddr, paddr, flags) in pages {
+            let current_tag = vaddr.raw() >> 21;
+            if current_tag != leaf_tag {
+                leaf_table = self.leaf_table_for_mapping(vaddr);
+                leaf_tag = current_tag;
+            }
+            Self::get_pte_list(leaf_table)[vaddr.pn_index(0)] =
+                PTE::new_page(paddr, flags.into());
+            mapped += 1;
+        }
+        mapped
+    }
+
+    /// Revoke 4 KiB leaves without issuing a TLB invalidation.
+    ///
+    /// The caller must retain every affected data-frame owner until it has
+    /// completed the architecture's local and remote TLB retirement barrier.
+    pub fn unmap_pages_without_flush<I>(&self, pages: I) -> usize
+    where
+        I: IntoIterator<Item = VirtAddr>,
+    {
+        let mut leaf_tag = usize::MAX;
+        let mut leaf_table = None;
+        let mut unmapped = 0usize;
+        for vaddr in pages {
+            let current_tag = vaddr.raw() >> 21;
+            if current_tag != leaf_tag {
+                leaf_table = self.leaf_table_for_unmapping(vaddr);
+                leaf_tag = current_tag;
+            }
+            let Some(table) = leaf_table else {
+                continue;
+            };
+            let pte = &mut Self::get_pte_list(table)[vaddr.pn_index(0)];
+            if pte.is_valid() {
+                *pte = PTE::empty();
+                unmapped += 1;
+            }
+        }
+        unmapped
+    }
+
     /// Mapping a page to specific virtual page (user space address).
     ///
     /// Ensure that PageTable is which you want to map.
@@ -76,32 +168,7 @@ impl PageTable {
         flags: MappingFlags,
         _size: MappingSize,
     ) {
-        let mut pte_list = Self::get_pte_list(self.0);
-        if Self::PAGE_LEVEL == 4 {
-            let pte = &mut pte_list[vaddr.pn_index(3)];
-            if !pte.is_valid() {
-                *pte = PTE::new_table(frame_alloc());
-            }
-            pte_list = Self::get_pte_list(pte.address());
-        }
-        // level 3
-        {
-            let pte = &mut pte_list[vaddr.pn_index(2)];
-            if !pte.is_valid() {
-                *pte = PTE::new_table(frame_alloc());
-            }
-            pte_list = Self::get_pte_list(pte.address());
-        }
-        // level 2
-        {
-            let pte = &mut pte_list[vaddr.pn_index(1)];
-            if !pte.is_valid() {
-                *pte = PTE::new_table(frame_alloc());
-            }
-            pte_list = Self::get_pte_list(pte.address());
-        }
-        // level 1, map page
-        pte_list[vaddr.pn_index(0)] = PTE::new_page(paddr, flags.into());
+        self.map_pages_without_flush(core::iter::once((vaddr, paddr, flags)));
         TLB::flush_vaddr(vaddr);
     }
 

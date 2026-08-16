@@ -24,6 +24,7 @@ const WRITEBACK_CLUSTER_BYTES: usize = 256 * 1024;
 const CLEAN_PAGE_CACHE_MIN_PAGES: usize = 2048;
 const CLEAN_PAGE_CACHE_MAX_PAGES: usize = 65536;
 const CLEAN_PAGE_CACHE_MEMORY_DIVISOR: usize = 32;
+const CLEAN_PAGE_FOLIO_PAGES: usize = 16;
 const PBLOCK_RUN_CACHE_LIMIT: usize = 2048;
 const PBLOCK_RUN_LOOKAHEAD: u32 = 16;
 // The official compiler workload touches more than 50K distinct inodes in a
@@ -38,6 +39,26 @@ static WRITEBACK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static EXECUTABLE_IMAGE_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "buildstorm-diagnostics")]
 static EXECUTABLE_IMAGE_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_MAX: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_RUN_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_RUN_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_RUN_MAX: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_PREFETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_PREFETCH_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_INSERTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static CLEAN_PAGE_CACHE_FOLIO_TOUCHES: AtomicUsize = AtomicUsize::new(0);
 static NAMESPACE_GENERATION: AtomicUsize = AtomicUsize::new(0);
 fn checked_file_end(offset: usize, len: usize) -> Result<usize, SysErrNo> {
     let end = offset.checked_add(len).ok_or(SysErrNo::EFBIG)?;
@@ -419,9 +440,45 @@ struct CleanPageKey {
     page_idx: usize,
 }
 
-struct CachedCleanPage {
-    frame: FrameTracker,
+impl CleanPageKey {
+    fn folio_key(self) -> CleanPageFolioKey {
+        CleanPageFolioKey {
+            ino: self.ino,
+            start_page_idx: self.page_idx - self.page_idx % CLEAN_PAGE_FOLIO_PAGES,
+        }
+    }
+
+    fn folio_slot(self) -> usize {
+        self.page_idx % CLEAN_PAGE_FOLIO_PAGES
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CleanPageFolioKey {
+    ino: u32,
+    start_page_idx: usize,
+}
+
+struct CachedCleanFolio {
+    frames: [Option<FrameTracker>; CLEAN_PAGE_FOLIO_PAGES],
     last_used: u64,
+}
+
+impl CachedCleanFolio {
+    fn new(last_used: u64) -> Self {
+        Self {
+            frames: core::array::from_fn(|_| None),
+            last_used,
+        }
+    }
+
+    fn page_count(&self) -> usize {
+        self.frames.iter().filter(|frame| frame.is_some()).count()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.iter().all(|frame| frame.is_none())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -534,17 +591,19 @@ impl PblockRunCache {
 }
 
 struct CleanPageCache {
-    pages: BTreeMap<CleanPageKey, CachedCleanPage>,
-    ages: BTreeSet<(u64, CleanPageKey)>,
+    folios: BTreeMap<CleanPageFolioKey, CachedCleanFolio>,
+    ages: BTreeSet<(u64, CleanPageFolioKey)>,
     next_age: u64,
+    page_count: usize,
 }
 
 impl CleanPageCache {
     fn new() -> Self {
         Self {
-            pages: BTreeMap::new(),
+            folios: BTreeMap::new(),
             ages: BTreeSet::new(),
             next_age: 1,
+            page_count: 0,
         }
     }
 
@@ -555,12 +614,22 @@ impl CleanPageCache {
     }
 
     fn get(&mut self, key: CleanPageKey) -> Option<FrameTracker> {
+        let folio_key = key.folio_key();
+        let slot = key.folio_slot();
+        let (old_age, frame) = {
+            let folio = self.folios.get(&folio_key)?;
+            (folio.last_used, folio.frames[slot].as_ref()?.clone())
+        };
         let age = self.bump_age();
-        let page = self.pages.get_mut(&key)?;
-        self.ages.remove(&(page.last_used, key));
-        page.last_used = age;
-        self.ages.insert((age, key));
-        Some(page.frame.clone())
+        self.ages.remove(&(old_age, folio_key));
+        self.folios
+            .get_mut(&folio_key)
+            .expect("clean folio disappeared while locked")
+            .last_used = age;
+        self.ages.insert((age, folio_key));
+        #[cfg(feature = "buildstorm-diagnostics")]
+        CLEAN_PAGE_CACHE_FOLIO_TOUCHES.fetch_add(1, Ordering::Relaxed);
+        Some(frame)
     }
 
     fn uncached_prefix_len(&self, ino: u32, start_page_idx: usize, max_pages: usize) -> usize {
@@ -569,7 +638,13 @@ impl CleanPageCache {
             let Some(page_idx) = start_page_idx.checked_add(pages) else {
                 break;
             };
-            if self.pages.contains_key(&CleanPageKey { ino, page_idx }) {
+            let key = CleanPageKey { ino, page_idx };
+            if self
+                .folios
+                .get(&key.folio_key())
+                .and_then(|folio| folio.frames[key.folio_slot()].as_ref())
+                .is_some()
+            {
                 break;
             }
             pages += 1;
@@ -579,62 +654,111 @@ impl CleanPageCache {
 
     fn get_run(&mut self, ino: u32, start_page_idx: usize, max_pages: usize) -> Vec<FrameTracker> {
         let mut frames = Vec::new();
-        for page in 0..max_pages {
-            let Some(page_idx) = start_page_idx.checked_add(page) else {
+        while frames.len() < max_pages {
+            let Some(page_idx) = start_page_idx.checked_add(frames.len()) else {
                 break;
             };
             let key = CleanPageKey { ino, page_idx };
-            let age = self.bump_age();
-            let Some(cached) = self.pages.get_mut(&key) else {
+            let folio_key = key.folio_key();
+            let slot = key.folio_slot();
+            let Some(old_age) = self
+                .folios
+                .get(&folio_key)
+                .and_then(|folio| folio.frames[slot].as_ref().map(|_| folio.last_used))
+            else {
                 break;
             };
-            self.ages.remove(&(cached.last_used, key));
-            cached.last_used = age;
-            self.ages.insert((age, key));
-            frames.push(cached.frame.clone());
+            let age = self.bump_age();
+            self.ages.remove(&(old_age, folio_key));
+            self.folios
+                .get_mut(&folio_key)
+                .expect("clean folio disappeared while locked")
+                .last_used = age;
+            self.ages.insert((age, folio_key));
+            #[cfg(feature = "buildstorm-diagnostics")]
+            CLEAN_PAGE_CACHE_FOLIO_TOUCHES.fetch_add(1, Ordering::Relaxed);
+
+            let folio = self
+                .folios
+                .get(&folio_key)
+                .expect("clean folio disappeared while locked");
+            let remaining = max_pages - frames.len();
+            for frame in folio.frames[slot..].iter().take(remaining) {
+                let Some(frame) = frame.as_ref() else {
+                    break;
+                };
+                frames.push(frame.clone());
+            }
+        }
+        #[cfg(feature = "buildstorm-diagnostics")]
+        {
+            CLEAN_PAGE_CACHE_RUN_CALLS.fetch_add(1, Ordering::Relaxed);
+            CLEAN_PAGE_CACHE_RUN_PAGES.fetch_add(frames.len(), Ordering::Relaxed);
+            CLEAN_PAGE_CACHE_RUN_MAX.fetch_max(frames.len(), Ordering::Relaxed);
         }
         frames
     }
 
     fn insert(&mut self, key: CleanPageKey, frame: FrameTracker) {
-        let age = self.bump_age();
-        if let Some(page) = self.pages.get_mut(&key) {
-            self.ages.remove(&(page.last_used, key));
-            page.frame = frame;
-            page.last_used = age;
-            self.ages.insert((age, key));
-            return;
-        }
-        if self.pages.len() >= clean_page_cache_limit() {
+        let folio_key = key.folio_key();
+        let slot = key.folio_slot();
+        let replacing = self
+            .folios
+            .get(&folio_key)
+            .and_then(|folio| folio.frames[slot].as_ref())
+            .is_some();
+        if !replacing && self.page_count >= clean_page_cache_limit() {
             self.evict_one();
         }
-        self.pages.insert(
-            key,
-            CachedCleanPage {
-                frame,
-                last_used: age,
-            },
-        );
-        self.ages.insert((age, key));
+
+        if let Some(old_age) = self.folios.get(&folio_key).map(|folio| folio.last_used) {
+            self.ages.remove(&(old_age, folio_key));
+        }
+        let age = self.bump_age();
+        let folio = self
+            .folios
+            .entry(folio_key)
+            .or_insert_with(|| CachedCleanFolio::new(age));
+        let inserted = folio.frames[slot].is_none();
+        folio.frames[slot] = Some(frame);
+        folio.last_used = age;
+        self.ages.insert((age, folio_key));
+        if inserted {
+            self.page_count += 1;
+        }
+        #[cfg(feature = "buildstorm-diagnostics")]
+        if inserted {
+            CLEAN_PAGE_CACHE_INSERTS.fetch_add(1, Ordering::Relaxed);
+            CLEAN_PAGE_CACHE_MAX.fetch_max(self.page_count, Ordering::Relaxed);
+        }
     }
 
     fn evict_one(&mut self) {
-        if let Some((age, key)) = self.ages.iter().next().copied() {
-            self.ages.remove(&(age, key));
-            self.pages.remove(&key);
+        if let Some((age, folio_key)) = self.ages.iter().next().copied() {
+            self.ages.remove(&(age, folio_key));
+            if let Some(folio) = self.folios.remove(&folio_key) {
+                let evicted = folio.page_count();
+                self.page_count = self.page_count.saturating_sub(evicted);
+                #[cfg(feature = "buildstorm-diagnostics")]
+                CLEAN_PAGE_CACHE_EVICTIONS.fetch_add(evicted, Ordering::Relaxed);
+            }
         }
     }
 
     fn invalidate_ino(&mut self, ino: u32) {
-        let victims: Vec<CleanPageKey> = self
-            .pages
+        let victims: Vec<CleanPageFolioKey> = self
+            .folios
             .keys()
             .copied()
             .filter(|key| key.ino == ino)
             .collect();
-        for key in victims {
-            if let Some(page) = self.pages.remove(&key) {
-                self.ages.remove(&(page.last_used, key));
+        for folio_key in victims {
+            if let Some(folio) = self.folios.remove(&folio_key) {
+                self.ages.remove(&(folio.last_used, folio_key));
+                let invalidated = folio.page_count();
+                self.page_count = self.page_count.saturating_sub(invalidated);
+                #[cfg(feature = "buildstorm-diagnostics")]
+                CLEAN_PAGE_CACHE_INVALIDATIONS.fetch_add(invalidated, Ordering::Relaxed);
             }
         }
     }
@@ -645,22 +769,57 @@ impl CleanPageCache {
         }
         let first = start / PAGE_SIZE;
         let last = (end - 1) / PAGE_SIZE;
-        let victims: Vec<CleanPageKey> = self
-            .pages
+        let victims: Vec<CleanPageFolioKey> = self
+            .folios
             .keys()
             .copied()
-            .filter(|key| key.ino == ino && key.page_idx >= first && key.page_idx <= last)
+            .filter(|key| {
+                key.ino == ino
+                    && key.start_page_idx <= last
+                    && key.start_page_idx.saturating_add(CLEAN_PAGE_FOLIO_PAGES) > first
+            })
             .collect();
-        for key in victims {
-            if let Some(page) = self.pages.remove(&key) {
-                self.ages.remove(&(page.last_used, key));
+        for folio_key in victims {
+            let mut invalidated = 0usize;
+            let mut remove_folio = false;
+            let mut old_age = 0u64;
+            if let Some(folio) = self.folios.get_mut(&folio_key) {
+                old_age = folio.last_used;
+                let first_slot = first.saturating_sub(folio_key.start_page_idx);
+                let last_slot = last
+                    .saturating_sub(folio_key.start_page_idx)
+                    .min(CLEAN_PAGE_FOLIO_PAGES - 1);
+                for slot in first_slot..=last_slot {
+                    invalidated += usize::from(folio.frames[slot].take().is_some());
+                }
+                remove_folio = folio.is_empty();
             }
+            if remove_folio {
+                self.folios.remove(&folio_key);
+                self.ages.remove(&(old_age, folio_key));
+            }
+            self.page_count = self.page_count.saturating_sub(invalidated);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            CLEAN_PAGE_CACHE_INVALIDATIONS.fetch_add(invalidated, Ordering::Relaxed);
         }
     }
 
+    #[cfg(feature = "buildstorm-diagnostics")]
+    fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    #[cfg(feature = "buildstorm-diagnostics")]
+    fn folio_count(&self) -> usize {
+        self.folios.len()
+    }
+
     fn clear(&mut self) {
-        self.pages.clear();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        CLEAN_PAGE_CACHE_INVALIDATIONS.fetch_add(self.page_count, Ordering::Relaxed);
+        self.folios.clear();
         self.ages.clear();
+        self.page_count = 0;
     }
 }
 
@@ -670,6 +829,38 @@ fn clean_page_cache_limit() -> usize {
     proportional
         .max(CLEAN_PAGE_CACHE_MIN_PAGES)
         .min(CLEAN_PAGE_CACHE_MAX_PAGES)
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+pub fn diagnostic_clean_page_cache_stats() -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
+    let cache = CLEAN_PAGE_CACHE.lock();
+    (
+        cache.page_count(),
+        CLEAN_PAGE_CACHE_MAX.load(Ordering::Relaxed),
+        cache.folio_count(),
+        CLEAN_PAGE_CACHE_FOLIO_TOUCHES.load(Ordering::Relaxed),
+        CLEAN_PAGE_CACHE_RUN_CALLS.load(Ordering::Relaxed),
+        CLEAN_PAGE_CACHE_RUN_PAGES.load(Ordering::Relaxed),
+        CLEAN_PAGE_CACHE_RUN_MAX.load(Ordering::Relaxed),
+        CLEAN_PAGE_CACHE_PREFETCH_CALLS.load(Ordering::Relaxed),
+        CLEAN_PAGE_CACHE_PREFETCH_PAGES.load(Ordering::Relaxed),
+        CLEAN_PAGE_CACHE_INSERTS.load(Ordering::Relaxed),
+        CLEAN_PAGE_CACHE_EVICTIONS.load(Ordering::Relaxed),
+        CLEAN_PAGE_CACHE_INVALIDATIONS.load(Ordering::Relaxed),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1108,6 +1299,10 @@ fn fill_clean_page_frame(
     metadata: Option<CleanPageReadMetadata>,
 ) -> Result<FrameTracker, SysErrNo> {
     let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    frame_allocator::diagnostic_note_allocation(
+        frame_allocator::FrameAllocationClass::CleanFile,
+    );
     let page_start = page_idx.checked_mul(PAGE_SIZE).ok_or(SysErrNo::EFBIG)?;
     let metadata = match metadata {
         Some(metadata) => metadata,
@@ -1210,6 +1405,11 @@ fn prefetch_clean_page_frames(
     if keys.len() < 2 {
         return Ok(());
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        CLEAN_PAGE_CACHE_PREFETCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        CLEAN_PAGE_CACHE_PREFETCH_PAGES.fetch_add(keys.len(), Ordering::Relaxed);
+    }
 
     let blocks = crate::fs::block_dev::read_root_blocks(&offsets)?;
     if blocks.len() != keys.len() {
@@ -1221,6 +1421,10 @@ fn prefetch_clean_page_frames(
             return Err(SysErrNo::EIO);
         }
         let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        frame_allocator::diagnostic_note_allocation(
+            frame_allocator::FrameAllocationClass::CleanFile,
+        );
         unsafe {
             core::ptr::copy_nonoverlapping(block.as_ptr(), frame.ppn().addr() as *mut u8, read_len);
         }
@@ -1256,14 +1460,32 @@ pub fn clean_page_cache_frames(
     }
 
     let read_ahead_pages = read_ahead_pages.max(1).min(max_pages);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let metadata_scope = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::CleanCacheMetadata,
+    );
     let fs = ROOT_EXT4.lock().clone().ok_or(SysErrNo::ENOENT)?;
     let metadata = clean_page_read_metadata(&fs, ino)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    drop(metadata_scope);
     let start_page_idx = file_offset / PAGE_SIZE;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let prefetch_scope = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::CleanCachePrefetch,
+    );
     let _ = prefetch_clean_page_frames(&fs, ino, start_page_idx, read_ahead_pages, metadata);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    drop(prefetch_scope);
     let mut source = None;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let get_run_scope = crate::buildstorm_diagnostics::WorkScope::new(
+        crate::buildstorm_diagnostics::WorkClass::CleanCacheGetRun,
+    );
     let mut frames = CLEAN_PAGE_CACHE
         .lock()
         .get_run(ino, start_page_idx, max_pages);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    drop(get_run_scope);
     for page in frames.len()..max_pages {
         let Some(delta) = page.checked_mul(PAGE_SIZE) else {
             break;
@@ -1457,6 +1679,10 @@ fn promote_dense_regular_cache(cached: &mut CachedRegularFile) -> Result<(), Sys
     let mut pages = BTreeMap::new();
     for (page_idx, chunk) in dense.chunks(PAGE_SIZE).enumerate() {
         let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        frame_allocator::diagnostic_note_allocation(
+            frame_allocator::FrameAllocationClass::FileWrite,
+        );
         unsafe {
             core::ptr::copy_nonoverlapping(
                 chunk.as_ptr(),
@@ -1481,6 +1707,10 @@ fn cached_page_for_write(
         return Ok(frame.clone());
     }
     let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
+    #[cfg(feature = "buildstorm-diagnostics")]
+    frame_allocator::diagnostic_note_allocation(
+        frame_allocator::FrameAllocationClass::FileWrite,
+    );
     if preserve_contents {
         let page_start = page_idx.checked_mul(PAGE_SIZE).ok_or(SysErrNo::EFBIG)?;
         if page_start < cached.persisted_size {

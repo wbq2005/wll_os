@@ -4,6 +4,7 @@
 use alloc::vec::Vec;
 use polyhal::VirtAddr;
 
+use crate::mm::map_area::MapAreaBacking;
 use crate::mm::memory_set::MemorySet;
 use crate::mm::page_table::PTEFlags;
 use crate::utils::error::SysErrNo;
@@ -357,10 +358,11 @@ impl<'a> ElfFile<'a> {
 
         let user_stack_top = crate::config::USER_STACK_TOP;
         let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
-        memory_set.insert_framed_area(
+        memory_set.insert_lazy_area_with_backing(
             VirtAddr::new(user_stack_bottom),
             VirtAddr::new(user_stack_top),
             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
+            MapAreaBacking::Anonymous,
         )?;
 
         Ok((memory_set, user_stack_top, entry))
@@ -554,10 +556,11 @@ impl<'a> ElfFile<'a> {
             user_stack_top
         );
 
-        memory_set.insert_framed_area(
+        memory_set.insert_lazy_area_with_backing(
             VirtAddr::new(user_stack_bottom),
             VirtAddr::new(user_stack_top),
             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
+            MapAreaBacking::Anonymous,
         )?;
 
         Ok((memory_set, user_stack_top, entry))

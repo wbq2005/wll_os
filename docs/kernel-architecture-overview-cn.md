@@ -436,3 +436,22 @@ LA clean build 已完成，失败来自随后 coreutils 目录恢复操作缺少
 修复后的 LA public 8G/8 完整流程为 `official-pass`，而评测机独有 UEFI 后处理仍为
 `unverified`。证据见
 `docs/evidence/buildstorm-stage2/20260816-la-fchdir-official-public-complete/`。
+
+## 17. MADV_DONTNEED 与匿名 resident retirement
+
+`MapAreaBacking::AnonymousShared` 将 `MAP_SHARED|MAP_ANONYMOUS` 从 private anonymous
+policy 中显式分离。VMA 只描述地址范围、权限和 backing policy；实际物理页继续由
+`ResidentSet` 唯一持有，fork/clone 对 shared resident 增加 frame owner 引用，COW
+只作用于 private mapping。
+
+`MADV_DONTNEED` 的职责分布如下：syscall 层验证页对齐、长度与 advice；`MemorySet`
+验证请求范围完整覆盖并只选择 private anonymous VMA；`ResidentSet` 提取重叠 VPN
+的 owner；`PageTableOps` 批量清除 4 KiB leaf。`TlbProtocol` 的顺序固定为 PTE revoke、
+发布 fence、本地 flush、远端 root-keyed shootdown、最后释放 frame owner。该顺序
+避免任何 CPU 在 stale TLB 尚存时复用物理页。
+
+discard 不改变 VMA 拓扑，因此下一次访问按原权限重新 fault，并从 frame allocator
+获得清零页。shared anonymous、SysV shm 与 file mapping 不进入该路径。诊断计数只在
+`buildstorm-diagnostics` 下编译，production 默认关闭。双架构 SMP 生命周期和完整
+8G/8 BuildStorm 均已通过，证据见
+`docs/evidence/buildstorm-stage2/stage17-madvise-dontneed-official-20260816/`。

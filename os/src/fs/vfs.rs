@@ -38,7 +38,8 @@ lazy_static! {
         RwLock::new(BTreeMap::new());
     static ref READLINK_RESULT_CACHE: RwLock<BTreeMap<String, Result<String, SysErrNo>>> =
         RwLock::new(BTreeMap::new());
-    static ref RESOLVED_DIRECTORY_CACHE: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
+    static ref RESOLVED_DIRECTORY_CACHE: RwLock<BTreeSet<String>> =
+        RwLock::new(BTreeSet::new());
     static ref RESOLVED_PARENT_CACHE: RwLock<BTreeMap<String, String>> =
         RwLock::new(BTreeMap::new());
 }

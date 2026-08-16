@@ -337,8 +337,7 @@ pub fn grow_from_frame_allocator(total_memory_bytes: usize) -> usize {
     // Large user-space builds can require a single high-order allocation.
     // Reserving 1/4 of RAM keeps multi-hundred-MiB buddy blocks available on
     // the official 8 GiB runs while remaining capped at 2 GiB.
-    let requested = (total_memory_bytes / DYNAMIC_HEAP_MEMORY_FRACTION)
-        .min(MAX_DYNAMIC_HEAP_SIZE);
+    let requested = (total_memory_bytes / DYNAMIC_HEAP_MEMORY_FRACTION).min(MAX_DYNAMIC_HEAP_SIZE);
     let requested = if requested.is_power_of_two() {
         requested
     } else {

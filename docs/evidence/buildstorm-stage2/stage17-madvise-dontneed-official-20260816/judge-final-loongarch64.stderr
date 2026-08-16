@@ -1,0 +1,3 @@
+[judge] scripted total = 180.0 / 180.0 (+ doc 20 pts, judged manually) = 200 
+[judge] compile: arch=loongarch64 elapsed=558s baseline=1985s
+[judge] WARN: guest saw cores=8, expected 12 for loongarch64 -- check qemu -smp

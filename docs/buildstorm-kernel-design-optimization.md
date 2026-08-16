@@ -1881,3 +1881,35 @@ serial-QEMU evidence collection. Raw serial, runner metadata, hashes, judge
 output, build logs, and the independent regression are indexed under
 `docs/evidence/buildstorm-stage2/20260816-la-fchdir-capability-gates/` and
 `docs/evidence/buildstorm-stage2/20260816-la-fchdir-official-public-complete/`.
+
+## 45. Anonymous resident retirement for MADV_DONTNEED (2026-08-16)
+
+The evaluator emitted 135 jemalloc fallback warnings because syscall 233
+returned success without discarding memory. The retained implementation gives
+`MADV_DONTNEED` Linux-compatible behavior for private anonymous residents while
+leaving VMA topology, shared mappings, SysV memory, and file mappings intact.
+
+Ownership remains layered. `ResidentSet` extracts VMA-relative owners but does
+not edit page tables. `PageTableOps` batches leaf revocation and reuses one walk
+per 2 MiB leaf table. `MemorySet` publishes the PTE writes, performs the local
+flush and remote root-keyed shootdown, and only then releases retired frame
+owners. A later fault allocates a zeroed page under the existing VMA policy.
+`AnonymousShared` is classified separately so fork/clone sharing and discard
+policy cannot be confused with private anonymous memory.
+
+The LA diagnostic window observed 1,481 calls, 190,954 requested pages, and
+32,904 discarded pages; the fallback warning count became zero. The isolated
+same-host Stage17 A/B improved from 556.35 to 547.73 seconds (1.55%). The exact
+submission tree excludes the rejected Stage16 syscall-return/CPU-index fast
+path. Its complete unmodified 8G/8 runs finished at 558.27 seconds on
+LoongArch64 and 686.50 seconds on RISC-V64; both official judges parsed
+180/180. Relative to clean `12f110ae` at 623.15 seconds, the final LoongArch64
+tree is 10.41% faster. Four release cfg checks and both SMP8 lifecycle suites
+passed. The complete evidence, seven-file Stage17 incremental patch, and
+19-file final cumulative patch are under
+`docs/evidence/buildstorm-stage2/stage17-madvise-dontneed-official-20260816/`.
+
+AI assisted with evidence correlation, invariant review, implementation, and
+single-QEMU A/B orchestration. The official image, suite, guest script, judge,
+markers, guest clock, and workload-independent production behavior were not
+modified.

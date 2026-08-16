@@ -9,6 +9,8 @@ use core::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::config::MAX_CPUS;
+#[cfg(target_arch = "riscv64")]
+use crate::config::PAGE_SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -23,6 +25,7 @@ static PLATFORM_KIND: AtomicUsize = AtomicUsize::new(PlatformKind::Unknown as us
 static PHYSICAL_CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
 static TOTAL_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 static GOLDFISH_RTC_BASE: AtomicUsize = AtomicUsize::new(0);
+static ZERO_BLOCK_BYTES: AtomicUsize = AtomicUsize::new(0);
 static CPU_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 static CPU_STATES: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(CpuState::Absent as usize) }; MAX_CPUS];
@@ -86,6 +89,10 @@ pub fn init(boot_hardware_id: usize) {
     };
 
     let mut cpu_count = 0usize;
+    #[cfg(target_arch = "riscv64")]
+    let mut cboz_consensus = None;
+    #[cfg(target_arch = "riscv64")]
+    let mut cboz_usable = true;
     for node in fdt.find_nodes("/cpus/cpu") {
         if cpu_count >= MAX_CPUS {
             log::warn!("[platform] ignoring CPU beyond MAX_CPUS={}", MAX_CPUS);
@@ -96,6 +103,39 @@ pub fn init(boot_hardware_id: usize) {
             .and_then(|mut regions| regions.next())
             .map(|region| region.address as usize)
             .unwrap_or(cpu_count);
+        #[cfg(target_arch = "riscv64")]
+        {
+            let listed_extension = node
+                .find_property("riscv,isa-extensions")
+                .map(|property| property.str_list().any(|extension| extension == "zicboz"))
+                .unwrap_or(false);
+            let legacy_extension =
+                node.find_property("riscv,isa")
+                    .map(|property| {
+                        property.str().split('_').any(|extension| {
+                            extension == "zicboz" || extension.starts_with("zicboz1")
+                        })
+                    })
+                    .unwrap_or(false);
+            let block_bytes = node
+                .find_property("riscv,cboz-block-size")
+                .and_then(|property| {
+                    (property.raw_value().len() >= core::mem::size_of::<u32>())
+                        .then(|| property.u32() as usize)
+                })
+                .filter(|bytes| *bytes != 0 && bytes.is_power_of_two() && *bytes <= PAGE_SIZE);
+            let cpu_block = (listed_extension || legacy_extension)
+                .then_some(block_bytes)
+                .flatten();
+            if cpu_count == 0 {
+                cboz_consensus = cpu_block;
+            } else if cboz_consensus != cpu_block {
+                cboz_usable = false;
+            }
+            if cpu_block.is_none() {
+                cboz_usable = false;
+            }
+        }
         CPU_IDS[cpu_count].store(hardware_id, Ordering::Relaxed);
         CPU_STATES[cpu_count].store(CpuState::Present as usize, Ordering::Relaxed);
         cpu_count += 1;
@@ -106,6 +146,13 @@ pub fn init(boot_hardware_id: usize) {
         cpu_count = 1;
     }
     PHYSICAL_CPU_COUNT.store(cpu_count, Ordering::Release);
+
+    #[cfg(target_arch = "riscv64")]
+    if cboz_usable {
+        if let Some(block_bytes) = cboz_consensus {
+            ZERO_BLOCK_BYTES.store(block_bytes, Ordering::Release);
+        }
+    }
 
     let total_memory = fdt
         .memory()
@@ -139,6 +186,42 @@ pub fn init(boot_hardware_id: usize) {
         total_memory / 1024 / 1024,
         model
     );
+    #[cfg(target_arch = "riscv64")]
+    log::info!(
+        "[platform] cbo.zero block={} bytes",
+        ZERO_BLOCK_BYTES.load(Ordering::Acquire)
+    );
+}
+
+pub fn zero_block_bytes() -> usize {
+    ZERO_BLOCK_BYTES.load(Ordering::Acquire)
+}
+
+/// Zero a physical-memory range using the best runtime-safe platform backend.
+///
+/// The caller must provide a valid writable range. Zicboz is used only when
+/// every discovered RISC-V CPU reports the same usable block size.
+pub unsafe fn zero_phys_range(ptr: *mut u8, len: usize) {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let block_bytes = zero_block_bytes();
+        let start = ptr as usize;
+        if block_bytes != 0 && start % block_bytes == 0 && len % block_bytes == 0 {
+            if let Some(end) = start.checked_add(len) {
+                let mut addr = start;
+                while addr < end {
+                    core::arch::asm!(
+                        ".insn i 0x0f, 0x2, x0, {base}, 0x4",
+                        base = in(reg) addr,
+                        options(nostack)
+                    );
+                    addr += block_bytes;
+                }
+                return;
+            }
+        }
+    }
+    core::ptr::write_bytes(ptr, 0, len);
 }
 
 pub fn kind() -> PlatformKind {

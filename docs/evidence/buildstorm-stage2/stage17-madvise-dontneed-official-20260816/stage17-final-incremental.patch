@@ -1,0 +1,472 @@
+--- a/patch/polyhal/src/pagetable/mod.rs
++++ b/patch/polyhal/src/pagetable/mod.rs
+@@ -81,6 +81,25 @@
+         table
+     }
+ 
++    fn leaf_table_for_unmapping(&self, vaddr: VirtAddr) -> Option<PhysAddr> {
++        let mut table = self.0;
++        if Self::PAGE_LEVEL == 4 {
++            let pte = Self::get_pte_list(table)[vaddr.pn_index(3)];
++            if !pte.is_table() {
++                return None;
++            }
++            table = pte.address();
++        }
++        for level in (1..=2).rev() {
++            let pte = Self::get_pte_list(table)[vaddr.pn_index(level)];
++            if !pte.is_table() {
++                return None;
++            }
++            table = pte.address();
++        }
++        Some(table)
++    }
++
+     /// Publish 4 KiB leaves without issuing a TLB invalidation.
+     ///
+     /// Adjacent virtual pages reuse their leaf-table walk. The caller must
+@@ -105,6 +124,35 @@
+         }
+         mapped
+     }
++
++    /// Revoke 4 KiB leaves without issuing a TLB invalidation.
++    ///
++    /// The caller must retain every affected data-frame owner until it has
++    /// completed the architecture's local and remote TLB retirement barrier.
++    pub fn unmap_pages_without_flush<I>(&self, pages: I) -> usize
++    where
++        I: IntoIterator<Item = VirtAddr>,
++    {
++        let mut leaf_tag = usize::MAX;
++        let mut leaf_table = None;
++        let mut unmapped = 0usize;
++        for vaddr in pages {
++            let current_tag = vaddr.raw() >> 21;
++            if current_tag != leaf_tag {
++                leaf_table = self.leaf_table_for_unmapping(vaddr);
++                leaf_tag = current_tag;
++            }
++            let Some(table) = leaf_table else {
++                continue;
++            };
++            let pte = &mut Self::get_pte_list(table)[vaddr.pn_index(0)];
++            if pte.is_valid() {
++                *pte = PTE::empty();
++                unmapped += 1;
++            }
++        }
++        unmapped
++    }
+ 
+     /// Mapping a page to specific virtual page (user space address).
+     ///
+--- a/os/src/mm/map_area.rs
++++ b/os/src/mm/map_area.rs
+@@ -344,6 +344,7 @@
+ #[derive(Clone)]
+ pub enum MapAreaBacking {
+     Anonymous,
++    AnonymousShared,
+     File {
+         file: FileDescriptor,
+         offset: usize,
+@@ -360,6 +361,7 @@
+     fn split_right(&self, delta: usize) -> Self {
+         match self {
+             Self::Anonymous => Self::Anonymous,
++            Self::AnonymousShared => Self::AnonymousShared,
+             Self::File {
+                 file,
+                 offset,
+@@ -388,6 +390,7 @@
+     fn can_merge_with(&self, left_len: usize, right: &Self) -> bool {
+         match (self, right) {
+             (Self::Anonymous, Self::Anonymous) => true,
++            (Self::AnonymousShared, Self::AnonymousShared) => true,
+             (
+                 Self::File {
+                     file: left_file,
+@@ -481,6 +484,19 @@
+         &self.resident
+     }
+ 
++    /// Transfer resident ownership for a VMA-relative range to the caller.
++    /// PTE revocation and the TLB retirement barrier are coordinated by
++    /// `MemorySet`; this method changes no mapping or VMA policy.
++    pub(crate) fn extract_resident_range(
++        &mut self,
++        start_vpn: usize,
++        end_vpn: usize,
++    ) -> ResidentSet {
++        self.resident
++            .extract_range(start_vpn, end_vpn)
++            .unwrap_or_else(ResidentSet::new)
++    }
++
+     /// Transfer `page` to this VMA's resident owner as its dense suffix.
+     ///
+     /// On `Err`, ownership remains with the caller and no PTE changed.  On
+@@ -570,6 +586,7 @@
+             MapAreaBacking::File { shared: false, .. } => 2,
+             MapAreaBacking::File { shared: true, .. } => 3,
+             MapAreaBacking::SharedMemory { .. } => 4,
++            MapAreaBacking::AnonymousShared => 5,
+         };
+         let page_state = page
+             .map(|page| match page.state() {
+--- a/os/src/mm/memory_set.rs
++++ b/os/src/mm/memory_set.rs
+@@ -65,7 +65,9 @@
+ fn is_shared_mapping(area: &MapArea) -> bool {
+     matches!(
+         area.backing,
+-        MapAreaBacking::SharedMemory { .. } | MapAreaBacking::File { shared: true, .. }
++        MapAreaBacking::AnonymousShared
++            | MapAreaBacking::SharedMemory { .. }
++            | MapAreaBacking::File { shared: true, .. }
+     )
+ }
+ 
+@@ -154,6 +156,36 @@
+     }
+ }
+ 
++fn unmap_area_resident_range_without_flush(
++    page_table: &PageTableWrapper,
++    area: &MapArea,
++    start_idx: usize,
++    end_idx: usize,
++) -> usize {
++    if !has_leaf_permission(area.flags) || start_idx >= end_idx {
++        return 0;
++    }
++    page_table.unmap_pages_without_flush(
++        area.resident()
++            .iter_range(start_idx, end_idx)
++            .map(|(idx, _)| VirtAddr::new(area.start_va.raw() + idx * PAGE_SIZE)),
++    )
++}
++
++fn commit_page_table_retirement(page_table: &PageTableWrapper, writes: usize) {
++    if writes == 0 {
++        return;
++    }
++    fence(Ordering::SeqCst);
++    #[cfg(feature = "buildstorm-diagnostics")]
++    {
++        crate::buildstorm_diagnostics::note_local_tlb_flush();
++        crate::buildstorm_diagnostics::note_page_table_batch(writes, true);
++    }
++    TLB::flush_all();
++    crate::platform::tlb_shootdown(page_table.root().raw());
++}
++
+ fn unmap_area_pages(page_table: &PageTableWrapper, area: &MapArea, flags: PTEFlags) {
+     unmap_area_pages_without_shootdown(page_table, area, flags);
+     if !has_leaf_permission(flags) || !area.has_frames() {
+@@ -200,7 +232,9 @@
+             let mut file = file.clone();
+             let _ = file.read_at(page_offset.saturating_add(*offset), &mut data)?;
+         }
+-        MapAreaBacking::Anonymous | MapAreaBacking::SharedMemory { .. } => {}
++        MapAreaBacking::Anonymous
++        | MapAreaBacking::AnonymousShared
++        | MapAreaBacking::SharedMemory { .. } => {}
+     }
+     Ok(data)
+ }
+@@ -319,6 +353,9 @@
+             }
+             area.append_resident(frame).map_err(|_| SysErrNo::EFAULT)?;
+         }
++        if is_shared_mapping(&area) {
++            area.set_all_resident_state(PageState::Shared);
++        }
+ 
+         self.areas.push(area);
+         self.coalesce_areas();
+@@ -599,6 +636,52 @@
+         }
+     }
+ 
++    /// Discard resident pages from private anonymous VMAs without changing
++    /// their topology. Revoked frames stay owned until the local and remote
++    /// TLB retirement barrier has completed.
++    pub fn discard_anonymous_range(
++        &mut self,
++        start_va: VirtAddr,
++        end_va: VirtAddr,
++    ) -> Result<usize, SysErrNo> {
++        let start = start_va.raw();
++        let end = end_va.raw();
++        if start >= end || start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
++            return Err(SysErrNo::EINVAL);
++        }
++        if !self.range_covered(start, end) {
++            return Err(SysErrNo::ENOMEM);
++        }
++
++        let mut retired = Vec::new();
++        let mut revoked = 0usize;
++        let mut discarded = 0usize;
++        for area in &mut self.areas {
++            if !area.overlaps(start, end) || !matches!(area.backing, MapAreaBacking::Anonymous) {
++                continue;
++            }
++            let overlap_start = start.max(area.start_va.raw());
++            let overlap_end = end.min(area.end_va.raw());
++            let start_idx = (overlap_start - area.start_va.raw()) / PAGE_SIZE;
++            let end_idx = (overlap_end - area.start_va.raw()) / PAGE_SIZE;
++            revoked = revoked.saturating_add(unmap_area_resident_range_without_flush(
++                &self.page_table,
++                area,
++                start_idx,
++                end_idx,
++            ));
++            let owner = area.extract_resident_range(start_idx, end_idx);
++            discarded = discarded.saturating_add(owner.len());
++            if !owner.is_empty() {
++                retired.push(owner);
++            }
++        }
++
++        commit_page_table_retirement(&self.page_table, revoked);
++        drop(retired);
++        Ok(discarded)
++    }
++
+     pub fn unmap_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> Result<(), SysErrNo> {
+         let start = start_va.raw();
+         let end = end_va.raw();
+@@ -1260,9 +1343,9 @@
+             core::ptr::copy_nonoverlapping(data.as_ptr(), frame.ppn().addr() as *mut u8, PAGE_SIZE);
+         }
+         let state = match self.areas[idx].backing {
+-            MapAreaBacking::File { shared: true, .. } | MapAreaBacking::SharedMemory { .. } => {
+-                PageState::Shared
+-            }
++            MapAreaBacking::AnonymousShared
++            | MapAreaBacking::File { shared: true, .. }
++            | MapAreaBacking::SharedMemory { .. } => PageState::Shared,
+             MapAreaBacking::File { shared: false, .. } => PageState::FileClean,
+             MapAreaBacking::Anonymous => PageState::Private,
+         };
+@@ -1524,7 +1607,10 @@
+             let mut new_area =
+                 MapArea::with_backing(area.start_va, area.end_va, new_flags, area.backing.clone());
+ 
+-            if matches!(area.backing, MapAreaBacking::SharedMemory { .. }) {
++            if matches!(
++                area.backing,
++                MapAreaBacking::AnonymousShared | MapAreaBacking::SharedMemory { .. }
++            ) {
+                 new_area.set_all_resident_state(PageState::Shared);
+                 new_area.clone_resident_from(area);
+                 map_area_pages(&new_ms.page_table, &new_area);
+--- a/os/src/syscall/mm.rs
++++ b/os/src/syscall/mm.rs
+@@ -41,6 +41,7 @@
+ const MS_INVALIDATE: usize = 0x2;
+ const MS_SYNC: usize = 0x4;
+ const MS_SUPPORTED: usize = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
++const MADV_DONTNEED: i32 = 4;
+ const IPC_PRIVATE: isize = 0;
+ const IPC_CREAT: i32 = 0o1000;
+ const IPC_EXCL: i32 = 0o2000;
+@@ -683,7 +684,15 @@
+ 
+     let map_has_leaf = pte_has_leaf_permission(pte_flags);
+     let (backing, file_data, lazy_clean_mmap) = if anonymous {
+-        (MapAreaBacking::Anonymous, None, false)
++        (
++            if shared {
++                MapAreaBacking::AnonymousShared
++            } else {
++                MapAreaBacking::Anonymous
++            },
++            None,
++            false,
++        )
+     } else {
+         let inner = task.inner.lock();
+         let mut fds = inner.fd_table.lock();
+@@ -841,6 +850,34 @@
+     Ok(0)
+ }
+ 
++/// Apply advisory policy to a mapped range. `MADV_DONTNEED` retires only
++/// private anonymous resident pages; other advice retains the prior no-op
++/// compatibility behavior.
++pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SyscallRet {
++    if addr % PAGE_SIZE != 0 {
++        return Err(SysErrNo::EINVAL);
++    }
++    if len == 0 {
++        return Ok(0);
++    }
++    if advice != MADV_DONTNEED {
++        return Ok(0);
++    }
++
++    let (start, end) = checked_range(addr, len)?;
++    let task = current_task().ok_or(SysErrNo::ESRCH)?;
++    let _discarded = {
++        let mut ms = crate::buildstorm_memory_set_lock!(
++            crate::buildstorm_diagnostics::MemorySetLockSite::Madvise,
++            &task.memory_set,
++        );
++        ms.discard_anonymous_range(VirtAddr::new(start), VirtAddr::new(end))?
++    };
++    #[cfg(feature = "buildstorm-diagnostics")]
++    crate::buildstorm_diagnostics::note_madvise_dontneed((end - start) / PAGE_SIZE, _discarded);
++    Ok(0)
++}
++
+ /// munmap system call.
+ pub fn sys_munmap(addr: usize, length: usize) -> SyscallRet {
+     #[cfg(feature = "buildstorm-diagnostics")]
+--- a/os/src/syscall/mod.rs
++++ b/os/src/syscall/mod.rs
+@@ -540,7 +540,7 @@
+         SYSCALL_GETSID => other::sys_getsid(args[0]),
+         SYSCALL_MEMBARRIER => other::sys_membarrier(args[0], args[1]),
+         SYSCALL_MPROTECT => mm::sys_mprotect(args[0], args[1], args[2] as i32),
+-        SYSCALL_MADVISE => Ok(0), // madvise advisory, ignore
++        SYSCALL_MADVISE => mm::sys_madvise(args[0], args[1], args[2] as i32),
+ 
+         // sched stubs / single-CPU policy
+         SYSCALL_SCHED_GETAFFINITY => other::sys_sched_getaffinity(args[0], args[1], args[2]),
+--- a/os/src/buildstorm_diagnostics.rs
++++ b/os/src/buildstorm_diagnostics.rs
+@@ -457,6 +457,7 @@
+     MmapSelect,
+     MmapCommit,
+     Mprotect,
++    Madvise,
+     Munmap,
+     FileInvalidate,
+     FileWriteback,
+@@ -466,7 +467,7 @@
+     Futex,
+ }
+ 
+-const MEMORY_SET_LOCK_SITE_NAMES: [&str; 16] = [
++const MEMORY_SET_LOCK_SITE_NAMES: [&str; 17] = [
+     "other",
+     "user_entry_activation",
+     "hardware_page_fault",
+@@ -476,6 +477,7 @@
+     "mmap_select",
+     "mmap_commit",
+     "mprotect",
++    "madvise",
+     "munmap",
+     "file_invalidate",
+     "file_writeback",
+@@ -507,6 +509,9 @@
+ static MMAP_FAILED_VMAS_MAX: AtomicUsize = AtomicUsize::new(0);
+ static MMAP_HIGH_ARENA_PLACEMENTS: AtomicUsize = AtomicUsize::new(0);
+ static MMAP_LOW_ARENA_PLACEMENTS: AtomicUsize = AtomicUsize::new(0);
++static MADVISE_DONTNEED_CALLS: AtomicUsize = AtomicUsize::new(0);
++static MADVISE_DONTNEED_REQUESTED_PAGES: AtomicUsize = AtomicUsize::new(0);
++static MADVISE_DONTNEED_DISCARDED_PAGES: AtomicUsize = AtomicUsize::new(0);
+ static MUNMAP_BELOW_CURSOR_LENGTH_COUNTS: [AtomicUsize; MMAP_LENGTH_BUCKETS] =
+     [const { AtomicUsize::new(0) }; MMAP_LENGTH_BUCKETS];
+ static MUNMAP_OVERLAPS_CURSOR: AtomicUsize = AtomicUsize::new(0);
+@@ -1803,6 +1808,13 @@
+ }
+ 
+ #[inline]
++pub(crate) fn note_madvise_dontneed(requested_pages: usize, discarded_pages: usize) {
++    MADVISE_DONTNEED_CALLS.fetch_add(1, Ordering::Relaxed);
++    MADVISE_DONTNEED_REQUESTED_PAGES.fetch_add(requested_pages, Ordering::Relaxed);
++    MADVISE_DONTNEED_DISCARDED_PAGES.fetch_add(discarded_pages, Ordering::Relaxed);
++}
++
++#[inline]
+ fn mmap_length_bucket(length: usize) -> usize {
+     if length <= 64 * 1024 {
+         0
+@@ -2781,6 +2793,12 @@
+         MMAP_LOW_ARENA_PLACEMENTS.load(Ordering::Relaxed),
+     );
+     crate::println!(
++        "BUILDSTORM_DIAG madvise_dontneed calls={} requested_pages={} discarded_pages={}",
++        MADVISE_DONTNEED_CALLS.load(Ordering::Relaxed),
++        MADVISE_DONTNEED_REQUESTED_PAGES.load(Ordering::Relaxed),
++        MADVISE_DONTNEED_DISCARDED_PAGES.load(Ordering::Relaxed),
++    );
++    crate::println!(
+         "BUILDSTORM_DIAG mmap_result select_ok={} select_enomem={} reselect_ok={} reselect_enomem={} len_le_64k={} len_le_1m={} len_le_16m={} len_le_256m={} len_gt_256m={} failed_len_max={} failed_gap_max={} failed_vmas_max={}",
+         MMAP_SELECT_OK.load(Ordering::Relaxed),
+         MMAP_SELECT_ENOMEM.load(Ordering::Relaxed),
+--- a/os/src/smp_regression.rs
++++ b/os/src/smp_regression.rs
+@@ -411,8 +411,65 @@
+     {
+         panic!("[smp-regression] fail phase=resident-memory anonymous-fault");
+     }
++    let populated = parent
++        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
++        .expect("resident lifecycle populated anonymous page");
++    unsafe {
++        core::ptr::write_bytes(populated.raw() as *mut u8, 0xa5, page);
++    }
++    let topology_before_discard = parent.areas.len();
++    let discarded = parent
++        .discard_anonymous_range(
++            VirtAddr::new(RESIDENT_TEST_VADDR + page),
++            VirtAddr::new(RESIDENT_TEST_VADDR + 2 * page),
++        )
++        .expect("resident lifecycle anonymous discard");
++    if discarded != 1
++        || parent
++            .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
++            .is_some()
++        || parent.areas.len() != topology_before_discard
++    {
++        panic!("[smp-regression] fail phase=resident-memory anonymous-discard");
++    }
++    parent
++        .handle_page_fault(RESIDENT_TEST_VADDR + page, false, false)
++        .expect("resident lifecycle anonymous refault");
++    let zeroed = parent
++        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
++        .expect("resident lifecycle refault mapping");
++    let zeroed_page = unsafe { core::slice::from_raw_parts(zeroed.raw() as *const u8, page) };
++    if zeroed_page.iter().any(|byte| *byte != 0) {
++        panic!("[smp-regression] fail phase=resident-memory discard-refault-zero");
++    }
++
++    parent
++        .insert_framed_area_with_backing(
++            VirtAddr::new(SHARED_LEFT_VADDR),
++            VirtAddr::new(SHARED_LEFT_VADDR + page),
++            flags,
++            MapAreaBacking::AnonymousShared,
++        )
++        .expect("resident lifecycle anonymous shared mapping");
++    let anonymous_shared_page = parent
++        .translate(VirtAddr::new(SHARED_LEFT_VADDR))
++        .expect("resident lifecycle anonymous shared translation");
++    if parent
++        .discard_anonymous_range(
++            VirtAddr::new(SHARED_LEFT_VADDR),
++            VirtAddr::new(SHARED_LEFT_VADDR + page),
++        )
++        .expect("resident lifecycle anonymous shared discard")
++        != 0
++        || parent.translate(VirtAddr::new(SHARED_LEFT_VADDR)) != Some(anonymous_shared_page)
++    {
++        panic!("[smp-regression] fail phase=resident-memory anonymous-shared-discard");
++    }
+ 
+     let mut child = parent.fork_cow().expect("resident lifecycle fork COW");
++    if child.translate(VirtAddr::new(SHARED_LEFT_VADDR)) != Some(anonymous_shared_page) {
++        panic!("[smp-regression] fail phase=resident-memory anonymous-shared-fork");
++    }
+     let parent_page = parent
+         .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+         .expect("resident lifecycle parent mapping");

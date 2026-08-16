@@ -15,6 +15,10 @@ impl PageAlloc for KernelPageAlloc {
     fn alloc(&self) -> PhysAddr {
         frame_allocator::alloc_frame()
             .map(|frame| {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                frame_allocator::diagnostic_note_allocation(
+                    frame_allocator::FrameAllocationClass::PageTable,
+                );
                 let paddr: PhysAddr = frame.into_raw_ppn().into();
                 paddr.clear_len(crate::config::PAGE_SIZE);
                 paddr

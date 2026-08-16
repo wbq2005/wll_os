@@ -344,6 +344,7 @@ impl ResidentSet {
 #[derive(Clone)]
 pub enum MapAreaBacking {
     Anonymous,
+    AnonymousShared,
     File {
         file: FileDescriptor,
         offset: usize,
@@ -360,6 +361,7 @@ impl MapAreaBacking {
     fn split_right(&self, delta: usize) -> Self {
         match self {
             Self::Anonymous => Self::Anonymous,
+            Self::AnonymousShared => Self::AnonymousShared,
             Self::File {
                 file,
                 offset,
@@ -388,6 +390,7 @@ impl MapAreaBacking {
     fn can_merge_with(&self, left_len: usize, right: &Self) -> bool {
         match (self, right) {
             (Self::Anonymous, Self::Anonymous) => true,
+            (Self::AnonymousShared, Self::AnonymousShared) => true,
             (
                 Self::File {
                     file: left_file,
@@ -481,6 +484,19 @@ impl MapArea {
         &self.resident
     }
 
+    /// Transfer resident ownership for a VMA-relative range to the caller.
+    /// PTE revocation and the TLB retirement barrier are coordinated by
+    /// `MemorySet`; this method changes no mapping or VMA policy.
+    pub(crate) fn extract_resident_range(
+        &mut self,
+        start_vpn: usize,
+        end_vpn: usize,
+    ) -> ResidentSet {
+        self.resident
+            .extract_range(start_vpn, end_vpn)
+            .unwrap_or_else(ResidentSet::new)
+    }
+
     /// Transfer `page` to this VMA's resident owner as its dense suffix.
     ///
     /// On `Err`, ownership remains with the caller and no PTE changed.  On
@@ -570,6 +586,7 @@ impl MapArea {
             MapAreaBacking::File { shared: false, .. } => 2,
             MapAreaBacking::File { shared: true, .. } => 3,
             MapAreaBacking::SharedMemory { .. } => 4,
+            MapAreaBacking::AnonymousShared => 5,
         };
         let page_state = page
             .map(|page| match page.state() {

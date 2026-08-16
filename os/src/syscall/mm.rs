@@ -41,6 +41,7 @@ const MS_ASYNC: usize = 0x1;
 const MS_INVALIDATE: usize = 0x2;
 const MS_SYNC: usize = 0x4;
 const MS_SUPPORTED: usize = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+const MADV_DONTNEED: i32 = 4;
 const IPC_PRIVATE: isize = 0;
 const IPC_CREAT: i32 = 0o1000;
 const IPC_EXCL: i32 = 0o2000;
@@ -321,7 +322,12 @@ fn shm_alloc_frames(size: usize) -> Result<Vec<FrameTracker>, SysErrNo> {
     let pages = len / PAGE_SIZE;
     let mut frames = Vec::new();
     for _ in 0..pages {
-        frames.push(frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?);
+        let frame = frame_allocator::alloc_frame().ok_or(SysErrNo::ENOMEM)?;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        frame_allocator::diagnostic_note_allocation(
+            frame_allocator::FrameAllocationClass::SharedMemory,
+        );
+        frames.push(frame);
     }
     Ok(frames)
 }
@@ -678,7 +684,15 @@ pub fn sys_mmap(
 
     let map_has_leaf = pte_has_leaf_permission(pte_flags);
     let (backing, file_data, lazy_clean_mmap) = if anonymous {
-        (MapAreaBacking::Anonymous, None, false)
+        (
+            if shared {
+                MapAreaBacking::AnonymousShared
+            } else {
+                MapAreaBacking::Anonymous
+            },
+            None,
+            false,
+        )
     } else {
         let inner = task.inner.lock();
         let mut fds = inner.fd_table.lock();
@@ -833,6 +847,34 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallRet {
         );
         ms.protect_range(VirtAddr::new(start), VirtAddr::new(end), pte_flags)?;
     }
+    Ok(0)
+}
+
+/// Apply advisory policy to a mapped range. `MADV_DONTNEED` retires only
+/// private anonymous resident pages; other advice retains the prior no-op
+/// compatibility behavior.
+pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SyscallRet {
+    if addr % PAGE_SIZE != 0 {
+        return Err(SysErrNo::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    if advice != MADV_DONTNEED {
+        return Ok(0);
+    }
+
+    let (start, end) = checked_range(addr, len)?;
+    let task = current_task().ok_or(SysErrNo::ESRCH)?;
+    let _discarded = {
+        let mut ms = crate::buildstorm_memory_set_lock!(
+            crate::buildstorm_diagnostics::MemorySetLockSite::Madvise,
+            &task.memory_set,
+        );
+        ms.discard_anonymous_range(VirtAddr::new(start), VirtAddr::new(end))?
+    };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::buildstorm_diagnostics::note_madvise_dontneed((end - start) / PAGE_SIZE, _discarded);
     Ok(0)
 }
 

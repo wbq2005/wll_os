@@ -216,6 +216,8 @@ def parse_guest_aggregate_block(
         "cpus": {},
         "user_runs": {},
         "user_active": {},
+        "syscalls": {},
+        "user_traps": {},
         "work": {},
         "phases": {},
         "fault_sources": {},
@@ -261,6 +263,14 @@ def parse_guest_aggregate_block(
             cpu = fields.get("cpu")
             if isinstance(cpu, int):
                 result["user_active"][str(cpu)] = fields
+        elif body.startswith("syscall="):
+            syscall_id = fields.get("syscall")
+            if isinstance(syscall_id, int):
+                result["syscalls"][str(syscall_id)] = fields
+        elif body.startswith("user_trap="):
+            name = fields.get("user_trap")
+            if isinstance(name, str):
+                result["user_traps"][name] = fields
         elif body.startswith("mm "):
             result["mm"] = fields
         elif body.startswith("frame_ownership "):

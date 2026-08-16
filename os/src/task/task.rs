@@ -60,12 +60,12 @@ impl TaskControlBlock {
 
         // 在用户栈上构造最小的 argc/argv/auxv
         let sp = crate::syscall::process::setup_user_stack_for_init(
-            &memory_set,
+            &mut memory_set,
             user_stack_top,
             entry,
             phdr_vaddr,
             phnum,
-        );
+        )?;
 
         let mut trap_frame = TrapFrame::new();
         init_user_trapframe(&mut trap_frame);
@@ -238,13 +238,14 @@ impl TaskControlBlock {
 
                 let user_stack_top = crate::config::USER_STACK_TOP;
                 let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
-                memory_set.insert_framed_area(
+                memory_set.insert_lazy_area_with_backing(
                     polyhal::VirtAddr::new(user_stack_bottom),
                     polyhal::VirtAddr::new(user_stack_top),
                     crate::mm::page_table::PTEFlags::U
                         | crate::mm::page_table::PTEFlags::R
                         | crate::mm::page_table::PTEFlags::W
                         | crate::mm::page_table::PTEFlags::V,
+                    crate::mm::map_area::MapAreaBacking::Anonymous,
                 )?;
 
                 (
@@ -289,7 +290,7 @@ impl TaskControlBlock {
 
         // 2. Setup user stack with spec's argv/envp
         let sp = crate::syscall::process::setup_user_stack(
-            &memory_set,
+            &mut memory_set,
             user_stack_top,
             &launch_argv,
             &spec.envp,
@@ -297,7 +298,7 @@ impl TaskControlBlock {
             phdr_vaddr,
             phnum,
             interp_base,
-        );
+        )?;
         crate::syscall::signal::install_signal_trampoline(&mut memory_set)?;
 
         let mut trap_frame = TrapFrame::new();

@@ -90,12 +90,7 @@ fn verify_regular_file_window(
     }
 }
 
-fn verify_regular_file_all(
-    ino: u32,
-    overwrite_start: usize,
-    overwrite_len: usize,
-    phase: &str,
-) {
+fn verify_regular_file_all(ino: u32, overwrite_start: usize, overwrite_len: usize, phase: &str) {
     let mut observed = alloc::vec![0u8; REGULAR_FILE_IO_CHUNK];
     let mut start = 0usize;
     while start < REGULAR_FILE_BYTES {
@@ -416,8 +411,65 @@ fn verify_resident_memory_lifecycle() {
     {
         panic!("[smp-regression] fail phase=resident-memory anonymous-fault");
     }
+    let populated = parent
+        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+        .expect("resident lifecycle populated anonymous page");
+    unsafe {
+        core::ptr::write_bytes(populated.raw() as *mut u8, 0xa5, page);
+    }
+    let topology_before_discard = parent.areas.len();
+    let discarded = parent
+        .discard_anonymous_range(
+            VirtAddr::new(RESIDENT_TEST_VADDR + page),
+            VirtAddr::new(RESIDENT_TEST_VADDR + 2 * page),
+        )
+        .expect("resident lifecycle anonymous discard");
+    if discarded != 1
+        || parent
+            .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+            .is_some()
+        || parent.areas.len() != topology_before_discard
+    {
+        panic!("[smp-regression] fail phase=resident-memory anonymous-discard");
+    }
+    parent
+        .handle_page_fault(RESIDENT_TEST_VADDR + page, false, false)
+        .expect("resident lifecycle anonymous refault");
+    let zeroed = parent
+        .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
+        .expect("resident lifecycle refault mapping");
+    let zeroed_page = unsafe { core::slice::from_raw_parts(zeroed.raw() as *const u8, page) };
+    if zeroed_page.iter().any(|byte| *byte != 0) {
+        panic!("[smp-regression] fail phase=resident-memory discard-refault-zero");
+    }
+
+    parent
+        .insert_framed_area_with_backing(
+            VirtAddr::new(SHARED_LEFT_VADDR),
+            VirtAddr::new(SHARED_LEFT_VADDR + page),
+            flags,
+            MapAreaBacking::AnonymousShared,
+        )
+        .expect("resident lifecycle anonymous shared mapping");
+    let anonymous_shared_page = parent
+        .translate(VirtAddr::new(SHARED_LEFT_VADDR))
+        .expect("resident lifecycle anonymous shared translation");
+    if parent
+        .discard_anonymous_range(
+            VirtAddr::new(SHARED_LEFT_VADDR),
+            VirtAddr::new(SHARED_LEFT_VADDR + page),
+        )
+        .expect("resident lifecycle anonymous shared discard")
+        != 0
+        || parent.translate(VirtAddr::new(SHARED_LEFT_VADDR)) != Some(anonymous_shared_page)
+    {
+        panic!("[smp-regression] fail phase=resident-memory anonymous-shared-discard");
+    }
 
     let mut child = parent.fork_cow().expect("resident lifecycle fork COW");
+    if child.translate(VirtAddr::new(SHARED_LEFT_VADDR)) != Some(anonymous_shared_page) {
+        panic!("[smp-regression] fail phase=resident-memory anonymous-shared-fork");
+    }
     let parent_page = parent
         .translate(VirtAddr::new(RESIDENT_TEST_VADDR + page))
         .expect("resident lifecycle parent mapping");
