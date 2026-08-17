@@ -1,7 +1,6 @@
-#![allow(dead_code)]
 use crate::trapframe::TrapFrame;
-use core::arch::naked_asm;
-use loongArch64::register::badv;
+use loongArch64::register::{badi, badv};
+use polyhal::{pagetable::{MappingFlags, PageTable}, VirtAddr};
 
 pub const LDH_OP: u32 = 0xa1;
 pub const LDHU_OP: u32 = 0xa9;
@@ -36,183 +35,199 @@ pub const FSTXD_OP: u32 = 0x7078;
 pub const FLDXS_OP: u32 = 0x7060;
 pub const FLDXD_OP: u32 = 0x7068;
 
-#[allow(binary_asm_labels)]
-#[naked]
-unsafe extern "C" fn unaligned_read(addr: u64, value: &mut u64, n: u64, symbol: u32) -> i32 {
-    naked_asm!(
-        includes_trap_macros!(),
-        "
-            beqz	$a2, 5f
-
-            li.w	$t1, 8
-            li.w	$t2, 0
-
-            addi.d	$t0, $a2, -1
-            mul.d	$t1, $t0, $t1
-            add.d 	$a0, $a0, $t0
-
-            beq	    $a3, $zero, 2f
-        1:	ld.b	$t3, $a0, 0
-            b	3f
-
-        2:	ld.bu	$t3, $a0, 0
-        3:	sll.d	$t3, $t3, $t1
-            or	    $t2, $t2, $t3
-            addi.d	$t1, $t1, -8
-            addi.d	$a0, $a0, -1
-            addi.d	$a2, $a2, -1
-            bgt	    $a2, $zero, 2b
-        4:	st.d	$t2, $a1, 0
-
-            move	$a0, $a2
-            jr	    $ra
-
-        5:	li.w    $a0, -1
-            jr	    $ra
-
-            FIXUP_EX 1, 6, 1
-            FIXUP_EX 2, 6, 0
-            FIXUP_EX 4, 6, 0
-        ",
-    )
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UnalignedError {
+    UnsupportedInstruction(u32),
+    InvalidUserMemory,
 }
 
-#[allow(binary_asm_labels)]
-#[naked]
-unsafe extern "C" fn unaligned_write(_addr: u64, _value: u64, _n: u64) -> i32 {
-    naked_asm!(
-        includes_trap_macros!(),
-        "
-        beqz	$a2, 3f
-
-        li.w	$t0, 0
-    1:	srl.d	$t1, $a1, $t0
-    2:	st.b	$t1, $a0, 0
-        addi.d	$t0, $t0, 8
-        addi.d	$a2, $a2, -1
-        addi.d	$a0, $a0, 1
-        bgt	    $a2, $zero, 1b
-    
-        move	$a0, $a2
-        jr	    $ra
-    
-    3:	li.w    $a0, -1
-        jr	    $ra
-    
-        FIXUP_EX 2, 4, 1
-        ",
-    )
+#[derive(Clone, Copy)]
+enum UserAccess {
+    Read,
+    Write,
+    Execute,
 }
 
 #[inline]
-pub unsafe fn write_bytes(addr: u64, value: u64, n: usize) {
-    let ptr = addr as *mut u8;
-    let bytes = value.to_ne_bytes();
-    for i in 0..n {
-        ptr.add(i).write_volatile(bytes[i]);
+fn access_allowed(flags: MappingFlags, access: UserAccess) -> bool {
+    if !flags.contains(MappingFlags::P | MappingFlags::U) {
+        return false;
+    }
+    match access {
+        UserAccess::Read | UserAccess::Execute => true,
+        UserAccess::Write => flags.contains(MappingFlags::W),
     }
 }
 
-#[allow(unused_assignments)]
-pub unsafe fn emulate_load_store_insn(pt_regs: &mut TrapFrame) {
-    let la_inst: u32;
-    let addr: u64;
-    let rd: usize;
-
-    let mut value: u64 = 0;
-    let mut res: i32 = 0;
-
-    // debug!("Unaligned Access PC @ {:#x} ", pt_regs.era);
-
-    unsafe {
-        core::arch::asm!(
-            "ld.w {val}, {addr}, 0 ",
-             addr = in(reg) pt_regs.era as u64,
-             val = out(reg) la_inst,
-        )
+#[inline]
+fn read_user_byte(addr: usize, access: UserAccess) -> Result<u8, UnalignedError> {
+    let (paddr, flags) = PageTable::current()
+        .translate(VirtAddr::new(addr))
+        .ok_or(UnalignedError::InvalidUserMemory)?;
+    if !access_allowed(flags, access) {
+        return Err(UnalignedError::InvalidUserMemory);
     }
-    addr = badv::read().vaddr() as u64;
-    // debug!("badv is {:#x}", addr);
-    rd = (la_inst & 0x1f) as usize;
-    // debug!("rd: {}  inst: {:#x}", rd, la_inst);
+    // LoongArch's DMW1 alias is the only kernel-safe way to access a physical
+    // frame after the trap has switched privilege, and the access is byte-sized.
+    Ok(unsafe { paddr.get_ptr::<u8>().read_volatile() })
+}
 
-    if (la_inst >> 22) == LDD_OP || (la_inst >> 24) == LDPTRD_OP || (la_inst >> 15) == LDXD_OP {
-        res = unaligned_read(addr, &mut value, 8, 1);
-        if res < 0 {
-            panic!("Address Error @ {:#x}", addr)
-        }
-        pt_regs.regs[rd] = value as usize;
-    } else if (la_inst >> 22) == LDW_OP
-        || (la_inst >> 24) == LDPTRW_OP
-        || (la_inst >> 15) == LDXW_OP
-    {
-        res = unaligned_read(addr, &mut value, 4, 1);
-        if res < 0 {
-            panic!("Address Error @ {:#x}", addr)
-        }
-        pt_regs.regs[rd] = value as usize;
-    } else if (la_inst >> 22) == LDWU_OP || (la_inst >> 15) == LDXWU_OP {
-        res = unaligned_read(addr, &mut value, 4, 0);
-        if res < 0 {
-            panic!("Address Error @ {:#x}", addr)
-        }
-        pt_regs.regs[rd] = value as usize;
-    } else if (la_inst >> 22) == LDH_OP || (la_inst >> 15) == LDXH_OP {
-        res = unaligned_read(addr, &mut value, 2, 1);
-        if res < 0 {
-            panic!("Address Error @ {:#x}", addr)
-        }
-        pt_regs.regs[rd] = value as usize;
-    } else if (la_inst >> 22) == LDHU_OP || (la_inst >> 15) == LDXHU_OP {
-        res = unaligned_read(addr, &mut value, 2, 0);
-        if res < 0 {
-            panic!("Address Error @ {:#x}", addr)
-        }
-        pt_regs.regs[rd] = value as usize;
-    } else if (la_inst >> 22) == STD_OP
-        || (la_inst >> 24) == STPTRD_OP
-        || (la_inst >> 15) == STXD_OP
-    {
-        value = pt_regs.regs[rd] as u64;
-        res = unaligned_write(addr, value, 8);
-        // write_bytes(addr, value, 8);
-    } else if (la_inst >> 22) == STW_OP
-        || (la_inst >> 24) == STPTRW_OP
-        || (la_inst >> 15) == STXW_OP
-    {
-        value = pt_regs.regs[rd] as u64;
-        res = unaligned_write(addr, value, 4);
-        // write_bytes(addr, value, 4);
-    } else if (la_inst >> 22) == STH_OP || (la_inst >> 15) == STXH_OP {
-        value = pt_regs.regs[rd] as u64;
-        res = unaligned_write(addr, value, 2);
-        // write_bytes(addr, value, 2);
+#[inline]
+fn write_user_byte(addr: usize, value: u8) -> Result<(), UnalignedError> {
+    let (paddr, flags) = PageTable::current()
+        .translate(VirtAddr::new(addr))
+        .ok_or(UnalignedError::InvalidUserMemory)?;
+    if !access_allowed(flags, UserAccess::Write) {
+        return Err(UnalignedError::InvalidUserMemory);
+    }
+    unsafe { paddr.get_mut_ptr::<u8>().write_volatile(value) };
+    Ok(())
+}
+
+fn read_user_value(addr: usize, size: usize) -> Result<u64, UnalignedError> {
+    let mut value = 0u64;
+    for offset in 0..size {
+        let byte_addr = addr
+            .checked_add(offset)
+            .ok_or(UnalignedError::InvalidUserMemory)?;
+        value |= (read_user_byte(byte_addr, UserAccess::Read)? as u64) << (offset * 8);
+    }
+    Ok(value)
+}
+
+fn write_user_value(addr: usize, value: u64, size: usize) -> Result<(), UnalignedError> {
+    for offset in 0..size {
+        let byte_addr = addr
+            .checked_add(offset)
+            .ok_or(UnalignedError::InvalidUserMemory)?;
+        write_user_byte(byte_addr, (value >> (offset * 8)) as u8)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn sign_extend(value: u64, bits: usize) -> usize {
+    let shift = 64 - bits;
+    ((value << shift) as i64 >> shift) as usize
+}
+
+fn faulting_user_instruction(tf: &TrapFrame) -> Result<u32, UnalignedError> {
+    // BADI is architecturally latched for address/alignment exceptions.  The
+    // fallback is needed on older QEMU versions that leave it zero.
+    let instruction = badi::read().inst();
+    if instruction != 0 {
+        return Ok(instruction);
+    }
+    let mut bytes = [0u8; 4];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        *byte = read_user_byte(
+            tf.era
+                .checked_add(offset)
+                .ok_or(UnalignedError::InvalidUserMemory)?,
+            UserAccess::Execute,
+        )?;
+    }
+    Ok(u32::from_le_bytes(bytes))
+}
+
+/// Emulate a LoongArch user-mode scalar access that trapped for alignment.
+///
+/// The caller invokes this while the faulting task's page table is still
+/// active. Every byte is translated independently, so an access crossing a
+/// page boundary is safe and never dereferences a user VA from the kernel
+/// root. On success the trap frame is advanced exactly once.
+pub fn emulate_load_store_insn(tf: &mut TrapFrame) -> Result<(), UnalignedError> {
+    let instruction = faulting_user_instruction(tf)?;
+    let rd = (instruction & 0x1f) as usize;
+    let op22 = instruction >> 22;
+    let op24 = instruction >> 24;
+    let op15 = instruction >> 15;
+    let addr = badv::read().vaddr();
+
+    let integer_load = if op22 == LDD_OP || op24 == LDPTRD_OP || op15 == LDXD_OP {
+        Some((8, false))
+    } else if op22 == LDW_OP || op24 == LDPTRW_OP || op15 == LDXW_OP {
+        Some((4, true))
+    } else if op22 == LDWU_OP || op15 == LDXWU_OP {
+        Some((4, false))
+    } else if op22 == LDH_OP || op15 == LDXH_OP {
+        Some((2, true))
+    } else if op22 == LDHU_OP || op15 == LDXHU_OP {
+        Some((2, false))
     } else {
-        panic!("unhandled unaligned address, inst:{:#x}", la_inst);
-    }
-    // else if (la_inst >> 22 ) == FLDD_OP
-    //       ||  (la_inst >> 15 ) == FLDXD_OP {
-    //     res = unaligned_read(addr, &mut value, 8, 1);
-    //     if res < 0 { panic!("Address Error @ {:#x}", addr) }
-    //     write_fpr(rd, value);
-    // } else if (la_inst >> 22 ) == FLDS_OP
-    //       ||  (la_inst >> 15 ) == FLDXS_OP {
-    //     res = unaligned_read(addr, &mut value, 4, 1);
-    //     if res < 0 { panic!("Address Error @ {:#x}", addr) }
-    //     write_fpr(rd, value);
-    // } else if (la_inst >> 22 ) == FSTD_OP
-    //       ||  (la_inst >> 15 ) == FSTXD_OP {
-    //    value = read_fpr(rd);
-    //     res = unaligned_write(addr, value, 8);
-    // } else if (la_inst >> 22 ) == FSTS_OP
-    //       ||  (la_inst >> 15 ) == FSTXS_OP {
-    //     value = read_fpr(rd);
-    //     res = unaligned_write(addr, value, 4);
-    // }
+        None
+    };
 
-    if res < 0 {
-        panic!("Address Error @ {:#x}", addr)
+    if let Some((size, signed)) = integer_load {
+        let value = read_user_value(addr, size)?;
+        tf.regs[rd] = if signed {
+            sign_extend(value, size * 8)
+        } else {
+            value as usize
+        };
+        if rd == 0 {
+            tf.regs[rd] = 0;
+        }
+        tf.era = tf
+            .era
+            .checked_add(4)
+            .ok_or(UnalignedError::InvalidUserMemory)?;
+        return Ok(());
     }
 
-    pt_regs.era += 4;
+    let integer_store = if op22 == STD_OP || op24 == STPTRD_OP || op15 == STXD_OP {
+        Some(8)
+    } else if op22 == STW_OP || op24 == STPTRW_OP || op15 == STXW_OP {
+        Some(4)
+    } else if op22 == STH_OP || op15 == STXH_OP {
+        Some(2)
+    } else {
+        None
+    };
+
+    if let Some(size) = integer_store {
+        write_user_value(addr, tf.regs[rd] as u64, size)?;
+        tf.era = tf
+            .era
+            .checked_add(4)
+            .ok_or(UnalignedError::InvalidUserMemory)?;
+        return Ok(());
+    }
+
+    let fp_load = if op22 == FLDD_OP || op15 == FLDXD_OP {
+        Some(8)
+    } else if op22 == FLDS_OP || op15 == FLDXS_OP {
+        Some(4)
+    } else {
+        None
+    };
+
+    if let Some(size) = fp_load {
+        tf.f[rd] = read_user_value(addr, size)?;
+        tf.lsx[rd][0] = tf.f[rd];
+        tf.era = tf
+            .era
+            .checked_add(4)
+            .ok_or(UnalignedError::InvalidUserMemory)?;
+        return Ok(());
+    }
+
+    let fp_store = if op22 == FSTD_OP || op15 == FSTXD_OP {
+        Some(8)
+    } else if op22 == FSTS_OP || op15 == FSTXS_OP {
+        Some(4)
+    } else {
+        None
+    };
+
+    if let Some(size) = fp_store {
+        write_user_value(addr, tf.f[rd], size)?;
+        tf.era = tf
+            .era
+            .checked_add(4)
+            .ok_or(UnalignedError::InvalidUserMemory)?;
+        return Ok(());
+    }
+
+    Err(UnalignedError::UnsupportedInstruction(instruction))
 }

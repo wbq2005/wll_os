@@ -7,6 +7,7 @@ use crate::timer;
 use crate::utils::error::SysErrNo;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 use lazy_static::lazy_static;
 use polyhal::VirtAddr;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
@@ -670,11 +671,14 @@ pub(crate) fn send_interval_timer_signal(task: &Arc<TaskControlBlock>, which: us
     queue_signal(task, signum, PendingSignalInfo::from_current(SI_USER));
 }
 
-pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {
-    let Some(task) = current_task() else {
+pub(crate) fn handle_pending_for_task(ctx: &mut TrapFrame, task: &Arc<TaskControlBlock>) -> bool {
+    if task.is_kernel {
+        return false;
+    }
+    if task.signal_pending_hint.load(Ordering::Acquire) == 0 {
         return true;
-    };
-    if task.is_kernel || task.status() == TaskStatus::Zombie {
+    }
+    if task.status() == TaskStatus::Zombie {
         return false;
     }
 
@@ -712,6 +716,8 @@ pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {
             state.pending &= !signal_bit(signum);
             state.pending_info[signum as usize] = PendingSignalInfo::empty();
             state.blocked = sanitize_mask(blocked);
+            task.signal_pending_hint
+                .store(usize::from(state.pending != 0), Ordering::Release);
             (old_mask, info)
         };
 
@@ -725,6 +731,16 @@ pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {
         }
         return true;
     }
+}
+
+pub fn handle_pending_for_user(ctx: &mut TrapFrame) -> bool {
+    let Some(task) = current_task() else {
+        return true;
+    };
+    if task.status() == TaskStatus::Zombie {
+        return false;
+    }
+    handle_pending_for_task(ctx, &task)
 }
 
 /// Deliver a synchronous CPU exception through the Linux signal ABI.
@@ -814,6 +830,7 @@ fn queue_signal(task: &Arc<TaskControlBlock>, signum: i32, info: PendingSignalIn
     let mut state = task.signal_state.lock();
     state.pending |= signal_bit(signum);
     state.pending_info[signum as usize] = info;
+    task.signal_pending_hint.store(1, Ordering::Release);
     drop(state);
     SIGNAL_WAIT_QUEUE.wake_all();
     wake_for_signal(task);
@@ -847,6 +864,8 @@ fn clear_pending_signal(task: &Arc<TaskControlBlock>, signum: i32) {
     let mut state = task.signal_state.lock();
     state.pending &= !signal_bit(signum);
     state.pending_info[signum as usize] = PendingSignalInfo::empty();
+    task.signal_pending_hint
+        .store(usize::from(state.pending != 0), Ordering::Release);
 }
 
 fn has_pending_in_mask(task: &Arc<TaskControlBlock>, mask: usize) -> bool {
@@ -867,6 +886,8 @@ fn take_pending_from_mask(
     let info = state.pending_info[signum as usize];
     state.pending &= !signal_bit(signum);
     state.pending_info[signum as usize] = PendingSignalInfo::empty();
+    task.signal_pending_hint
+        .store(usize::from(state.pending != 0), Ordering::Release);
     Some((signum, info))
 }
 

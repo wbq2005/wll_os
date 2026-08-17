@@ -701,7 +701,7 @@ pub(crate) fn run_current_user_task_until_reschedule(
             crate::trap::restore_kernel_page_table();
             break;
         }
-        if !crate::syscall::signal::handle_pending_for_user(ctx) {
+        if !crate::syscall::signal::handle_pending_for_task(ctx, task) {
             crate::trap::restore_kernel_page_table();
             break;
         }
@@ -746,7 +746,7 @@ fn run_current_user_task_one_boundary(task: &Arc<TaskControlBlock>, ctx: &mut Tr
     if !current_cpu_owns_running_user_task(task) {
         return;
     }
-    if !crate::syscall::signal::handle_pending_for_user(ctx) {
+    if !crate::syscall::signal::handle_pending_for_task(ctx, task) {
         return;
     }
     if !current_cpu_owns_running_user_task(task) {
@@ -1403,25 +1403,40 @@ fn finish_task_exit(task: &Arc<TaskControlBlock>, exit_code: i32) {
     };
     if clear_child_tid != 0 {
         let bytes = 0i32.to_ne_bytes();
-        {
+        let write_result = {
             let mut memory_set = crate::buildstorm_memory_set_lock!(
                 crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyWrite,
                 &task.memory_set,
             );
-            if let Err(err) = crate::syscall::user::copy_to_user_in_memory_set(
+            crate::syscall::user::copy_to_user_in_memory_set(
                 &mut memory_set,
                 clear_child_tid,
                 &bytes,
-            ) {
-                log::debug!(
-                    "[task] clear_child_tid failed tid={} addr={:#x} err={:?}",
-                    task.pid.0,
-                    clear_child_tid,
-                    err
-                );
-            }
+            )
+        };
+        if let Err(err) = write_result {
+            log::debug!(
+                "[task] clear_child_tid failed tid={} addr={:#x} err={:?}",
+                task.pid.0,
+                clear_child_tid,
+                err
+            );
         }
-        crate::syscall::other::futex_wake_addr_for_task(task, clear_child_tid, usize::MAX);
+        let _woken =
+            crate::syscall::other::futex_wake_addr_for_task(task, clear_child_tid, usize::MAX);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        if !crate::buildstorm_diagnostics::exec_focus_only() {
+            crate::println!(
+                "BUILDSTORM_DIAG clear_child_tid pid={} tgid={} uaddr={:#x} key={:#x} write_ok={} write_errno={} woken={}",
+                task.pid.0,
+                task.thread_group.tgid(),
+                clear_child_tid,
+                Arc::as_ptr(&task.memory_set) as usize,
+                write_result.is_ok(),
+                write_result.err().map(|errno| errno as usize).unwrap_or(0),
+                _woken,
+            );
+        }
     }
     purge_wait_state_for_task(task);
     task.set_exit_code(exit_code);
@@ -1956,6 +1971,8 @@ pub struct TaskControlBlock {
     pub credentials: Mutex<Credentials>,
     pub signal_actions: crate::syscall::signal::SharedSignalActions,
     pub signal_state: Mutex<crate::syscall::signal::SignalState>,
+    /// Conservative lock-free hint for the common no-pending exit-to-user path.
+    pub signal_pending_hint: AtomicUsize,
     /// User trap frame. Outside inner for foreground driver.
     pub trap_frame: Mutex<Option<TrapFrame>>,
     /// Task status. Outside inner to avoid deadlock.

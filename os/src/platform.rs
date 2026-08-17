@@ -305,6 +305,11 @@ pub fn current_hardware_cpu_id() -> usize {
 
 pub fn current_cpu_index() -> usize {
     let hardware_id = current_hardware_cpu_id();
+    // QEMU and the supported boards normally enumerate hardware IDs from
+    // zero. Keep sparse/non-identity topologies correct through the fallback.
+    if hardware_id < MAX_CPUS && CPU_IDS[hardware_id].load(Ordering::Acquire) == hardware_id {
+        return hardware_id;
+    }
     for cpu in 0..physical_cpu_count().min(MAX_CPUS) {
         if CPU_IDS[cpu].load(Ordering::Acquire) == hardware_id {
             return cpu;

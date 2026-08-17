@@ -5,28 +5,37 @@ use polyhal_trap::trap::TrapType;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 use spin::Mutex;
 
-use crate::cpu::CpuLocal;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::config::MAX_CPUS;
 use crate::syscall::syscall;
 use crate::task::exit_current_and_run_next;
 use crate::task::TaskStatus;
 use crate::timer::set_next_trigger;
 
 const SIGILL: i32 = 4;
+const SIGBUS: i32 = 7;
 const SIGSEGV: i32 = 11;
+const SYSCALL_OUTCOME_PARKED: usize = 1 << 0;
+const SYSCALL_OUTCOME_EXECVE: usize = 1 << 1;
+const SYSCALL_OUTCOME_SIGRETURN: usize = 1 << 2;
+
+static CURRENT_SYSCALL_CTX_PTR: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+static SYSCALL_OUTCOME: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+#[cfg(feature = "buildstorm-diagnostics")]
+static UNALIGNED_ACCESS_OK: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn syscall_cpu() -> usize {
+    crate::platform::current_cpu_index().min(MAX_CPUS - 1)
+}
+
 lazy_static! {
-    /// 存 `TrapFrame` 裸指针（单核）；用 `usize` 避免 `*mut TrapFrame: !Send` 与 `lazy_static` 冲突。
-    pub static ref CURRENT_SYSCALL_CTX_PTR: CpuLocal<usize> = CpuLocal::new_with(|_| 0);
-
-    /// 标记当前是否处于 execve 调用上下文中。
-    /// 置位时 handle_syscall 跳过 syscall_ok() PC 前进，让 execve 直接返回到新程序入口。
-    static ref EXECVE_COMPLETED: CpuLocal<bool> = CpuLocal::new_with(|_| false);
-    static ref SIGRETURN_COMPLETED: CpuLocal<bool> = CpuLocal::new_with(|_| false);
-
     /// 标记前台驱动模式：当此标志为 true 时，exit/suspend/timer 不要调用 run_next_task()，
     /// 而是将当前任务置为 Zombie 后直接返回，由前台驱动负责收尾。
     static ref FOREGROUND_DRIVER_ACTIVE: Mutex<bool> = Mutex::new(false);
-    static ref SYSCALL_PARKED: CpuLocal<bool> = CpuLocal::new_with(|_| false);
-
 }
 
 pub fn enter_foreground_driver() {
@@ -44,18 +53,11 @@ pub fn foreground_driver_active() -> bool {
 }
 
 pub fn signal_syscall_parked() {
-    *SYSCALL_PARKED.lock() = true;
+    SYSCALL_OUTCOME[syscall_cpu()].fetch_or(SYSCALL_OUTCOME_PARKED, Ordering::Release);
 }
 
 pub fn syscall_parked() -> bool {
-    *SYSCALL_PARKED.lock()
-}
-
-fn take_syscall_parked() -> bool {
-    let mut guard = SYSCALL_PARKED.lock();
-    let was = *guard;
-    *guard = false;
-    was
+    SYSCALL_OUTCOME[syscall_cpu()].load(Ordering::Acquire) & SYSCALL_OUTCOME_PARKED != 0
 }
 
 fn exit_user_thread_group_for_signal(signum: i32) {
@@ -108,21 +110,8 @@ fn note_terminal_user_trap(
         })
         .unwrap_or((0, 0, 0, 0, 0, 0));
     crate::buildstorm_diagnostics::note_first_terminal_user_trap(
-        kind,
-        task.pid.0,
-        vaddr,
-        sepc,
-        sp,
-        ra,
-        tp,
-        fault_pa,
-        sepc_pa,
-        vma_start,
-        vma_end,
-        vma_flags,
-        backing,
-        resident,
-        page_state,
+        kind, task.pid.0, vaddr, sepc, sp, ra, tp, fault_pa, sepc_pa, vma_start, vma_end,
+        vma_flags, backing, resident, page_state,
     );
 }
 
@@ -146,7 +135,7 @@ pub fn prepare_user_trapframe(tf: &mut TrapFrame) {
 }
 
 pub fn clone_current_trapframe() -> Option<TrapFrame> {
-    let ptr = *CURRENT_SYSCALL_CTX_PTR.lock();
+    let ptr = CURRENT_SYSCALL_CTX_PTR[syscall_cpu()].load(Ordering::Acquire);
     if ptr == 0 {
         None
     } else {
@@ -155,7 +144,7 @@ pub fn clone_current_trapframe() -> Option<TrapFrame> {
 }
 
 pub fn update_current_trapframe(f: impl FnOnce(&mut TrapFrame)) -> bool {
-    let ptr = *CURRENT_SYSCALL_CTX_PTR.lock();
+    let ptr = CURRENT_SYSCALL_CTX_PTR[syscall_cpu()].load(Ordering::Acquire);
     if ptr == 0 {
         false
     } else {
@@ -175,27 +164,11 @@ pub fn save_current_trapframe(tf: &TrapFrame) {
 /// 向 trap 处理层发送信号：当前 execve 已替换地址空间，
 /// handle_syscall 应跳过 syscall_ok() PC 前进，直接返回到新程序入口。
 pub fn signal_execve_done() {
-    *EXECVE_COMPLETED.lock() = true;
+    SYSCALL_OUTCOME[syscall_cpu()].fetch_or(SYSCALL_OUTCOME_EXECVE, Ordering::Release);
 }
 
 pub fn signal_rt_sigreturn_done() {
-    *SIGRETURN_COMPLETED.lock() = true;
-}
-
-/// Returns true if the current trap was caused by execve completing.
-/// Consumes the flag so it can only be observed once per trap.
-fn take_execve_done() -> bool {
-    let mut guard = EXECVE_COMPLETED.lock();
-    let was = *guard;
-    *guard = false;
-    was
-}
-
-fn take_sigreturn_done() -> bool {
-    let mut guard = SIGRETURN_COMPLETED.lock();
-    let was = *guard;
-    *guard = false;
-    was
+    SYSCALL_OUTCOME[syscall_cpu()].fetch_or(SYSCALL_OUTCOME_SIGRETURN, Ordering::Release);
 }
 
 /// 初始化 Trap/中断处理（trap 向量，不含定时器）
@@ -264,6 +237,12 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         TrapType::Timer => {
             #[cfg(feature = "buildstorm-diagnostics")]
             crate::buildstorm_diagnostics::note_kernel_tick();
+            // A timed syscall can be parked in kernel context (notably the
+            // foreground driver's blocked-owner loop).  Such a task cannot
+            // reach user_interrupt(), so process timer waiters here as well
+            // as on the user trap path.  Without this, nanosleep children
+            // remain blocked forever while their parent waits in wait4.
+            crate::timer::wake_expired_timers();
             crate::timer::rearm_kernel_tick();
         }
         TrapType::Ipi(_) => {
@@ -283,6 +262,14 @@ pub fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         }
         TrapType::Irq(irq) => {
             log::info!("[trap] IRQ {:?} received", irq);
+        }
+        TrapType::UnalignedAccess => {
+            log::error!("[trap] kernel unaligned access at sepc={:#x}", ctx[TrapFrameArgs::SEPC]);
+            exit_current_and_run_next(-2);
+        }
+        TrapType::UnalignedAccessFault(vaddr) => {
+            log::error!("[trap] kernel unaligned emulation failed at {:#x}", vaddr);
+            exit_current_and_run_next(-2);
         }
         TrapType::Unknown => {
             log::warn!("[trap] Unknown trap type");
@@ -340,6 +327,47 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let action = crate::platform::acknowledge_local_ipi();
             crate::platform::handle_ipi(action);
         }
+        // The LoongArch trap layer has already translated and emulated the
+        // fault while the user page table was active. Restoring the kernel
+        // root above is the only common-layer work needed here.
+        TrapType::UnalignedAccess => {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            {
+                let count = UNALIGNED_ACCESS_OK.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 8 || count.is_power_of_two() {
+                    crate::println!(
+                        "BUILDSTORM_DIAG unaligned_ok count={} sepc={:#x}",
+                        count,
+                        ctx[TrapFrameArgs::SEPC],
+                    );
+                }
+            }
+        }
+        TrapType::UnalignedAccessFault(vaddr) => {
+            #[cfg(feature = "smp-regression")]
+            crate::smp_regression::note_user_memory_lifecycle_terminal_trap(
+                5,
+                vaddr,
+                ctx[TrapFrameArgs::SEPC],
+            );
+            #[cfg(feature = "buildstorm-diagnostics")]
+            note_terminal_user_trap(5, crate::task::current_task().as_ref(), vaddr, ctx);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::println!(
+                "BUILDSTORM_DIAG unaligned_failure sepc={:#x} badv={:#x} signal={}",
+                ctx[TrapFrameArgs::SEPC],
+                vaddr,
+                SIGBUS,
+            );
+            log::error!(
+                "[trap] User unaligned emulation failed at {:#x}, killing process",
+                vaddr
+            );
+            if crate::syscall::signal::handle_synchronous_fault_for_user(ctx, SIGBUS) {
+                return;
+            }
+            exit_user_thread_group_for_signal(SIGBUS);
+        }
         trap @ (TrapType::StorePageFault(vaddr)
         | TrapType::LoadPageFault(vaddr)
         | TrapType::InstructionPageFault(vaddr)
@@ -382,11 +410,7 @@ pub fn user_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                     _ => unreachable!(),
                 };
                 #[cfg(feature = "smp-regression")]
-                crate::smp_regression::note_user_memory_lifecycle_terminal_trap(
-                    1,
-                    vaddr,
-                    sepc,
-                );
+                crate::smp_regression::note_user_memory_lifecycle_terminal_trap(1, vaddr, sepc);
                 #[cfg(feature = "buildstorm-diagnostics")]
                 note_terminal_user_trap(terminal_kind, Some(&task), vaddr, ctx);
                 let sp = ctx[TrapFrameArgs::SP];
@@ -483,40 +507,39 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     log::debug!("[syscall] id: {}, args: {:?}", syscall_id, args);
 
     // 暴露当前 syscall 上下文，供 fork/clone 等复制寄存器上下文使用
-    *CURRENT_SYSCALL_CTX_PTR.lock() = ctx as *mut TrapFrame as usize;
+    let cpu = syscall_cpu();
+    SYSCALL_OUTCOME[cpu].store(0, Ordering::Release);
+    CURRENT_SYSCALL_CTX_PTR[cpu].store(ctx as *mut TrapFrame as usize, Ordering::Release);
 
     // 调用系统调用分发函数
-    let syscall_task = crate::task::current_task();
     #[cfg(feature = "buildstorm-diagnostics")]
-    crate::buildstorm_diagnostics::note_syscall_enter(syscall_id);
+    crate::buildstorm_diagnostics::note_active_syscall_enter(
+        syscall_id,
+        ctx[TrapFrameArgs::SEPC],
+    );
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let syscall_scope = crate::buildstorm_diagnostics::note_syscall_enter(syscall_id);
     let result = syscall(syscall_id, args);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    drop(syscall_scope);
     #[cfg(feature = "buildstorm-diagnostics")]
     crate::buildstorm_diagnostics::note_syscall_exit(syscall_id);
 
-    *CURRENT_SYSCALL_CTX_PTR.lock() = 0;
-    if take_syscall_parked() {
+    CURRENT_SYSCALL_CTX_PTR[cpu].store(0, Ordering::Release);
+    let outcome = SYSCALL_OUTCOME[cpu].swap(0, Ordering::AcqRel);
+    if outcome & SYSCALL_OUTCOME_PARKED != 0 {
         return;
     }
 
     // 设置返回值到 a0/x[10]
     // 检查是否是 execve 刚完成——如果是，跳过 syscall_ok() 的 PC 前进，
     // 让 CPU sret 到新程序的入口地址（sepc 已在 sys_execve 中设为 entry）。
-    let execve_done = take_execve_done();
-    if execve_done {
+    if outcome & SYSCALL_OUTCOME_EXECVE != 0 {
         return;
     }
-    let sigreturn_done = take_sigreturn_done();
-    if sigreturn_done {
+    if outcome & SYSCALL_OUTCOME_SIGRETURN != 0 {
         return;
     }
-    if syscall_task
-        .as_ref()
-        .map(|task| task.status() == TaskStatus::Zombie)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    crate::timer::wake_expired_timers();
     match result {
         Ok(ret) => {
             ctx[TrapFrameArgs::RET] = ret;
@@ -528,13 +551,6 @@ fn handle_syscall(ctx: &mut TrapFrame) {
     }
     // 普通系统调用：PC 需要前进（跳过 ecall 指令）
     ctx.syscall_ok();
-    let should_return = syscall_task
-        .as_ref()
-        .map(|task| !matches!(task.status(), TaskStatus::Zombie | TaskStatus::Stopped))
-        .unwrap_or(true);
-    if should_return {
-        let _ = crate::syscall::signal::handle_pending_for_user(ctx);
-    }
 }
 
 /// 处理进程退出系统调用

@@ -748,3 +748,38 @@ Zicboz 清零后端；该精确最终树的 LA 与 RV 分别在 558.27 秒、686
 `docs/evidence/buildstorm-stage2/stage17-madvise-dontneed-official-20260816/README.md`。
 AI 辅助日志/源码审计、协议设计、实现和串行 A/B；开发者可从最终增量补丁、原始
 serial、runner JSON、SMP/cfg 日志、judge 与 hash 独立复核。
+
+## 17. LoongArch 嵌套 QEMU 的 UAL 能力 ABI（2026-08-18）
+
+v15 评测日志显示，LoongArch Rust release 编译已经完成，随后嵌套
+`qemu-system-loongarch64` 在 TCG 初始化阶段直接报：
+
+```text
+TCG: unaligned access support required; exiting
+```
+
+交叉检查 QEMU LoongArch TCG 源码确认，它读取宿主进程的 `AT_HWCAP`，要求
+`HWCAP_LOONGARCH_UAL` bit 2。内核原先只发布 `CPUCFG | FPU = 0x9`，漏掉
+`UAL = 0x4`，因此 QEMU 在真正运行前退出。修复将 LoongArch auxv 改为
+`CPUCFG | UAL | FPU = 0xd`。这不是按测试或 QEMU 名称伪造行为：内核已有通用
+LoongArch 未对齐异常处理，对用户整数/浮点标量访问逐字节翻译，跨页访问安全，且
+`ERA` 只前进一次；该 ABI 能力有真实内核实现支撑。RISC-V auxv 保持不变。
+
+验证矩阵：
+
+| 验证 | 结果 | 等级 |
+| --- | --- | --- |
+| RV/LA production release cfg | 全部通过 | `capability-pass` |
+| RV/LA diagnostics release cfg | 全部通过 | `capability-pass` |
+| UAL 位与跨页模拟不变量回归 | 通过，值 `0xd`、bit 2 存在 | `capability-pass` |
+| 官方评测 BuildStorm | RV `180/180`，LA `180/180` | `official-pass` |
+
+本轮官方总分为 `736.2`；BuildStorm 两架构均通过 compile ok、compile time、
+minibuild 和 toolchain。成功提交包为
+`wll_os_buildstorm_la_hwcap_ual_v16_diag_20260818.zip`，SHA-256 为
+`BABAB2471C9B0EB3EC83429C7B40F65F4516EA7DA3BE1F9E340092B374609C94`。
+
+AI 协助完成 QEMU 源码定位、评测日志关联、ABI 因果模型和回归编排；开发者可从
+源码、四种 cfg 构建输出、原始 LoongArch 日志和官方评分结果复核。未修改官方镜像、
+suite、guest script、judge、marker 或 guest 时间；diagnostics 仍显式 gated，
+production 默认 `BUILDSTORM_DIAGNOSTICS ?= 0`。

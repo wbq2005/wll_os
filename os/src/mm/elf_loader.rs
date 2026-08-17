@@ -353,17 +353,37 @@ impl<'a> ElfFile<'a> {
         // Cache the launch PC before copying load segments. The loader should
         // not depend on rereading ELF header bytes after user mappings are built.
         let entry = self.entry_with_bias(bias);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_elf_load_phase(
+            crate::buildstorm_diagnostics::ELF_LOAD_ROLE_TARGET,
+            crate::buildstorm_diagnostics::ELF_LOAD_PHASE_ADDRESS_SPACE,
+            bias,
+        );
         let mut memory_set = MemorySet::from_kernel();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_elf_load_phase(
+            crate::buildstorm_diagnostics::ELF_LOAD_ROLE_TARGET,
+            crate::buildstorm_diagnostics::ELF_LOAD_PHASE_SEGMENT_MAP,
+            bias,
+        );
         self.load_segments_into(&mut memory_set, bias)?;
 
         let user_stack_top = crate::config::USER_STACK_TOP;
         let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_elf_load_phase(
+            crate::buildstorm_diagnostics::ELF_LOAD_ROLE_TARGET,
+            crate::buildstorm_diagnostics::ELF_LOAD_PHASE_STACK_MAP,
+            bias,
+        );
         memory_set.insert_lazy_area_with_backing(
             VirtAddr::new(user_stack_bottom),
             VirtAddr::new(user_stack_top),
             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
             MapAreaBacking::Anonymous,
         )?;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::clear_elf_load();
 
         Ok((memory_set, user_stack_top, entry))
     }
@@ -373,7 +393,7 @@ impl<'a> ElfFile<'a> {
         memory_set: &mut MemorySet,
         bias: usize,
     ) -> Result<(), SysErrNo> {
-        for ph in &self.program_headers {
+        for (_segment, ph) in self.program_headers.iter().enumerate() {
             if ph.p_type != PT_LOAD {
                 continue;
             }
@@ -389,9 +409,25 @@ impl<'a> ElfFile<'a> {
             if ph.p_flags & 4 != 0 {
                 flags |= PTEFlags::R;
             }
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_elf_load_segment(
+                crate::buildstorm_diagnostics::ELF_LOAD_PHASE_SEGMENT_MAP,
+                _segment,
+                ph.p_vaddr,
+                ph.p_filesz,
+                ph.p_memsz,
+            );
             memory_set.insert_framed_area(start_va, end_va, flags)?;
 
             if ph.p_filesz > 0 {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_elf_load_segment(
+                    crate::buildstorm_diagnostics::ELF_LOAD_PHASE_SEGMENT_COPY,
+                    _segment,
+                    ph.p_vaddr,
+                    ph.p_filesz,
+                    ph.p_memsz,
+                );
                 let src_start = ph.p_offset;
                 let src_end = ph.p_offset + ph.p_filesz;
                 if src_end > self.data.len() {
@@ -419,18 +455,11 @@ impl<'a> ElfFile<'a> {
                 }
             }
 
-            if ph.p_memsz > ph.p_filesz {
-                let bss_start = ph.p_vaddr + ph.p_filesz + bias;
-                let bss_end = ph.p_vaddr + ph.p_memsz + bias;
-                for addr in bss_start..bss_end {
-                    let Some(pa) = memory_set.translate(VirtAddr::new(addr)) else {
-                        return Err(SysErrNo::ENOMEM);
-                    };
-                    unsafe {
-                        *(pa.raw() as *mut u8) = 0;
-                    }
-                }
-            }
+            // insert_framed_area() obtains every data page through alloc_frame(),
+            // whose contract is to zero the complete frame before returning it.
+            // Copying p_filesz bytes therefore leaves [p_filesz, p_memsz) as the
+            // required zero-filled BSS. A second byte-wise page-table walk here
+            // made large static PIE executables spend minutes in execve.
         }
         Ok(())
     }
@@ -438,10 +467,16 @@ impl<'a> ElfFile<'a> {
     pub fn load(&self) -> Result<(MemorySet, usize, usize), SysErrNo> {
         // Keep the original entry stable across segment copy/zero-fill work.
         let entry = self.entry();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_elf_load_phase(
+            crate::buildstorm_diagnostics::ELF_LOAD_ROLE_TARGET,
+            crate::buildstorm_diagnostics::ELF_LOAD_PHASE_ADDRESS_SPACE,
+            0,
+        );
         let mut memory_set = MemorySet::from_kernel();
 
         // 加载所有 LOAD 段
-        for ph in &self.program_headers {
+        for (_segment, ph) in self.program_headers.iter().enumerate() {
             if ph.p_type == PT_LOAD {
                 log::info!(
                     "[elf] Loading segment: vaddr={:#x}, filesz={:#x}, memsz={:#x}, offset={:#x}",
@@ -468,9 +503,25 @@ impl<'a> ElfFile<'a> {
                 }
 
                 // 为段分配物理页帧并建立映射
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_elf_load_segment(
+                    crate::buildstorm_diagnostics::ELF_LOAD_PHASE_SEGMENT_MAP,
+                    _segment,
+                    ph.p_vaddr,
+                    ph.p_filesz,
+                    ph.p_memsz,
+                );
                 memory_set.insert_framed_area(start_va, end_va, flags)?;
                 // 复制文件内容到内存（按页批量复制，避免逐字节翻译）
                 if ph.p_filesz > 0 {
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    crate::buildstorm_diagnostics::note_elf_load_segment(
+                        crate::buildstorm_diagnostics::ELF_LOAD_PHASE_SEGMENT_COPY,
+                        _segment,
+                        ph.p_vaddr,
+                        ph.p_filesz,
+                        ph.p_memsz,
+                    );
                     let src_start = ph.p_offset;
                     let src_end = ph.p_offset + ph.p_filesz;
                     if src_end > self.data.len() {
@@ -510,6 +561,14 @@ impl<'a> ElfFile<'a> {
 
                 // 清零 BSS 段 (p_memsz > p_filesz 的区域)
                 if ph.p_memsz > ph.p_filesz {
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    crate::buildstorm_diagnostics::note_elf_load_segment(
+                        crate::buildstorm_diagnostics::ELF_LOAD_PHASE_SEGMENT_ZERO,
+                        _segment,
+                        ph.p_vaddr,
+                        ph.p_filesz,
+                        ph.p_memsz,
+                    );
                     let bss_start = ph.p_vaddr + ph.p_filesz;
                     let bss_end = ph.p_vaddr + ph.p_memsz;
                     let page_size = crate::config::PAGE_SIZE;
@@ -550,6 +609,12 @@ impl<'a> ElfFile<'a> {
         // 用户栈从高地址向下增长
         let user_stack_top = crate::config::USER_STACK_TOP;
         let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_elf_load_phase(
+            crate::buildstorm_diagnostics::ELF_LOAD_ROLE_TARGET,
+            crate::buildstorm_diagnostics::ELF_LOAD_PHASE_STACK_MAP,
+            0,
+        );
         log::info!(
             "[elf] Allocating user stack: {:#x} - {:#x}",
             user_stack_bottom,
@@ -562,6 +627,8 @@ impl<'a> ElfFile<'a> {
             PTEFlags::U | PTEFlags::R | PTEFlags::W | PTEFlags::V,
             MapAreaBacking::Anonymous,
         )?;
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::clear_elf_load();
 
         Ok((memory_set, user_stack_top, entry))
     }

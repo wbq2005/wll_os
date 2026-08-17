@@ -921,8 +921,30 @@ fn run_user_program_spec_foreground_exit_code(spec: &UserProgramSpec) -> Result<
     let harness = current_task();
     let task = match TaskControlBlock::new_user_with_args_env_cwd(spec) {
         Ok(task) => task,
-        Err(err) => return Err(err),
+        Err(err) => {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            console_write(&format!(
+                "BUILDSTORM_DIAG task_create_failure path={} root={} cwd={} errno={}\n",
+                spec.path,
+                spec.root,
+                spec.cwd,
+                err as usize,
+            ));
+            return Err(err);
+        }
     };
+
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let started_at_us = crate::timer::get_time_us();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    console_write(&format!(
+        "BUILDSTORM_DIAG script_task_created pid={} tgid={} path={} root={} cwd={}\n",
+        task.pid.0,
+        task.thread_group.tgid(),
+        spec.path,
+        spec.root,
+        spec.cwd,
+    ));
 
     // A real LTP binary is normally launched by a shell/test runner inside the
     // runner's session, not as a fresh session leader. Keep each foreground test
@@ -936,6 +958,15 @@ fn run_user_program_spec_foreground_exit_code(spec: &UserProgramSpec) -> Result<
 
     run_user_task_foreground(task.clone(), foreground_timeout_us(spec));
     let exit_code = task.thread_group.exit_code();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    console_write(&format!(
+        "BUILDSTORM_DIAG foreground_wait_end pid={} tgid={} exit={} status={:?} elapsed_us={}\n",
+        task.pid.0,
+        task.thread_group.tgid(),
+        exit_code,
+        task.status(),
+        crate::timer::get_time_us().saturating_sub(started_at_us),
+    ));
     cleanup_foreground_task_tree(&task);
     if let Some(ref h) = harness {
         h.set_status(TaskStatus::Running);
@@ -1302,12 +1333,56 @@ fn run_user_task_foreground(task: Arc<TaskControlBlock>, timeout_us: usize) {
     let deadline_us = crate::timer::deadline_after_us(timeout_us);
     crate::task::set_foreground_deadline_us(deadline_us);
 
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let mut next_heartbeat_us = crate::timer::get_time_us().saturating_add(10_000_000);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    console_write(&format!(
+        "BUILDSTORM_DIAG foreground_wait_begin pid={} tgid={} timeout_us={} deadline_us={}\n",
+        task.pid.0,
+        task.thread_group.tgid(),
+        timeout_us,
+        deadline_us,
+    ));
+
     task.set_status(TaskStatus::Ready);
     manager::add_task(task.clone());
 
     loop {
         crate::timer::wake_expired_timers();
-        if crate::timer::get_time_us() >= deadline_us {
+        let now_us = crate::timer::get_time_us();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        if !crate::buildstorm_diagnostics::exec_focus_only() && now_us >= next_heartbeat_us {
+            let counts = manager::diagnostic_task_counts();
+            let active_pid = CURRENT_TASK
+                .lock()
+                .as_ref()
+                .map(|active| active.pid.0)
+                .unwrap_or(0);
+            console_write(&format!(
+                "BUILDSTORM_DIAG foreground_heartbeat pid={} tgid={} active_pid={} live={} runnable={} blocked={} queue={} rustc_live={} rustc_runnable={} now_us={} deadline_us={}\n",
+                task.pid.0,
+                task.thread_group.tgid(),
+                active_pid,
+                counts.0,
+                counts.1,
+                counts.2,
+                manager::queue_len(),
+                counts.3,
+                counts.4,
+                now_us,
+                deadline_us,
+            ));
+            next_heartbeat_us = now_us.saturating_add(10_000_000);
+        }
+        if now_us >= deadline_us {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            console_write(&format!(
+                "BUILDSTORM_DIAG foreground_timeout pid={} tgid={} now_us={} deadline_us={}\n",
+                task.pid.0,
+                task.thread_group.tgid(),
+                now_us,
+                deadline_us,
+            ));
             console_write("[harness] TIMEOUT pid=");
             console_write(&format!("{}", task.pid.0));
             console_write("\n");
@@ -1397,29 +1472,30 @@ fn logical_path_for_script(
     }
 
     let host_script = crate::fs::normalize_path(script_path);
+    let interpreter_path = interpreter
+        .map(|spec| spec.path.as_str())
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or("/bin/sh");
+
+    // A runnable interpreter in the global namespace makes `/` authoritative
+    // for absolute paths. Compatibility images without a global userspace
+    // can still fall back to an independent root below the suite directory.
+    let global_interpreter = crate::fs::apply_root("/", interpreter_path);
+    if crate::fs::read_executable_file(&global_interpreter).is_some() {
+        return Some((String::from("/"), host_script));
+    }
+
     let mut candidate_root = dirname(&host_script);
-    loop {
+    while candidate_root != "/" {
         // Some runtime images are complete root filesystems, while compact
         // compatibility images place an independent userspace below a suite
         // directory. Select the nearest ancestor that actually supplies the
         // script's absolute interpreter instead of keying this decision on a
         // libc name or test group.
-        let interpreter_path = interpreter
-            .map(|spec| spec.path.as_str())
-            .filter(|path| path.starts_with('/'))
-            .unwrap_or("/bin/sh");
         let interpreter_host = crate::fs::apply_root(&candidate_root, interpreter_path);
         if crate::fs::read_executable_file(&interpreter_host).is_some() {
-            let logical_script = if candidate_root == "/" {
-                host_script.clone()
-            } else {
-                crate::fs::normalize_path(&host_script[candidate_root.len()..])
-            };
+            let logical_script = crate::fs::normalize_path(&host_script[candidate_root.len()..]);
             return Some((candidate_root, logical_script));
-        }
-
-        if candidate_root == "/" {
-            break;
         }
         candidate_root = dirname(&candidate_root);
     }
@@ -1519,7 +1595,26 @@ fn script_program_spec(script_path: &str) -> Result<UserProgramSpec, ScriptLaunc
 }
 
 fn run_script(script_path: &str) -> Result<(), ScriptLaunchError> {
-    let spec = script_program_spec(script_path)?;
+    let spec = match script_program_spec(script_path) {
+        Ok(spec) => spec,
+        Err(error) => {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            console_write(&format!(
+                "BUILDSTORM_DIAG script_start_failure path={} error={:?}\n",
+                script_path, error
+            ));
+            return Err(error);
+        }
+    };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    console_write(&format!(
+        "BUILDSTORM_DIAG script_start path={} exec_path={} argv0={} root={} cwd={}\n",
+        script_path,
+        spec.path,
+        spec.argv.first().map(String::as_str).unwrap_or(""),
+        spec.root,
+        spec.cwd,
+    ));
     #[cfg(feature = "buildstorm-diagnostics")]
     {
         // One lifecycle boundary record per harness script.  This is not a
@@ -1578,7 +1673,10 @@ fn run_script(script_path: &str) -> Result<(), ScriptLaunchError> {
                 trap.page_state,
             ));
         }
-        console_write(&format!("BUILDSTORM_DIAG script_exit code={}\n", exit_code));
+        console_write(&format!(
+            "BUILDSTORM_DIAG script_exit path={} code={}\n",
+            script_path, exit_code
+        ));
         return Ok(());
     }
     #[cfg(not(feature = "buildstorm-diagnostics"))]

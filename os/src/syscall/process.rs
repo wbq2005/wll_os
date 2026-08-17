@@ -15,6 +15,18 @@ use polyhal::VirtAddr;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 use spin::Mutex;
 
+#[cfg(feature = "buildstorm-diagnostics")]
+macro_rules! exec_stage {
+    ($stage:ident) => {
+        crate::buildstorm_diagnostics::note_exec_stage(crate::buildstorm_diagnostics::$stage)
+    };
+}
+
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+macro_rules! exec_stage {
+    ($stage:ident) => {};
+}
+
 /// Linux clone 的低 8 位为发往父进程的信号 (`CSIGNAL`)。
 const CSIGNAL: usize = 0xff;
 const ALLOWED_CLONE_FLAGS: usize = CLONE_VM
@@ -612,7 +624,10 @@ fn setup_user_stack_with_credentials(
     const AT_EXECFN: usize = 31;
 
     #[cfg(target_arch = "loongarch64")]
-    const LINUX_AT_HWCAP: usize = 0x1 | 0x8; // CPUCFG | FPU
+    // Linux LoongArch hwcap bits: CPUCFG=bit 0, UAL=bit 2, FPU=bit 3.
+    // The trap layer emulates user scalar unaligned accesses, including
+    // page-crossing accesses, so UAL is a real capability of this ABI.
+    const LINUX_AT_HWCAP: usize = 0x1 | 0x4 | 0x8;
     #[cfg(not(target_arch = "loongarch64"))]
     const LINUX_AT_HWCAP: usize = 0;
 
@@ -702,6 +717,10 @@ fn setup_user_stack_with_credentials(
 ///
 /// 加载并执行新程序
 pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallRet {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let exec_diagnostic = crate::buildstorm_diagnostics::ExecDiagnosticScope::enter(
+        current_task().map(|task| task.pid.0).unwrap_or(0),
+    );
     let path_str = match read_user_path(path) {
         Ok(value) => value,
         Err(error) => {
@@ -720,6 +739,9 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             return Err(error);
         }
     };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    exec_diagnostic.set_path(&path_str);
+    exec_stage!(EXEC_STAGE_PATH_READY);
     log::info!("[syscall] execve(path='{}')", path_str);
 
     // 在替换地址空间之前，从旧地址空间读取 argv/envp
@@ -731,6 +753,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         EXEC_FAILURE_STAGE_ARGV_ENTRY,
         EXEC_FAILURE_STAGE_ARGV_STRING,
     )?;
+    exec_stage!(EXEC_STAGE_ARGV_READY);
     let mut envp = read_user_str_array(
         envp_ptr,
         path as usize,
@@ -739,6 +762,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         EXEC_FAILURE_STAGE_ENVP_ENTRY,
         EXEC_FAILURE_STAGE_ENVP_STRING,
     )?;
+    exec_stage!(EXEC_STAGE_ENVP_READY);
     if envp.is_empty() {
         envp.push(String::from("PATH=/bin:/basic:/"));
         envp.push(String::from("LD_LIBRARY_PATH=/lib"));
@@ -750,11 +774,13 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
     } else {
         (String::from("/"), String::from("/"))
     };
+    exec_stage!(EXEC_STAGE_FS_CONTEXT);
     let requested_logical_path = crate::fs::resolve_path(&cwd, &path_str);
     let logical_path =
         proc_self_exe_target(&requested_logical_path)?.unwrap_or(requested_logical_path);
     let host_path = crate::fs::apply_root(&root, &logical_path);
 
+    exec_stage!(EXEC_STAGE_TARGET_OPEN);
     let mut elf_data = match super::with_kernel_page_table(|| read_executable_file(&host_path)) {
         Some(data) => data,
         None => {
@@ -766,6 +792,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             return Err(SysErrNo::ENOENT);
         }
     };
+    exec_stage!(EXEC_STAGE_TARGET_OPEN_DONE);
 
     // 从 ELF 头中获取 phdr 信息用于 auxv
     let mut launch_argv = if argv.is_empty() {
@@ -782,6 +809,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             return Err(SysErrNo::ENOEXEC);
         };
         let interp_host = crate::fs::apply_root(&root, &interp_logical);
+        exec_stage!(EXEC_STAGE_SHEBANG_OPEN);
         elf_data = match super::with_kernel_page_table(|| read_executable_file(&interp_host)) {
             Some(data) => data,
             None => {
@@ -793,9 +821,11 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
                 return Err(SysErrNo::ENOENT);
             }
         };
+        exec_stage!(EXEC_STAGE_SHEBANG_OPEN_DONE);
         launch_argv = script_argv;
         exec_logical_path = interp_logical;
     }
+    exec_stage!(EXEC_STAGE_TARGET_PARSE);
     let elf = match ElfFile::parse(&elf_data) {
         Ok(elf) => elf,
         Err(e) => {
@@ -816,6 +846,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
 
     let (mut new_memory_set, user_stack_top, entry, phdr_vaddr, phnum, interp_base) =
         if let Some(interp) = interp_path_opt {
+            exec_stage!(EXEC_STAGE_INTERPRETER_OPEN);
             let (interp_path, interp_host_path, interp_data) =
                 super::with_kernel_page_table(|| crate::fs::read_interpreter(&root, interp))
                     .ok_or_else(|| {
@@ -826,10 +857,18 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
                         );
                         SysErrNo::ENOENT
                     })?;
+            exec_stage!(EXEC_STAGE_INTERPRETER_OPEN_DONE);
             log::info!(
                 "[syscall] execve: interpreter {} resolved to {}",
                 interp_path,
                 interp_host_path
+            );
+            exec_stage!(EXEC_STAGE_MEMORY_BUILD);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_elf_load_phase(
+                crate::buildstorm_diagnostics::ELF_LOAD_ROLE_INTERPRETER,
+                crate::buildstorm_diagnostics::ELF_LOAD_PHASE_INTERPRETER_PARSE,
+                0,
             );
             let interp_elf = ElfFile::parse(&interp_data)?;
             let target_bias = if elf.header.e_type == 3 {
@@ -837,16 +876,46 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             } else {
                 0
             };
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_elf_load_phase(
+                crate::buildstorm_diagnostics::ELF_LOAD_ROLE_INTERPRETER,
+                crate::buildstorm_diagnostics::ELF_LOAD_PHASE_INTERPRETER_BIAS,
+                0,
+            );
             let interp_bias = ElfFile::choose_interpreter_bias(&elf, target_bias, &interp_elf)?;
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_elf_load_phase(
+                crate::buildstorm_diagnostics::ELF_LOAD_ROLE_TARGET,
+                crate::buildstorm_diagnostics::ELF_LOAD_PHASE_ADDRESS_SPACE,
+                target_bias,
+            );
             let mut memory_set = crate::mm::memory_set::MemorySet::from_kernel();
             log::info!("[syscall] execve: loading target segments");
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_elf_load_phase(
+                crate::buildstorm_diagnostics::ELF_LOAD_ROLE_TARGET,
+                crate::buildstorm_diagnostics::ELF_LOAD_PHASE_SEGMENT_MAP,
+                target_bias,
+            );
             elf.load_segments_into(&mut memory_set, target_bias)?;
             log::info!("[syscall] execve: loading interpreter segments");
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_elf_load_phase(
+                crate::buildstorm_diagnostics::ELF_LOAD_ROLE_INTERPRETER,
+                crate::buildstorm_diagnostics::ELF_LOAD_PHASE_SEGMENT_MAP,
+                interp_bias,
+            );
             interp_elf.load_segments_into(&mut memory_set, interp_bias)?;
             log::info!("[syscall] execve: mapping user stack");
 
             let user_stack_top = crate::config::USER_STACK_TOP;
             let user_stack_bottom = user_stack_top - crate::config::USER_STACK_SIZE;
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_elf_load_phase(
+                crate::buildstorm_diagnostics::ELF_LOAD_ROLE_TARGET,
+                crate::buildstorm_diagnostics::ELF_LOAD_PHASE_STACK_MAP,
+                target_bias,
+            );
             memory_set.insert_lazy_area_with_backing(
                 VirtAddr::new(user_stack_bottom),
                 VirtAddr::new(user_stack_top),
@@ -856,6 +925,8 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
                     | crate::mm::page_table::PTEFlags::V,
                 crate::mm::map_area::MapAreaBacking::Anonymous,
             )?;
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::clear_elf_load();
 
             (
                 memory_set,
@@ -868,6 +939,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         } else {
             let phdr_vaddr = elf.phdr_vaddr(0);
             let phnum = elf.phnum();
+            exec_stage!(EXEC_STAGE_MEMORY_BUILD);
             if elf.header.e_type == 3 {
                 let bias = 0x0040_0000usize;
                 let (memory_set, user_stack_top, entry) = match elf.load_at(bias) {
@@ -939,6 +1011,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         entry
     };
 
+    exec_stage!(EXEC_STAGE_STACK_SETUP);
     let sp = setup_user_stack(
         &mut new_memory_set,
         user_stack_top,
@@ -949,12 +1022,17 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         phnum,
         interp_base,
     )?;
+    exec_stage!(EXEC_STAGE_SIGNAL_TRAMPOLINE);
     crate::syscall::signal::install_signal_trampoline(&mut new_memory_set)?;
     if let Some(task) = current_task() {
+        exec_stage!(EXEC_STAGE_TERMINATE_PEERS);
         crate::task::terminate_thread_group_peers_for_exec(&task);
+        exec_stage!(EXEC_STAGE_DETACH_SHM);
         crate::syscall::mm::detach_task_shared_memory(&task);
+        exec_stage!(EXEC_STAGE_RESET_SIGNALS);
         crate::syscall::signal::reset_signal_handlers_for_exec(&task);
         let closed_on_exec = {
+            exec_stage!(EXEC_STAGE_TASK_INNER_LOCK);
             let mut inner = task.inner.lock();
 
             // 重置堆
@@ -962,9 +1040,11 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             inner.has_execed = true;
             inner.robust_list_head = 0;
             inner.robust_list_len = 0;
+            exec_stage!(EXEC_STAGE_FD_TABLE_LOCK);
             let mut fds = inner.fd_table.lock();
             #[cfg(feature = "buildstorm-diagnostics")]
             let (pipe_endpoints, pipe_cloexec) = fds.diagnostic_pipe_counts();
+            exec_stage!(EXEC_STAGE_CLOSE_FILES);
             let closed = fds.close_on_exec();
             #[cfg(feature = "buildstorm-diagnostics")]
             {
@@ -980,12 +1060,14 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             }
             closed
         };
+        exec_stage!(EXEC_STAGE_RELEASE_POSIX_LOCKS);
         crate::syscall::fs::release_posix_locks_for_closed_files(
             task.thread_group.tgid(),
             &closed_on_exec,
         );
         drop(closed_on_exec);
         {
+            exec_stage!(EXEC_STAGE_MM_LOCK);
             let mut mm = task.mm.lock();
             mm.program_break = crate::config::USER_HEAP_START;
             mm.mapped_break = crate::config::USER_HEAP_START;
@@ -997,7 +1079,9 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             // The syscall runs under the outgoing user page table. Switch to
             // the stable kernel root before replacing it so PageTableWrapper
             // can release the old root and all of its user page-table frames.
+            exec_stage!(EXEC_STAGE_KERNEL_PT_RESTORE);
             crate::trap::restore_kernel_page_table();
+            exec_stage!(EXEC_STAGE_MEMORY_SET_LOCK);
             let mut ms = crate::buildstorm_memory_set_lock!(
                 crate::buildstorm_diagnostics::MemorySetLockSite::ExecReplace,
                 &task.memory_set,
@@ -1005,10 +1089,12 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             log::info!("[syscall] execve: replacing memory set");
             #[cfg(not(feature = "buildstorm-diagnostics"))]
             {
+                exec_stage!(EXEC_STAGE_MEMORY_REPLACE);
                 *ms = new_memory_set;
             }
             #[cfg(feature = "buildstorm-diagnostics")]
             {
+                exec_stage!(EXEC_STAGE_MEMORY_REPLACE);
                 let swap_started_at = crate::timer::get_time_us();
                 let old_memory_set = core::mem::replace(&mut *ms, new_memory_set);
                 crate::buildstorm_diagnostics::note_phase(
@@ -1017,6 +1103,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
                 );
 
                 let drop_started_at = crate::timer::get_time_us();
+                exec_stage!(EXEC_STAGE_OLD_MEMORY_DROP);
                 old_memory_set.diagnostic_drop_after_exec();
                 crate::buildstorm_diagnostics::note_phase(
                     46,
@@ -1028,6 +1115,7 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
         {
             log::info!("[syscall] execve: resetting trap frame");
             let mut updated_saved_tf = false;
+            exec_stage!(EXEC_STAGE_TRAP_FRAME_LOCK);
             let mut tf_guard = task.trap_frame.lock();
             if let Some(ref mut tf) = *tf_guard {
                 reset_exec_trapframe(tf, entry, sp, argv_with_path.len());
@@ -1048,8 +1136,21 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
             argv_with_path.len()
         );
     }
+    exec_stage!(EXEC_STAGE_COMPLETE);
 
     // 通知 trap 处理：execve 已替换地址空间，跳过 syscall_ok() PC 前进
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if let Some(sequence) = crate::buildstorm_diagnostics::note_exec_success_marker() {
+        let pid = current_task().map(|task| task.pid.0).unwrap_or(0);
+        crate::println!(
+            "BUILDSTORM_DIAG exec_success seq={} pid={} path={} entry={:#x} argc={}",
+            sequence,
+            pid,
+            path_str,
+            entry,
+            argv_with_path.len(),
+        );
+    }
     if let Some(task) = current_task() {
         release_vfork_parent(&task);
     }
@@ -1059,12 +1160,32 @@ pub fn sys_execve(path: *const u8, argv_ptr: usize, envp_ptr: usize) -> SyscallR
 
 pub fn sys_exit(exit_code: i32) -> SyscallRet {
     log::info!("[syscall] exit(code={})", exit_code);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if let Some(sequence) = crate::buildstorm_diagnostics::note_exit_marker() {
+        let (pid, tgid) = current_task()
+            .map(|task| (task.pid.0, task.thread_group.tgid()))
+            .unwrap_or((0, 0));
+        crate::println!(
+            "BUILDSTORM_DIAG exit seq={} kind=thread pid={} tgid={} code={}",
+            sequence, pid, tgid, exit_code
+        );
+    }
     exit_current_and_run_next(exit_code);
     Ok(0)
 }
 
 pub fn sys_exit_group(exit_code: i32) -> SyscallRet {
     log::info!("[syscall] exit_group(code={})", exit_code);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if let Some(sequence) = crate::buildstorm_diagnostics::note_exit_marker() {
+        let (pid, tgid) = current_task()
+            .map(|task| (task.pid.0, task.thread_group.tgid()))
+            .unwrap_or((0, 0));
+        crate::println!(
+            "BUILDSTORM_DIAG exit seq={} kind=group pid={} tgid={} code={}",
+            sequence, pid, tgid, exit_code
+        );
+    }
     exit_thread_group_and_run_next(exit_code);
     Ok(0)
 }
@@ -1091,7 +1212,7 @@ pub fn sys_getppid() -> SyscallRet {
     Ok(ppid)
 }
 
-fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> SyscallRet {
+fn sys_wait4_thread_group_inner(pid: isize, status: *mut i32, options: usize) -> SyscallRet {
     let task = current_task().ok_or(SysErrNo::ESRCH)?;
     let target = match pid {
         -1 | 0 => WaitTarget::AnyChild,
@@ -1133,6 +1254,16 @@ fn sys_wait4_thread_group(pid: isize, status: *mut i32, options: usize) -> Sysca
         // Register the waiter before the final child-state check.  A child can
         // exit between the checks above and a bare sleep, which would otherwise
         // lose its SIGCHLD wakeup and leave the parent blocked forever.
+        #[cfg(feature = "buildstorm-diagnostics")]
+        if let Some(sequence) = crate::buildstorm_diagnostics::note_wait4_block_marker() {
+            crate::println!(
+                "BUILDSTORM_DIAG wait4_block seq={} caller_pid={} target={} options={:#x}",
+                sequence,
+                task.pid.0,
+                pid,
+                options,
+            );
+        }
         match crate::task::wait_queue::sleep_on_child_exit_if(|| {
             Ok(peek_zombie_child(&task, target).is_none() && has_matching_child(&task, target))
         }) {
@@ -1180,7 +1311,36 @@ pub fn sys_sched_yield() -> SyscallRet {
 ///   - 子进程获得调度机会运行并退出成为僵尸；
 ///   - 父进程再次被调度时调用 wait4 可以成功回收。
 pub fn sys_wait4(pid: isize, status: *mut i32, options: usize, _rusage: usize) -> SyscallRet {
-    sys_wait4_thread_group(pid, status, options)
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let marker_sequence = crate::buildstorm_diagnostics::note_wait4_marker();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if let Some(sequence) = marker_sequence {
+        let caller_pid = current_task().map(|task| task.pid.0).unwrap_or(0);
+        crate::println!(
+            "BUILDSTORM_DIAG wait4_enter seq={} caller_pid={} target={} options={:#x}",
+            sequence, caller_pid, pid, options
+        );
+    }
+
+    let result = sys_wait4_thread_group_inner(pid, status, options);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if let Some(sequence) = marker_sequence {
+        match &result {
+            Ok(child_pid) => crate::println!(
+                "BUILDSTORM_DIAG wait4_return seq={} caller_pid={} child_pid={} result=ok",
+                sequence,
+                current_task().map(|task| task.pid.0).unwrap_or(0),
+                child_pid,
+            ),
+            Err(error) => crate::println!(
+                "BUILDSTORM_DIAG wait4_return seq={} caller_pid={} errno={} result=error",
+                sequence,
+                current_task().map(|task| task.pid.0).unwrap_or(0),
+                *error as usize,
+            ),
+        }
+    }
+    result
 }
 
 fn waitid_target(idtype: usize, id: usize) -> Result<WaitTarget, SysErrNo> {
@@ -1554,6 +1714,7 @@ pub fn sys_clone(
         signal_state: Mutex::new(crate::syscall::signal::SignalState::fork_from(
             signal_blocked,
         )),
+        signal_pending_hint: AtomicUsize::new(0),
         trap_frame: Mutex::new(Some(child_tf)),
         status: Mutex::new(crate::task::TaskStatus::Ready),
         block_reason: Mutex::new(None),

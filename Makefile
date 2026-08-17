@@ -9,6 +9,10 @@ LIBCTEST ?= 0
 IOZONE ?= 1
 LMBENCH ?= 1
 LTP ?= 0
+# Diagnostic builds add lifecycle markers and aggregate counters without
+# changing production behavior.  Keep the production default disabled; the
+# diagnostic submission archive sets this to 1 explicitly.
+BUILDSTORM_DIAGNOSTICS ?= 0
 # Final submissions must not stop after the CAgent task.  Keep both official
 # finals groups in the plain `make all` artifact; focused runners override this
 # value explicitly when they need one workload in isolation.
@@ -68,6 +72,11 @@ ifeq ($(LTP),1)
 else
     LTP_EXTRA :=
 endif
+ifeq ($(BUILDSTORM_DIAGNOSTICS),1)
+    BUILDSTORM_DIAGNOSTICS_EXTRA := --features buildstorm-diagnostics
+else
+    BUILDSTORM_DIAGNOSTICS_EXTRA :=
+endif
 ifneq ($(strip $(LTP_CASES)),)
     LTP_CASES_ENV := LTP_CASES="$(LTP_CASES)"
 else
@@ -78,12 +87,12 @@ NO_PRELOAD_PATTERN := _testcode\.sh|busybox_cmd\.txt|testcase busybox
 .PHONY: all build clean check check-sdcard check-kernel-no-preload prepare-cargo-config unpack-sdcard print-phase2-gate print-ltp-cases
 all:
 	@echo "Building for RISC-V..."
-	$(MAKE) ARCH=riscv64 build INIT=$(INIT) LOG=$(LOG) LTP=1 LTP_CASES=$(FOCUSED_LTP_CASES)
+	$(MAKE) ARCH=riscv64 build INIT=$(INIT) LOG=$(LOG) LTP=1 LTP_CASES=$(FOCUSED_LTP_CASES) BUILDSTORM_DIAGNOSTICS=$(BUILDSTORM_DIAGNOSTICS)
 	cp target/riscv64gc-unknown-none-elf/release/wll_OS kernel-rv
 	$(MAKE) check-kernel-no-preload
 	@echo "RISC-V build done: kernel-rv"
 	@echo "Building for LoongArch..."
-	$(MAKE) ARCH=loongarch64 build INIT=$(INIT) LOG=$(LOG) LTP=1 LTP_CASES=$(FOCUSED_LTP_CASES)
+	$(MAKE) ARCH=loongarch64 build INIT=$(INIT) LOG=$(LOG) LTP=1 LTP_CASES=$(FOCUSED_LTP_CASES) BUILDSTORM_DIAGNOSTICS=$(BUILDSTORM_DIAGNOSTICS)
 	cp target/loongarch64-unknown-none/release/wll_OS kernel-la
 	@echo "LoongArch build done: kernel-la"
 
@@ -164,13 +173,13 @@ build:
 	@echo "Building kernel for $(ARCH)..."
 	$(MAKE) prepare-cargo-config
 	@if [ "$(DEV_PRELOAD)" = "1" ]; then $(MAKE) check-sdcard ARCH=$(ARCH); fi
-	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) WLL_HARNESS_LIBC=$(HARNESS_LIBC) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
+	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) WLL_HARNESS_LIBC=$(HARNESS_LIBC) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) build --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA) $(BUILDSTORM_DIAGNOSTICS_EXTRA)
 
 # 快速检查（不做链接，更快，适合开发阶段验证代码）
 check:
 	@echo "Checking kernel for $(ARCH)..."
 	$(MAKE) prepare-cargo-config
-	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) WLL_HARNESS_LIBC=$(HARNESS_LIBC) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA)
+	cd os && WLL_INTERACTIVE=$(INTERACTIVE) WLL_HARNESS_GROUPS=$(HARNESS_GROUPS) WLL_HARNESS_LIBC=$(HARNESS_LIBC) $(LTP_CASES_ENV) cargo +$(RUSTUP_TOOLCHAIN) check --locked --offline --release --target $(TARGET) $(CARGO_EXTRA) $(DEV_PRELOAD_EXTRA) $(LIBCTEST_EXTRA) $(IOZONE_EXTRA) $(LMBENCH_EXTRA) $(LTP_EXTRA) $(BUILDSTORM_DIAGNOSTICS_EXTRA)
 
 check-kernel-no-preload:
 	@if [ ! -f kernel-rv ]; then \

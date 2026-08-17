@@ -8,6 +8,8 @@ use crate::timer;
 use crate::utils::error::SysErrNo;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+#[cfg(feature = "buildstorm-diagnostics")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -30,6 +32,16 @@ struct FutexWaiter {
     bitset: usize,
     task: Arc<crate::task::TaskControlBlock>,
     token: usize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    source_uaddr: usize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    expected: i32,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    private: bool,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    registered_at_us: usize,
+    #[cfg(feature = "buildstorm-diagnostics")]
+    deadline_us: usize,
 }
 
 const FUTEX_SHARED_KEY: usize = usize::MAX;
@@ -42,6 +54,27 @@ lazy_static! {
     static ref ACTIVE_INTERVAL_TIMER_TASKS: Mutex<Vec<Weak<crate::task::TaskControlBlock>>> =
         Mutex::new(Vec::new());
 }
+
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_MATCHES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_TOKEN_REJECTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_KEY_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_LAST_MISS_UADDR: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_LAST_MISS_KEY: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_LAST_OBSERVED_KEY: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_LAST_REJECT_PID: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_LAST_REJECT_TOKEN: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "buildstorm-diagnostics")]
+static FUTEX_WAKE_LAST_REJECT_CURRENT_TOKEN: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1736,6 +1769,8 @@ fn futex_wake_addr_key(uaddr: usize, key: usize, n: usize, bitset: usize) -> usi
     if uaddr == 0 || n == 0 {
         return 0;
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    FUTEX_WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut woke = 0usize;
     while woke < n {
         let waiter = {
@@ -1743,12 +1778,33 @@ fn futex_wake_addr_key(uaddr: usize, key: usize, n: usize, bitset: usize) -> usi
             let Some(index) = waiters.iter().position(|waiter| {
                 waiter.uaddr == uaddr && waiter.key == key && (waiter.bitset & bitset) != 0
             }) else {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if let Some(waiter) = waiters
+                    .iter()
+                    .find(|waiter| waiter.uaddr == uaddr && waiter.key != key)
+                {
+                    FUTEX_WAKE_KEY_MISSES.fetch_add(1, Ordering::Relaxed);
+                    FUTEX_WAKE_LAST_MISS_UADDR.store(uaddr, Ordering::Relaxed);
+                    FUTEX_WAKE_LAST_MISS_KEY.store(key, Ordering::Relaxed);
+                    FUTEX_WAKE_LAST_OBSERVED_KEY.store(waiter.key, Ordering::Relaxed);
+                }
                 break;
             };
             waiters.remove(index)
         };
         if crate::task::wake_task_token_with(&waiter.task, waiter.token, WaitOutcome::Woken) {
             woke += 1;
+            #[cfg(feature = "buildstorm-diagnostics")]
+            FUTEX_WAKE_MATCHES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            {
+                FUTEX_WAKE_TOKEN_REJECTS.fetch_add(1, Ordering::Relaxed);
+                FUTEX_WAKE_LAST_REJECT_PID.store(waiter.task.pid.0, Ordering::Relaxed);
+                FUTEX_WAKE_LAST_REJECT_TOKEN.store(waiter.token, Ordering::Relaxed);
+                FUTEX_WAKE_LAST_REJECT_CURRENT_TOKEN
+                    .store(waiter.task.current_wait_token(), Ordering::Relaxed);
+            }
         }
     }
     woke
@@ -1925,6 +1981,16 @@ fn futex_wait_addr(
         bitset,
         task: task.clone(),
         token,
+        #[cfg(feature = "buildstorm-diagnostics")]
+        source_uaddr: uaddr,
+        #[cfg(feature = "buildstorm-diagnostics")]
+        expected: val as i32,
+        #[cfg(feature = "buildstorm-diagnostics")]
+        private,
+        #[cfg(feature = "buildstorm-diagnostics")]
+        registered_at_us: timer::get_time_us(),
+        #[cfg(feature = "buildstorm-diagnostics")]
+        deadline_us: deadline.unwrap_or(0),
     });
     match read_user_i32(uaddr) {
         Ok(current) if current == val as i32 => {}
@@ -2029,30 +2095,106 @@ pub(crate) fn remove_futex_waiters_for_task(task: &Arc<crate::task::TaskControlB
 
 #[cfg(feature = "buildstorm-diagnostics")]
 pub(crate) fn diagnostic_dump_futex_waiters() {
-    let waiters: Vec<(usize, usize, usize, usize, usize, usize)> = FUTEX_WAITERS
+    let now = timer::get_time_us();
+    let waiters: Vec<(
+        Arc<crate::task::TaskControlBlock>,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        i32,
+        bool,
+        usize,
+        usize,
+    )> = FUTEX_WAITERS
         .lock()
         .iter()
         .map(|waiter| {
             (
-                waiter.task.pid.0,
-                waiter.task.thread_group.tgid(),
+                waiter.task.clone(),
                 waiter.uaddr,
                 waiter.key,
                 waiter.bitset,
                 waiter.token,
+                waiter.source_uaddr,
+                waiter.expected,
+                waiter.private,
+                waiter.registered_at_us,
+                waiter.deadline_us,
             )
         })
         .collect();
-    crate::println!("[buildstorm-diag] futex-waiters={}", waiters.len());
-    for (pid, tgid, uaddr, key, bitset, token) in waiters {
+
+    crate::println!(
+        "BUILDSTORM_DIAG futex_state waiters={} wake_calls={} wake_matches={} token_rejects={} key_misses={} last_miss_uaddr={:#x} last_miss_key={:#x} last_observed_key={:#x} last_reject_pid={} last_reject_token={} last_reject_current_token={}",
+        waiters.len(),
+        FUTEX_WAKE_CALLS.load(Ordering::Relaxed),
+        FUTEX_WAKE_MATCHES.load(Ordering::Relaxed),
+        FUTEX_WAKE_TOKEN_REJECTS.load(Ordering::Relaxed),
+        FUTEX_WAKE_KEY_MISSES.load(Ordering::Relaxed),
+        FUTEX_WAKE_LAST_MISS_UADDR.load(Ordering::Relaxed),
+        FUTEX_WAKE_LAST_MISS_KEY.load(Ordering::Relaxed),
+        FUTEX_WAKE_LAST_OBSERVED_KEY.load(Ordering::Relaxed),
+        FUTEX_WAKE_LAST_REJECT_PID.load(Ordering::Relaxed),
+        FUTEX_WAKE_LAST_REJECT_TOKEN.load(Ordering::Relaxed),
+        FUTEX_WAKE_LAST_REJECT_CURRENT_TOKEN.load(Ordering::Relaxed),
+    );
+    for (
+        task,
+        uaddr,
+        key,
+        bitset,
+        token,
+        source_uaddr,
+        expected,
+        private,
+        registered_at_us,
+        deadline_us,
+    ) in waiters
+    {
+        let (clear_child_tid, robust_head, robust_len) = {
+            let inner = task.inner.lock();
+            (
+                inner.clear_child_tid,
+                inner.robust_list_head,
+                inner.robust_list_len,
+            )
+        };
+        let mut bytes = [0u8; core::mem::size_of::<i32>()];
+        let current_result = {
+            let mut memory_set = crate::buildstorm_memory_set_lock!(
+                crate::buildstorm_diagnostics::MemorySetLockSite::UserCopyRead,
+                &task.memory_set,
+            );
+            super::user::copy_from_user_in_memory_set(&mut memory_set, source_uaddr, &mut bytes)
+        };
+        let (current, read_errno) = match current_result {
+            Ok(()) => (i32::from_ne_bytes(bytes) as isize, 0usize),
+            Err(errno) => (isize::MIN, errno as usize),
+        };
         crate::println!(
-            "[buildstorm-diag] futex-wait pid={} tgid={} uaddr={:#x} key={:#x} bitset={:#x} token={}",
-            pid,
-            tgid,
+            "BUILDSTORM_DIAG futex_waiter pid={} tgid={} status={:?} block={:?} source_uaddr={:#x} key_uaddr={:#x} key={:#x} private={} bitset={:#x} expected={} current={} read_errno={} token={} current_token={} outcome={:?} age_us={} deadline_us={} clear_child_tid={:#x} robust_head={:#x} robust_len={}",
+            task.pid.0,
+            task.thread_group.tgid(),
+            task.status(),
+            *task.block_reason.lock(),
+            source_uaddr,
             uaddr,
             key,
+            private,
             bitset,
-            token
+            expected,
+            current,
+            read_errno,
+            token,
+            task.current_wait_token(),
+            *task.wait_outcome.lock(),
+            now.saturating_sub(registered_at_us),
+            deadline_us,
+            clear_child_tid,
+            robust_head,
+            robust_len,
         );
     }
 }

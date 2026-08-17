@@ -12,7 +12,15 @@ use spin::{Mutex, MutexGuard};
 use crate::task::wait_queue::{BlockReason, WaitOutcome};
 
 const REPORT_INTERVAL_US: usize = 10 * 1_000_000;
+// This diagnostic build is dedicated to the terminal exec stall. Keeping the
+// periodic report compact avoids turning serial output into a second workload.
+const EXEC_FOCUS_ONLY: bool = true;
 const CPU_SLOTS: usize = crate::config::MAX_CPUS;
+
+#[inline]
+pub(crate) const fn exec_focus_only() -> bool {
+    EXEC_FOCUS_ONLY
+}
 const SYSCALL_SLOTS: usize = 512;
 const SYSCALL_SAMPLE_SHIFT: usize = 6;
 const SYSCALL_SAMPLE_MASK: usize = (1 << SYSCALL_SAMPLE_SHIFT) - 1;
@@ -546,6 +554,56 @@ const BLOCK_ACTOR_SLOTS: usize = BLOCK_ACTOR_NAMES.len();
 static NEXT_REPORT_AT_US: AtomicUsize = AtomicUsize::new(0);
 static REPORT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+// Lifecycle markers are intentionally sampled.  A full compiler workload can
+// execute thousands of short-lived helpers; emitting every boundary would
+// hide the first stuck transition in serial output and perturb the workload.
+static EXEC_SUCCESS_MARKERS: AtomicUsize = AtomicUsize::new(0);
+static EXEC_FAILURE_MARKERS: AtomicUsize = AtomicUsize::new(0);
+static WAIT4_MARKERS: AtomicUsize = AtomicUsize::new(0);
+static WAIT4_BLOCK_MARKERS: AtomicUsize = AtomicUsize::new(0);
+static EXIT_MARKERS: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn lifecycle_sample(sequence: usize) -> bool {
+    sequence <= 64 || sequence % 256 == 0
+}
+
+#[inline]
+pub(crate) fn note_exec_success_marker() -> Option<usize> {
+    if EXEC_FOCUS_ONLY {
+        return None;
+    }
+    let sequence = EXEC_SUCCESS_MARKERS.fetch_add(1, Ordering::Relaxed) + 1;
+    lifecycle_sample(sequence).then_some(sequence)
+}
+
+#[inline]
+pub(crate) fn note_wait4_marker() -> Option<usize> {
+    if EXEC_FOCUS_ONLY {
+        return None;
+    }
+    let sequence = WAIT4_MARKERS.fetch_add(1, Ordering::Relaxed) + 1;
+    lifecycle_sample(sequence).then_some(sequence)
+}
+
+#[inline]
+pub(crate) fn note_wait4_block_marker() -> Option<usize> {
+    if EXEC_FOCUS_ONLY {
+        return None;
+    }
+    let sequence = WAIT4_BLOCK_MARKERS.fetch_add(1, Ordering::Relaxed) + 1;
+    lifecycle_sample(sequence).then_some(sequence)
+}
+
+#[inline]
+pub(crate) fn note_exit_marker() -> Option<usize> {
+    if EXEC_FOCUS_ONLY {
+        return None;
+    }
+    let sequence = EXIT_MARKERS.fetch_add(1, Ordering::Relaxed) + 1;
+    lifecycle_sample(sequence).then_some(sequence)
+}
+
 // Terminal user traps are exceptional lifecycle boundaries, rather than a
 // page-fault trace.  Capture just the first one so a failed diagnostic run can
 // be attributed without perturbing the normal MM hot path.
@@ -753,6 +811,24 @@ pub(crate) fn note_first_exec_failure_boundary(
     FIRST_EXEC_FAILURE_PAGE_STATE.store(page_state, Ordering::Relaxed);
     FIRST_EXEC_FAILURE_PTE_PA.store(pte_pa, Ordering::Relaxed);
     FIRST_EXEC_FAILURE_STATE.store(2, Ordering::Release);
+
+    // Emit the failure boundary immediately.  A foreground script that hangs
+    // after an exec error may never return to the harness to drain the saved
+    // one-shot record, so the serial log must contain a self-contained marker.
+    let sequence = EXEC_FAILURE_MARKERS.fetch_add(1, Ordering::Relaxed) + 1;
+    if lifecycle_sample(sequence) {
+        crate::println!(
+            "BUILDSTORM_DIAG exec_failure seq={} errno={} pid={} stage={} vector_base={:#x} index={} entry_addr={:#x} value_ptr={:#x}",
+            sequence,
+            errno,
+            pid,
+            stage,
+            vector_base,
+            index,
+            entry_addr,
+            value_ptr,
+        );
+    }
 }
 
 #[inline]
@@ -1146,6 +1222,115 @@ static ACTIVE_USER_TRAP_SINCE_US: [AtomicUsize; CPU_SLOTS] =
 static ACTIVE_USER_TRAP_ENTRIES: [AtomicUsize; CPU_SLOTS] =
     [const { AtomicUsize::new(0) }; CPU_SLOTS];
 
+// A user trap can remain active while a syscall is blocked or spins inside a
+// subsystem.  Keep the last active syscall identity so a late snapshot can
+// distinguish a scheduler starvation from a syscall that never returns.
+static ACTIVE_SYSCALL_ID: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(usize::MAX) }; CPU_SLOTS];
+static ACTIVE_SYSCALL_SEPC: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_SYSCALL_SINCE_US: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_SYSCALL_ENTRIES: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_SYSCALL_LAST_EXIT_US: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+
+pub(crate) const EXEC_STAGE_ENTER: usize = 1;
+pub(crate) const EXEC_STAGE_PATH_READY: usize = 2;
+pub(crate) const EXEC_STAGE_ARGV_READY: usize = 3;
+pub(crate) const EXEC_STAGE_ENVP_READY: usize = 4;
+pub(crate) const EXEC_STAGE_FS_CONTEXT: usize = 5;
+pub(crate) const EXEC_STAGE_TARGET_OPEN: usize = 6;
+pub(crate) const EXEC_STAGE_VFS_RESOLVE_SYMLINK: usize = 7;
+pub(crate) const EXEC_STAGE_VFS_MOUNT_ROUTE: usize = 8;
+pub(crate) const EXEC_STAGE_VFS_MEMFS: usize = 9;
+pub(crate) const EXEC_STAGE_VFS_EXT4_ENTER: usize = 10;
+pub(crate) const EXEC_STAGE_EXT4_NAMESPACE_LOCK: usize = 11;
+pub(crate) const EXEC_STAGE_EXT4_RESOLVE: usize = 12;
+pub(crate) const EXEC_STAGE_EXT4_INODE_LOOKUP: usize = 13;
+pub(crate) const EXEC_STAGE_EXT4_EXEC_CACHE: usize = 14;
+pub(crate) const EXEC_STAGE_EXT4_REGULAR_CACHE: usize = 15;
+pub(crate) const EXEC_STAGE_EXT4_EXTENT_READ: usize = 16;
+pub(crate) const EXEC_STAGE_TARGET_OPEN_DONE: usize = 17;
+pub(crate) const EXEC_STAGE_SHEBANG_OPEN: usize = 18;
+pub(crate) const EXEC_STAGE_SHEBANG_OPEN_DONE: usize = 19;
+pub(crate) const EXEC_STAGE_TARGET_PARSE: usize = 20;
+pub(crate) const EXEC_STAGE_INTERPRETER_OPEN: usize = 21;
+pub(crate) const EXEC_STAGE_INTERPRETER_OPEN_DONE: usize = 22;
+pub(crate) const EXEC_STAGE_MEMORY_BUILD: usize = 23;
+pub(crate) const EXEC_STAGE_STACK_SETUP: usize = 24;
+pub(crate) const EXEC_STAGE_SIGNAL_TRAMPOLINE: usize = 25;
+pub(crate) const EXEC_STAGE_TERMINATE_PEERS: usize = 26;
+pub(crate) const EXEC_STAGE_DETACH_SHM: usize = 27;
+pub(crate) const EXEC_STAGE_RESET_SIGNALS: usize = 28;
+pub(crate) const EXEC_STAGE_TASK_INNER_LOCK: usize = 29;
+pub(crate) const EXEC_STAGE_FD_TABLE_LOCK: usize = 30;
+pub(crate) const EXEC_STAGE_CLOSE_FILES: usize = 31;
+pub(crate) const EXEC_STAGE_RELEASE_POSIX_LOCKS: usize = 32;
+pub(crate) const EXEC_STAGE_MM_LOCK: usize = 33;
+pub(crate) const EXEC_STAGE_KERNEL_PT_RESTORE: usize = 34;
+pub(crate) const EXEC_STAGE_MEMORY_SET_LOCK: usize = 35;
+pub(crate) const EXEC_STAGE_MEMORY_REPLACE: usize = 36;
+pub(crate) const EXEC_STAGE_OLD_MEMORY_DROP: usize = 37;
+pub(crate) const EXEC_STAGE_TRAP_FRAME_LOCK: usize = 38;
+pub(crate) const EXEC_STAGE_COMPLETE: usize = 39;
+
+pub(crate) const ELF_LOAD_ROLE_TARGET: usize = 1;
+pub(crate) const ELF_LOAD_ROLE_INTERPRETER: usize = 2;
+
+pub(crate) const ELF_LOAD_PHASE_INTERPRETER_PARSE: usize = 1;
+pub(crate) const ELF_LOAD_PHASE_INTERPRETER_BIAS: usize = 2;
+pub(crate) const ELF_LOAD_PHASE_ADDRESS_SPACE: usize = 3;
+pub(crate) const ELF_LOAD_PHASE_SEGMENT_MAP: usize = 4;
+pub(crate) const ELF_LOAD_PHASE_SEGMENT_COPY: usize = 5;
+pub(crate) const ELF_LOAD_PHASE_SEGMENT_ZERO: usize = 6;
+pub(crate) const ELF_LOAD_PHASE_STACK_MAP: usize = 7;
+
+pub(crate) const ADDRESS_SPACE_CREATE_IDLE: usize = 0;
+pub(crate) const ADDRESS_SPACE_CREATE_ROOT: usize = 1;
+pub(crate) const ADDRESS_SPACE_CREATE_ASID: usize = 2;
+
+static ACTIVE_EXEC_STAGE: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_EXEC_PID: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_EXEC_PATH_HASH: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_EXEC_PATH_LEN: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_EXEC_STARTED_AT_US: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_EXEC_STAGE_SINCE_US: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_EXEC_LAST_EXIT_US: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_EXEC_ENTRIES: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+const EXEC_PATH_SLOTS: usize = 64;
+static EXEC_PATH_HASHES: [AtomicUsize; EXEC_PATH_SLOTS] =
+    [const { AtomicUsize::new(0) }; EXEC_PATH_SLOTS];
+static EXEC_PATH_COUNTS: [AtomicUsize; EXEC_PATH_SLOTS] =
+    [const { AtomicUsize::new(0) }; EXEC_PATH_SLOTS];
+static ACTIVE_ELF_LOAD_ROLE: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_ELF_LOAD_PHASE: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_ELF_LOAD_SEGMENT: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_ELF_LOAD_VADDR: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_ELF_LOAD_FILESZ: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_ELF_LOAD_MEMSZ: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_ELF_LOAD_BIAS: [AtomicUsize; CPU_SLOTS] = [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_ELF_LOAD_PHASE_SINCE_US: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_ADDRESS_SPACE_CREATE_PHASE: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ACTIVE_ADDRESS_SPACE_CREATE_SINCE_US: [AtomicUsize; CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; CPU_SLOTS];
+static ASID_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static ASID_REUSES: AtomicUsize = AtomicUsize::new(0);
+static ASID_GLOBAL_RECYCLES: AtomicUsize = AtomicUsize::new(0);
+static ASID_ZERO_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+static ASID_LAST_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+static ASID_MAX: AtomicUsize = AtomicUsize::new(0);
+static ASID_NEXT: AtomicUsize = AtomicUsize::new(0);
+static ASID_REUSABLE: AtomicUsize = AtomicUsize::new(0);
+static ASID_RETIRED: AtomicUsize = AtomicUsize::new(0);
+
 #[inline]
 fn now_us() -> usize {
     crate::timer::get_time_us()
@@ -1154,6 +1339,222 @@ fn now_us() -> usize {
 #[inline]
 fn cpu_slot() -> usize {
     crate::platform::current_cpu_index().min(CPU_SLOTS.saturating_sub(1))
+}
+
+fn exec_stage_name(stage: usize) -> &'static str {
+    match stage {
+        EXEC_STAGE_ENTER => "enter",
+        EXEC_STAGE_PATH_READY => "path_ready",
+        EXEC_STAGE_ARGV_READY => "argv_ready",
+        EXEC_STAGE_ENVP_READY => "envp_ready",
+        EXEC_STAGE_FS_CONTEXT => "fs_context",
+        EXEC_STAGE_TARGET_OPEN => "target_open",
+        EXEC_STAGE_VFS_RESOLVE_SYMLINK => "vfs_resolve_symlink",
+        EXEC_STAGE_VFS_MOUNT_ROUTE => "vfs_mount_route",
+        EXEC_STAGE_VFS_MEMFS => "vfs_memfs",
+        EXEC_STAGE_VFS_EXT4_ENTER => "vfs_ext4_enter",
+        EXEC_STAGE_EXT4_NAMESPACE_LOCK => "ext4_namespace_lock",
+        EXEC_STAGE_EXT4_RESOLVE => "ext4_resolve",
+        EXEC_STAGE_EXT4_INODE_LOOKUP => "ext4_inode_lookup",
+        EXEC_STAGE_EXT4_EXEC_CACHE => "ext4_exec_cache",
+        EXEC_STAGE_EXT4_REGULAR_CACHE => "ext4_regular_cache",
+        EXEC_STAGE_EXT4_EXTENT_READ => "ext4_extent_read",
+        EXEC_STAGE_TARGET_OPEN_DONE => "target_open_done",
+        EXEC_STAGE_SHEBANG_OPEN => "shebang_open",
+        EXEC_STAGE_SHEBANG_OPEN_DONE => "shebang_open_done",
+        EXEC_STAGE_TARGET_PARSE => "target_parse",
+        EXEC_STAGE_INTERPRETER_OPEN => "interpreter_open",
+        EXEC_STAGE_INTERPRETER_OPEN_DONE => "interpreter_open_done",
+        EXEC_STAGE_MEMORY_BUILD => "memory_build",
+        EXEC_STAGE_STACK_SETUP => "stack_setup",
+        EXEC_STAGE_SIGNAL_TRAMPOLINE => "signal_trampoline",
+        EXEC_STAGE_TERMINATE_PEERS => "terminate_peers",
+        EXEC_STAGE_DETACH_SHM => "detach_shm",
+        EXEC_STAGE_RESET_SIGNALS => "reset_signals",
+        EXEC_STAGE_TASK_INNER_LOCK => "task_inner_lock",
+        EXEC_STAGE_FD_TABLE_LOCK => "fd_table_lock",
+        EXEC_STAGE_CLOSE_FILES => "close_files",
+        EXEC_STAGE_RELEASE_POSIX_LOCKS => "release_posix_locks",
+        EXEC_STAGE_MM_LOCK => "mm_lock",
+        EXEC_STAGE_KERNEL_PT_RESTORE => "kernel_pt_restore",
+        EXEC_STAGE_MEMORY_SET_LOCK => "memory_set_lock",
+        EXEC_STAGE_MEMORY_REPLACE => "memory_replace",
+        EXEC_STAGE_OLD_MEMORY_DROP => "old_memory_drop",
+        EXEC_STAGE_TRAP_FRAME_LOCK => "trap_frame_lock",
+        EXEC_STAGE_COMPLETE => "complete",
+        _ => "idle",
+    }
+}
+
+fn elf_load_role_name(role: usize) -> &'static str {
+    match role {
+        ELF_LOAD_ROLE_TARGET => "target",
+        ELF_LOAD_ROLE_INTERPRETER => "interpreter",
+        _ => "none",
+    }
+}
+
+fn elf_load_phase_name(phase: usize) -> &'static str {
+    match phase {
+        ELF_LOAD_PHASE_INTERPRETER_PARSE => "interpreter_parse",
+        ELF_LOAD_PHASE_INTERPRETER_BIAS => "interpreter_bias",
+        ELF_LOAD_PHASE_ADDRESS_SPACE => "address_space",
+        ELF_LOAD_PHASE_SEGMENT_MAP => "segment_map",
+        ELF_LOAD_PHASE_SEGMENT_COPY => "segment_copy",
+        ELF_LOAD_PHASE_SEGMENT_ZERO => "segment_zero",
+        ELF_LOAD_PHASE_STACK_MAP => "stack_map",
+        _ => "idle",
+    }
+}
+
+fn address_space_create_phase_name(phase: usize) -> &'static str {
+    match phase {
+        ADDRESS_SPACE_CREATE_ROOT => "root_page_table",
+        ADDRESS_SPACE_CREATE_ASID => "asid_allocate",
+        _ => "idle",
+    }
+}
+
+pub(crate) fn note_address_space_create_phase(phase: usize) {
+    let cpu = cpu_slot();
+    ACTIVE_ADDRESS_SPACE_CREATE_SINCE_US[cpu].store(now_us(), Ordering::Relaxed);
+    ACTIVE_ADDRESS_SPACE_CREATE_PHASE[cpu].store(phase, Ordering::Release);
+}
+
+pub(crate) fn note_asid_allocator_state(
+    max_asid: usize,
+    next_asid: usize,
+    reusable: usize,
+    retired: usize,
+) {
+    ASID_MAX.store(max_asid, Ordering::Relaxed);
+    ASID_NEXT.store(next_asid, Ordering::Relaxed);
+    ASID_REUSABLE.store(reusable, Ordering::Relaxed);
+    ASID_RETIRED.store(retired, Ordering::Relaxed);
+}
+
+pub(crate) fn note_asid_allocation(asid: usize, reused: bool, global_flush: bool) {
+    ASID_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    ASID_LAST_ALLOCATED.store(asid, Ordering::Relaxed);
+    if asid == 0 {
+        ASID_ZERO_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+    if reused {
+        ASID_REUSES.fetch_add(1, Ordering::Relaxed);
+        if global_flush {
+            ASID_GLOBAL_RECYCLES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[inline]
+fn clear_elf_load_for_cpu(cpu: usize) {
+    ACTIVE_ELF_LOAD_ROLE[cpu].store(0, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_PHASE[cpu].store(0, Ordering::Release);
+}
+
+pub(crate) fn note_elf_load_phase(role: usize, phase: usize, bias: usize) {
+    let cpu = cpu_slot();
+    if ACTIVE_EXEC_STAGE[cpu].load(Ordering::Acquire) != EXEC_STAGE_MEMORY_BUILD {
+        return;
+    }
+    ACTIVE_ELF_LOAD_ROLE[cpu].store(role, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_SEGMENT[cpu].store(0, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_VADDR[cpu].store(0, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_FILESZ[cpu].store(0, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_MEMSZ[cpu].store(0, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_BIAS[cpu].store(bias, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_PHASE_SINCE_US[cpu].store(now_us(), Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_PHASE[cpu].store(phase, Ordering::Release);
+}
+
+pub(crate) fn note_elf_load_segment(
+    phase: usize,
+    segment: usize,
+    p_vaddr: usize,
+    p_filesz: usize,
+    p_memsz: usize,
+) {
+    let cpu = cpu_slot();
+    if ACTIVE_EXEC_STAGE[cpu].load(Ordering::Acquire) != EXEC_STAGE_MEMORY_BUILD {
+        return;
+    }
+    ACTIVE_ELF_LOAD_SEGMENT[cpu].store(segment, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_VADDR[cpu].store(p_vaddr, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_FILESZ[cpu].store(p_filesz, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_MEMSZ[cpu].store(p_memsz, Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_PHASE_SINCE_US[cpu].store(now_us(), Ordering::Relaxed);
+    ACTIVE_ELF_LOAD_PHASE[cpu].store(phase, Ordering::Release);
+}
+
+pub(crate) fn clear_elf_load() {
+    clear_elf_load_for_cpu(cpu_slot());
+}
+
+pub(crate) struct ExecDiagnosticScope {
+    cpu: usize,
+}
+
+impl ExecDiagnosticScope {
+    pub(crate) fn enter(pid: usize) -> Self {
+        let cpu = cpu_slot();
+        let now = now_us();
+        ACTIVE_EXEC_PID[cpu].store(pid, Ordering::Relaxed);
+        ACTIVE_EXEC_PATH_HASH[cpu].store(0, Ordering::Relaxed);
+        ACTIVE_EXEC_PATH_LEN[cpu].store(0, Ordering::Relaxed);
+        clear_elf_load_for_cpu(cpu);
+        ACTIVE_EXEC_STARTED_AT_US[cpu].store(now, Ordering::Relaxed);
+        ACTIVE_EXEC_STAGE_SINCE_US[cpu].store(now, Ordering::Relaxed);
+        ACTIVE_EXEC_ENTRIES[cpu].fetch_add(1, Ordering::Relaxed);
+        ACTIVE_EXEC_STAGE[cpu].store(EXEC_STAGE_ENTER, Ordering::Release);
+        Self { cpu }
+    }
+
+    pub(crate) fn set_path(&self, path: &str) {
+        let mut hash = 0xcbf2_9ce4_8422_2325usize;
+        for byte in path.as_bytes() {
+            hash ^= *byte as usize;
+            hash = hash.wrapping_mul(0x0100_0000_01b3usize);
+        }
+        ACTIVE_EXEC_PATH_HASH[self.cpu].store(hash, Ordering::Relaxed);
+        ACTIVE_EXEC_PATH_LEN[self.cpu].store(path.len(), Ordering::Relaxed);
+        let slot = hash % EXEC_PATH_SLOTS;
+        let previous = EXEC_PATH_HASHES[slot].swap(hash, Ordering::AcqRel);
+        let count = if previous == hash {
+            EXEC_PATH_COUNTS[slot].fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            EXEC_PATH_COUNTS[slot].store(1, Ordering::Relaxed);
+            1
+        };
+        if count <= 4 || count.is_power_of_two() {
+            crate::println!(
+                "BUILDSTORM_DIAG exec_path pid={} hash={:#x} count={} path={}",
+                ACTIVE_EXEC_PID[self.cpu].load(Ordering::Relaxed),
+                hash,
+                count,
+                path,
+            );
+        }
+    }
+}
+
+impl Drop for ExecDiagnosticScope {
+    fn drop(&mut self) {
+        clear_elf_load_for_cpu(self.cpu);
+        ACTIVE_EXEC_PID[self.cpu].store(0, Ordering::Relaxed);
+        ACTIVE_EXEC_LAST_EXIT_US[self.cpu].store(now_us(), Ordering::Relaxed);
+        ACTIVE_EXEC_STAGE[self.cpu].store(0, Ordering::Release);
+    }
+}
+
+#[inline]
+pub(crate) fn note_exec_stage(stage: usize) {
+    let cpu = cpu_slot();
+    if ACTIVE_EXEC_STAGE[cpu].load(Ordering::Acquire) == 0 {
+        return;
+    }
+    ACTIVE_EXEC_STAGE_SINCE_US[cpu].store(now_us(), Ordering::Relaxed);
+    ACTIVE_EXEC_STAGE[cpu].store(stage, Ordering::Release);
 }
 
 #[inline]
@@ -2514,7 +2915,20 @@ pub(crate) fn note_syscall_enter(syscall_id: usize) -> Option<SyscallScope> {
     })
 }
 #[inline]
-pub(crate) fn note_syscall_exit(_syscall_id: usize) {}
+pub(crate) fn note_active_syscall_enter(syscall_id: usize, sepc: usize) {
+    let cpu = cpu_slot();
+    ACTIVE_SYSCALL_ID[cpu].store(syscall_id, Ordering::Release);
+    ACTIVE_SYSCALL_SEPC[cpu].store(sepc, Ordering::Relaxed);
+    ACTIVE_SYSCALL_SINCE_US[cpu].store(now_us(), Ordering::Relaxed);
+    ACTIVE_SYSCALL_ENTRIES[cpu].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn note_syscall_exit(_syscall_id: usize) {
+    let cpu = cpu_slot();
+    ACTIVE_SYSCALL_ID[cpu].store(usize::MAX, Ordering::Release);
+    ACTIVE_SYSCALL_LAST_EXIT_US[cpu].store(now_us(), Ordering::Relaxed);
+}
 
 pub(crate) fn maybe_report() {
     let now = now_us();
@@ -2544,6 +2958,125 @@ pub(crate) fn maybe_report() {
     let sequence = REPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let task_counts = crate::task::manager::diagnostic_task_counts();
     crate::println!("BUILDSTORM_DIAG snapshot={} now_us={} cpu={} user_tasks_live={} user_tasks_runnable={} user_tasks_blocked={} rustc_tasks_live={} rustc_tasks_runnable={} user_processes_live={} user_processes_runnable={} user_processes_blocked={} rustc_processes_live={} rustc_processes_runnable={} rq_current={}", sequence, now, crate::platform::current_cpu_index(), task_counts.0, task_counts.1, task_counts.2, task_counts.3, task_counts.4, task_counts.5, task_counts.6, task_counts.7, task_counts.8, task_counts.9, crate::task::manager::queue_len());
+    if EXEC_FOCUS_ONLY {
+        let mut active = false;
+        let mut stuck = false;
+        for cpu in 0..CPU_SLOTS {
+            let stage = ACTIVE_EXEC_STAGE[cpu].load(Ordering::Acquire);
+            if stage == 0 {
+                continue;
+            }
+            active = true;
+            let syscall_id = ACTIVE_SYSCALL_ID[cpu].load(Ordering::Acquire);
+            let started_at = ACTIVE_EXEC_STARTED_AT_US[cpu].load(Ordering::Relaxed);
+            let stage_since = ACTIVE_EXEC_STAGE_SINCE_US[cpu].load(Ordering::Relaxed);
+            let total_elapsed = now.saturating_sub(started_at);
+            stuck |= total_elapsed >= 5_000_000;
+            crate::println!(
+                "BUILDSTORM_DIAG syscall_active cpu={} id={} sepc={:#x} since_us={} elapsed_us={} entries={}",
+                cpu,
+                syscall_id,
+                ACTIVE_SYSCALL_SEPC[cpu].load(Ordering::Relaxed),
+                ACTIVE_SYSCALL_SINCE_US[cpu].load(Ordering::Relaxed),
+                if syscall_id == usize::MAX {
+                    0
+                } else {
+                    now.saturating_sub(ACTIVE_SYSCALL_SINCE_US[cpu].load(Ordering::Relaxed))
+                },
+                ACTIVE_SYSCALL_ENTRIES[cpu].load(Ordering::Relaxed),
+            );
+            crate::println!(
+                "BUILDSTORM_DIAG exec_active cpu={} pid={} stage={} name={} path_hash={:#x} path_len={} total_elapsed_us={} stage_elapsed_us={} entries={}",
+                cpu,
+                ACTIVE_EXEC_PID[cpu].load(Ordering::Relaxed),
+                stage,
+                exec_stage_name(stage),
+                ACTIVE_EXEC_PATH_HASH[cpu].load(Ordering::Relaxed),
+                ACTIVE_EXEC_PATH_LEN[cpu].load(Ordering::Relaxed),
+                total_elapsed,
+                now.saturating_sub(stage_since),
+                ACTIVE_EXEC_ENTRIES[cpu].load(Ordering::Relaxed),
+            );
+            let elf_phase = ACTIVE_ELF_LOAD_PHASE[cpu].load(Ordering::Acquire);
+            if stage == EXEC_STAGE_MEMORY_BUILD && elf_phase != 0 {
+                let phase_since = ACTIVE_ELF_LOAD_PHASE_SINCE_US[cpu].load(Ordering::Relaxed);
+                let role = ACTIVE_ELF_LOAD_ROLE[cpu].load(Ordering::Relaxed);
+                crate::println!(
+                    "BUILDSTORM_DIAG elf_load_active cpu={} role={} phase={} name={} segment={} p_vaddr={:#x} p_filesz={} p_memsz={} bias={:#x} phase_elapsed_us={}",
+                    cpu,
+                    elf_load_role_name(role),
+                    elf_phase,
+                    elf_load_phase_name(elf_phase),
+                    ACTIVE_ELF_LOAD_SEGMENT[cpu].load(Ordering::Relaxed),
+                    ACTIVE_ELF_LOAD_VADDR[cpu].load(Ordering::Relaxed),
+                    ACTIVE_ELF_LOAD_FILESZ[cpu].load(Ordering::Relaxed),
+                    ACTIVE_ELF_LOAD_MEMSZ[cpu].load(Ordering::Relaxed),
+                    ACTIVE_ELF_LOAD_BIAS[cpu].load(Ordering::Relaxed),
+                    now.saturating_sub(phase_since),
+                );
+                if elf_phase == ELF_LOAD_PHASE_ADDRESS_SPACE {
+                    let create_phase =
+                        ACTIVE_ADDRESS_SPACE_CREATE_PHASE[cpu].load(Ordering::Acquire);
+                    let create_since =
+                        ACTIVE_ADDRESS_SPACE_CREATE_SINCE_US[cpu].load(Ordering::Relaxed);
+                    crate::println!(
+                        "BUILDSTORM_DIAG address_space_create cpu={} phase={} name={} elapsed_us={}",
+                        cpu,
+                        create_phase,
+                        address_space_create_phase_name(create_phase),
+                        if create_phase == ADDRESS_SPACE_CREATE_IDLE {
+                            0
+                        } else {
+                            now.saturating_sub(create_since)
+                        },
+                    );
+                }
+            }
+        }
+        crate::println!(
+            "BUILDSTORM_DIAG asid_allocator allocations={} reuses={} global_recycles={} zero_fallbacks={} last={} max={} next={} reusable={} retired={}",
+            ASID_ALLOCATIONS.load(Ordering::Relaxed),
+            ASID_REUSES.load(Ordering::Relaxed),
+            ASID_GLOBAL_RECYCLES.load(Ordering::Relaxed),
+            ASID_ZERO_FALLBACKS.load(Ordering::Relaxed),
+            ASID_LAST_ALLOCATED.load(Ordering::Relaxed),
+            ASID_MAX.load(Ordering::Relaxed),
+            ASID_NEXT.load(Ordering::Relaxed),
+            ASID_REUSABLE.load(Ordering::Relaxed),
+            ASID_RETIRED.load(Ordering::Relaxed),
+        );
+        if !active {
+            let entries: usize = ACTIVE_EXEC_ENTRIES
+                .iter()
+                .map(|value| value.load(Ordering::Relaxed))
+                .sum();
+            crate::println!("BUILDSTORM_DIAG exec_active state=idle entries={}", entries);
+        }
+        if stuck {
+            crate::task::manager::diagnostic_dump_user_comm();
+            crate::syscall::other::diagnostic_dump_futex_waiters();
+        }
+        // After the compile marker the hidden wrapper may leave only a
+        // parent and child task blocked in wait4/IO while no exec is active.
+        // Dump the ownership edges at a low rate so the first post-boot
+        // deadlock is attributable without flooding the serial log.
+        if !active && task_counts.1 == 0 && task_counts.2 != 0 {
+            let should_dump = sequence <= 3 || sequence % 6 == 0;
+            if should_dump {
+                crate::println!(
+                    "BUILDSTORM_DIAG idle_blocked user_tasks_blocked={} rustc_tasks_blocked={} sequence={}",
+                    task_counts.2,
+                    task_counts.3.saturating_sub(task_counts.4),
+                    sequence,
+                );
+                crate::task::manager::diagnostic_dump_user_comm();
+                crate::task::wait_queue::diagnostic_dump_waiters();
+                crate::syscall::other::diagnostic_dump_futex_waiters();
+            }
+        }
+        crate::println!("BUILDSTORM_DIAG snapshot_end={}", sequence);
+        return;
+    }
     crate::mm::heap_allocator::report_cache_diagnostics();
     for cpu in 0..CPU_SLOTS {
         crate::println!("BUILDSTORM_DIAG cpu={} user_ticks={} kernel_ticks={} idle_ticks={} context_switches={} migrations={} runqueue_max={}", cpu, USER_TICKS[cpu].load(Ordering::Relaxed), KERNEL_TICKS[cpu].load(Ordering::Relaxed), IDLE_TICKS[cpu].load(Ordering::Relaxed), CONTEXT_SWITCHES[cpu].load(Ordering::Relaxed), TASK_MIGRATIONS[cpu].load(Ordering::Relaxed), RUNQUEUE_MAX[cpu].load(Ordering::Relaxed));
@@ -2591,6 +3124,51 @@ pub(crate) fn maybe_report() {
         let trap_kind = ACTIVE_USER_TRAP_KIND[cpu].load(Ordering::Acquire);
         let trap_since_us = ACTIVE_USER_TRAP_SINCE_US[cpu].load(Ordering::Relaxed);
         crate::println!("BUILDSTORM_DIAG user_active cpu={} pid={} since_us={} elapsed_us={} last_exit_us={} entries={} trap_kind={} trap_since_us={} trap_elapsed_us={} trap_entries={}", cpu, pid, since_us, if pid == 0 { 0 } else { now.saturating_sub(since_us) }, ACTIVE_USER_LAST_EXIT_US[cpu].load(Ordering::Relaxed), ACTIVE_USER_ENTRIES[cpu].load(Ordering::Relaxed), trap_kind, trap_since_us, if trap_kind == 0 { 0 } else { now.saturating_sub(trap_since_us) }, ACTIVE_USER_TRAP_ENTRIES[cpu].load(Ordering::Relaxed));
+    }
+    for cpu in 0..CPU_SLOTS {
+        let syscall_id = ACTIVE_SYSCALL_ID[cpu].load(Ordering::Acquire);
+        crate::println!(
+            "BUILDSTORM_DIAG syscall_active cpu={} id={} sepc={:#x} since_us={} elapsed_us={} last_exit_us={} entries={}",
+            cpu,
+            syscall_id,
+            ACTIVE_SYSCALL_SEPC[cpu].load(Ordering::Relaxed),
+            ACTIVE_SYSCALL_SINCE_US[cpu].load(Ordering::Relaxed),
+            if syscall_id == usize::MAX {
+                0
+            } else {
+                now.saturating_sub(ACTIVE_SYSCALL_SINCE_US[cpu].load(Ordering::Relaxed))
+            },
+            ACTIVE_SYSCALL_LAST_EXIT_US[cpu].load(Ordering::Relaxed),
+            ACTIVE_SYSCALL_ENTRIES[cpu].load(Ordering::Relaxed),
+        );
+    }
+    for cpu in 0..CPU_SLOTS {
+        let stage = ACTIVE_EXEC_STAGE[cpu].load(Ordering::Acquire);
+        let started_at = ACTIVE_EXEC_STARTED_AT_US[cpu].load(Ordering::Relaxed);
+        let stage_since = ACTIVE_EXEC_STAGE_SINCE_US[cpu].load(Ordering::Relaxed);
+        crate::println!(
+            "BUILDSTORM_DIAG exec_active cpu={} pid={} stage={} name={} path_hash={:#x} path_len={} started_at_us={} total_elapsed_us={} stage_since_us={} stage_elapsed_us={} last_exit_us={} entries={}",
+            cpu,
+            ACTIVE_EXEC_PID[cpu].load(Ordering::Relaxed),
+            stage,
+            exec_stage_name(stage),
+            ACTIVE_EXEC_PATH_HASH[cpu].load(Ordering::Relaxed),
+            ACTIVE_EXEC_PATH_LEN[cpu].load(Ordering::Relaxed),
+            started_at,
+            if stage == 0 {
+                0
+            } else {
+                now.saturating_sub(started_at)
+            },
+            stage_since,
+            if stage == 0 {
+                0
+            } else {
+                now.saturating_sub(stage_since)
+            },
+            ACTIVE_EXEC_LAST_EXIT_US[cpu].load(Ordering::Relaxed),
+            ACTIVE_EXEC_ENTRIES[cpu].load(Ordering::Relaxed),
+        );
     }
     for cpu in 0..CPU_SLOTS {
         crate::println!("BUILDSTORM_DIAG blocked_owner cpu={} current={} max={} enters={} exits={} loop_dispatches={} timed_loops={} timed_total_us={} timed_max_us={} empty_iterations={} wake_to_owner={} wake_to_global={}", cpu, BLOCKED_OWNER_CURRENT[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_MAX[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_ENTERS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_EXITS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_LOOP_DISPATCHES[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_LOOPS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_TOTAL_US[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_TIMED_MAX_US[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_EMPTY_ITERATIONS[cpu].load(Ordering::Relaxed), BLOCKED_OWNER_WAKES[cpu].load(Ordering::Relaxed), BLOCKED_GLOBAL_WAKES.load(Ordering::Relaxed));
@@ -2848,6 +3426,7 @@ pub(crate) fn maybe_report() {
         CLONE_FORK_COW_RESIDENT_PAGES.load(Ordering::Relaxed)
     );
     crate::task::manager::diagnostic_dump_user_comm();
+    crate::syscall::other::diagnostic_dump_futex_waiters();
     report_exited_mmap_protocols();
     crate::println!("BUILDSTORM_DIAG snapshot_end={}", sequence);
 }

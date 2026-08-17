@@ -13,6 +13,11 @@ pub enum TrapType {
     SysCall,
     Timer,
     Ipi(usize),
+    /// A user-mode LoongArch alignment fault was emulated successfully.
+    UnalignedAccess,
+    /// A user-mode alignment fault could not be emulated.  This is terminal
+    /// for the faulting instruction; retrying it would trap forever.
+    UnalignedAccessFault(usize),
     Unknown,
     SupervisorExternal,
     StorePageFault(usize),

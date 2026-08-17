@@ -1913,3 +1913,33 @@ AI assisted with evidence correlation, invariant review, implementation, and
 single-QEMU A/B orchestration. The official image, suite, guest script, judge,
 markers, guest clock, and workload-independent production behavior were not
 modified.
+
+## 46. LoongArch nested-QEMU UAL capability (2026-08-18)
+
+The evaluator log for the v15 diagnostic archive completed the LoongArch Rust
+build, then failed the nested `qemu-system-loongarch64` run with the exact
+message `TCG: unaligned access support required; exiting`. QEMU's LoongArch
+TCG backend reads the host process `AT_HWCAP` and requires
+`HWCAP_LOONGARCH_UAL` (bit 2). The kernel exposed only `CPUCFG | FPU` (`0x9`),
+so QEMU exited before its guest run.
+
+The shared process-stack ABI now publishes `CPUCFG | UAL | FPU` (`0xd`) on
+LoongArch. This is backed by the existing architecture trap path: user scalar
+integer and floating-point unaligned accesses are translated byte-by-byte,
+including page-crossing accesses, and the saved `ERA` advances exactly once.
+No QEMU name, test path, command, output, or guest clock is inspected, and no
+official suite or image was changed. RISC-V keeps its existing `AT_HWCAP=0`.
+
+Both architectures passed production and diagnostics release checks, complete
+diagnostic release builds, and an independent auxv/emulation invariant check.
+The subsequent official evaluator run scored BuildStorm `180/180` on both
+RISC-V64 and LoongArch64. This is `official-pass` evidence from the user's raw
+evaluator result. The source ZIP was
+`wll_os_buildstorm_la_hwcap_ual_v16_diag_20260818.zip` with SHA-256
+`BABAB2471C9B0EB3EC83429C7B40F65F4516EA7DA3BE1F9E340092B374609C94`.
+
+AI assisted QEMU-source lookup, log correlation, ABI reasoning, and regression
+orchestration. The developer can reproduce the four cfg checks and inspect the
+raw evaluator log `C:\Users\22478\Downloads\LoongArch输出 (33).txt` plus the
+success report dated 2026-08-18. Diagnostics remain explicitly gated and
+production defaults to `BUILDSTORM_DIAGNOSTICS ?= 0`.

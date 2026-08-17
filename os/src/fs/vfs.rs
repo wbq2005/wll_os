@@ -13,6 +13,18 @@ use super::fd;
 use super::{block_dev, ext4_vol, vfat};
 use super::{normalize_path, MemNodeMetadata, MemNodeSnapshot, MemSpecialKind, MEM_FS};
 
+#[cfg(feature = "buildstorm-diagnostics")]
+macro_rules! exec_vfs_stage {
+    ($stage:ident) => {
+        crate::buildstorm_diagnostics::note_exec_stage(crate::buildstorm_diagnostics::$stage)
+    };
+}
+
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+macro_rules! exec_vfs_stage {
+    ($stage:ident) => {};
+}
+
 const S_IFDIR: u32 = 0o040000;
 const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;
@@ -2094,11 +2106,13 @@ pub fn read_executable_file(name: &str) -> Option<Arc<Vec<u8>>> {
     if is_removed(&original) {
         return None;
     }
+    exec_vfs_stage!(EXEC_STAGE_VFS_RESOLVE_SYMLINK);
     let norm = resolve_final_symlink(&original, false).ok()?;
     if is_removed(&norm) {
         return None;
     }
 
+    exec_vfs_stage!(EXEC_STAGE_VFS_MOUNT_ROUTE);
     if let Some((volume, backend_path)) = mounted_vfat_backend(&norm) {
         // execve must be able to inspect both ELF images and shebang scripts.
         // Keep VFAT consistent with the ext4/tmpfs paths below; the caller
@@ -2107,6 +2121,7 @@ pub fn read_executable_file(name: &str) -> Option<Arc<Vec<u8>>> {
     }
 
     let tmpfs_path = is_tmpfs_path(&norm);
+    exec_vfs_stage!(EXEC_STAGE_VFS_MEMFS);
     let mem_data = if tmpfs_path || mounted_ext4_backend_path(&norm).is_none() {
         MEM_FS.lock().get_file(&norm).map(|f| Arc::new(f.to_vec()))
     } else {
@@ -2120,6 +2135,7 @@ pub fn read_executable_file(name: &str) -> Option<Arc<Vec<u8>>> {
         return mem_data;
     }
 
+    exec_vfs_stage!(EXEC_STAGE_VFS_EXT4_ENTER);
     let ext4_data = ext4_vol::slurp_regular_file_shared(&ext4_lookup_path(&norm));
     if let Some(data) = ext4_data {
         if is_elf_image(&data) {
@@ -3535,6 +3551,12 @@ fn open_path_descriptor(
     follow_symlink: bool,
 ) -> Result<fd::FileDescriptor, SysErrNo> {
     let meta = metadata(host_path, follow_symlink)?;
+    // O_DIRECTORY is a type constraint, including for O_PATH descriptors.
+    // Keep the check at the path-descriptor boundary so every backend obeys
+    // the same openat ABI instead of deferring ENOTDIR to a later dirfd use.
+    if flags & fd::open_flags::O_DIRECTORY != 0 && meta.kind != VfsNodeKind::Directory {
+        return Err(SysErrNo::ENOTDIR);
+    }
     Ok(fd::FileDescriptor::Path {
         logical_path: normalize_path(logical_path),
         host_path: normalize_path(host_path),

@@ -217,9 +217,28 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
             TrapType::Breakpoint
         }
         Trap::Exception(Exception::AddressNotAligned) => {
-            // error!("address not aligned: {:#x?}", tf);
-            unsafe { emulate_load_store_insn(tf) }
-            TrapType::Unknown
+            if tf.from_user() {
+                match emulate_load_store_insn(tf) {
+                    Ok(()) => TrapType::UnalignedAccess,
+                    Err(error) => {
+                        log::warn!(
+                            "[loongarch-trap] user unaligned access failed: {:?} era={:#x} badv={:#x}",
+                            error,
+                            tf.era,
+                            badv::read().vaddr()
+                        );
+                        // Do not return Unknown here: the user PC still
+                        // points at the faulting instruction, so the generic
+                        // Unknown path would resume it indefinitely.  Carry
+                        // the PC to the OS so it can deliver a terminal
+                        // signal and release the task.
+                        TrapType::UnalignedAccessFault(tf.era)
+                    }
+                }
+            } else {
+                // Kernel alignment faults are not user emulation candidates.
+                TrapType::Unknown
+            }
         }
         Trap::Interrupt(_) => {
             let irq_num: usize = estat.is().trailing_zeros() as usize;

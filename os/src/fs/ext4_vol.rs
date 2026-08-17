@@ -12,6 +12,18 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ext4_rs::{Errno, Ext4, Ext4Error, InodeFileType, BLOCK_SIZE};
 
+#[cfg(feature = "buildstorm-diagnostics")]
+macro_rules! exec_ext4_stage {
+    ($stage:ident) => {
+        crate::buildstorm_diagnostics::note_exec_stage(crate::buildstorm_diagnostics::$stage)
+    };
+}
+
+#[cfg(not(feature = "buildstorm-diagnostics"))]
+macro_rules! exec_ext4_stage {
+    ($stage:ident) => {};
+}
+
 /// ext4 标准根 inode 号（与 `ext4_rs` 内部一致，crate 根未再导出该常量）。
 const ROOT_INODE: u32 = 2;
 const EXT4_DIRENT_UNKNOWN: u8 = 0;
@@ -3592,8 +3604,11 @@ pub fn exchange_ext4(old_path: &str, new_path: &str) -> Result<(), SysErrNo> {
 }
 
 pub fn slurp_regular_file_shared(path: &str) -> Option<Arc<Vec<u8>>> {
+    exec_ext4_stage!(EXEC_STAGE_EXT4_NAMESPACE_LOCK);
     let namespace = NAMESPACE_LOCK.read();
+    exec_ext4_stage!(EXEC_STAGE_EXT4_RESOLVE);
     let resolved = resolve_symlinks_locked(path).ok()?;
+    exec_ext4_stage!(EXEC_STAGE_EXT4_INODE_LOOKUP);
     let fs = ROOT_EXT4.lock().clone()?;
     let (ino, kind) = resolve_existing_locked(&fs, &resolved)?;
     if kind != Ext4NodeKind::Regular {
@@ -3601,6 +3616,7 @@ pub fn slurp_regular_file_shared(path: &str) -> Option<Arc<Vec<u8>>> {
     }
     drop(namespace);
 
+    exec_ext4_stage!(EXEC_STAGE_EXT4_EXEC_CACHE);
     if let Some(data) = cached_executable_image(ino) {
         return Some(data);
     }
@@ -3608,6 +3624,7 @@ pub fn slurp_regular_file_shared(path: &str) -> Option<Arc<Vec<u8>>> {
     // them.  The regular-file cache is authoritative until writeback; reading
     // the ext4 inode here would otherwise expose a stale or empty image and
     // make the child-side exec helper exit with status 2.
+    exec_ext4_stage!(EXEC_STAGE_EXT4_REGULAR_CACHE);
     if let Some(data) = cached_regular_snapshot(ino) {
         let data = Arc::new(data);
         cache_executable_image(ino, data.clone());
@@ -3628,6 +3645,7 @@ pub fn slurp_regular_file_shared(path: &str) -> Option<Arc<Vec<u8>>> {
     let size = inode_ref.inode.size() as usize;
     let mut out = alloc::vec![0u8; size];
     let mut off = 0usize;
+    exec_ext4_stage!(EXEC_STAGE_EXT4_EXTENT_READ);
     while off < size {
         let n = extent_aware_read_at(ino, off, &mut out[off..]).ok()?;
         if n == 0 {

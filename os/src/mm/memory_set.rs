@@ -282,9 +282,23 @@ impl MemorySet {
 
     /// Create a fresh address space with an independent root page table.
     pub fn new_bare() -> Self {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_address_space_create_phase(
+            crate::buildstorm_diagnostics::ADDRESS_SPACE_CREATE_ROOT,
+        );
+        let page_table = PageTableWrapper::alloc_new();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_address_space_create_phase(
+            crate::buildstorm_diagnostics::ADDRESS_SPACE_CREATE_ASID,
+        );
+        let address_space_id = allocate_address_space_id();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_address_space_create_phase(
+            crate::buildstorm_diagnostics::ADDRESS_SPACE_CREATE_IDLE,
+        );
         Self {
-            page_table: PageTableWrapper::alloc_new(),
-            address_space_id: allocate_address_space_id(),
+            page_table,
+            address_space_id,
             areas: Vec::new(),
         }
     }
@@ -1696,7 +1710,16 @@ lazy_static! {
 fn allocate_address_space_id() -> usize {
     let retired = {
         let mut allocator = ASID_ALLOCATOR.lock();
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_asid_allocator_state(
+            allocator.max_asid,
+            allocator.next_asid,
+            allocator.reusable.len(),
+            allocator.retired.len(),
+        );
         if let Some(asid) = allocator.allocate_without_recycling() {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            crate::buildstorm_diagnostics::note_asid_allocation(asid, false, false);
             return asid;
         }
         mem::take(&mut allocator.retired)
@@ -1706,13 +1729,38 @@ fn allocate_address_space_id() -> usize {
         // ASID 0 is shared with the kernel and therefore requires a full
         // local flush on every activation. This preserves correctness if the
         // implementation exposes no ASID bits or all live IDs are occupied.
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::buildstorm_diagnostics::note_asid_allocation(0, false, false);
         return 0;
     }
 
+    // RISC-V retains ASID-tagged translations across address-space switches,
+    // so a retired identifier cannot be reused until every CPU has discarded
+    // the old translations. LoongArch currently performs a full local TLB
+    // invalidation on every user-root activation. Consequently no CPU can use
+    // a recycled LoongArch ASID before invalidating its own stale entries, and
+    // a synchronous all-CPU IPI round trip here is both redundant and unsafe:
+    // one non-acknowledging online CPU would stall address-space creation.
+    #[cfg(target_arch = "riscv64")]
     crate::platform::flush_tlb_all_cpus();
     let mut allocator = ASID_ALLOCATOR.lock();
     allocator.reusable.extend(retired);
-    allocator.allocate_without_recycling().unwrap_or(0)
+    let asid = allocator.allocate_without_recycling().unwrap_or(0);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    {
+        crate::buildstorm_diagnostics::note_asid_allocator_state(
+            allocator.max_asid,
+            allocator.next_asid,
+            allocator.reusable.len(),
+            allocator.retired.len(),
+        );
+        crate::buildstorm_diagnostics::note_asid_allocation(
+            asid,
+            true,
+            cfg!(target_arch = "riscv64"),
+        );
+    }
+    asid
 }
 
 fn retire_address_space_id(asid: usize) {
