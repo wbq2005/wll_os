@@ -610,8 +610,10 @@ judge 只包含 glibc。RV 在 `BUILDSTORM_RESULT ... elapsed_s=2020.80` 后又�
 
 LA 的 release 编译已在 2020.04 秒结束，首错是 EFI 目录创建调用 legacy
 `mkdir(1030)` 返回 ENOSYS。修复复用 `sys_mkdirat(AT_FDCWD, ...)`，没有增加第二套
-VFS 语义。后续 `cp`/`vars.fd` 信息是父目录未创建后的派生错误；修复后未修改
-public LA 脚本完整输出 `ok=true`。
+VFS 语义。2026-08-17 的新评测证明 `/work/buildstorm.esp` 已能创建，但独立的
+`/work/buildstorm.vars.fd/vars.fd` 仍返回 `ENOTDIR`；因此撤回“全部 `vars.fd` 信息
+都是 mkdir 派生错误”的旧判断。未修改 public LA 脚本完整输出 `ok=true`，只能证明
+公共流程，没有覆盖该隐藏 fixture。
 
 ### 14.2 热点因果模型与实现
 
@@ -659,8 +661,9 @@ UEFI 启动准备，最早错误为：
 mkdir: cannot create directory '/work/buildstorm.esp': Function not implemented
 ```
 
-后续 `cp` 的 `No such file or directory` 和 `Not a directory` 都是父目录未创建的
-派生错误。GNU coreutils 的递归目录创建会保存目录 FD、切换工作目录，再以
+后续 ESP 目标的 `No such file or directory` 是父目录未创建的派生错误；当时同时
+出现的 `buildstorm.vars.fd/vars.fd` 证据不足以归类。GNU coreutils 的递归目录创建会
+保存目录 FD、切换工作目录，再以
 asm-generic syscall 50 `fchdir` 恢复；旧分发表没有 syscall 50，因而返回
 `ENOSYS`。这解释了为什么 toolchain、minibuild 和完整 Rust 编译都成功，LA 却没有
 最终 `BUILDSTORM_RESULT`，只能得到环境 20 分。
@@ -749,7 +752,171 @@ Zicboz 清零后端；该精确最终树的 LA 与 RV 分别在 558.27 秒、686
 AI 辅助日志/源码审计、协议设计、实现和串行 A/B；开发者可从最终增量补丁、原始
 serial、runner JSON、SMP/cfg 日志、judge 与 hash 独立复核。
 
-## 17. LoongArch 嵌套 QEMU 的 UAL 能力 ABI（2026-08-18）
+## 17. 2026-08-17 LoongArch64 TLB generation 验证协议
+
+### 17.1 Stage22 归因与因果模型
+
+LoongArch64 diagnostics 330 秒最终快照记录 user-root activation 501,352 次、
+kernel-root restore 501,351 次及 `local_flush=1,008,959`。同时
+`table_misses=0`、`missing_trap=8`；syscall 的同 root/ASID/stable-generation
+比例为 237,860 / 295,101（约 80.6%），timer 为 10,177 / 11,053（约 92.1%）。
+store/load page fault 则几乎总伴随 generation 变化。
+
+据此建立的模型不是“LoongArch 不需要 TLB flush”，而是“只有精确证明 root、
+非零 ASID 和页表代际未变的 CPU，才可跨 kernel-root 区间保留用户 translation”。
+页表编辑、shootdown、ASID recycle 或 ASID 0 仍必须回到保守失效。
+
+### 17.2 实现边界与不变量
+
+`PageTableWrapper` 在所有 wrapper 级单页/批量 map/unmap 后推进 translation
+generation；generation 原子操作只在 LoongArch64 生效。平台层为每个 CPU 缓存
+已验证的 `{root, ASID, generation}`。激活路径先发布 active root，再处理 deferred
+shootdown，随后才决定是否复用 translation；远端 IPI、全 CPU flush、PTE 代际变化
+和 ASID recycle 都会使验证失效。kernel ASID 0 与用户 ASID 0 可能别名，因此保持
+全 flush，非零用户 ASID 则可安全保留。
+
+VmaMap 继续只拥有区间策略，ResidentSet 继续拥有 resident frame，PageTableOps
+继续拥有 leaf 操作，TlbProtocol 继续拥有本地/远端失效。该候选没有改动 COW、
+shared/file mapping、exec/exit/fork、VFS、scheduler 或 allocator 的所有权边界。
+
+### 17.3 A/B、反证与性能边界
+
+同机、同镜像、同 8G/8 的 LoongArch64 production 对照从 555.02 秒降到
+542.02 秒，改善 13.00 秒（2.34%）。短窗第 23 crate 从 35.84 秒降到 33.64 秒，
+约 6.1%，但 330 秒时两者同为 34 crates，后续边界基本持平。候选 diagnostics
+记录 `local_flush=254071`；由于诊断计数口径随实现改变，只能表述为直接热点约减少
+四分之三，不能当成精确硬件事件差。
+
+Stage24 尝试在普通 syscall/fault 中始终保留 user root。它虽通过四 cfg 和双架构
+SMP8，却在 LA production 600 秒仅输出 toolchain，没有 minibuild/BEGIN，也没有
+panic/OOM。这一结果强反证了取消 kernel-root trap boundary 的模型，因此 Stage24
+保持隔离。历史 `3418beb6` 直接删除 activation flush 曾触发
+`InstructionNotExist`/SIGILL；Stage23 依靠完整 generation 与 shootdown invalidation，
+不能与该失败方案混同。
+
+2.34% 的 wall-time 收益远小于失效次数降幅，说明 TLB 不是剩余主根因。下一轮应
+回到 rustc/LLVM 长空档，对用户运行、fault、I/O、ext4、allocator、MemorySet 和
+VFS 等待做统一时间轴归因，不以继续删除 TLB 边界作为默认方向。
+
+### 17.4 验证矩阵、官方证据与 AI 披露
+
+| 验证 | RISC-V64 | LoongArch64 | 等级 |
+| --- | --- | --- | --- |
+| production/diagnostics release | 通过/通过 | 通过/通过 | `capability-pass` |
+| SMP8 MM/VFS/ABI/heap 回归 | 通过 | 通过 | `capability-pass` |
+| public BuildStorm 8G/8 | `ok=true 773.45s` | `ok=true 542.02s` | `official-pass` |
+| public judge 自动项 | 180/180 | 180/180 | `official-pass` |
+
+官方 suite commit 为 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`，QEMU 11.0.3，
+运行参数为 `-snapshot -m 8G -smp 8`。镜像、script、judge、marker、guest 时间和
+`/proc/uptime` 均未修改；production 不按 crate、测试、路径、命令或输出分支。
+自动 180 分不包含人工设计文档 20 分，也不能跨宿主换算正式评测机时间分。
+
+AI 用于 diagnostics 与源码/dirty diff 交叉核对、协议设计、实现和串行 QEMU 编排；
+开发者可从原始 serial、runner JSON、source diff/status、patch-id、kernel/image hash、
+judge 输出及四 cfg/SMP 日志独立复核。完整记录见
+`docs/evidence/buildstorm-stage2/20260817-stage23-la-tlb-generation-conclusion-cn.md`。
+
+## 18. 2026-08-17 脚本全局根命名空间修复
+
+### 18.1 首错与交叉证据
+
+评测 LA 在 3008.46 秒完成 release artifact 后，隐藏 nested-QEMU 准备阶段首次
+失败于 `/work/buildstorm.vars.fd/vars.fd` 的 `ENOTDIR`。目录、symlink、递归复制与
+file-to-directory 重建的独立回归均通过，不支持放宽 VFS 路径类型语义。
+
+进一步审计发现，harness 原来会从脚本目录向上选择“最近的 shebang 解释器”。当
+全局 root 和 suite root 同时提供解释器时，绝对脚本 `/glibc/...` 会被隐式改成
+root `/glibc`，使其子进程的绝对 `/work/...` 映射到 `/glibc/work/...`。独立负向
+回归在旧逻辑上稳定得到 `exit=1 root=/.../suite`。
+
+Cosmos `mirror-upload-b2488999da07` 的可迁移线索与此一致：其 bootstrap 使用
+`pivot_root` 将评测盘变为唯一全局 `/`，并卸载旧根。Cosmos 没有修补 `cp` 或
+`vars.fd`，其 QEMU 资源路径也不同，因此只作为架构交叉证据，没有复制实现。
+
+### 18.2 通用设计
+
+脚本启动现在先检查当前全局 root 是否提供 shebang 解释器。若提供，则保留 `/`
+及脚本原始绝对路径；只有全局解释器不可用时，才回退到真正自包含的 suite root。
+这与 Linux mount namespace 中绝对路径从进程 root 解析的语义一致。
+
+production 不检查架构、测试、crate、命令、输出或资源路径。VFS 对
+`regular/child` 的 `ENOTDIR` 语义不变；syscall、MM、调度、TLB、marker 与时间均未
+修改。新增 SMP-only 双向回归同时证明全局 root 优先和兼容 root fallback，避免修复
+公共镜像时破坏旧的独立 userspace 布局。
+
+### 18.3 验证与边界
+
+四种 release cfg、RV/LA SMP8 均通过；最终 SMP 串口同时包含
+`script-root-namespace root=/`、`script-compat-root` 和 `pass cpus=8`。LA public
+8G/8 完整编译为 543.97 秒；与最新评测配置对齐的 36G/12 完整编译为 547.47 秒，
+最新 public judge 解析为 180/180。两次均有精确
+`BUILDSTORM_COMPILE mode=multi ok=true`。
+
+该修复发生在 workload 启动边界，不宣称编译速度收益；相对 Stage23 同机 542.02
+秒的差异仅 0.36%。公共镜像不含隐藏 nested-QEMU 资源布局，因此隐藏
+`vars.fd` 门仍为 `unverified`，需要新提交评测确认。完整身份、哈希、原始日志、
+Cosmos 分支历史和复现命令见
+`docs/evidence/buildstorm-stage2/20260817-stage25-script-root-namespace/README.md`。
+
+## 19. 2026-08-17 zip 评测入口与 LA 隐藏门观测
+
+### 19.1 两个通道的首错边界
+
+最新官方评测总分为 `596.3`：RISC-V64 BuildStorm 已得 `178.1`，LoongArch64
+仍只有 toolchain/minibuild 的 `20.0`。LA 原始串口显示 Rust clean build 在
+`1500.31s` 完成产物生成，随后隐藏准备步骤首错为：
+
+```text
+cp: cannot stat '/work/buildstorm.vars.fd/vars.fd': Not a directory
+```
+
+这不是公开 `final-2026` 脚本中的路径；公开脚本只负责编译并输出
+`BUILDSTORM_COMPILE`，因此该隐藏后处理仍是 `unverified`。VFS 对普通文件作为目录
+前缀返回 `ENOTDIR` 的 Linux 语义不能按 `vars.fd` 路径放宽，下一步需要评测通道
+提供隐藏 fixture 或通过通用错误观测 marker 暴露其真实类型。
+
+另一条 zip 通道在任何内核启动前报：
+
+```text
+make: *** No rule to make target 'all'. Stop.
+```
+
+交叉检查 `2e698077` 的 Git 树确认顶层 `Makefile` 实际存在；根因是上传包未把
+Makefile 放在解压根（最可能是 GitHub 下载包的外层仓库目录）。该错误不能归因于
+LA 内核或 BuildStorm workload。
+
+### 19.2 通用打包设计与观测 marker
+
+`create_kernel_zip.py` 现在从当前提交执行 `git archive --format=zip HEAD`，不添加
+外层目录，并在生成前校验四个根入口和 ZIP CRC。`Makefile` 的 `all` 目标首先执行
+`submission-preflight`，输出：
+
+```text
+WLL_SUBMISSION_PREFLIGHT status=START cwd=...
+WLL_SUBMISSION_PREFLIGHT status=OK makefile=... cargo=... os=...
+```
+
+该 marker 只报告构建入口布局，不选择架构、测试、命令、输出或路径，不改变内核
+运行时行为；若日志没有它，应先判定为 zip 解包/工作目录问题，而不是立即修改
+MM/VFS。打包脚本输出 commit、entry count、SHA-256，便于将评测 zip 与源码身份绑定。
+
+### 19.3 验证与证据分级
+
+| 项目 | 结果 | 等级 |
+| --- | --- | --- |
+| RV 官方 BuildStorm | `178.1`，含 `BUILDSTORM_COMPILE` | `official-pass` |
+| LA 官方 BuildStorm | artifact 后隐藏 `vars.fd` 首错 | `unverified` |
+| `2e698077` 原始 Git 树 | 顶层 Makefile 存在 | `capability-pass` |
+| 根相对 zip 结构 | 由新脚本本地 CRC/入口检查 | `capability-pass` |
+
+本轮 zip 修复只处理提交包的通用入口，不宣称已修复 LA 隐藏 UEFI/nested-QEMU
+阶段。AI 用于交叉核对两份原始评测日志、官方脚本、提交树和成功队伍 Makefile 结构；
+开发者可用 `python3 create_kernel_zip.py --output ../wll_os-submission.zip`、
+`unzip -l` 和压缩包内 `make all` 复核。未修改官方 image、suite、judge、guest
+marker 或时间源。
+
+## 20. LoongArch 嵌套 QEMU 的 UAL 能力 ABI（2026-08-18）
 
 v15 评测日志显示，LoongArch Rust release 编译已经完成，随后嵌套
 `qemu-system-loongarch64` 在 TCG 初始化阶段直接报：

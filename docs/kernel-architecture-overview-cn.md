@@ -217,7 +217,17 @@ PolyHAL `PageTable` 提供 map/unmap/translate/release，架构文件实现 PTE 
 - address-space 析构前保证不会再有 CPU 使用旧 root；
 - RISC-V64 与 LoongArch64 的具体指令留在各自实现。
 
-当前实现仍以逐页操作为主。历史批处理候选没有通过 300 秒性能门槛，因此没有引入未证实的复杂事务 API。
+LoongArch64 的 `PageTableWrapper` 额外拥有单调 translation generation。所有 wrapper
+级 map/unmap 都在 leaf 写入后推进 generation；平台层按 CPU 保存已验证的
+`{root, ASID, generation}`。用户返回只有在非零 ASID 的三项身份精确匹配时才复用
+translation。PTE 编辑、remote IPI、deferred shootdown、全局 flush 和 ASID recycle
+都会撤销验证，ASID 0 始终走保守全 flush。激活协议先发布 active root 再读取
+deferred request，使并发编辑者要么同步 shootdown 当前 CPU，要么由新的 generation
+迫使该 CPU 在返回用户态前失效。
+
+RISC-V64 不执行 generation 原子更新，继续使用其既有 ASID/sfence.vma 协议。
+当前实现仍以逐页操作为主。历史批处理候选没有通过 300 秒性能门槛，因此没有引入
+未证实的复杂事务 API。
 
 ## 8. VFS、FD 与 ext4
 
@@ -455,3 +465,53 @@ discard 不改变 VMA 拓扑，因此下一次访问按原权限重新 fault，�
 `buildstorm-diagnostics` 下编译，production 默认关闭。双架构 SMP 生命周期和完整
 8G/8 BuildStorm 均已通过，证据见
 `docs/evidence/buildstorm-stage2/stage17-madvise-dontneed-official-20260816/`。
+
+## 18. LoongArch64 trap-root 与 TLB generation 边界
+
+LoongArch64 trap 入口继续切换到 kernel root/ASID 0。非零用户 ASID 的 translation
+与 kernel ASID 0 不别名，因此可跨该区间保留；返回用户态时由第 7 节的精确三元组
+验证决定是否复用。用户 ASID 0 仍可能与 kernel root 别名，必须全量失效。
+
+这一设计不把 trap-root 生命周期交给 `MemorySet` 之外的模块，也不让
+`PageTableWrapper` 管理 CPU-local 状态：页表 wrapper 只拥有 generation，平台层只
+拥有 CPU-local 验证与 shootdown，`MemorySet` 负责把两者按地址空间锁序组合。
+Stage24 的“普通 syscall/fault 始终保留 user root”方案在 public LA 600 秒窗口只到
+toolchain，已经被隔离；当前架构不取消 kernel-root 安全边界。
+
+同源 LoongArch64 8G/8 A/B 为 555.02 秒到 542.02 秒，提升 2.34%；双架构最终
+8G/8 public BuildStorm 分别为 RV 773.45 秒、LA 542.02 秒，均有精确 `ok=true`
+marker 和 judge 180/180。该结果证明协议正确并消除了真实高频失效，但收益也说明
+TLB 不是剩余主热点。证据与诚实边界见
+`docs/evidence/buildstorm-stage2/20260817-stage23-la-tlb-generation-conclusion-cn.md`。
+
+## 19. VFS 路径类型与隐藏 fixture 边界
+
+VFS 必须保持 Linux 的组件类型不变量：除最终分量外，每个路径分量都必须解析为
+目录；普通文件不能因为调用者随后附加子路径而变成隐式目录。`metadata`、`statx`、
+`openat`、`chdir` 与 `mkdirat` 必须对同一 inode 类型给出一致结果，namespace cache
+只能缓存该事实，不能改变它。
+
+2026-08-17 评测中，LA artifact 已构建完成，随后
+`/work/buildstorm.vars.fd/vars.fd` 返回 `ENOTDIR`。独立双层目录、短/长 symlink、
+GNU copy 与文件到目录重建序列在当前 LA SMP8 内核通过；因此不能用 VFS 容错把
+`regular/child` 接受为合法路径。hidden fixture 在可取得原始 inode/mount 身份前
+保持 `unverified`。这条边界防止把评测数据布局错误伪装成内核兼容性修复。
+
+## 20. 脚本启动的 root authority
+
+Harness 的 `UserProgramSpec.root` 是进程文件系统命名空间的权威边界，不是根据脚本
+所在目录任意选择的搜索前缀。对绝对脚本路径，root 选择遵循以下顺序：
+
+1. 当前全局 root 提供 shebang 解释器时，绝对路径全部从 `/` 解析。
+2. 当前全局 root 不提供解释器时，才允许选择包含完整解释器的独立 suite root。
+3. 进程创建后，ELF、解释器、cwd、exec 和所有 syscall 路径共享同一 root，不在
+   VFS 或 syscall 层再次猜测。
+
+该边界等价于 Linux 在既定 mount namespace/chroot 中解析绝对路径。脚本附近存在
+另一个同名解释器不能隐式改变 `/work`、`/tmp` 或 `/opt` 的归属。兼容回退仍用于
+没有全局 userspace 的旧镜像，但由“全局解释器不可用”这一能力条件触发，不按 libc、
+测试名、架构或资源路径触发。
+
+VFS 继续只负责路径分量与 inode 类型，普通文件作为中间分量必须返回 `ENOTDIR`；
+harness 不通过 VFS 容错修复命名空间错误。该职责划分由双向 SMP 回归覆盖，详见
+`docs/evidence/buildstorm-stage2/20260817-stage25-script-root-namespace/README.md`。

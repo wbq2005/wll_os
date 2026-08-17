@@ -1,0 +1,63 @@
+{
+  "arch": "loongarch64",
+  "memory": "8G",
+  "smp": 8,
+  "window_seconds": 330,
+  "begin_timeout_seconds": 600,
+  "qmp_sample_interval_seconds": 0,
+  "qmp_sample_delay_seconds": 0,
+  "production_diagnostics_disabled": false,
+  "image": "/srv/buildstorm/images/sdcard-la-pub.img",
+  "image_sha256": "d1410544e677e11efb1c240be6ffb201c89d6de58c9675e73314a696e4cefdc5",
+  "kernel": "/srv/buildstorm/worktrees/stage23-la-tlb-generation-20260817/target/loongarch64-unknown-none/release/wll_OS",
+  "kernel_sha256": "8abfa4be696b1d6439c35891bdc62af1eacb9cae959b29f0816a6c6b0ce0d590",
+  "source": {
+    "commit": "d676f7508bc08fb563ab451f184028158b942ed2",
+    "branch": "codex/buildstorm-stage23-la-tlb-generation",
+    "status": "## codex/buildstorm-stage23-la-tlb-generation\n M os/src/mm/memory_set.rs\n M os/src/platform.rs\n M os/src/smp_regression.rs\n M os/src/trap/mod.rs\n M patch/polyhal/src/pagetable/mod.rs\n?? scripts/__pycache__/\n",
+    "dirty_diff_sha256": "3f59d3ae9d3385115d6b9885a92be0ff82f21561894996a7613652288ce218c3"
+  },
+  "build_command": [
+    "/root/.cargo/bin/cargo",
+    "+nightly-2025-01-18",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--target",
+    "loongarch64-unknown-none",
+    "--no-default-features",
+    "--features",
+    "loongarch",
+    "--features",
+    "buildstorm-diagnostics"
+  ],
+  "build_elapsed_seconds": 8.274219472994446,
+  "build_log": "/srv/buildstorm/worktrees/stage23-la-tlb-generation-20260817/_tmp/release-build-loongarch64.log",
+  "qemu_version": "QEMU emulator version 11.0.3",
+  "qemu_args": [
+    "/usr/local/bin/qemu-system-loongarch64",
+    "-snapshot",
+    "-kernel",
+    "/srv/buildstorm/worktrees/stage23-la-tlb-generation-20260817/target/loongarch64-unknown-none/release/wll_OS",
+    "-m",
+    "8G",
+    "-smp",
+    "8",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "stdio",
+    "-drive",
+    "file=/srv/buildstorm/images/sdcard-la-pub.img,if=none,format=raw,id=x0",
+    "-no-reboot",
+    "-device",
+    "virtio-blk-pci,drive=x0"
+  ],
+  "target_snapshot_stats": {
+    "available": false,
+    "reason": "-snapshot keeps guest target writes in an ephemeral QEMU overlay; host does not mount or inspect the official image"
+  }
+}

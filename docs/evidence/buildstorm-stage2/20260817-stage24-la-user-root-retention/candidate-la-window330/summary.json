@@ -1,0 +1,20 @@
+{
+  "compiling_lines": 0,
+  "last_crate": null,
+  "finished_lines": 0,
+  "buildstorm_result_lines": [
+    "BUILDSTORM_TOOLCHAIN ok"
+  ],
+  "guest_aggregate_lines": [],
+  "guest_aggregate_snapshot_count": 0,
+  "guest_aggregate_complete_snapshot_count": 0,
+  "guest_aggregate_before_marker": null,
+  "guest_aggregate_final": null,
+  "panic_seen": false,
+  "oom_seen": false,
+  "qemu_exit_code_before_termination": -9,
+  "marker_seen": false,
+  "host_elapsed_seconds": 600.0993734600052,
+  "marker_window_elapsed_seconds": null,
+  "progress_timeline": []
+}

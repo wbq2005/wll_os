@@ -84,8 +84,8 @@ else
 endif
 NO_PRELOAD_PATTERN := _testcode\.sh|busybox_cmd\.txt|testcase busybox
 
-.PHONY: all build clean check check-sdcard check-kernel-no-preload prepare-cargo-config unpack-sdcard print-phase2-gate print-ltp-cases
-all:
+.PHONY: all submission-preflight build clean check check-sdcard check-kernel-no-preload prepare-cargo-config unpack-sdcard print-phase2-gate print-ltp-cases
+all: submission-preflight
 	@echo "Building for RISC-V..."
 	$(MAKE) ARCH=riscv64 build INIT=$(INIT) LOG=$(LOG) LTP=1 LTP_CASES=$(FOCUSED_LTP_CASES) BUILDSTORM_DIAGNOSTICS=$(BUILDSTORM_DIAGNOSTICS)
 	cp target/riscv64gc-unknown-none-elf/release/wll_OS kernel-rv
@@ -95,6 +95,14 @@ all:
 	$(MAKE) ARCH=loongarch64 build INIT=$(INIT) LOG=$(LOG) LTP=1 LTP_CASES=$(FOCUSED_LTP_CASES) BUILDSTORM_DIAGNOSTICS=$(BUILDSTORM_DIAGNOSTICS)
 	cp target/loongarch64-unknown-none/release/wll_OS kernel-la
 	@echo "LoongArch build done: kernel-la"
+
+# The zip-based evaluator runs `make all` in the extraction directory. Keep
+# this generic preflight visible in its log so an archive-root mistake is
+# distinguishable from a kernel or QEMU failure.
+submission-preflight:
+	@printf '%s\n' "WLL_SUBMISSION_PREFLIGHT status=START cwd=$(CURDIR)"
+	@test -f Makefile && test -f Cargo.toml && test -f os/Cargo.toml && test -f rust-toolchain.toml
+	@printf '%s\n' "WLL_SUBMISSION_PREFLIGHT status=OK makefile=$(abspath Makefile) cargo=$(abspath Cargo.toml) os=$(abspath os/Cargo.toml)"
 
 print-phase2-gate:
 	@echo "[phase2] basic 子集建议覆盖: fork clone pipe yield wait waitpid exit（wait4 阻塞 + pipe2 O_NONBLOCK）。"

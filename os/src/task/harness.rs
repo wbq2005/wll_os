@@ -1070,6 +1070,7 @@ pub(crate) fn run_user_memory_lifecycle_regression() {
 
     run_directory_abi_regression();
     run_directory_metadata_abi_regression();
+    run_script_root_namespace_regression();
 
     // The busybox probe is intentionally static/self-contained.  A separate
     // diagnostic-only dynamic ELF probe exercises the glibc interpreter and
@@ -1128,6 +1129,36 @@ fn run_directory_metadata_abi_regression() {
                  test \"$(stat -c '%a' /.wll_dir_metadata_abi/parent/child)\" = 750; \
                  ln -s parent/child /.wll_dir_metadata_abi/link; \
                  test \"$(readlink /.wll_dir_metadata_abi/link)\" = parent/child; \
+                 mkdir -p /.wll_dir_metadata_abi/store.fd; \
+                 printf 'uefi-variable-store-probe\n' > /.wll_dir_metadata_abi/store.fd/input.fd; \
+                 test -d /.wll_dir_metadata_abi/store.fd; \
+                 test -f /.wll_dir_metadata_abi/store.fd/input.fd; \
+                 test \"$(stat -c '%F' /.wll_dir_metadata_abi/store.fd)\" = directory; \
+                 cp /.wll_dir_metadata_abi/store.fd/input.fd /.wll_dir_metadata_abi/copy.fd; \
+                 cmp /.wll_dir_metadata_abi/store.fd/input.fd /.wll_dir_metadata_abi/copy.fd; \
+                 ln -s store.fd /.wll_dir_metadata_abi/store-link; \
+                 cp /.wll_dir_metadata_abi/store-link/input.fd /.wll_dir_metadata_abi/link-copy.fd; \
+                 cmp /.wll_dir_metadata_abi/store.fd/input.fd /.wll_dir_metadata_abi/link-copy.fd; \
+                 cp -a /.wll_dir_metadata_abi/store.fd /.wll_dir_metadata_abi/archive.fd; \
+                 test -d /.wll_dir_metadata_abi/archive.fd; \
+                 test -f /.wll_dir_metadata_abi/archive.fd/input.fd; \
+                 cmp /.wll_dir_metadata_abi/store.fd/input.fd /.wll_dir_metadata_abi/archive.fd/input.fd; \
+                 cp -R /.wll_dir_metadata_abi/store.fd /.wll_dir_metadata_abi/recursive.fd; \
+                 test -d /.wll_dir_metadata_abi/recursive.fd; \
+                 test -f /.wll_dir_metadata_abi/recursive.fd/input.fd; \
+                 cmp /.wll_dir_metadata_abi/store.fd/input.fd /.wll_dir_metadata_abi/recursive.fd/input.fd; \
+                 mkdir -p /.wll_dir_metadata_abi/long/one/two/three/four/five/six/seven/eight; \
+                 printf 'long-link-probe\n' > /.wll_dir_metadata_abi/long/one/two/three/four/five/six/seven/eight/input.fd; \
+                 ln -s /.wll_dir_metadata_abi/long/one/two/three/four/five/six/seven/eight /.wll_dir_metadata_abi/long-link; \
+                 cp /.wll_dir_metadata_abi/long-link/input.fd /.wll_dir_metadata_abi/long-copy.fd; \
+                 cmp /.wll_dir_metadata_abi/long/one/two/three/four/five/six/seven/eight/input.fd /.wll_dir_metadata_abi/long-copy.fd; \
+                 printf 'replace-me\n' > /.wll_dir_metadata_abi/reused.fd; \
+                 stat /.wll_dir_metadata_abi/reused.fd >/dev/null; \
+                 rm /.wll_dir_metadata_abi/reused.fd; \
+                 mkdir /.wll_dir_metadata_abi/reused.fd; \
+                 printf 'replacement-directory-probe\n' > /.wll_dir_metadata_abi/reused.fd/input.fd; \
+                 cp /.wll_dir_metadata_abi/reused.fd/input.fd /.wll_dir_metadata_abi/reused-copy.fd; \
+                 cmp /.wll_dir_metadata_abi/reused.fd/input.fd /.wll_dir_metadata_abi/reused-copy.fd; \
                  rm -rf /.wll_dir_metadata_abi",
             ),
         ],
@@ -1148,6 +1179,78 @@ fn run_directory_metadata_abi_regression() {
         );
     }
     console_write("[smp-regression] pass phase=directory-metadata-abi\n");
+}
+
+#[cfg(feature = "smp-regression")]
+fn run_script_root_namespace_regression() {
+    const BASE: &str = "/.__wll_script_root_namespace";
+    const GLOBAL_INTERPRETER: &str = "/.__wll_script_root_namespace/interp/sh";
+    const SUITE_INTERPRETER: &str =
+        "/.__wll_script_root_namespace/suite/.__wll_script_root_namespace/interp/sh";
+    const SCRIPT: &str = "/.__wll_script_root_namespace/suite/probe.sh";
+    const COMPAT_INTERPRETER: &str = "/.__wll_script_root_namespace/suite/.__wll_compat_interp/sh";
+    const COMPAT_SCRIPT: &str = "/.__wll_script_root_namespace/suite/compat.sh";
+
+    let busybox = crate::fs::read_executable_file("/glibc/busybox")
+        .expect("script-root namespace regression busybox");
+    {
+        let mut fs = crate::fs::MEM_FS.lock();
+        fs.add_file_with_mode(GLOBAL_INTERPRETER, busybox.as_ref().clone(), 0o755);
+        fs.add_file_with_mode(SUITE_INTERPRETER, busybox.as_ref().clone(), 0o755);
+        fs.add_file_with_mode(COMPAT_INTERPRETER, busybox.as_ref().clone(), 0o755);
+        fs.add_file_with_mode(
+            SCRIPT,
+            b"#!/.__wll_script_root_namespace/interp/sh\n\
+set -e\n\
+test -f /.__wll_script_root_namespace/global/token\n"
+                .to_vec(),
+            0o755,
+        );
+        fs.add_file_with_mode(
+            &alloc::format!("{}/global/token", BASE),
+            b"global-root-owned\n".to_vec(),
+            0o644,
+        );
+        fs.add_file_with_mode(
+            COMPAT_SCRIPT,
+            b"#!/.__wll_compat_interp/sh\n\
+set -e\n\
+test -f /.__wll_compat_resource/token\n"
+                .to_vec(),
+            0o755,
+        );
+        fs.add_file_with_mode(
+            &alloc::format!("{}/suite/.__wll_compat_resource/token", BASE),
+            b"compat-root-owned\n".to_vec(),
+            0o644,
+        );
+    }
+
+    let spec = script_program_spec(SCRIPT).expect("script-root namespace regression spec");
+    let selected_root = spec.root.clone();
+    let exit_code = run_user_program_spec_foreground_exit_code(&spec)
+        .expect("script-root namespace regression launch");
+    if exit_code != 0 || selected_root != "/" {
+        panic!(
+            "[smp-regression] fail phase=script-root-namespace exit={} root={}",
+            exit_code, selected_root
+        );
+    }
+    console_write("[smp-regression] pass phase=script-root-namespace root=/\n");
+
+    let compat_spec =
+        script_program_spec(COMPAT_SCRIPT).expect("compat script-root namespace regression spec");
+    let compat_root = compat_spec.root.clone();
+    let compat_exit_code = run_user_program_spec_foreground_exit_code(&compat_spec)
+        .expect("compat script-root namespace regression launch");
+    let expected_compat_root = alloc::format!("{}/suite", BASE);
+    if compat_exit_code != 0 || compat_root != expected_compat_root {
+        panic!(
+            "[smp-regression] fail phase=script-compat-root exit={} root={}",
+            compat_exit_code, compat_root
+        );
+    }
+    console_write("[smp-regression] pass phase=script-compat-root\n");
 }
 
 #[cfg(all(feature = "buildstorm-diagnostics", feature = "smp-regression"))]
