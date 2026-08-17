@@ -249,7 +249,18 @@ make ARCH=riscv64 check IOZONE=0 LMBENCH=0 LTP=0
 
 # 外部诊断：聚焦 LTP slice
 python scripts/perf_baseline_runner.py --arch riscv64 --suite ltp --runs 1 --delete-sdcard-copy
+
+# 生成课程 zip：条目直接位于压缩包根目录
+python3 create_kernel_zip.py --output ../wll_os-submission.zip
 ```
+
+zip 测评通道要求 `Makefile`、`Cargo.toml`、`os/Cargo.toml` 和
+`rust-toolchain.toml` 直接位于压缩包根目录。不要直接上传 GitHub 的
+`<repo>-<commit>.zip`，那种下载包会额外嵌套一层目录，评测器在解压目录执行
+`make all` 时会得到 `No rule to make target 'all'`。`create_kernel_zip.py` 使用
+当前提交的 `git archive` 生成无外层目录的包，并在本地校验根入口与 ZIP CRC。
+评测日志中的 `WLL_SUBMISSION_PREFLIGHT status=OK` 表示已进入正确源码根目录；它
+不能替代 QEMU 内核或官方 BuildStorm 成功标记。
 
 默认构建不会因为缺少 `sdcard-rv.img` / `sdcard-la.img` 失败。若存在对应 `.img.xz` 且环境有 `xz`，可执行：
 

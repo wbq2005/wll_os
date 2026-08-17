@@ -858,3 +858,60 @@ production 不检查架构、测试、crate、命令、输出或资源路径。V
 `vars.fd` 门仍为 `unverified`，需要新提交评测确认。完整身份、哈希、原始日志、
 Cosmos 分支历史和复现命令见
 `docs/evidence/buildstorm-stage2/20260817-stage25-script-root-namespace/README.md`。
+
+## 19. 2026-08-17 zip 评测入口与 LA 隐藏门观测
+
+### 19.1 两个通道的首错边界
+
+最新官方评测总分为 `596.3`：RISC-V64 BuildStorm 已得 `178.1`，LoongArch64
+仍只有 toolchain/minibuild 的 `20.0`。LA 原始串口显示 Rust clean build 在
+`1500.31s` 完成产物生成，随后隐藏准备步骤首错为：
+
+```text
+cp: cannot stat '/work/buildstorm.vars.fd/vars.fd': Not a directory
+```
+
+这不是公开 `final-2026` 脚本中的路径；公开脚本只负责编译并输出
+`BUILDSTORM_COMPILE`，因此该隐藏后处理仍是 `unverified`。VFS 对普通文件作为目录
+前缀返回 `ENOTDIR` 的 Linux 语义不能按 `vars.fd` 路径放宽，下一步需要评测通道
+提供隐藏 fixture 或通过通用错误观测 marker 暴露其真实类型。
+
+另一条 zip 通道在任何内核启动前报：
+
+```text
+make: *** No rule to make target 'all'. Stop.
+```
+
+交叉检查 `2e698077` 的 Git 树确认顶层 `Makefile` 实际存在；根因是上传包未把
+Makefile 放在解压根（最可能是 GitHub 下载包的外层仓库目录）。该错误不能归因于
+LA 内核或 BuildStorm workload。
+
+### 19.2 通用打包设计与观测 marker
+
+`create_kernel_zip.py` 现在从当前提交执行 `git archive --format=zip HEAD`，不添加
+外层目录，并在生成前校验四个根入口和 ZIP CRC。`Makefile` 的 `all` 目标首先执行
+`submission-preflight`，输出：
+
+```text
+WLL_SUBMISSION_PREFLIGHT status=START cwd=...
+WLL_SUBMISSION_PREFLIGHT status=OK makefile=... cargo=... os=...
+```
+
+该 marker 只报告构建入口布局，不选择架构、测试、命令、输出或路径，不改变内核
+运行时行为；若日志没有它，应先判定为 zip 解包/工作目录问题，而不是立即修改
+MM/VFS。打包脚本输出 commit、entry count、SHA-256，便于将评测 zip 与源码身份绑定。
+
+### 19.3 验证与证据分级
+
+| 项目 | 结果 | 等级 |
+| --- | --- | --- |
+| RV 官方 BuildStorm | `178.1`，含 `BUILDSTORM_COMPILE` | `official-pass` |
+| LA 官方 BuildStorm | artifact 后隐藏 `vars.fd` 首错 | `unverified` |
+| `2e698077` 原始 Git 树 | 顶层 Makefile 存在 | `capability-pass` |
+| 根相对 zip 结构 | 由新脚本本地 CRC/入口检查 | `capability-pass` |
+
+本轮 zip 修复只处理提交包的通用入口，不宣称已修复 LA 隐藏 UEFI/nested-QEMU
+阶段。AI 用于交叉核对两份原始评测日志、官方脚本、提交树和成功队伍 Makefile 结构；
+开发者可用 `python3 create_kernel_zip.py --output ../wll_os-submission.zip`、
+`unzip -l` 和压缩包内 `make all` 复核。未修改官方 image、suite、judge、guest
+marker 或时间源。

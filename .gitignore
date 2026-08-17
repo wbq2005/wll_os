@@ -58,3 +58,6 @@ _tmp/
 # Build error logs (temporary files)
 os/build_err*.txt
 os/build_la*.txt
+
+# Python bytecode created while validating repository helper scripts.
+__pycache__/
