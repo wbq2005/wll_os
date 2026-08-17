@@ -1,0 +1,5 @@
+[loongarch64] stage=complete reached=True log=/srv/buildstorm/worktrees/stage18-audit-d676-20260816/_tmp/buildstorm-loongarch64-complete.log
+BUILDSTORM_TOOLCHAIN ok
+BUILDSTORM_MINIBUILD ok
+BUILDSTORM_BEGIN mode=multi
+BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=555.02 cores=8 bytes=1716224 arch=loongarch64

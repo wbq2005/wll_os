@@ -1,0 +1,198 @@
+{
+  "compiling_lines": 34,
+  "last_crate": "hashbrown v0.17.1",
+  "finished_lines": 2,
+  "buildstorm_result_lines": [
+    "BUILDSTORM_TOOLCHAIN ok",
+    "BUILDSTORM_MINIBUILD ok",
+    "BUILDSTORM_BEGIN mode=multi"
+  ],
+  "guest_aggregate_lines": [],
+  "guest_aggregate_snapshot_count": 0,
+  "guest_aggregate_complete_snapshot_count": 0,
+  "guest_aggregate_before_marker": null,
+  "guest_aggregate_final": null,
+  "panic_seen": false,
+  "oom_seen": false,
+  "qemu_exit_code_before_termination": -9,
+  "marker_seen": true,
+  "host_elapsed_seconds": 357.45966490100545,
+  "marker_window_elapsed_seconds": 330.2272933110071,
+  "progress_timeline": [
+    {
+      "kind": "finished",
+      "after_marker_seconds": 7.609848181004054,
+      "value": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.95s"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.439635868999176,
+      "value": "compiler_builtins v0.1.160 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.439635868999176,
+      "value": "core v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.639939141998184,
+      "value": "libc v0.2.185"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.639939141998184,
+      "value": "std v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/std)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.639939141998184,
+      "value": "thiserror v2.0.18"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.639939141998184,
+      "value": "heapless v0.9.3"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.84024787999806,
+      "value": "ax-errno v0.6.1 (/work/tgoskits/components/axerrno)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.84024787999806,
+      "value": "ax-percpu v0.4.14 (/work/tgoskits/components/percpu/percpu)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.84024787999806,
+      "value": "num-traits v0.2.19"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.84024787999806,
+      "value": "libc v0.2.186"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 32.84024787999806,
+      "value": "radium v0.7.0"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.04055153300578,
+      "value": "rust_decimal v1.42.1"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.04055153300578,
+      "value": "anyhow v1.0.103"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.04055153300578,
+      "value": "ax-alloc v0.8.12 (/work/tgoskits/os/arceos/modules/axalloc)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.24085950500739,
+      "value": "someboot v0.3.5 (/work/tgoskits/platforms/someboot)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.24085950500739,
+      "value": "somehal v0.8.0 (/work/tgoskits/platforms/somehal)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.24085950500739,
+      "value": "ax-driver v0.12.0 (/work/tgoskits/drivers/ax-driver)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.44115326499741,
+      "value": "axplat-dyn v0.7.12 (/work/tgoskits/platforms/axplat-dyn)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.44115326499741,
+      "value": "ax-hal v0.5.28 (/work/tgoskits/os/arceos/modules/axhal)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.44115326499741,
+      "value": "ax-task v0.6.4 (/work/tgoskits/os/arceos/modules/axtask)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.641439547005575,
+      "value": "ax-runtime v0.10.4 (/work/tgoskits/os/arceos/modules/axruntime)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.641439547005575,
+      "value": "scope-local v0.4.2 (/work/tgoskits/components/scope-local)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 33.641439547005575,
+      "value": "ax-posix-api v0.5.29 (/work/tgoskits/os/arceos/api/arceos_posix_api)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 245.886695883004,
+      "value": "rustc-std-workspace-core v1.99.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/rustc-std-workspace-core)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 245.886695883004,
+      "value": "alloc v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 246.48753345900332,
+      "value": "rustc-demangle v0.1.27"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 246.48753345900332,
+      "value": "panic_abort v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_abort)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 246.48753345900332,
+      "value": "cfg-if v1.0.4"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 246.48753345900332,
+      "value": "rustc-literal-escaper v0.0.7"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 258.70524321100675,
+      "value": "unwind v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/unwind)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 287.738143280003,
+      "value": "rustc-std-workspace-alloc v1.99.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/rustc-std-workspace-alloc)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 287.738143280003,
+      "value": "panic_unwind v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_unwind)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 288.3389195320051,
+      "value": "std_detect v0.1.5 (/root/.rustup/toolchains/nightly-2026-05-28-loongarch64-unknown-linux-gnu/lib/rustlib/src/rust/library/std_detect)"
+    },
+    {
+      "kind": "compiling",
+      "after_marker_seconds": 288.3389195320051,
+      "value": "hashbrown v0.17.1"
+    }
+  ]
+}

@@ -33,6 +33,30 @@ wll_OS 是一个面向全国大学生计算机系统能力大赛操作系统内�
 
 ## BuildStorm 决赛状态
 
+### 2026-08-17 LoongArch64 TLB generation 优化
+
+Stage22 diagnostics 证明 LoongArch64 在约 50.1 万次用户陷入中，user-root activation
+与 kernel-root restore 各执行一次全 TLB 失效；但普通 syscall 和 timer 返回中，
+root、非零 ASID 与 PTE generation 分别有约 80.6% 和 92.1% 保持稳定。Stage23
+因此由 `PageTableWrapper` 统一拥有 translation generation，并在平台层按 CPU
+验证 `{root, ASID, generation}`。PTE 修改、远端 IPI、deferred shootdown 和 ASID
+recycle 都会撤销验证；ASID 0 仍走保守 flush。RISC-V64 路径不执行 generation
+原子操作。
+
+同一 LoongArch64 8G/8 官方 production A/B 从 555.02 秒降到 542.02 秒，改善
+13.00 秒（2.34%）。直接 TLB 失效热点明显下降，但时间收益表明它不是剩余主根因。
+更激进的 Stage24 user-root retention 在 600 秒只到 toolchain，已经隔离且未合入。
+最终候选在未修改官方 `final-2026` suite `b5ec6ef` 上完成双架构 8G/8：
+
+| 架构 | 成功标记 | guest 编译时间 | judge 自动项 |
+| --- | --- | ---: | ---: |
+| RISC-V64 | `BUILDSTORM_COMPILE mode=multi ok=true` | 773.45 s | 180/180 |
+| LoongArch64 | `BUILDSTORM_COMPILE mode=multi ok=true` | 542.02 s | 180/180 |
+
+两项均为 `official-pass`；设计文档 20 分由人工评审，未自行计分。完整因果模型、
+不变量、A/B、反证和证据索引见
+[Stage23 中文结论](docs/evidence/buildstorm-stage2/20260817-stage23-la-tlb-generation-conclusion-cn.md)。
+
 ### 2026-08-16 评测修复
 
 最新评测提交 `2953af6a725c015f89e64db9eab8f60ee27f6fe1` 总分为 542.1；RV
@@ -48,6 +72,15 @@ BuildStorm、路径或命令特判。双架构 production/diagnostics release �
 `BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=553.62`，官方 judge 自动项
 180/180。该 public 流程为 `official-pass`；评测机独有的 UEFI 后处理门仍为
 `unverified`，需下一轮评测确认。
+
+2026-08-17 的下一轮评测已证明 mkdir 修复生效：ESP 目录错误消失，LA clean build
+在 3008.46 秒完成。新的唯一首错是
+`cp: cannot stat '/work/buildstorm.vars.fd/vars.fd': Not a directory`。扩展后的独立
+LA SMP8 回归已覆盖 `.fd` 目录、短/长目录 symlink、GNU `stat/cp/cmp`，以及文件删除
+后同名目录重建，均通过。POSIX `ENOTDIR` 因而指向 hidden fixture 前缀本身不是目录；
+在无法取得 hidden 镜像前，该门保持 `unverified`，内核不为特定路径放宽
+`regular/child` 语义。审计记录见
+[评测输出 42/26 边界](docs/evidence/buildstorm-stage2/20260817-evaluator-output42-26-la-vars-prefix-audit-cn.md)。
 
 ### 2026-08-16 MADV_DONTNEED 通用优化
 
@@ -304,6 +337,12 @@ python scripts/perf_baseline_runner.py --arch loongarch64 --suite all --runs 1 -
 - **文件系统**：MemFS、ext4 运行时卷、VFS 叠加、fd-table、pipe/socket/pseudo device。
 - **系统调用层**：按 Linux/asm-generic ABI 提供 libc 与评测所需的真实子集。
 - **Harness 层**：从运行时文件系统发现测试脚本，按 feature 和 env 控制 suite 顺序。
+
+Harness 启动绝对路径脚本时，以当前全局 root 为首要命名空间：只要全局 root 提供
+shebang 解释器，脚本及其 `/work`、`/tmp`、`/opt` 等绝对路径都从 `/` 解析；仅当
+全局解释器不可用时，才回退到自包含的 suite root。该规则不按测试名、libc、架构、
+命令或输出分支，并保留旧兼容镜像的独立 userspace 能力。对应因果模型和双架构
+证据见 `docs/evidence/buildstorm-stage2/20260817-stage25-script-root-namespace/README.md`。
 
 ### 项目结构
 

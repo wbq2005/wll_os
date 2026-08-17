@@ -1,0 +1,61 @@
+{
+  "arch": "loongarch64",
+  "memory": "8G",
+  "smp": 8,
+  "window_seconds": 330,
+  "begin_timeout_seconds": 600,
+  "qmp_sample_interval_seconds": 0,
+  "qmp_sample_delay_seconds": 0,
+  "production_diagnostics_disabled": true,
+  "image": "/srv/buildstorm/images/sdcard-la-pub.img",
+  "image_sha256": "d1410544e677e11efb1c240be6ffb201c89d6de58c9675e73314a696e4cefdc5",
+  "kernel": "/srv/buildstorm/worktrees/stage18-audit-d676-20260816/target/loongarch64-unknown-none/release/wll_OS",
+  "kernel_sha256": "d057484d5fede62120f0e1d28178bdce7fe9501c719b9ee37251d9ac5ff5f2c4",
+  "source": {
+    "commit": "d676f7508bc08fb563ab451f184028158b942ed2",
+    "branch": "",
+    "status": "## HEAD (no branch)\n?? scripts/__pycache__/\n",
+    "dirty_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "build_command": [
+    "/root/.cargo/bin/cargo",
+    "+nightly-2025-01-18",
+    "build",
+    "--locked",
+    "--offline",
+    "--release",
+    "--target",
+    "loongarch64-unknown-none",
+    "--no-default-features",
+    "--features",
+    "loongarch"
+  ],
+  "build_elapsed_seconds": 9.429794715993921,
+  "build_log": "/srv/buildstorm/worktrees/stage18-audit-d676-20260816/_tmp/release-build-loongarch64.log",
+  "qemu_version": "QEMU emulator version 11.0.3",
+  "qemu_args": [
+    "/usr/local/bin/qemu-system-loongarch64",
+    "-snapshot",
+    "-kernel",
+    "/srv/buildstorm/worktrees/stage18-audit-d676-20260816/target/loongarch64-unknown-none/release/wll_OS",
+    "-m",
+    "8G",
+    "-smp",
+    "8",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "stdio",
+    "-drive",
+    "file=/srv/buildstorm/images/sdcard-la-pub.img,if=none,format=raw,id=x0",
+    "-no-reboot",
+    "-device",
+    "virtio-blk-pci,drive=x0"
+  ],
+  "target_snapshot_stats": {
+    "available": false,
+    "reason": "-snapshot keeps guest target writes in an ephemeral QEMU overlay; host does not mount or inspect the official image"
+  }
+}

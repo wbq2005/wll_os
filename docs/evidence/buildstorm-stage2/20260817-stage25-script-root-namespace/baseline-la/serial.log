@@ -1,0 +1,117 @@
+[DTB] ptr = 0x9000000000100000
+[DTB] magic = 0xd00dfeed (expected 0xD00DFEED)
+[kernel] Hello, OS!
+[kernel] Memory init
+[VIRTIO] Probing...
+[VIRTIO] found
+[EXT4] mounted successfully
+[smp-regression] pass phase=interval-timer-state-machine
+[smp-regression] pass phase=large-kernel-allocation bytes=335544320 checksum=10444800
+[smp-regression] pass phase=resident-memory-lifecycle
+[smp-regression] pass phase=high-arena-memory-lifecycle
+[smp-regression] pass phase=namespace-lifecycle iterations=64 readers=7
+[33m[ WARN] [block] read_offset failed @0x40003f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 64[0m
+[33m[ WARN] [block] read_offset failed @0x40003f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 128[0m
+[33m[ WARN] [block] read_offset failed @0x40003f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 192[0m
+[33m[ WARN] [block] read_offset failed @0x40003f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 256[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 320[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 384[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 448[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 512[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 576[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 640[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 704[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 768[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 832[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 896[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 960[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1024[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1088[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1152[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1216[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1280[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1344[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1408[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1472[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1536[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1600[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1664[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1728[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1792[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1856[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1920[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 1984[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 2048[0m
+[33m[ WARN] [block] read_offset failed @0x100040001f30a000[0m
+[33m[ WARN] [Batch Append] Could not get last extent, starting at block 2[0m
+[smp-regression] pass phase=regular-file-lifecycle bytes=8401153 writeback_chunk=262144
+[smp-regression] pass phase=user-memory-lifecycle
+[smp-regression] pass phase=directory-abi
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 223[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 132[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 223[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 132[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 223[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 132[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 223[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[33m[ WARN] [syscall] Unsupported syscall: 132[0m
+[33m[ WARN] [syscall] Unsupported syscall: 293[0m
+[smp-regression] pass phase=directory-metadata-abi
+Kernel panic on cpu 0 (hardware 7): panicked at os/src/task/harness.rs:1179:9:
+[smp-regression] fail phase=script-root-namespace exit=1 root=/.__wll_script_root_namespace/suite

@@ -17,7 +17,9 @@ cfg_if::cfg_if! {
     }
 }
 
-use core::ops::Deref;
+use core::{ops::Deref, sync::atomic::AtomicUsize};
+#[cfg(target_arch = "loongarch64")]
+use core::sync::atomic::Ordering;
 
 use crate::{components::common::frame_alloc, PhysAddr, VirtAddr};
 
@@ -433,7 +435,7 @@ pub struct TLB;
 /// If you release the PageTableWrapper,
 /// the PageTable will release its page table entry.
 #[derive(Debug)]
-pub struct PageTableWrapper(pub PageTable);
+pub struct PageTableWrapper(pub PageTable, AtomicUsize);
 
 impl Deref for PageTableWrapper {
     type Target = PageTable;
@@ -447,6 +449,86 @@ impl Deref for PageTableWrapper {
 ///
 /// This operation will copy kernel page table space from booting page table.
 impl PageTableWrapper {
+    /// Monotonic identity of the leaf mappings published through this owner.
+    ///
+    /// Address-space activation uses this value to decide whether an ASID's
+    /// cached translations still describe this page table.  Keep the counter
+    /// at the page-table operation boundary so every user mapping path shares
+    /// one source of truth.
+    #[inline]
+    pub fn translation_generation(&self) -> usize {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            self.1.load(Ordering::Acquire)
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            0
+        }
+    }
+
+    #[inline]
+    fn note_translation_edit(&self, writes: usize) {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            if writes != 0 {
+                self.1.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        let _ = writes;
+    }
+
+    pub fn map_pages_without_flush<I>(&self, pages: I) -> usize
+    where
+        I: IntoIterator<Item = (VirtAddr, PhysAddr, MappingFlags)>,
+    {
+        let writes = self.0.map_pages_without_flush(pages);
+        self.note_translation_edit(writes);
+        writes
+    }
+
+    pub fn unmap_pages_without_flush<I>(&self, pages: I) -> usize
+    where
+        I: IntoIterator<Item = VirtAddr>,
+    {
+        let writes = self.0.unmap_pages_without_flush(pages);
+        self.note_translation_edit(writes);
+        writes
+    }
+
+    #[inline]
+    pub fn map_page(
+        &self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: MappingFlags,
+        size: MappingSize,
+    ) {
+        self.0.map_page(vaddr, paddr, flags, size);
+        self.note_translation_edit(1);
+    }
+
+    #[inline]
+    pub fn map_kernel(
+        &self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        flags: MappingFlags,
+        size: MappingSize,
+    ) {
+        self.0.map_kernel(vaddr, paddr, flags, size);
+        self.note_translation_edit(1);
+    }
+
+    #[inline]
+    pub fn unmap_page(&self, vaddr: VirtAddr) {
+        self.0.unmap_page(vaddr);
+        // Conservatively advance even when the leaf was already absent.  An
+        // extra activation flush is safe; missing a real edit is not.
+        self.note_translation_edit(1);
+    }
+
     /// Alloc a new PageTableWrapper sharing the boot page table root
     ///
     /// This reuses the OpenSBI-established page table for compatibility.
@@ -456,7 +538,7 @@ impl PageTableWrapper {
     pub fn alloc() -> Self {
         // 使用启动页表的根地址，保持与 OpenSBI 设置的 1:1 映射兼容
         let boot_pt_root = PageTable::current();
-        Self(boot_pt_root)
+        Self(boot_pt_root, AtomicUsize::new(1))
     }
 
     /// Allocate a NEW independent page table with kernel mappings copied
@@ -476,7 +558,7 @@ impl PageTableWrapper {
         // 调用 restore() 从启动页表复制内核映射
         pt.restore();
 
-        Self(pt)
+        Self(pt, AtomicUsize::new(1))
     }
 }
 

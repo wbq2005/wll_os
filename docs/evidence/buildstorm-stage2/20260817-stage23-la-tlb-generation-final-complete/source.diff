@@ -1,0 +1,335 @@
+diff --git a/os/src/mm/memory_set.rs b/os/src/mm/memory_set.rs
+index c1ed9b6..29888c4 100644
+--- a/os/src/mm/memory_set.rs
++++ b/os/src/mm/memory_set.rs
+@@ -478,11 +478,15 @@ impl MemorySet {
+             crate::buildstorm_diagnostics::WorkClass::AddressSpaceActivation,
+         );
+         crate::perf_counters::note_user_page_table_activation();
+-        // Callers hold the shared MemorySet lock while activating. Publishing
+-        // the root before changing the hardware page table makes a concurrent
+-        // page-table editor observe this CPU only after the new root is live;
+-        // an editor that finished earlier leaves a generation handled here.
+-        crate::platform::mark_current_address_space(self.address_space_root());
++        // Callers hold the shared MemorySet lock while activating.  Publishing
++        // the root before changing hardware state closes the shootdown race;
++        // the page-table generation catches edits completed while this CPU was
++        // running on the kernel root and therefore not an active shootdown
++        // target.
++        let root = self.address_space_root();
++        let generation = self.page_table.translation_generation();
++        let _translations_current =
++            crate::platform::mark_current_address_space(root, self.address_space_id, generation);
+         #[cfg(target_arch = "riscv64")]
+         let already_active = PageTable::current().root() == self.page_table.root()
+             && PageTable::current_asid() == self.address_space_id;
+@@ -496,20 +500,18 @@ impl MemorySet {
+             #[cfg(feature = "buildstorm-diagnostics")]
+             crate::buildstorm_diagnostics::note_root_activation(true, true);
+         }
+-        // LoongArch page-table edits currently occur under kernel ASID 0 and
+-        // need a conservative local invalidation before re-entering user mode.
+-        // RISC-V can retain its ASID-tagged entries across the transition.
+-        // RISC-V keeps the shared kernel root permanently on ASID 0. User page
+-        // table edits do not modify that root, and explicit kernel mapping
+-        // changes already invalidate their affected entries, so restoring the
+-        // same root needs no sfence.vma. LoongArch still requires the proven
+-        // conservative full invalidation on every user-root activation.
++        // LoongArch retains a nonzero-ASID translation only after validating
++        // the exact root and page-table generation.  ASID 0 remains shared
++        // with the kernel and always takes the conservative flush path.
+         #[cfg(target_arch = "loongarch64")]
+         {
+-            #[cfg(feature = "buildstorm-diagnostics")]
+-            crate::buildstorm_diagnostics::note_local_tlb_flush();
+-            TLB::flush_all();
++            if !_translations_current {
++                #[cfg(feature = "buildstorm-diagnostics")]
++                crate::buildstorm_diagnostics::note_local_tlb_flush();
++                TLB::flush_all();
++            }
+         }
++        crate::platform::complete_current_address_space(root, self.address_space_id, generation);
+     }
+ 
+     pub fn address_space_id(&self) -> usize {
+diff --git a/os/src/platform.rs b/os/src/platform.rs
+index 72ea00e..bf89aa6 100644
+--- a/os/src/platform.rs
++++ b/os/src/platform.rs
+@@ -36,6 +36,13 @@ static TLB_GENERATION: AtomicUsize = AtomicUsize::new(0);
+ static TLB_REQUEST: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+ static TLB_ACK: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+ static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
++#[cfg(target_arch = "loongarch64")]
++static VERIFIED_USER_ROOT: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
++#[cfg(target_arch = "loongarch64")]
++static VERIFIED_USER_ASID: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
++#[cfg(target_arch = "loongarch64")]
++static VERIFIED_USER_GENERATION: [AtomicUsize; MAX_CPUS] =
++    [const { AtomicUsize::new(0) }; MAX_CPUS];
+ 
+ const IPI_RESCHEDULE: u32 = 1 << 1;
+ const IPI_TLB_SHOOTDOWN: u32 = 1 << 2;
+@@ -469,6 +476,7 @@ pub fn handle_ipi(action: usize) {
+     if action & IPI_TLB_SHOOTDOWN as usize != 0 {
+         polyhal::pagetable::TLB::flush_all();
+         let cpu = current_cpu_index();
++        invalidate_verified_user_translations(cpu);
+         let generation = TLB_REQUEST[cpu].load(Ordering::Acquire);
+         TLB_ACK[cpu].store(generation, Ordering::Release);
+     }
+@@ -485,7 +493,20 @@ pub fn acknowledge_local_ipi() -> usize {
+     }
+ }
+ 
+-pub fn mark_current_address_space(root: usize) {
++#[cfg(target_arch = "loongarch64")]
++#[inline]
++fn invalidate_verified_user_translations(cpu: usize) {
++    VERIFIED_USER_GENERATION[cpu].store(0, Ordering::Release);
++}
++
++/// Publish the user root and report whether this CPU already has translations
++/// for the exact root, ASID, and page-table generation.
++///
++/// Callers hold the address-space lock.  The active-root publication and the
++/// deferred shootdown handshake close the race with a concurrent editor: an
++/// editor either targets this CPU, or its newer page-table generation forces a
++/// local flush before user mode resumes.
++pub fn mark_current_address_space(root: usize, asid: usize, generation: usize) -> bool {
+     let cpu = current_cpu_index();
+     // Publish the active root before sampling the deferred generation. If a
+     // concurrent shooter publishes first, this CPU observes the request and
+@@ -493,10 +514,44 @@ pub fn mark_current_address_space(root: usize) {
+     // active root and includes this CPU in the synchronous remote flush.
+     ACTIVE_ADDRESS_SPACE[cpu].store(root, Ordering::SeqCst);
+     let request = TLB_REQUEST[cpu].load(Ordering::Acquire);
++    let mut flushed = false;
+     if TLB_ACK[cpu].load(Ordering::Acquire) != request {
+         polyhal::pagetable::TLB::flush_all();
++        #[cfg(target_arch = "loongarch64")]
++        invalidate_verified_user_translations(cpu);
+         TLB_ACK[cpu].store(request, Ordering::Release);
++        flushed = true;
++    }
++
++    #[cfg(target_arch = "loongarch64")]
++    {
++        asid != 0
++            && (flushed
++                || (VERIFIED_USER_GENERATION[cpu].load(Ordering::Acquire) == generation
++                    && VERIFIED_USER_ROOT[cpu].load(Ordering::Relaxed) == root
++                    && VERIFIED_USER_ASID[cpu].load(Ordering::Relaxed) == asid))
+     }
++    #[cfg(target_arch = "riscv64")]
++    {
++        let _ = (asid, generation, flushed);
++        true
++    }
++}
++
++/// Record the identity installed after the activation flush decision.
++pub fn complete_current_address_space(root: usize, asid: usize, generation: usize) {
++    #[cfg(target_arch = "loongarch64")]
++    {
++        let cpu = current_cpu_index();
++        VERIFIED_USER_GENERATION[cpu].store(0, Ordering::Release);
++        if asid != 0 {
++            VERIFIED_USER_ROOT[cpu].store(root, Ordering::Relaxed);
++            VERIFIED_USER_ASID[cpu].store(asid, Ordering::Relaxed);
++            VERIFIED_USER_GENERATION[cpu].store(generation, Ordering::Release);
++        }
++    }
++    #[cfg(target_arch = "riscv64")]
++    let _ = (root, asid, generation);
+ }
+ 
+ pub fn clear_current_address_space() {
+@@ -652,6 +707,8 @@ pub fn flush_tlb_all_cpus() {
+     #[cfg(feature = "buildstorm-diagnostics")]
+     crate::buildstorm_diagnostics::note_local_tlb_flush();
+     polyhal::pagetable::TLB::flush_all();
++    #[cfg(target_arch = "loongarch64")]
++    invalidate_verified_user_translations(current_cpu_index());
+     tlb_shootdown_inner(usize::MAX, true);
+ }
+ 
+diff --git a/os/src/smp_regression.rs b/os/src/smp_regression.rs
+index 30cbeed..34aad45 100644
+--- a/os/src/smp_regression.rs
++++ b/os/src/smp_regression.rs
+@@ -917,7 +917,7 @@ fn worker() -> ! {
+     SEEN_MASK.fetch_or(bit, Ordering::AcqRel);
+ 
+     if cpu != COORDINATOR_CPU.load(Ordering::Acquire) {
+-        crate::platform::mark_current_address_space(TEST_ROOT.load(Ordering::Acquire));
++        crate::platform::mark_current_address_space(TEST_ROOT.load(Ordering::Acquire), 1, 1);
+         TLB_READY_MASK.fetch_or(bit, Ordering::AcqRel);
+         while !RELEASE_TLB_WORKERS.load(Ordering::Acquire) {
+             core::hint::spin_loop();
+@@ -1132,7 +1132,7 @@ pub fn run() {
+ 
+     let remote_mask = expected & !coordinator_bit;
+     wait_for(&TLB_READY_MASK, remote_mask, "tlb-ready");
+-    crate::platform::mark_current_address_space(root);
++    crate::platform::mark_current_address_space(root, 1, 1);
+     crate::platform::tlb_shootdown(root);
+     crate::platform::clear_current_address_space();
+ 
+diff --git a/os/src/trap/mod.rs b/os/src/trap/mod.rs
+index 1e0540d..cd593c2 100644
+--- a/os/src/trap/mod.rs
++++ b/os/src/trap/mod.rs
+@@ -560,13 +560,11 @@ pub fn restore_kernel_page_table() {
+         #[cfg(feature = "buildstorm-diagnostics")]
+         crate::buildstorm_diagnostics::note_root_activation(false, false);
+         kpt.change_with_asid(0);
+-        #[cfg(target_arch = "loongarch64")]
+-        {
+-            // LoongArch changes PGDL and ASID independently.  Switching from
+-            // a user root back to the kernel root therefore needs a local
+-            // invalidation even when the previous ASID was nonzero.
+-            polyhal::pagetable::TLB::flush_all();
+-        }
++        // A nonzero user ASID cannot alias the kernel's ASID-0 translations.
++        // Preserve it across the kernel-root interval; activation validates
++        // the root and page-table generation before reusing it.  When user and
++        // kernel share ASID 0, the roots can alias and a full flush remains
++        // mandatory.
+         if reused_kernel_asid {
+             #[cfg(feature = "buildstorm-diagnostics")]
+             crate::buildstorm_diagnostics::note_local_tlb_flush();
+diff --git a/patch/polyhal/src/pagetable/mod.rs b/patch/polyhal/src/pagetable/mod.rs
+index e6ff51c..a9aae02 100644
+--- a/patch/polyhal/src/pagetable/mod.rs
++++ b/patch/polyhal/src/pagetable/mod.rs
+@@ -17,7 +17,9 @@ cfg_if::cfg_if! {
+     }
+ }
+ 
+-use core::ops::Deref;
++use core::{ops::Deref, sync::atomic::AtomicUsize};
++#[cfg(target_arch = "loongarch64")]
++use core::sync::atomic::Ordering;
+ 
+ use crate::{components::common::frame_alloc, PhysAddr, VirtAddr};
+ 
+@@ -432,8 +434,8 @@ pub struct TLB;
+ /// You can use this wrapper to packing PageTable.
+ /// If you release the PageTableWrapper,
+ /// the PageTable will release its page table entry.
+-#[derive(Debug)]
+-pub struct PageTableWrapper(pub PageTable);
++#[derive(Debug)]
++pub struct PageTableWrapper(pub PageTable, AtomicUsize);
+ 
+ impl Deref for PageTableWrapper {
+     type Target = PageTable;
+@@ -446,7 +448,87 @@ impl Deref for PageTableWrapper {
+ /// Allocate a new PageTableWrapper with new page table root
+ ///
+ /// This operation will copy kernel page table space from booting page table.
+-impl PageTableWrapper {
++impl PageTableWrapper {
++    /// Monotonic identity of the leaf mappings published through this owner.
++    ///
++    /// Address-space activation uses this value to decide whether an ASID's
++    /// cached translations still describe this page table.  Keep the counter
++    /// at the page-table operation boundary so every user mapping path shares
++    /// one source of truth.
++    #[inline]
++    pub fn translation_generation(&self) -> usize {
++        #[cfg(target_arch = "loongarch64")]
++        {
++            self.1.load(Ordering::Acquire)
++        }
++        #[cfg(not(target_arch = "loongarch64"))]
++        {
++            0
++        }
++    }
++
++    #[inline]
++    fn note_translation_edit(&self, writes: usize) {
++        #[cfg(target_arch = "loongarch64")]
++        {
++            if writes != 0 {
++                self.1.fetch_add(1, Ordering::AcqRel);
++            }
++        }
++        #[cfg(not(target_arch = "loongarch64"))]
++        let _ = writes;
++    }
++
++    pub fn map_pages_without_flush<I>(&self, pages: I) -> usize
++    where
++        I: IntoIterator<Item = (VirtAddr, PhysAddr, MappingFlags)>,
++    {
++        let writes = self.0.map_pages_without_flush(pages);
++        self.note_translation_edit(writes);
++        writes
++    }
++
++    pub fn unmap_pages_without_flush<I>(&self, pages: I) -> usize
++    where
++        I: IntoIterator<Item = VirtAddr>,
++    {
++        let writes = self.0.unmap_pages_without_flush(pages);
++        self.note_translation_edit(writes);
++        writes
++    }
++
++    #[inline]
++    pub fn map_page(
++        &self,
++        vaddr: VirtAddr,
++        paddr: PhysAddr,
++        flags: MappingFlags,
++        size: MappingSize,
++    ) {
++        self.0.map_page(vaddr, paddr, flags, size);
++        self.note_translation_edit(1);
++    }
++
++    #[inline]
++    pub fn map_kernel(
++        &self,
++        vaddr: VirtAddr,
++        paddr: PhysAddr,
++        flags: MappingFlags,
++        size: MappingSize,
++    ) {
++        self.0.map_kernel(vaddr, paddr, flags, size);
++        self.note_translation_edit(1);
++    }
++
++    #[inline]
++    pub fn unmap_page(&self, vaddr: VirtAddr) {
++        self.0.unmap_page(vaddr);
++        // Conservatively advance even when the leaf was already absent.  An
++        // extra activation flush is safe; missing a real edit is not.
++        self.note_translation_edit(1);
++    }
++
+     /// Alloc a new PageTableWrapper sharing the boot page table root
+     ///
+     /// This reuses the OpenSBI-established page table for compatibility.
+@@ -456,7 +538,7 @@ impl PageTableWrapper {
+     pub fn alloc() -> Self {
+         // 使用启动页表的根地址，保持与 OpenSBI 设置的 1:1 映射兼容
+         let boot_pt_root = PageTable::current();
+-        Self(boot_pt_root)
++        Self(boot_pt_root, AtomicUsize::new(1))
+     }
+ 
+     /// Allocate a NEW independent page table with kernel mappings copied
+@@ -476,7 +558,7 @@ impl PageTableWrapper {
+         // 调用 restore() 从启动页表复制内核映射
+         pt.restore();
+ 
+-        Self(pt)
++        Self(pt, AtomicUsize::new(1))
+     }
+ }
+ 

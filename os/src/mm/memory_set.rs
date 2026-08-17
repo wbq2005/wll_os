@@ -478,11 +478,15 @@ impl MemorySet {
             crate::buildstorm_diagnostics::WorkClass::AddressSpaceActivation,
         );
         crate::perf_counters::note_user_page_table_activation();
-        // Callers hold the shared MemorySet lock while activating. Publishing
-        // the root before changing the hardware page table makes a concurrent
-        // page-table editor observe this CPU only after the new root is live;
-        // an editor that finished earlier leaves a generation handled here.
-        crate::platform::mark_current_address_space(self.address_space_root());
+        // Callers hold the shared MemorySet lock while activating.  Publishing
+        // the root before changing hardware state closes the shootdown race;
+        // the page-table generation catches edits completed while this CPU was
+        // running on the kernel root and therefore not an active shootdown
+        // target.
+        let root = self.address_space_root();
+        let generation = self.page_table.translation_generation();
+        let _translations_current =
+            crate::platform::mark_current_address_space(root, self.address_space_id, generation);
         #[cfg(target_arch = "riscv64")]
         let already_active = PageTable::current().root() == self.page_table.root()
             && PageTable::current_asid() == self.address_space_id;
@@ -496,20 +500,18 @@ impl MemorySet {
             #[cfg(feature = "buildstorm-diagnostics")]
             crate::buildstorm_diagnostics::note_root_activation(true, true);
         }
-        // LoongArch page-table edits currently occur under kernel ASID 0 and
-        // need a conservative local invalidation before re-entering user mode.
-        // RISC-V can retain its ASID-tagged entries across the transition.
-        // RISC-V keeps the shared kernel root permanently on ASID 0. User page
-        // table edits do not modify that root, and explicit kernel mapping
-        // changes already invalidate their affected entries, so restoring the
-        // same root needs no sfence.vma. LoongArch still requires the proven
-        // conservative full invalidation on every user-root activation.
+        // LoongArch retains a nonzero-ASID translation only after validating
+        // the exact root and page-table generation.  ASID 0 remains shared
+        // with the kernel and always takes the conservative flush path.
         #[cfg(target_arch = "loongarch64")]
         {
-            #[cfg(feature = "buildstorm-diagnostics")]
-            crate::buildstorm_diagnostics::note_local_tlb_flush();
-            TLB::flush_all();
+            if !_translations_current {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                crate::buildstorm_diagnostics::note_local_tlb_flush();
+                TLB::flush_all();
+            }
         }
+        crate::platform::complete_current_address_space(root, self.address_space_id, generation);
     }
 
     pub fn address_space_id(&self) -> usize {
