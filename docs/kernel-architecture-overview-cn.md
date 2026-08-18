@@ -466,23 +466,21 @@ discard 不改变 VMA 拓扑，因此下一次访问按原权限重新 fault，�
 8G/8 BuildStorm 均已通过，证据见
 `docs/evidence/buildstorm-stage2/stage17-madvise-dontneed-official-20260816/`。
 
-## 18. LoongArch64 trap-root 与 TLB generation 边界
+## 18. LoongArch64 trap-root 与保守 TLB 边界
 
-LoongArch64 trap 入口继续切换到 kernel root/ASID 0。非零用户 ASID 的 translation
-与 kernel ASID 0 不别名，因此可跨该区间保留；返回用户态时由第 7 节的精确三元组
-验证决定是否复用。用户 ASID 0 仍可能与 kernel root 别名，必须全量失效。
+LoongArch64 trap 入口切换到 kernel root/ASID 0，返回用户态前激活对应用户 root。
+当前生产协议在这两个 root 边界都执行本地全量 `TLB::flush_all()`；远端页表修改仍由
+active-root shootdown 协议处理。`PageTableWrapper` 只拥有页表和 leaf 操作，不再
+拥有 translation generation；平台层也不缓存 CPU-local verified-root 三元组。
 
-这一设计不把 trap-root 生命周期交给 `MemorySet` 之外的模块，也不让
-`PageTableWrapper` 管理 CPU-local 状态：页表 wrapper 只拥有 generation，平台层只
-拥有 CPU-local 验证与 shootdown，`MemorySet` 负责把两者按地址空间锁序组合。
-Stage24 的“普通 syscall/fault 始终保留 user root”方案在 public LA 600 秒窗口只到
-toolchain，已经被隔离；当前架构不取消 kernel-root 安全边界。
-
-同源 LoongArch64 8G/8 A/B 为 555.02 秒到 542.02 秒，提升 2.34%；双架构最终
-8G/8 public BuildStorm 分别为 RV 773.45 秒、LA 542.02 秒，均有精确 `ok=true`
-marker 和 judge 180/180。该结果证明协议正确并消除了真实高频失效，但收益也说明
-TLB 不是剩余主热点。证据与诚实边界见
-`docs/evidence/buildstorm-stage2/20260817-stage23-la-tlb-generation-conclusion-cn.md`。
+Stage23 曾尝试按 `{root, ASID, generation}` 保留非零用户 ASID translation，并在
+public 8G/8 得到 2.34% 的历史 A/B 收益。但随后官方 SMP12/36G clean build 出现
+glibc heap corruption/SIGABRT，说明该门禁没有覆盖评测机压力下的 stale translation
+风险，因此已经回退。Stage24 的“普通 syscall/fault 始终保留 user root”也已隔离。
+历史证据保留在
+`docs/evidence/buildstorm-stage2/20260817-stage23-la-tlb-generation-conclusion-cn.md`，
+当前回退证据见
+`docs/evidence/buildstorm-stage2/20260818-stage23-la-tlb-evaluator-regression-revert/README.md`。
 
 ## 19. VFS 路径类型与隐藏 fixture 边界
 

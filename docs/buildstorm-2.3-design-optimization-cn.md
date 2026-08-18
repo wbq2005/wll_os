@@ -752,7 +752,11 @@ Zicboz 清零后端；该精确最终树的 LA 与 RV 分别在 558.27 秒、686
 AI 辅助日志/源码审计、协议设计、实现和串行 A/B；开发者可从最终增量补丁、原始
 serial、runner JSON、SMP/cfg 日志、judge 与 hash 独立复核。
 
-## 17. 2026-08-17 LoongArch64 TLB generation 验证协议
+## 17. 2026-08-17 LoongArch64 TLB generation 历史候选（已回退）
+
+本节保留 Stage23 当时的因果模型、A/B 与历史证据，不能再作为当前生产架构说明。
+2026-08-18 官方 SMP12/36G 评测出现 glibc heap corruption 后，该候选已按第 21 节
+回退；当前生产路径使用用户根激活和切回 kernel root 的保守本地全量失效。
 
 ### 17.1 Stage22 归因与因果模型
 
@@ -804,8 +808,8 @@ VFS 等待做统一时间轴归因，不以继续删除 TLB 边界作为默认�
 | --- | --- | --- | --- |
 | production/diagnostics release | 通过/通过 | 通过/通过 | `capability-pass` |
 | SMP8 MM/VFS/ABI/heap 回归 | 通过 | 通过 | `capability-pass` |
-| public BuildStorm 8G/8 | `ok=true 773.45s` | `ok=true 542.02s` | `official-pass` |
-| public judge 自动项 | 180/180 | 180/180 | `official-pass` |
+| 历史 public BuildStorm 8G/8 | `ok=true 773.45s` | `ok=true 542.02s` | 历史 `official-pass` |
+| 历史 public judge 自动项 | 180/180 | 180/180 | 历史 `official-pass` |
 
 官方 suite commit 为 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`，QEMU 11.0.3，
 运行参数为 `-snapshot -m 8G -smp 8`。镜像、script、judge、marker、guest 时间和
