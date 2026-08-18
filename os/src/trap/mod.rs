@@ -576,11 +576,13 @@ pub fn restore_kernel_page_table() {
         #[cfg(feature = "buildstorm-diagnostics")]
         crate::buildstorm_diagnostics::note_root_activation(false, false);
         kpt.change_with_asid(0);
-        // A nonzero user ASID cannot alias the kernel's ASID-0 translations.
-        // Preserve it across the kernel-root interval; activation validates
-        // the root and page-table generation before reusing it.  When user and
-        // kernel share ASID 0, the roots can alias and a full flush remains
-        // mandatory.
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // LoongArch changes PGDL and ASID independently. Switching from
+            // a user root back to the kernel root therefore needs a local
+            // invalidation even when the previous ASID was nonzero.
+            polyhal::pagetable::TLB::flush_all();
+        }
         if reused_kernel_asid {
             #[cfg(feature = "buildstorm-diagnostics")]
             crate::buildstorm_diagnostics::note_local_tlb_flush();

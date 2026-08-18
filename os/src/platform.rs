@@ -36,13 +36,6 @@ static TLB_GENERATION: AtomicUsize = AtomicUsize::new(0);
 static TLB_REQUEST: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static TLB_ACK: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
-#[cfg(target_arch = "loongarch64")]
-static VERIFIED_USER_ROOT: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
-#[cfg(target_arch = "loongarch64")]
-static VERIFIED_USER_ASID: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
-#[cfg(target_arch = "loongarch64")]
-static VERIFIED_USER_GENERATION: [AtomicUsize; MAX_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 const IPI_RESCHEDULE: u32 = 1 << 1;
 const IPI_TLB_SHOOTDOWN: u32 = 1 << 2;
@@ -481,7 +474,6 @@ pub fn handle_ipi(action: usize) {
     if action & IPI_TLB_SHOOTDOWN as usize != 0 {
         polyhal::pagetable::TLB::flush_all();
         let cpu = current_cpu_index();
-        invalidate_verified_user_translations(cpu);
         let generation = TLB_REQUEST[cpu].load(Ordering::Acquire);
         TLB_ACK[cpu].store(generation, Ordering::Release);
     }
@@ -498,20 +490,7 @@ pub fn acknowledge_local_ipi() -> usize {
     }
 }
 
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn invalidate_verified_user_translations(cpu: usize) {
-    VERIFIED_USER_GENERATION[cpu].store(0, Ordering::Release);
-}
-
-/// Publish the user root and report whether this CPU already has translations
-/// for the exact root, ASID, and page-table generation.
-///
-/// Callers hold the address-space lock.  The active-root publication and the
-/// deferred shootdown handshake close the race with a concurrent editor: an
-/// editor either targets this CPU, or its newer page-table generation forces a
-/// local flush before user mode resumes.
-pub fn mark_current_address_space(root: usize, asid: usize, generation: usize) -> bool {
+pub fn mark_current_address_space(root: usize) {
     let cpu = current_cpu_index();
     // Publish the active root before sampling the deferred generation. If a
     // concurrent shooter publishes first, this CPU observes the request and
@@ -519,44 +498,10 @@ pub fn mark_current_address_space(root: usize, asid: usize, generation: usize) -
     // active root and includes this CPU in the synchronous remote flush.
     ACTIVE_ADDRESS_SPACE[cpu].store(root, Ordering::SeqCst);
     let request = TLB_REQUEST[cpu].load(Ordering::Acquire);
-    let mut flushed = false;
     if TLB_ACK[cpu].load(Ordering::Acquire) != request {
         polyhal::pagetable::TLB::flush_all();
-        #[cfg(target_arch = "loongarch64")]
-        invalidate_verified_user_translations(cpu);
         TLB_ACK[cpu].store(request, Ordering::Release);
-        flushed = true;
     }
-
-    #[cfg(target_arch = "loongarch64")]
-    {
-        asid != 0
-            && (flushed
-                || (VERIFIED_USER_GENERATION[cpu].load(Ordering::Acquire) == generation
-                    && VERIFIED_USER_ROOT[cpu].load(Ordering::Relaxed) == root
-                    && VERIFIED_USER_ASID[cpu].load(Ordering::Relaxed) == asid))
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let _ = (asid, generation, flushed);
-        true
-    }
-}
-
-/// Record the identity installed after the activation flush decision.
-pub fn complete_current_address_space(root: usize, asid: usize, generation: usize) {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let cpu = current_cpu_index();
-        VERIFIED_USER_GENERATION[cpu].store(0, Ordering::Release);
-        if asid != 0 {
-            VERIFIED_USER_ROOT[cpu].store(root, Ordering::Relaxed);
-            VERIFIED_USER_ASID[cpu].store(asid, Ordering::Relaxed);
-            VERIFIED_USER_GENERATION[cpu].store(generation, Ordering::Release);
-        }
-    }
-    #[cfg(target_arch = "riscv64")]
-    let _ = (root, asid, generation);
 }
 
 pub fn clear_current_address_space() {
@@ -712,8 +657,6 @@ pub fn flush_tlb_all_cpus() {
     #[cfg(feature = "buildstorm-diagnostics")]
     crate::buildstorm_diagnostics::note_local_tlb_flush();
     polyhal::pagetable::TLB::flush_all();
-    #[cfg(target_arch = "loongarch64")]
-    invalidate_verified_user_translations(current_cpu_index());
     tlb_shootdown_inner(usize::MAX, true);
 }
 

@@ -917,7 +917,7 @@ fn worker() -> ! {
     SEEN_MASK.fetch_or(bit, Ordering::AcqRel);
 
     if cpu != COORDINATOR_CPU.load(Ordering::Acquire) {
-        crate::platform::mark_current_address_space(TEST_ROOT.load(Ordering::Acquire), 1, 1);
+        crate::platform::mark_current_address_space(TEST_ROOT.load(Ordering::Acquire));
         TLB_READY_MASK.fetch_or(bit, Ordering::AcqRel);
         while !RELEASE_TLB_WORKERS.load(Ordering::Acquire) {
             core::hint::spin_loop();
@@ -1132,7 +1132,7 @@ pub fn run() {
 
     let remote_mask = expected & !coordinator_bit;
     wait_for(&TLB_READY_MASK, remote_mask, "tlb-ready");
-    crate::platform::mark_current_address_space(root, 1, 1);
+    crate::platform::mark_current_address_space(root);
     crate::platform::tlb_shootdown(root);
     crate::platform::clear_current_address_space();
 

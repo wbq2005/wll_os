@@ -515,3 +515,16 @@ Harness 的 `UserProgramSpec.root` 是进程文件系统命名空间的权威边
 VFS 继续只负责路径分量与 inode 类型，普通文件作为中间分量必须返回 `ENOTDIR`；
 harness 不通过 VFS 容错修复命名空间错误。该职责划分由双向 SMP 回归覆盖，详见
 `docs/evidence/buildstorm-stage2/20260817-stage25-script-root-namespace/README.md`。
+
+## 21. Stage23 evaluator 回归后的 TLB 安全边界
+
+官方 SMP12/36G LoongArch clean build 曾在 `ax-hal` 编译期间触发 glibc
+`corrupted double-linked list`/`SIGABRT`。该结果与 generation-based TLB reuse
+的 stale translation 风险一致，且成功 v16 树使用的是保守失效路径。因此当前架构
+恢复用户根激活和 user-to-kernel root 切换的本地全量 `TLB::flush_all()`，不再以
+CPU-local generation 验证替代硬件失效。该回退不改变 VmaMap、ResidentSet、PTE、
+TlbProtocol 的所有权边界，也不影响已验证的 UAL、脚本 root 和目录 ABI 修复。
+
+四种 release/cfg 编译检查已通过；新的官方 `BUILDSTORM_COMPILE ... ok=true` 尚未
+取得，当前证据等级为 `unverified`。Stage23 的历史 public 8G/8 结果保留为历史
+证据，不作为修复树的稳定性承诺。

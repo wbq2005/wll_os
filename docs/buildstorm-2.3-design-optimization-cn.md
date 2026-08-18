@@ -950,3 +950,21 @@ AI 协助完成 QEMU 源码定位、评测日志关联、ABI 因果模型和回�
 源码、四种 cfg 构建输出、原始 LoongArch 日志和官方评分结果复核。未修改官方镜像、
 suite、guest script、judge、marker 或 guest 时间；diagnostics 仍显式 gated，
 production 默认 `BUILDSTORM_DIAGNOSTICS ?= 0`。
+
+## 21. 2026-08-18 Stage23 LoongArch TLB evaluator regression 回退
+
+最新官方评测在 LoongArch nested BuildStorm 的 glibc clean build 阶段出现
+`corrupted double-linked list` 和 `SIGABRT`，串口结果为
+`BUILDSTORM_RESULT mode=multi status=FAIL rc=1 cores=12 elapsed_s=72.96 run=FAIL`。
+UAL 启动阻塞已经消失，内核完成启动、Hello World 和 nested QEMU 准备；Cargo 的
+last-use/data conversion 信息只是非致命缓存警告。该证据把首错归因到 Stage23
+引入的 LoongArch TLB generation reuse 在评测机压力下暴露 stale translation，
+而非 BuildStorm 脚本或编译器本身。
+
+修复只恢复成功 v16 树中的保守边界：用户根激活和切回 kernel root 都执行本地
+`TLB::flush_all()`，删除 `PageTableWrapper` generation 以及 CPU-local
+`{root, ASID, generation}` 验证状态，SMP regression 恢复原始接口。UAL auxv、
+Stage25 脚本 root、目录 ABI、VFS/MM 优化和根相对 ZIP 入口均保留。四种 release/cfg
+`cargo check` 全部 `EXIT=0`；官方复测尚未完成，因此当前状态仍为 `unverified`，
+不能把历史 180/180 迁移到修复树。原始日志、归因和范围见
+`docs/evidence/buildstorm-stage2/20260818-stage23-la-tlb-evaluator-regression-revert/README.md`。
