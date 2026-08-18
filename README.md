@@ -139,7 +139,7 @@ fault（71.482 秒）。保留的 clean-page cache batch 把 16 页预读检查�
 评测和设计入口：
 
 - [BuildStorm 2.3 中文累计设计与优化记录](docs/buildstorm-2.3-design-optimization-cn.md)
-- [BuildStorm 决赛 2.3 设计优化文档（PDF）](buildstorm-final-design-optimization.pdf)
+- [BuildStorm 决赛文档（PDF）](决赛文档.pdf)
 - [当前内核架构总设计](docs/kernel-architecture-overview-cn.md)
 - [历史累计设计记录](docs/buildstorm-kernel-design-optimization.md)
 - [双架构 official-pass 证据结论](docs/evidence/buildstorm-stage2/20260814-stage2-buildstorm-official-completion.md)
